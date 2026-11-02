@@ -438,7 +438,7 @@ class ClaudeCodeRunner(AgentRunner):
 
 
 class CustomCommandRunner(AgentRunner):
-    """Run a configured command as an Agent Team work runner."""
+    """Run a configured command as an Agent work runner."""
 
     def __init__(self, settings: AgentHarnessSettings):
         self.settings = settings
@@ -649,10 +649,11 @@ async def _spawn_scoped_process(
     backend, safe_cwd = prepared
     env = build_aoitalk_subprocess_env(extra_env={"NO_COLOR": "1"})
     try:
+        from ..tools.os_operations.command_executor import build_process_group_kwargs
+
         if backend == "native_windows":
             if os.name != "nt":
                 return None, "scoped harness execution denied: native_windows requires Windows"
-            from ..tools.os_operations.command_executor import build_process_group_kwargs
 
             process_group_kwargs = build_process_group_kwargs()
             process_group_kwargs["creationflags"] |= getattr(

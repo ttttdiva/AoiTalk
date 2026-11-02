@@ -91,7 +91,7 @@ function Test-OwnTaskDefinition($Task) {
 }
 
 function Get-RunningOwnTaskProcess {
-    $task = Get-ScheduledTask -TaskName "AoiTalk Plugin 41" -ErrorAction SilentlyContinue
+    $task = Get-ScheduledTask -TaskName "AoiTalk Plugin" -ErrorAction SilentlyContinue
     if (-not $task -or [string]$task.State -ne "Running" -or -not (Test-OwnTaskDefinition $task)) { return $null }
     $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -in @("powershell.exe", "pwsh.exe") -and

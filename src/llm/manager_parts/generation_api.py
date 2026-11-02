@@ -126,6 +126,7 @@ class GenerationApiMixin:
         sender: Callable[[dict[str, Any]], Awaitable[Any]],
         source_kind: str,
         gateway: OutboundPrivacyGateway | None = None,
+        provider_key_consumer_id: str | None = None,
     ) -> Any:
         """Run one direct model request inside the privacy transaction."""
 
@@ -150,7 +151,7 @@ class GenerationApiMixin:
         # Plain/utility requests bypass AgentTurnRunner. Apply the target's
         # allowance here before privacy and quota inspect the outbound body.
         config = getattr(self, "config", None)
-        from ...services.agent_team_service import config_get
+        from ...services.runtime_policy_utils import config_get
         # Same explicit-setting semantics as the native runner: a falsy value
         # means "unset", never an injected default.
         limit = config_get(config, "runtime.target_max_output_tokens", None) if config is not None else None
@@ -169,6 +170,26 @@ class GenerationApiMixin:
             payload = constrain_model_request_extra_body(payload)
         async def bounded_sender(outbound):
             record_bounded_model_request(outbound)
+            attribution_identity = getattr(
+                getattr(self, "_openai_client", None),
+                "_aoitalk_provider_key_identity",
+                None,
+            )
+            consumer_id = (
+                provider_key_consumer_id
+                or getattr(self, "_provider_key_consumer_id", None)
+                or "base_model:openai"
+            )
+            if provider == "openai" and attribution_identity is not None:
+                from ...services.provider_key_attribution_service import (
+                    call_with_provider_key_attribution,
+                )
+
+                return await call_with_provider_key_attribution(
+                    lambda: sender(outbound),
+                    identity=attribution_identity,
+                    consumer_id=consumer_id,
+                )
             return await sender(outbound)
         active_gateway = gateway or self._privacy_gateway_for_generation()
         return await active_gateway.execute(
@@ -185,6 +206,16 @@ class GenerationApiMixin:
             source_kind=source_kind,
             model=model,
             credential_identity=openai_credential_identity(getattr(self, "_openai_client", None)),
+            sdk_max_retries=(
+                getattr(getattr(self, "_openai_client", None), "max_retries", None)
+                if provider == "openai"
+                else None
+            ),
+            httpx_transport_retries=(
+                getattr(getattr(self, "_openai_client", None), "_aoitalk_httpx_transport_retries", None)
+                if provider == "openai"
+                else None
+            ),
         )
 
     """chat/generate_* 系の公開エントリポイント、ストリーム抽出、シーン画像生成。"""
@@ -207,13 +238,6 @@ class GenerationApiMixin:
         distinguishable in ``TokenUsage``.
         """
 
-        if bool(
-            getattr(get_turn_context(), "suppress_automatic_context", False)
-        ):
-            # Help is a transient Guide projection.  Even direct ephemeral
-            # provider helpers must not create ordinary TokenUsage rows.
-            return {}
-
         raw_usage = getattr(response, "usage", None)
         resolved_model = getattr(response, "model", None)
         if isinstance(response, dict):
@@ -226,6 +250,14 @@ class GenerationApiMixin:
             provider=str(getattr(self, "provider_label", "") or ""),
             resolved_model=(str(resolved_model) if resolved_model else None),
         )
+        self._capture_ephemeral_usage_if_requested(usage)
+        if bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        ):
+            # Help is a transient Guide projection. Even opted-in callers may
+            # inspect provider usage, but suppressed turns still create no
+            # ordinary TokenUsage rows.
+            return {}
         # ``normalize_usage({})`` intentionally returns a shape containing
         # ``None`` fields for callers that compare key sets.  Do not turn that
         # shape into a fabricated zero-token TokenUsage row.
@@ -846,6 +878,40 @@ class GenerationApiMixin:
             response, str(response.choices[0].message.content or ""),
             transport="openai.chat.completions", request_type=request_type,
         ))
+
+    def _capture_ephemeral_usage_if_requested(self, usage: Any) -> None:
+        """Expose only numeric provider usage to an explicitly opted-in caller.
+
+        This keeps the ordinary text API unchanged and avoids retaining provider
+        metadata on clients that do not request a one-call diagnostic snapshot.
+        """
+
+        if getattr(self, "_capture_ephemeral_usage_for_caller", False) is not True:
+            return
+        if not isinstance(usage, dict):
+            usage = {}
+
+        def nonnegative_int(value: Any) -> int | None:
+            if type(value) is int and 0 <= value <= 1_000_000_000:
+                return value
+            return None
+
+        input_units = nonnegative_int(usage.get("input_tokens"))
+        output_units = nonnegative_int(usage.get("output_tokens"))
+        total_source = usage.get("total_tokens_source")
+        total_source = total_source if total_source in {"reported", "derived"} else None
+        total_units = (
+            nonnegative_int(usage.get("total_tokens")) if total_source else None
+        )
+        self._captured_ephemeral_usage = {
+            "usage_present": any(
+                value is not None for value in (input_units, output_units, total_units)
+            ),
+            "usage_input_units": input_units,
+            "usage_output_units": output_units,
+            "usage_total_units": total_units,
+            "usage_total_source": total_source,
+        }
 
     async def generate_title_async(self, prompt: str) -> str:
         """Generate a title through the side-effect-free API and meter it as title."""

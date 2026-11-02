@@ -25,6 +25,11 @@ export type ChatComposerDraftSnapshot = {
   revision: string;
 };
 
+export type ChatComposerDraftCount = {
+  status: "available" | "unknown";
+  count: number | null;
+};
+
 const writeQueues = new Map<string, Promise<void>>();
 
 function stringValue(value: unknown): string | null {
@@ -96,6 +101,50 @@ export async function readChatComposerDraft(
     // A corrupt/unavailable private draft must not block the composer, and is
     // deliberately not removed before a successful scoped readback.
     return null;
+  }
+}
+
+/** Count persisted non-empty drafts for one server/user namespace without
+ * returning keys, conversation IDs, commands, or private composer text. */
+export async function countChatComposerDraftsForOwner(
+  owner: Pick<ChatComposerDraftScope, "authUser" | "serverProfile">,
+): Promise<ChatComposerDraftCount> {
+  if (!owner.authUser.trim() || !owner.serverProfile.trim()) {
+    return { status: "unknown", count: null };
+  }
+  try {
+    const prefix = `${STORAGE_KEYS.CHAT_COMPOSER_DRAFT_PREFIX}:`;
+    const keys = (await AsyncStorage.getAllKeys()).filter((key) => key.startsWith(prefix));
+    const scopedKeys: string[] = [];
+    for (const key of keys) {
+      try {
+        const parts: unknown = JSON.parse(decodeURIComponent(key.slice(prefix.length)));
+        if (!Array.isArray(parts) || parts.length !== 3
+          || parts.some((part) => typeof part !== "string")) {
+          return { status: "unknown", count: null };
+        }
+        if (parts[0] === owner.serverProfile && parts[1] === owner.authUser) scopedKeys.push(key);
+      } catch {
+        return { status: "unknown", count: null };
+      }
+    }
+
+    const values = await Promise.all(scopedKeys.map((key) => AsyncStorage.getItem(key)));
+    let count = 0;
+    for (const raw of values) {
+      if (raw === null) return { status: "unknown", count: null };
+      let record: ChatComposerDraftRecord | null;
+      try {
+        record = normalizeRecord(JSON.parse(raw));
+      } catch {
+        return { status: "unknown", count: null };
+      }
+      if (!record) return { status: "unknown", count: null };
+      if (record.text.length > 0 || record.activeCommand !== null) count += 1;
+    }
+    return { status: "available", count };
+  } catch {
+    return { status: "unknown", count: null };
   }
 }
 

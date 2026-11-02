@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, FastAPI, WebSocket, WebSocketDisconnect
 
+from ...services.admin_restart_admission import AdminRestartPendingError
 from ..public_base_path import with_public_base_path
 
 # Import os_operations user context functions (server.py と同じフォールバック付き)
@@ -175,6 +176,8 @@ def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
                         "persisted_user_message_id",
                         "skip_user_persistence",
                         "_dispatch_delivery_lifecycle",
+                        "agent_dialogue",
+                        "_dialogue_transport",
                     ):
                         message_data.pop(server_owned_field, None)
                     generation_status = server.get_conversation_generation_status(
@@ -222,7 +225,17 @@ def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
                         )
 
                         message_data["_trusted_legacy"] = TRUSTED_LEGACY_MARKER
-                    await server._handle_user_message(message_data)
+                    try:
+                        await server._handle_user_message(message_data)
+                    except AdminRestartPendingError as exc:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "error": str(exc),
+                                "code": "admin_restart_pending",
+                            }
+                        )
+                        continue
                 elif message_type == "clear_chat":
                     if (
                         server.auth_enabled

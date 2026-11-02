@@ -11,7 +11,9 @@ import base64
 import json
 import logging
 import os
+import sys
 import tempfile
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -54,6 +56,26 @@ _active_agent_team_cli: ContextVar[dict[str, Any] | None] = ContextVar(
     "codex_active_agent_team_cli",
     default=None,
 )
+_active_aoidots_agent_cli: ContextVar[dict[str, Any] | None] = ContextVar(
+    "codex_active_aoidots_agent_cli",
+    default=None,
+)
+_active_native_delegation_phase: ContextVar[Any | None] = ContextVar(
+    "codex_active_native_delegation_phase", default=None
+)
+
+
+@contextmanager
+def aoidots_agent_cli_context(*, formal_mcp_context: dict[str, Any] | None):
+    """Mark one server-proven AoiDots Root/Worker invocation."""
+
+    token = _active_aoidots_agent_cli.set(
+        dict(formal_mcp_context) if isinstance(formal_mcp_context, dict) else {}
+    )
+    try:
+        yield
+    finally:
+        _active_aoidots_agent_cli.reset(token)
 
 
 @contextmanager
@@ -113,6 +135,32 @@ For AoiTalk Project workspace or Docs operations, never use native shell or
 native file tools, never inspect the AoiTalk source repository, and never write
 the database directly. Use only the listed high-level AoiTalk tools.
 """
+
+_AOIDOTS_AGENT_CLI_PREAMBLE = """\
+You are an AoiDots Root or Worker inside AoiTalk.
+Use the actually registered first-party native MCP high-level tools when
+available, such as mcp__dialogue8__list_agent_workers,
+mcp__dialogue8__delegate, mcp__dialogue8__delegate_plan, and the available
+mcp__agent_activity__agent_activity read tool. Invoke native tools and use
+their actual results as proof of external work. Do not emit textual tool-call
+pseudoactions. Do not use native collaboration
+alternatives, shell, direct database access, or source files for this work.
+The server enforces the issued owner, Agent, revision, WorkRun, binding, lease,
+and tool policy; use only tools actually available to this invocation.
+
+If you are the Root orchestrating work, resolve Workers and the authorized
+Graph as needed and submit each delegation once. You may delegate multiple
+independent tasks when needed. After the current admissions are accepted, give
+a brief started acknowledgement and end the current model turn when there is
+nothing else useful to do now. Do not poll, sleep, wait, or repeatedly read
+status or activity solely for completion, and do not use native collaboration
+workers. Work continues through the normal background scheduler. A later
+question or typed result is delivered into a subsequent normal Root turn;
+handle any cross-Team handoff and acknowledgement then. Started is not done:
+keep unresolved work pending. User-requested status, rework, cancellation, and
+other discussion remain available; do not automatically cancel work.
+"""
+
 
 _AGENT_TEAM_CLI_PREAMBLE = """\
 You are an Execution Team CLI worker inside AoiTalk.
@@ -186,6 +234,9 @@ class CodexCLIBackend(CLIBackendBase):
     provider_state_root_supported = True
     # Codex owns repository file search/read/edit and shell natively.
     native_repository_tools = True
+    supports_formal_agent_mcp = True
+    supports_formal_agent_mcp_config_overrides = True
+    supports_aoidots_agent_execution = True
 
     _native_sessions_available: Optional[bool] = None
 
@@ -201,12 +252,16 @@ class CodexCLIBackend(CLIBackendBase):
         self._usage_event_index = 0
         # 最終出力は最後の agent_message なので、確定するまで1件保留する。
         self._pending_agent_message: Optional[tuple[str, int]] = None
+        self._last_native_tool_calls: list[dict[str, Any]] = []
+        self._native_invocation_id = uuid.uuid4().hex
         super().__init__()
 
     def _reset_stream_state(self) -> None:
+        self._native_invocation_id = uuid.uuid4().hex
         self._stream_round = 0
         self._usage_event_index = 0
         self._pending_agent_message = None
+        self._last_native_tool_calls = []
 
     def native_repository_capabilities_for_scope(self, scope: Any) -> frozenset:
         """Native capabilities of the next invocation inside ``scope``.
@@ -245,6 +300,15 @@ class CodexCLIBackend(CLIBackendBase):
 
     def native_feature_gate_args(self, disabled_features) -> list[str] | None:
         """Remove disabled native schemas and reject their direct invocation."""
+        if _active_aoidots_agent_cli.get() is not None:
+            # The dedicated AoiDots path is admitted only after the exact
+            # Root/Worker run scope and authority checks in
+            # cli_native_capabilities.py.  The provider receives the finite
+            # first-party MCP configuration assembled for that invocation.
+            args: list[str] = []
+            if "search" in disabled_features:
+                args.extend(["-c", 'web_search="disabled"'])
+            return args
         # MCP tables merge with host configuration: mcp_servers={} cannot
         # remove unenumerated host servers. There is no portable whole-MCP
         # exclusion flag, so refuse before starting the native CLI.
@@ -259,11 +323,140 @@ class CodexCLIBackend(CLIBackendBase):
         return args
 
     def native_mcp_gate_args(self, blocked_servers) -> list[str] | None:
+        if _active_aoidots_agent_cli.get() is not None:
+            return []
         # enabled=false alone is invalid when the server is absent on the
         # host. Supplying a transport can conflict with a merged HTTP/stdio
         # entry. AoiTalk cannot prove the native host configuration matches
         # its registry; refuse instead of modifying an unknown transport.
         return None if blocked_servers else []
+
+    def aoidots_agent_feature_gate_args(self, disabled_features) -> list[str]:
+        args: list[str] = []
+        if "search" in disabled_features:
+            args.extend(["-c", 'web_search="disabled"'])
+        # Formal AoiDots delegation is accounted for through the issued
+        # AgentRunScope and first-party MCP receivers.  Codex-native teams can
+        # otherwise wait on their own worker flow without producing the
+        # delegate/answer/result receipts that AoiTalk relays to the user.
+        # Keep this override on the attested AoiDots lane only; do not change
+        # the host Codex config or ordinary CLI feature gates.
+        args.extend(
+            [
+                "-c",
+                "features.multi_agent=false",
+                "-c",
+                "features.multi_agent_v2=false",
+            ]
+        )
+        return args
+
+    def native_agent_tool_allowlist_args(self, capabilities, mcp_servers=()) -> list[str]:
+        # Codex CLI has no provider-wide native tool allowlist flag. AoiDots
+        # exposes only its first-party receiver configuration through this
+        # dedicated route; read-only workspace access comes from its issued
+        # AgentRunScope and --sandbox flag.
+        del capabilities, mcp_servers
+        return []
+
+    def formal_agent_mcp_context(self, context: dict[str, Any] | None):
+        return aoidots_agent_cli_context(formal_mcp_context=context)
+
+    @staticmethod
+    def native_delegation_phase_args() -> list[str]:
+        return ["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                "-c", 'web_search="disabled"']
+
+    @contextmanager
+    def native_delegation_phase_context(self, client):
+        from ..cli_native_capabilities import _native_delegation_phase_proof
+        if client.cli_backend is not self or _native_delegation_phase_proof(client) is None:
+            raise PermissionError("invalid native delegation phase proof")
+        token = _active_native_delegation_phase.set(client)
+        try:
+            yield
+        finally:
+            _active_native_delegation_phase.reset(token)
+
+    def get_subprocess_env(self) -> dict[str, str]:
+        env = super().get_subprocess_env()
+        context = _active_aoidots_agent_cli.get()
+        if _active_native_delegation_phase.get() is not None:
+            context = {}
+        if not isinstance(context, dict):
+            return env
+        if context:
+            from ...services.codex_development_runtime import (
+                POLICY_ENABLED_ENV, POLICY_ENV, POLICY_OWNER_ENV,
+                POLICY_DIGEST_ENV, POLICY_CLI_PATH_ENV, POLICY_CLI_VERSION_ENV,
+            )
+
+            for key in (
+                POLICY_ENABLED_ENV, POLICY_ENV, POLICY_OWNER_ENV,
+                POLICY_DIGEST_ENV, POLICY_CLI_PATH_ENV, POLICY_CLI_VERSION_ENV,
+            ):
+                if key in os.environ:
+                    env[key] = os.environ[key]
+        for key in ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME"):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
+        codex_home = str(os.environ.get("CODEX_HOME") or "").strip()
+        if not codex_home:
+            user_profile = str(
+                env.get("USERPROFILE") or os.environ.get("USERPROFILE") or ""
+            ).strip()
+            if user_profile:
+                codex_home = str(Path(user_profile) / ".codex")
+        if codex_home:
+            env["CODEX_HOME"] = codex_home
+        env_names = (
+            "run_id",
+            "work_item_id",
+            "session_id",
+            "agent_id",
+            "agent_revision_id",
+            "binding_id",
+            "binding_snapshot_hash",
+            "capability_manifest_digest",
+            "authority_digest",
+            "lease_owner",
+            "lease_token",
+        )
+        env_keys = {
+            "run_id": "AOITALK_AGENT_RUN_ID",
+            "work_item_id": "AOITALK_AGENT_WORK_ITEM_ID",
+            "session_id": "AOITALK_AGENT_SESSION_ID",
+            "agent_id": "AOITALK_AGENT_ID",
+            "agent_revision_id": "AOITALK_AGENT_REVISION_ID",
+            "binding_id": "AOITALK_AGENT_BINDING_ID",
+            "binding_snapshot_hash": "AOITALK_AGENT_BINDING_SNAPSHOT_HASH",
+            "capability_manifest_digest": "AOITALK_AGENT_CAPABILITY_MANIFEST_DIGEST",
+            "authority_digest": "AOITALK_AGENT_AUTHORITY_DIGEST",
+            "lease_owner": "AOITALK_AGENT_LEASE_OWNER",
+            "lease_token": "AOITALK_AGENT_LEASE_TOKEN",
+        }
+        for name in env_names:
+            value = context.get(name)
+            if value not in (None, ""):
+                env[env_keys[name]] = str(value)
+        for key in (
+            "POSTGRES_HOST",
+            "POSTGRES_PORT",
+            "POSTGRES_DB",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+        ):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
+        env["PYTHON_DOTENV_DISABLED"] = "1"
+        return env
+
+    def get_scoped_provider_env(self) -> dict[str, str]:
+        # Retain support for a future scoped Codex runner. Current AoiDots
+        # execution uses the installed host CLI to share ChatGPT login state.
+        return {}
 
     def get_session_capabilities(self) -> CLISessionCapabilities:
         if self.__class__._native_sessions_available is None:
@@ -331,6 +524,8 @@ class CodexCLIBackend(CLIBackendBase):
         )
         plain_generation = _active_disable_native_tools.get()
         agent_team_cli = _active_agent_team_cli.get()
+        aoidots_agent_cli = (_active_aoidots_agent_cli.get() is not None
+                             or _active_native_delegation_phase.get() is not None)
         if plain_generation:
             # Tool-free generation is a stricter contract than an ambient
             # Agent Team opt-in. It must never regain native tools.
@@ -342,43 +537,40 @@ class CodexCLIBackend(CLIBackendBase):
             managed_workspace_request = False
             plain_generation = False
         bin_path = os.getenv("CODEX_BIN", "codex")
-        if self._active_run_scope() is not None:
+        if self._active_run_scope() is not None and not aoidots_agent_cli:
             from ...security.wsl_bwrap_backend import scoped_codex_executable
 
             bin_path = scoped_codex_executable(bin_path)
         action = str(getattr(self, "_active_native_session_action", "stateless"))
         session_id = str(getattr(self, "_active_native_session_id", "") or "").strip()
-        cmd = [
-            bin_path,
-            "exec",
-            "--yolo",
-            "--json",
-            "--color",
-            "never",
-        ]
+        cmd = [bin_path, "exec"]
+        if not aoidots_agent_cli:
+            cmd.append("--yolo")
+        cmd.extend(["--json", "--color", "never"])
         ephemeral = getattr(self, "_active_native_session_ephemeral", None)
         if ephemeral is None:
             # Existing specialist/internal calls remain isolated by default.
             ephemeral = True
         if ephemeral:
             cmd.append("--ephemeral")
+        # Codex rejects a repeated flag, and these conditions can overlap.
+        ignore_flags: list[str] = []
         if options is None and (policy.profile == GenerationProfile.CHAT or managed_workspace_request or plain_generation):
-            cmd.append("--ignore-rules")
+            ignore_flags.append("--ignore-rules")
+        if aoidots_agent_cli:
+            # Use the signed-in host CODEX_HOME and ignore user config/rules;
+            # AoiTalk adds its formal MCP servers as per-invocation overrides.
+            ignore_flags.extend(
+                ["--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]
+            )
         if options is None and (managed_workspace_request or plain_generation):
             # Managed workspace operations must be mediated by AoiTalk's
             # high-level tools.  A read-only sandbox still exposes Codex's
             # native shell for reads, so isolate this invocation from user
             # configuration and remove both shell implementations entirely.
-            cmd.extend(
-                [
-                    "--ignore-user-config",
-                    "--skip-git-repo-check",
-                    "--disable",
-                    "shell_tool",
-                    "--disable",
-                    "unified_exec",
-                ]
-            )
+            ignore_flags.extend(["--ignore-user-config", "--skip-git-repo-check"])
+            cmd.extend(["--disable", "shell_tool", "--disable", "unified_exec"])
+        cmd.extend(dict.fromkeys(ignore_flags))
 
         if options is None and plain_generation:
             # Ignore user/project tool configuration and close optional host
@@ -425,7 +617,9 @@ class CodexCLIBackend(CLIBackendBase):
         if reasoning_effort:
             cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
-        if options is not None:
+        if aoidots_agent_cli:
+            approval_policy = "never"
+        elif options is not None:
             requested_policy = options.effective_approval_policy
             approval_policy = {
                 "standard": "never",
@@ -441,7 +635,9 @@ class CodexCLIBackend(CLIBackendBase):
         if approval_policy:
             cmd.extend(["-c", f'approval_policy="{approval_policy.strip()}"'])
 
-        if options is not None:
+        if aoidots_agent_cli:
+            sandbox = "read-only"
+        elif options is not None:
             if options.sandbox is None:
                 sandbox = "workspace-write" if options.effective_approval_policy == "standard" else None
             elif isinstance(options.sandbox, bool):
@@ -460,6 +656,13 @@ class CodexCLIBackend(CLIBackendBase):
                 managed_workspace_request=managed_workspace_request,
                 plain_generation=plain_generation,
             )
+        if bool(getattr(self, "_agent_task_native_read_only", False)):
+            # Agent Tasks route writes and commands through the managed
+            # AoiTalk ToolRegistry. Codex has no native tool allowlist flag,
+            # and a write-capable AgentRunScope would otherwise make
+            # ``--sandbox workspace-write`` re-enable apply_patch/shell.
+            sandbox = "read-only"
+            cmd.extend(["--disable", "shell_tool", "--disable", "unified_exec"])
         if sandbox:
             cmd.extend(["--sandbox", sandbox])
 
@@ -510,6 +713,7 @@ class CodexCLIBackend(CLIBackendBase):
     def parse_output(self, raw_output: str) -> str:
         """Extract the final assistant message from Codex JSONL output."""
         agent_messages: list[str] = []
+        self._last_native_tool_calls = self._native_mcp_tool_calls(raw_output)
         usage_event_index = 0
         for line in raw_output.splitlines():
             line = line.strip()
@@ -520,11 +724,25 @@ class CodexCLIBackend(CLIBackendBase):
             except json.JSONDecodeError:
                 continue
             if event.get("type") == "turn.completed":
+                reported_usage = event.get("usage")
+                if _active_native_delegation_phase.get() is not None:
+                    from ..agent_run_budget import _token_total
+                    confirmed_total = _token_total(reported_usage)
+                    if confirmed_total is None:
+                        self._native_phase_usage_incomplete = True
+                        usage_event_index += 1
+                        continue
+                    raw_usage = reported_usage
+                    reported_usage = {**raw_usage, "total_tokens": confirmed_total}
+                    if raw_usage.get("input_tokens") is None and raw_usage.get("prompt_tokens") is None:
+                        self._native_phase_missing_input = True
+                    if raw_usage.get("output_tokens") is None and raw_usage.get("completion_tokens") is None:
+                        self._native_phase_missing_output = True
                 usage_key = (
                     f"codex:{self._usage_invocation_id}:turn:{usage_event_index}"
                 )
                 self.set_last_usage(
-                    event.get("usage"),
+                    reported_usage,
                     usage_key=usage_key,
                 )
                 usage_event_index += 1
@@ -542,6 +760,83 @@ class CodexCLIBackend(CLIBackendBase):
             return agent_messages[-1]
 
         return super().parse_output(raw_output)
+
+    @staticmethod
+    def _native_mcp_tool_name(item: dict[str, Any]) -> tuple[str, str]:
+        raw = str(item.get("tool") or item.get("name") or "").strip()
+        tool = raw.rsplit("__", 1)[-1].strip()
+        return {"delegate_agent_work": "agent_team_delegate"}.get(tool, tool), tool
+
+    def _native_mcp_identity(self, item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        raw_id = str(item.get("id") or item.get("call_id") or "").strip()
+        _, tool = self._native_mcp_tool_name(item)
+        metadata = {
+            "provider": "codex-cli",
+            "transport": "mcp",
+            "mcp_server": str(item.get("server") or item.get("server_name") or "").strip() or None,
+            "mcp_tool": tool,
+            "native_item_id": raw_id,
+            "native_invocation_id": self._native_invocation_id,
+        }
+        return (f"codex:{self._native_invocation_id}:{raw_id}" if raw_id else ""), metadata
+
+    def _native_mcp_tool_calls(self, raw_output: str) -> list[dict[str, Any]]:
+        """Normalize Codex MCP completion events to AoiTalk tool records."""
+
+        records: list[dict[str, Any]] = []
+        for line in str(raw_output or "").splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict) or str(event.get("type") or "") != "item.completed":
+                continue
+            item = event.get("item")
+            if not isinstance(item, dict) or str(item.get("type") or "").casefold() != "mcp_tool_call":
+                continue
+            canonical_tool, tool = self._native_mcp_tool_name(item)
+            if not tool:
+                continue
+            arguments = item.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = item.get("args")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            raw_result = item.get("result", item.get("output", ""))
+            if isinstance(raw_result, (dict, list, tuple)):
+                result = json.dumps(
+                    raw_result,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            else:
+                result = str(raw_result or "")
+            error_value = item.get("error")
+            if isinstance(error_value, dict):
+                error_value = error_value.get("message") or "MCP tool failed"
+            error = str(error_value or "")
+            status = str(item.get("status") or "").casefold()
+            success = not error and status not in {"failed", "error", "failure"}
+            call_id, metadata = self._native_mcp_identity(item)
+            records.append(
+                {
+                    "tool": canonical_tool,
+                    "arguments": dict(arguments),
+                    "result": result,
+                    "success": success,
+                    "tool_call_id": call_id,
+                    "executed": True,
+                    "metadata": metadata,
+                    **({"error": error} if error else {}),
+                }
+            )
+        return records
+
+    def consume_last_native_tool_calls(self) -> list[dict[str, Any]]:
+        calls = list(self._last_native_tool_calls)
+        self._last_native_tool_calls = []
+        return calls
 
     def handle_stream_output_line(
         self,
@@ -573,10 +868,17 @@ class CodexCLIBackend(CLIBackendBase):
             usage_index = self._usage_event_index
             self._usage_event_index += 1
             usage_key = f"codex:{self._usage_invocation_id}:turn:{usage_index}"
-            normalized_usage = self.set_last_usage(
-                event.get("usage"),
-                usage_key=usage_key,
-            )
+            if _active_native_delegation_phase.get() is not None:
+                from ..agent_run_budget import _token_total
+                confirmed_total = _token_total(event.get("usage"))
+                if confirmed_total is None:
+                    self._native_phase_usage_incomplete = True
+                    normalized_usage = None
+                else:
+                    reported_usage = {**event["usage"], "total_tokens": confirmed_total}
+                    normalized_usage = self.set_last_usage(reported_usage, usage_key=usage_key)
+            else:
+                normalized_usage = self.set_last_usage(event.get("usage"), usage_key=usage_key)
             payload: dict[str, Any] = {
                 "status": "codex_turn_completed",
                 "message": "Codex CLI turn completed",
@@ -603,6 +905,9 @@ class CodexCLIBackend(CLIBackendBase):
         item_type = str(item.get("type") or "")
         label = self._stream_item_label(item)
         operation_id = str(item.get("id") or item.get("call_id") or "").strip()
+        metadata = None
+        if item_type.lower() == "mcp_tool_call":
+            operation_id, metadata = self._native_mcp_identity(item)
         if event_type == "item.started":
             if self._is_tool_like_item(item):
                 tool_name, tool_args = self._stream_tool_context(item)
@@ -613,6 +918,8 @@ class CodexCLIBackend(CLIBackendBase):
                 }
                 if operation_id:
                     payload["operation_id"] = operation_id
+                if metadata is not None:
+                    payload["metadata"] = metadata
                 event_callback(
                     "tool_start",
                     payload,
@@ -666,6 +973,9 @@ class CodexCLIBackend(CLIBackendBase):
                 if operation_id:
                     payload["operation_id"] = operation_id
                     tool_result["tool_call_id"] = operation_id
+                if metadata is not None:
+                    payload["metadata"] = metadata
+                    tool_result["metadata"] = metadata
                 event_callback(
                     "tool_end",
                     payload,
@@ -748,7 +1058,8 @@ class CodexCLIBackend(CLIBackendBase):
             query = item.get("query") or item.get("text")
             return "web_search", {"query": query} if query else {}
 
-        label = self._stream_item_label(item)
+        label = (self._native_mcp_tool_name(item)[0] if item_type == "mcp_tool_call"
+                 else self._stream_item_label(item))
         args = {}
         raw_args = item.get("arguments") or item.get("args")
         if isinstance(raw_args, dict):
@@ -1005,6 +1316,19 @@ class CodexCLIBackend(CLIBackendBase):
         invocation_options: Optional[CLIInvocationOptions] = None,
     ):
         """Codex accepts one initial instruction stream, so pass it via stdin."""
+        phase_client = _active_native_delegation_phase.get()
+        if phase_client is not None:
+            self._native_phase_usage_incomplete = False
+            self._native_phase_missing_input = False
+            self._native_phase_missing_output = False
+        if phase_client is not None and (
+            model_override is not _MODEL_OVERRIDE_UNSET or invocation_options is not None
+            or disable_native_tools or native_session_id is not None
+            or native_session_action != "stateless" or ephemeral is False
+            or bool(self._image_paths)
+            or str(self._model or "") != str(getattr(phase_client, "model_name", ""))
+        ):
+            return False, "native delegation phase route or invocation changed"
         self._reset_stream_state()
         model_override_token = None
         disable_native_tools_token = None
@@ -1024,8 +1348,47 @@ class CodexCLIBackend(CLIBackendBase):
             and str(native_session_action or "stateless") != "resume"
             and not disable_native_tools
         ):
-            preamble = _AGENT_TEAM_CLI_PREAMBLE if _active_agent_team_cli.get() else _CODEX_ADAPTER_PREAMBLE
+            if _active_aoidots_agent_cli.get() is not None:
+                preamble = _AOIDOTS_AGENT_CLI_PREAMBLE
+            elif _active_agent_team_cli.get():
+                preamble = _AGENT_TEAM_CLI_PREAMBLE
+            else:
+                preamble = _CODEX_ADAPTER_PREAMBLE
             combined_prompt = f"{preamble}\n\n{combined_prompt}"
+
+        aoidots_agent_cli = _active_aoidots_agent_cli.get()
+        run_scope_token = None
+        if aoidots_agent_cli is not None or phase_client is not None:
+            try:
+                from ...security.agent_run_scope import (
+                    bind_run_scope,
+                    get_current_run_scope,
+                    reset_run_scope,
+                )
+                from ...services.agent_dialogue_workspace import (
+                    get_current_agent_dialogue_workspace,
+                )
+
+                scope = get_current_run_scope()
+                workspace = get_current_agent_dialogue_workspace()
+                if phase_client is not None:
+                    from ..cli_native_capabilities import _native_delegation_phase_proof
+                    if (phase_client.cli_backend is not self or _native_delegation_phase_proof(phase_client) is None
+                            or list(extra_args or ()) != self.native_delegation_phase_args()):
+                        return False, "native delegation phase controls are invalid"
+                if scope is None or workspace is None or not workspace.native_allowed:
+                    return False, "AoiDots Codex execution requires its issued AgentRunScope"
+                workspace.assert_provider_entry()
+                selected_cwd = Path(cwd or workspace.working_directory).resolve()
+                if selected_cwd != Path(scope.canonical_root).resolve():
+                    return False, "AoiDots Codex cwd does not match the issued AgentRunScope"
+                cwd = selected_cwd
+                # The AoiDots path uses the installed host Codex CLI so it can
+                # reuse ChatGPT login. Its cwd remains the server-issued
+                # per-session workspace and the CLI is started read-only.
+                run_scope_token = bind_run_scope(None)
+            except Exception:
+                return False, "AoiDots Codex execution context is unavailable"
 
         try:
             return super().execute_prompt(
@@ -1041,17 +1404,89 @@ class CodexCLIBackend(CLIBackendBase):
                 invocation_options=invocation_options,
             )
         finally:
+            if run_scope_token is not None:
+                from ...security.agent_run_scope import reset_run_scope
+
+                reset_run_scope(run_scope_token)
             if disable_native_tools_token is not None:
                 _active_disable_native_tools.reset(disable_native_tools_token)
             if model_override_token is not None:
                 _active_model_override.reset(model_override_token)
 
     def get_mcp_args(self, mcp_servers: Dict[str, Any]) -> List[str]:
-        """Codex CLI does not support runtime MCP arguments."""
-        if mcp_servers:
-            logger.info(
-                "[Codex CLI] %s MCP server(s) in config.yaml. "
-                "Codex CLI requires MCP to be configured in ~/.codex/config.toml",
-                len(mcp_servers),
-            )
-        return []
+        """Register the first-party formal MCP bridge for AoiDots Agent runs."""
+
+        from ..cli_native_capabilities import _CODEX_AOIDOTS_MCP_ATTESTATION
+        from ...services.agent_mcp_receiver_guard import (
+            FORMAL_AGENT_ACTIVITY_TOOLS,
+            FORMAL_AGENT_DIALOGUE_TOOLS,
+            _FORMAL_ENV,
+            _REQUIRED_DB_ENV,
+        )
+
+        repo_root = Path(__file__).resolve().parents[3]
+        python_executable = str(Path(sys.executable).resolve())
+        args: list[str] = []
+        for name, settings in dict(mcp_servers or {}).items():
+            server_name = str(name or "").strip()
+            if server_name not in {"agent_activity", "dialogue8"}:
+                continue
+            if not isinstance(settings, dict) or not isinstance(
+                settings.get("_aoitalk_formal_agent_context"), dict
+            ):
+                continue
+            platform_key = "windows" if os.name == "nt" else "linux"
+            platform_settings = settings.get(platform_key, settings)
+            if not isinstance(platform_settings, dict):
+                return []
+            expected_args = ["-m", "src.mcp_server_entry", server_name]
+            configured_args = platform_settings.get("args")
+            if not isinstance(configured_args, (list, tuple)) or [
+                str(item) for item in configured_args
+            ] != expected_args:
+                return []
+            # The MCP child runs trusted AoiTalk code from the same checkout.
+            # Keep run/lease/database values out of argv; Codex inherits them
+            # through the server-owned process environment below.
+            config_key = f"mcp_servers.{server_name}"
+            env_vars = [*_FORMAL_ENV.values(), *_REQUIRED_DB_ENV, "PYTHON_DOTENV_DISABLED"]
+            if (server_name == "dialogue8" and
+                    settings.get("_aoitalk_codex_aoidots_attested") is _CODEX_AOIDOTS_MCP_ATTESTATION):
+                # The formal delegation receiver evaluates the existing deployment
+                # policy in its own process. Pass names, never values, to Codex.
+                from ...services.codex_development_runtime import (
+                    POLICY_ENABLED_ENV, POLICY_ENV, POLICY_OWNER_ENV,
+                    POLICY_DIGEST_ENV, POLICY_CLI_PATH_ENV, POLICY_CLI_VERSION_ENV,
+                )
+
+                env_vars.extend((
+                    POLICY_ENABLED_ENV, POLICY_ENV, POLICY_OWNER_ENV,
+                    POLICY_DIGEST_ENV, POLICY_CLI_PATH_ENV, POLICY_CLI_VERSION_ENV,
+                ))
+            values = {
+                "enabled": "true",
+                "command": json.dumps(python_executable, ensure_ascii=False),
+                "args": json.dumps(expected_args, ensure_ascii=False),
+                "cwd": json.dumps(str(repo_root), ensure_ascii=False),
+                # Codex starts stdio MCP children with a core environment,
+                # not its full environment. Forward names only; lease and DB
+                # values remain in the inherited process environment.
+                "env_vars": json.dumps(env_vars),
+            }
+            if (
+                settings.get("_aoitalk_codex_aoidots_attested") is _CODEX_AOIDOTS_MCP_ATTESTATION
+                and settings.get("_aoitalk_root_mcp_startup_required") is True
+            ):
+                values.update(required="true", startup_readiness='"connection"')
+            for suffix, value in values.items():
+                args.extend(["-c", f"{config_key}.{suffix}={value}"])
+            if settings.get("_aoitalk_codex_aoidots_attested") is _CODEX_AOIDOTS_MCP_ATTESTATION:
+                # These names are the receiver allowlist, not an MCP wildcard.
+                tools = (
+                    FORMAL_AGENT_ACTIVITY_TOOLS
+                    if server_name == "agent_activity"
+                    else FORMAL_AGENT_DIALOGUE_TOOLS
+                )
+                for tool in sorted(tools):
+                    args.extend(["-c", f'{config_key}.tools.{tool}.approval_mode="approve"'])
+        return args

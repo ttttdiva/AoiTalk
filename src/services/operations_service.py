@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from inspect import isawaitable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_, select, update
@@ -93,6 +94,9 @@ from ..security.media_credential_crypto import (
     media_credential_ciphertext_key_id,
 )
 from .operations_text import EVALUATION_COLLECTION_MAX_BYTES, OPERATIONS_TEXT_BYTE_LIMITS
+from .marketplace.crowdworks_brief import crowdworks_brief_status
+from .marketplace.crowdworks_deadline import crowdworks_deadline
+from .marketplace.crowdworks_requirements import classify_missing_requirements
 from .project_context import has_project_read_access
 from .project_permissions import (
     has_effective_project_permission,
@@ -149,7 +153,37 @@ _UNSET = object()
 _ACTION_APPROVAL_HISTORY_LIMIT = 100
 _ACTION_ATTEMPT_HISTORY_LIMIT = 100
 _ACTION_TIMELINE_LIMIT = 200
+_CROWDWORKS_DETAIL_RETRY_ATTEMPT_LIMIT = 3
 MAX_ARTIFACT_PROVENANCE_BYTES = 64 * 1024
+
+
+def _crowdworks_detail_retry_priority(
+    metadata: Mapping[str, Any],
+    *,
+    min_expected_profit: float,
+    min_profit_per_hour: float,
+) -> int:
+    """Prioritize deadline refreshes only when stored economics meet policy."""
+
+    deadline_unverified = (
+        metadata.get("deadline_status") == "unverified"
+        or metadata.get("screening_status") == "deadline_unverified"
+    )
+    profit = metadata.get("expected_profit")
+    profit_per_hour = metadata.get("expected_profit_per_hour")
+    if (
+        deadline_unverified
+        and isinstance(profit, (int, float))
+        and not isinstance(profit, bool)
+        and math.isfinite(float(profit))
+        and float(profit) >= min_expected_profit
+        and isinstance(profit_per_hour, (int, float))
+        and not isinstance(profit_per_hour, bool)
+        and math.isfinite(float(profit_per_hour))
+        and float(profit_per_hour) >= min_profit_per_hour
+    ):
+        return 0
+    return 1
 
 MEDIA_ACTION_TYPES = frozenset(
     {
@@ -802,6 +836,139 @@ def _media_provider_operation(action_type: Any, payload: Mapping[str, Any] | Non
     return publication_operation(str(action_type or "").strip().lower(), payload)
 
 
+def _is_crowdworks_url(value: Any) -> bool:
+    try:
+        host = (urlsplit(str(value or "")).hostname or "").casefold()
+    except ValueError:
+        return False
+    return host in {"crowdworks.jp", "www.crowdworks.jp"}
+
+
+def _is_crowdworks_opportunity(connection: Any, opportunity: EngagementOpportunity) -> bool:
+    snapshot = opportunity.source_snapshot_json if isinstance(opportunity.source_snapshot_json, dict) else {}
+    return (
+        getattr(connection, "provider_key", None) == "crowdworks"
+        or snapshot.get("provider") == "crowdworks"
+        or _is_crowdworks_url(opportunity.source_url)
+    )
+
+
+def _crowdworks_opportunity_projection(row: EngagementOpportunity, payload: dict[str, Any], evaluation=None) -> dict[str, Any]:
+    parsed = urlsplit(str(row.source_url or ""))
+    if (parsed.hostname or "").casefold() not in {"crowdworks.jp", "www.crowdworks.jp"}:
+        return payload
+
+    deadline_at, deadline_status = crowdworks_deadline(
+        source_snapshot=row.source_snapshot_json,
+        source_text=row.source_text,
+        captured_at=row.created_at,
+        now=datetime.now(timezone.utc),
+    )
+    metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+    qa_status = metadata.get("application_qa_status")
+    qa = metadata.get("application_qa")
+    if qa_status is None and isinstance(qa, dict):
+        qa_status = qa.get("status")
+    qa_matches_proposal = bool(
+        isinstance(qa, dict)
+        and qa_status == "passed"
+        and evaluation is not None
+        and qa.get("evaluation_id") == str(evaluation.id)
+        and qa.get("draft_id") == metadata.get("application_draft_id")
+        and qa.get("draft_version") == metadata.get("application_draft_version")
+        and qa.get("draft_hash") == metadata.get("application_draft_hash")
+    )
+    stage = str(metadata.get("workflow_stage") or "").upper()
+    candidate_stage = stage in {"INGESTED", "EVALUATED", "APPLICATION_PROPOSED"}
+    missing = (
+        list(evaluation.missing_requirements or [])
+        if evaluation is not None and isinstance(evaluation.missing_requirements, (list, tuple))
+        else ["不足要件の評価を確認できません"]
+        if candidate_stage and stage != "INGESTED"
+        else []
+    )
+    requirement_classification = classify_missing_requirements(missing, brief_text=row.source_text)
+    blocking_requirements = requirement_classification["blocking"]
+    clarification_questions = requirement_classification["clarifiable"]
+    qa_matches_proposal = qa_matches_proposal and (
+        not clarification_questions
+        or (isinstance(qa, dict) and qa.get("clarification_questions_hash") == sha256_json(clarification_questions))
+    )
+    if clarification_questions and isinstance(payload.get("drafts"), list):
+        matching_draft = next((
+            draft for draft in payload["drafts"]
+            if isinstance(draft, dict) and draft.get("id") == metadata.get("application_draft_id")
+        ), None)
+        qa_matches_proposal = qa_matches_proposal and bool(
+            matching_draft
+            and isinstance(matching_draft.get("message"), str)
+            and all(question in matching_draft["message"] for question in clarification_questions)
+        )
+    payload["deadline_at"] = deadline_at
+    payload["deadline_status"] = deadline_status
+    snapshot = row.source_snapshot_json if isinstance(row.source_snapshot_json, dict) else {}
+    brief_status = crowdworks_brief_status(snapshot, row.source_text)
+    payload["brief_evidence_status"] = brief_status
+    payload["application_qa_status"] = qa_status
+    def safe_route_projection(value: Any) -> dict[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+        model = value.get("model")
+        fallback = value.get("route_fallback", "none")
+        if (
+            not isinstance(model, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model) is None
+            or not isinstance(fallback, str)
+            or fallback not in {"none", "luna"}
+        ):
+            return None
+        return {"route_model": model, "route_fallback": fallback}
+
+    model_routes = metadata.get("model_routes")
+    model_routes = model_routes if isinstance(model_routes, dict) else {}
+    application_qa = metadata.get("application_qa")
+    application_qa = application_qa if isinstance(application_qa, dict) else {}
+    payload["application_generation_route"] = safe_route_projection(
+        model_routes.get("application")
+    )
+    payload["application_qa_route"] = safe_route_projection(
+        application_qa.get("reviewer_route")
+    )
+    payload["blocking_requirement_count"] = len(blocking_requirements)
+    payload["clarification_questions"] = clarification_questions
+    approval_block_reason = None
+    if candidate_stage:
+        if deadline_status == "expired":
+            payload["screening_status"] = "deadline_expired"
+            approval_block_reason = "CrowdWorks掲載期限が終了しているため応募できません"
+        elif deadline_status != "open":
+            payload["screening_status"] = "deadline_unverified"
+            approval_block_reason = "応募期限を確認できないため追加確認が必要です"
+        elif brief_status != "complete":
+            payload["screening_status"] = "brief_unverified"
+            approval_block_reason = "案件詳細本文の完全性を確認できないため評価・応募案作成を保留しています"
+        elif blocking_requirements:
+            payload["screening_status"] = "requirements_incomplete"
+            approval_block_reason = f"阻害要件が{len(blocking_requirements)}件残っているため応募できません"
+        elif stage == "APPLICATION_PROPOSED" and not qa_matches_proposal:
+            payload["screening_status"] = "application_qa_unverified"
+            approval_block_reason = "応募案の独立AIレビューが確認できないため承認できません"
+        elif clarification_questions:
+            payload["screening_status"] = "clarifications_required"
+        if approval_block_reason:
+            payload["screening_reason"] = approval_block_reason
+    payload["approval_available"] = bool(
+        stage == "APPLICATION_PROPOSED"
+        and str(metadata.get("external_action_status") or "").lower() == "proposed"
+        and deadline_status == "open"
+        and brief_status == "complete"
+        and not blocking_requirements
+        and qa_matches_proposal
+    )
+    payload["approval_block_reason"] = approval_block_reason
+    return payload
+
+
 class OperationsService:
     """Application service for trusted external operations."""
 
@@ -1441,6 +1608,99 @@ class OperationsService:
             await self._flush_commit(session)
         return artifact.to_safe_dict()
 
+    async def adopt_delegation_artifact(
+        self, session: Any, actor: Any, opportunity_id: UUID | str, *,
+        order_id: UUID | str, work_artifact_id: UUID | str,
+        review_artifact_id: UUID | str, source_snapshot_hash: str, idempotency_key: str,
+        expected_work_hash: str | None = None, expected_review_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Adopt the current independently reviewed non-code output as an immutable envelope."""
+        from ..memory.models import AgentDelegation
+        from .agent_delegation_operations_inputs import operations_source_matches, validate_operations_source_ref
+        from .agent_delegation_planning import read_artifact_payload
+        from .agent_delegation_service import DelegationError, adopted_artifact, phase_items
+
+        session = self._resolve_session(session)
+        key = str(idempotency_key or "").strip()
+        if not key or len(key) > 200:
+            raise OperationsValidationError("invalid idempotency key")
+        opportunity = await self._get_or_404(session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True)
+        await self._assert_entity_access(session, actor, opportunity, permission="write")
+        if _actor_id(actor) != opportunity.owner_user_id:
+            raise OperationsAuthorizationError("artifact owner must match opportunity owner")
+        order_uuid = _as_uuid(order_id, "order_id")
+        work_uuid = _as_uuid(work_artifact_id, "work_artifact_id")
+        review_uuid = _as_uuid(review_artifact_id, "review_artifact_id")
+        request = {"order_id": str(order_uuid), "work_artifact_id": str(work_uuid),
+                   "review_artifact_id": str(review_uuid), "source_snapshot_hash": str(source_snapshot_hash).lower(),
+                   "expected_work_hash": expected_work_hash.lower() if expected_work_hash else None,
+                   "expected_review_hash": expected_review_hash.lower() if expected_review_hash else None}
+        metadata = dict(opportunity.metadata_json or {})
+        receipts = list(metadata.get("delegation_artifact_adoptions") or [])
+        for receipt in receipts:
+            if isinstance(receipt, dict) and receipt.get("idempotency_key") == key:
+                if receipt.get("request") != request:
+                    raise OperationsConflictError("idempotency key already used for different refs")
+                artifact = await self._get_or_404(session, ArtifactVersion, receipt["artifact_id"], "artifact_id")
+                if (artifact.owner_user_id != opportunity.owner_user_id or artifact.project_id != opportunity.project_id
+                        or artifact.provenance_json != receipt.get("provenance")):
+                    raise OperationsConflictError("adoption provenance changed")
+                return artifact.to_safe_dict()
+        try:
+            source = await validate_operations_source_ref(session, owner_user_id=opportunity.owner_user_id,
+                project_id=opportunity.project_id, source_ref={"opportunity_id": str(opportunity.id),
+                                                       "source_snapshot_hash": source_snapshot_hash})
+        except DelegationError as exc:
+            raise OperationsConflictError("operations source is invalid or changed") from exc
+        if not operations_source_matches(opportunity, source["source_snapshot_hash"]):
+            raise OperationsConflictError("operations source is invalid or changed")
+        order = await self._get_or_404(session, AgentDelegation, order_uuid, "order_id", for_update=True)
+        if (order.project_id != opportunity.project_id or order.created_by != opportunity.owner_user_id
+                or order.linked_work_item_id is not None or order.work_role not in {"researcher", "writer", "data_worker", "general_worker"} or order.cancelled_at
+                or (order.planning_input_pins_json or {}).get("operations_source_ref") != source):
+            raise OperationsConflictError("delegation source or scope mismatch")
+        items = await phase_items(session, order)
+        work = await adopted_artifact(session, items.get("work"), order, "work")
+        review = await adopted_artifact(session, items.get("review"), order, "review")
+        if (work is None or review is None or work.id != work_uuid or review.id != review_uuid
+                or review.accepted != 1 or order.worker_agent_id == order.reviewer_agent_id
+                or (expected_work_hash is not None and work.sha256 != expected_work_hash.lower())
+                or (expected_review_hash is not None and review.sha256 != expected_review_hash.lower())):
+            raise OperationsConflictError("current independently accepted work is required")
+        try:
+            work_payload = read_artifact_payload(work)
+            review_payload = read_artifact_payload(review)
+            evidence = review_payload.get("evidence", {}).get("work")
+            if (not isinstance(evidence, dict) or {k: v for k, v in evidence.items() if k not in {"content", "turn_evidence"}} != work.to_safe_dict()
+                    or review_payload.get("output", {}).get("accepted") is not True):
+                raise OperationsConflictError("review does not pin this work")
+            body = work_payload.get("output", {}).get("body")
+            if not isinstance(body, str) or not body.strip():
+                raise OperationsConflictError("work body is missing")
+        except (DelegationError, ValueError, TypeError, AttributeError) as exc:
+            raise OperationsConflictError("delegation artifact is invalid") from exc
+        provenance = {"operations_source_ref": source, "order_id": str(order.id), "round": order.round,
+                      "work": {**work.to_safe_dict(), "agent_id": str(order.worker_agent_id),
+                               "agent_revision_id": str(order.worker_revision_id)},
+                      "review": {**review.to_safe_dict(), "agent_id": str(order.reviewer_agent_id),
+                                 "agent_revision_id": str(order.reviewer_revision_id)},
+                      "input_pins": work_payload.get("input_pins", {}),
+                      "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+        envelope = canonical_json({"schema": "operations.delegation-artifact.v1", "provenance": provenance,
+                                   "body": body}).encode("utf-8")
+        result = await self.create_artifact(session, actor, content=envelope, filename="delegation-artifact.json",
+            mime_type="application/vnd.aoitalk.delegation-artifact+json", project_id=opportunity.project_id,
+            provenance=provenance, _defer_commit=True)
+        artifact = await self._get_or_404(session, ArtifactVersion, result["id"], "artifact_id")
+        if artifact.provenance_json != provenance:
+            raise OperationsConflictError("adoption provenance mismatch")
+        receipts.append({"idempotency_key": key, "request": request, "artifact_id": str(artifact.id),
+                         "provenance": provenance})
+        metadata["delegation_artifact_adoptions"] = receipts
+        opportunity.metadata_json = metadata
+        await self._flush_commit(session)
+        return artifact.to_safe_dict()
+
     async def get_artifact_content(
         self,
         session: Any | None = None,
@@ -1554,6 +1814,339 @@ class OperationsService:
         await self._flush_commit(session)
         return opportunity.to_safe_dict()
 
+    async def _crowdworks_retry_children_exist(self, session: Any, opportunity_id: UUID) -> bool:
+        # An Evaluation does not make a listing immutable: legacy records can
+        # still lack verified deadlines or a complete brief. Drafts and Actions
+        # are downstream user-facing bindings and must remain untouched.
+        for model in (ApplicationDraft, ExternalAction):
+            child_id = await self._scalar(
+                session,
+                select(model.id).where(model.opportunity_id == opportunity_id).limit(1),
+            )
+            if child_id is not None:
+                return True
+        return False
+
+    async def _crowdworks_detail_retry_target(
+        self,
+        session: Any,
+        actor: Any,
+        opportunity: EngagementOpportunity,
+        *,
+        connection_id: UUID | str,
+        max_attempts: int,
+    ) -> tuple[bool, int]:
+        owner_id = _actor_id(actor)
+        connection_uuid = _as_uuid(connection_id, "connection_id")
+        connection = await self._get_or_404(session, ExternalConnection, connection_uuid, "connection_id")
+        await self._assert_entity_access(session, actor, connection, permission="write")
+        if (
+            connection.owner_user_id != owner_id
+            or connection.provider_key != "crowdworks"
+            or opportunity.owner_user_id != owner_id
+            or opportunity.connection_id != connection.id
+            or opportunity.project_id != connection.project_id
+            or opportunity.status != "open"
+        ):
+            return False, 0
+        snapshot = opportunity.source_snapshot_json if isinstance(opportunity.source_snapshot_json, dict) else {}
+        metadata = opportunity.metadata_json if isinstance(opportunity.metadata_json, dict) else {}
+        if snapshot.get("provider") != "crowdworks" and metadata.get("provider") != "crowdworks":
+            return False, 0
+        if not isinstance(opportunity.source_url, str) or not opportunity.source_url.startswith(
+            "https://crowdworks.jp/public/jobs/"
+        ):
+            return False, 0
+        deadline_snapshot = dict(snapshot)
+        if isinstance(metadata.get("deadline_at"), str):
+            deadline_snapshot["deadline_at"] = metadata["deadline_at"]
+        _deadline_at, deadline_status = crowdworks_deadline(
+            source_snapshot=deadline_snapshot,
+            source_text=opportunity.source_text,
+            captured_at=opportunity.created_at,
+        )
+        if (
+            snapshot.get("detail_capture_status") == "complete"
+            and crowdworks_brief_status(snapshot, opportunity.source_text) == "complete"
+            and deadline_status != "unverified"
+        ):
+            return False, 0
+        try:
+            attempts = max(0, int(metadata.get("detail_retry_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        if attempts >= max_attempts or await self._crowdworks_retry_children_exist(session, opportunity.id):
+            return False, attempts
+        return True, attempts
+
+    async def list_crowdworks_detail_retry_candidates(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        *,
+        connection_id: UUID | str,
+        source_urls: Sequence[str],
+        max_attempts: int = 3,
+        min_expected_profit: float = 5000.0,
+        min_profit_per_hour: float = 2500.0,
+    ) -> dict[str, dict[str, Any]]:
+        """Select owner-bound, unprocessed legacy listings eligible for detail retry."""
+
+        session = self._resolve_session(session)
+        if actor is None:
+            raise OperationsValidationError("actor is required")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise OperationsValidationError("max_attempts must be a positive integer")
+        max_attempts = min(max_attempts, _CROWDWORKS_DETAIL_RETRY_ATTEMPT_LIMIT)
+        if (
+            type(min_expected_profit) not in (int, float)
+            or not math.isfinite(float(min_expected_profit))
+            or type(min_profit_per_hour) not in (int, float)
+            or not math.isfinite(float(min_profit_per_hour))
+        ):
+            raise OperationsValidationError("detail retry thresholds must be finite numbers")
+        min_expected_profit = float(min_expected_profit)
+        min_profit_per_hour = float(min_profit_per_hour)
+        urls = list(dict.fromkeys(str(value) for value in source_urls if isinstance(value, str)))[:100]
+        if not urls:
+            return {}
+        connection_uuid = _as_uuid(connection_id, "connection_id")
+        connection = await self._get_or_404(session, ExternalConnection, connection_uuid, "connection_id")
+        await self._assert_entity_access(session, actor, connection, permission="write")
+        owner_id = _actor_id(actor)
+        if connection.owner_user_id != owner_id or connection.provider_key != "crowdworks":
+            return {}
+        rows = await self._scalars(
+            session,
+            select(EngagementOpportunity)
+            .where(
+                EngagementOpportunity.owner_user_id == owner_id,
+                EngagementOpportunity.connection_id == connection_uuid,
+                EngagementOpportunity.project_id == connection.project_id,
+                EngagementOpportunity.source_url.in_(urls),
+                EngagementOpportunity.status == "open",
+            )
+            .order_by(EngagementOpportunity.created_at.asc(), EngagementOpportunity.id.asc())
+            .limit(100),
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            eligible, attempts = await self._crowdworks_detail_retry_target(
+                session, actor, row, connection_id=connection_uuid, max_attempts=max_attempts
+            )
+            if eligible and row.source_url:
+                metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+                result[row.source_url] = {
+                    "opportunity_id": str(row.id),
+                    "attempts": attempts,
+                    "detail_priority": _crowdworks_detail_retry_priority(
+                        metadata,
+                        min_expected_profit=min_expected_profit,
+                        min_profit_per_hour=min_profit_per_hour,
+                    ),
+                }
+        return result
+
+    async def begin_crowdworks_detail_retry(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        *,
+        opportunity_id: UUID | str,
+        connection_id: UUID | str,
+        max_attempts: int = 3,
+    ) -> int | None:
+        """Atomically reserve one bounded read-only detail refresh attempt."""
+
+        session = self._resolve_session(session)
+        if actor is None:
+            raise OperationsValidationError("actor is required")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise OperationsValidationError("max_attempts must be a positive integer")
+        max_attempts = min(max_attempts, _CROWDWORKS_DETAIL_RETRY_ATTEMPT_LIMIT)
+        opportunity = await self._get_or_404(
+            session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True
+        )
+        await self._assert_entity_access(session, actor, opportunity, permission="write")
+        eligible, attempts = await self._crowdworks_detail_retry_target(
+            session, actor, opportunity, connection_id=connection_id, max_attempts=max_attempts
+        )
+        if not eligible:
+            return None
+        attempt = attempts + 1
+        metadata = dict(opportunity.metadata_json or {})
+        evaluation_id = await self._scalar(
+            session,
+            select(OpportunityEvaluation.id)
+            .where(OpportunityEvaluation.opportunity_id == opportunity.id)
+            .order_by(OpportunityEvaluation.version.desc())
+            .limit(1),
+        )
+        metadata["detail_retry_attempts"] = attempt
+        metadata["detail_retry_last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["detail_retry_evaluation_id"] = (
+            str(evaluation_id) if evaluation_id is not None else None
+        )
+        metadata.pop("detail_retry_last_error_code", None)
+        opportunity.metadata_json = metadata
+        await self._flush_only(session)
+        await self._event(
+            session,
+            actor=actor,
+            entity_type="opportunity",
+            entity_id=opportunity.id,
+            event_type="opportunity.crowdworks_detail_retry_started",
+            owner_user_id=opportunity.owner_user_id,
+            project_id=opportunity.project_id,
+            payload={"attempt": attempt, "attempt_limit": max_attempts},
+        )
+        await self._flush_commit(session)
+        return attempt
+
+    async def finish_crowdworks_detail_retry(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        *,
+        opportunity_id: UUID | str,
+        connection_id: UUID | str,
+        attempt: int,
+        listing: Any,
+    ) -> bool:
+        """Apply detail refreshes until a Draft or Action binds the opportunity."""
+
+        session = self._resolve_session(session)
+        if actor is None:
+            raise OperationsValidationError("actor is required")
+        if type(attempt) is not int or not 1 <= attempt <= _CROWDWORKS_DETAIL_RETRY_ATTEMPT_LIMIT:
+            raise OperationsValidationError("attempt is outside the retry limit")
+        opportunity = await self._get_or_404(
+            session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True
+        )
+        await self._assert_entity_access(session, actor, opportunity, permission="write")
+        eligible, stored_attempts = await self._crowdworks_detail_retry_target(
+            session, actor, opportunity, connection_id=connection_id, max_attempts=4
+        )
+        if not eligible or stored_attempts != attempt:
+            await self._event(
+                session,
+                actor=actor,
+                entity_type="opportunity",
+                entity_id=opportunity.id,
+                event_type="opportunity.crowdworks_detail_retry_deferred",
+                owner_user_id=opportunity.owner_user_id,
+                project_id=opportunity.project_id,
+                payload={"attempt": int(attempt), "reason_code": "target_no_longer_eligible"},
+            )
+            await self._flush_commit(session)
+            return False
+        metadata = dict(opportunity.metadata_json or {})
+        evaluation_id = await self._scalar(
+            session,
+            select(OpportunityEvaluation.id)
+            .where(OpportunityEvaluation.opportunity_id == opportunity.id)
+            .order_by(OpportunityEvaluation.version.desc())
+            .limit(1),
+        )
+        expected_evaluation_id = metadata.get("detail_retry_evaluation_id")
+        current_evaluation_id = str(evaluation_id) if evaluation_id is not None else None
+        if expected_evaluation_id != current_evaluation_id:
+            await self._event(
+                session,
+                actor=actor,
+                entity_type="opportunity",
+                entity_id=opportunity.id,
+                event_type="opportunity.crowdworks_detail_retry_deferred",
+                owner_user_id=opportunity.owner_user_id,
+                project_id=opportunity.project_id,
+                payload={
+                    "attempt": int(attempt),
+                    "reason_code": "evaluation_changed_during_detail_retry",
+                },
+            )
+            await self._flush_commit(session)
+            return False
+        detail_status = str(getattr(listing, "detail_status", "") or "")
+        if detail_status != "complete":
+            metadata["detail_retry_last_error_code"] = "crowdworks_detail_capture_failed"
+            metadata["detail_retry_last_result"] = "failed"
+            opportunity.metadata_json = metadata
+            await self._flush_only(session)
+            await self._event(
+                session,
+                actor=actor,
+                entity_type="opportunity",
+                entity_id=opportunity.id,
+                event_type="opportunity.crowdworks_detail_retry_failed",
+                owner_user_id=opportunity.owner_user_id,
+                project_id=opportunity.project_id,
+                payload={"attempt": int(attempt), "error_code": "crowdworks_detail_capture_failed"},
+            )
+            await self._flush_commit(session)
+            return False
+
+        detail_text = str(getattr(listing, "detail_text", "") or "")
+        snapshot = listing.snapshot()
+        brief_status = crowdworks_brief_status(snapshot, detail_text)
+        deadline_status = str(getattr(listing, "deadline_status", "unverified") or "unverified")
+        metadata.update(
+            {
+                "provider": "crowdworks",
+                "compensation_yen": getattr(listing, "compensation_yen", None),
+                "compensation_type": getattr(listing, "compensation_type", None),
+                "compensation_parse_code": getattr(
+                    listing, "compensation_parse_code", None
+                ),
+                "deadline_at": getattr(listing, "deadline_at", None),
+                "deadline_status": deadline_status,
+                "detail_capture_status": "complete",
+                "brief_evidence_status": brief_status,
+                "detail_retry_last_result": "complete",
+            }
+        )
+        metadata.pop("detail_retry_last_error_code", None)
+        metadata.pop("detail_retry_evaluation_id", None)
+        if deadline_status == "expired":
+            metadata["screening_status"] = "deadline_expired"
+            metadata["screening_reason"] = "CrowdWorks掲載期限が取得時点ですでに終了しています"
+        elif deadline_status != "open":
+            metadata["screening_status"] = "deadline_unverified"
+            metadata["screening_reason"] = "応募期限を確認できないため、候補評価・応募案作成を保留しています"
+        elif brief_status != "complete":
+            metadata["screening_status"] = "brief_unverified"
+            metadata["screening_reason"] = "案件詳細本文が短いか、完全な指示内容を確認できないため評価を保留しています"
+        else:
+            metadata.pop("screening_status", None)
+            metadata.pop("screening_reason", None)
+        if current_evaluation_id is not None:
+            # This evaluation used the old, incomplete listing. Mark it stale
+            # so the ordinary evaluation lane refreshes it before Draft/QA.
+            metadata["workflow_stage"] = "DETAIL_CAPTURED"
+            metadata["evaluation_refresh_required"] = True
+        opportunity.source_text = detail_text
+        opportunity.source_snapshot_json = snapshot
+        opportunity.source_snapshot_hash = sha256_json(snapshot)
+        opportunity.metadata_json = metadata
+        await self._flush_only(session)
+        await self._event(
+            session,
+            actor=actor,
+            entity_type="opportunity",
+            entity_id=opportunity.id,
+            event_type="opportunity.crowdworks_detail_retry_completed",
+            owner_user_id=opportunity.owner_user_id,
+            project_id=opportunity.project_id,
+            payload={
+                "attempt": int(attempt),
+                "deadline_status": deadline_status if deadline_status in {"open", "expired", "unverified"} else "unverified",
+                "brief_evidence_status": brief_status,
+                "detail_text_chars": len(detail_text),
+                "detail_text_sha256": sha256_text(detail_text),
+            },
+        )
+        await self._flush_commit(session)
+        return True
+
     async def list_opportunities(
         self,
         session: Any | None = None,
@@ -1592,7 +2185,24 @@ class OperationsService:
             .limit(page_limit)
             .offset(page_offset),
         )
-        return [row.to_safe_dict() for row in rows]
+        latest_evaluations: dict[UUID, OpportunityEvaluation] = {}
+        if rows:
+            evaluation_rows = await self._scalars(
+                session,
+                select(OpportunityEvaluation)
+                .where(OpportunityEvaluation.opportunity_id.in_([row.id for row in rows]))
+                .order_by(OpportunityEvaluation.version.desc()),
+            )
+            for evaluation in evaluation_rows:
+                latest_evaluations.setdefault(evaluation.opportunity_id, evaluation)
+        return [
+            _crowdworks_opportunity_projection(
+                row,
+                row.to_safe_dict(),
+                latest_evaluations.get(row.id),
+            )
+            for row in rows
+        ]
 
     async def get_opportunity(
         self,
@@ -1641,7 +2251,97 @@ class OperationsService:
             payload["evaluations"] = [item.to_safe_dict() for item in evaluations]
             payload["drafts"] = [item.to_safe_dict() for item in drafts]
             payload["actions"] = [item.to_safe_dict() for item in actions]
+            latest_evaluation = evaluations[0] if evaluations else None
+            _crowdworks_opportunity_projection(opportunity, payload, latest_evaluation)
+        else:
+            _crowdworks_opportunity_projection(opportunity, payload)
         return payload
+
+    async def retry_development(
+        self, session: Any | None = None, actor: Any | None = None,
+        opportunity_id: UUID | str | None = None, *, expected_work_item_id: str,
+        expected_run_id: str, idempotency_key: str, note: str | None = None,
+    ) -> dict[str, Any]:
+        """Request one new development source revision after a proven failure."""
+        from ..memory.models import AgentRun, AgentWorkItem
+        from .marketplace.client_development import development_source_revision
+
+        session = self._resolve_session(session)
+        if actor is None or opportunity_id is None:
+            raise OperationsValidationError("actor and opportunity_id are required")
+        key = str(idempotency_key or "").strip()
+        note = str(note or "").strip() or None
+        if not key or len(key) > 200 or (note and len(note) > 2000):
+            raise OperationsValidationError("invalid retry request")
+        opportunity = await self._get_or_404(session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True)
+        await self._assert_entity_access(session, actor, opportunity, permission="write")
+        metadata = dict(opportunity.metadata_json or {})
+        request = {"work_item_id": str(expected_work_item_id), "run_id": str(expected_run_id), "note": note}
+        receipts = list(metadata.get("development_recovery_receipts") or [])
+        for receipt in receipts:
+            if isinstance(receipt, dict) and receipt.get("idempotency_key") == key:
+                if receipt.get("request") != request:
+                    raise OperationsConflictError("idempotency key already used for a different retry")
+                return opportunity.to_safe_dict()
+        if opportunity.status != "contract_accepted":
+            raise OperationsConflictError("opportunity is not in contract_accepted status")
+        revision = metadata.get("development_recovery_revision", 0)
+        if type(revision) is not int or revision < 0:
+            raise OperationsConflictError("invalid development recovery revision")
+        kind = str(metadata.get("worker_kind") or "").strip().lower().replace("-", "_")
+        if kind == "code":
+            kind = "app_development"
+        if kind not in {"web_development", "app_development"}:
+            raise OperationsValidationError("retry applies only to Web/App development")
+        work = await self._get_or_404(session, AgentWorkItem, expected_work_item_id, "expected_work_item_id", for_update=True)
+        run = await self._get_or_404(session, AgentRun, expected_run_id, "expected_run_id", for_update=True)
+        if (work.source_type != "marketplace_crowdworks_fulfillment"
+            or work.source_id != str(opportunity.id) or work.project_id != opportunity.project_id
+            or work.intent_key != f"marketplace.crowdworks.develop:{kind}"
+            or work.execution_adapter != f"crowdworks_development_{kind}"
+            or (work.metadata_json or {}).get("worker_kind") != kind
+            or run.work_item_id != work.id or run.project_id != opportunity.project_id
+            or (run.user_id is not None and str(run.user_id) != str(opportunity.owner_user_id))
+            or run.agent_id != work.assigned_agent_id or run.agent_revision_id != work.agent_revision_id):
+            raise OperationsConflictError("development attempt binding mismatch")
+        if work.source_revision != development_source_revision(opportunity, kind, agent_revision_id=str(work.agent_revision_id)):
+            raise OperationsConflictError("development source revision changed")
+        development = metadata.get("development") if isinstance(metadata.get("development"), dict) else {}
+        if development.get("status") == "uncertain":
+            raise OperationsConflictError("uncertain development cannot be retried")
+        for field, expected in (("opportunity_id", str(opportunity.id)), ("project_id", str(opportunity.project_id or "")),
+                                ("work_item_id", str(work.id)), ("agent_run_id", str(run.id)),
+                                ("source_revision", work.source_revision), ("worker_kind", kind)):
+            value = development.get(field)
+            if value not in (None, "") and str(value) != expected:
+                raise OperationsConflictError("development metadata binding mismatch")
+        latest = await self._scalar(session, select(AgentRun).where(AgentRun.work_item_id == work.id)
+                                    .order_by(AgentRun.work_item_attempt.desc(), AgentRun.created_at.desc(), AgentRun.id.desc()).limit(1))
+        if latest is None or latest.id != run.id or run.status not in {"failed", "cancelled", "blocked"}:
+            raise OperationsConflictError("latest development run is not a retryable terminal failure")
+        if work.state not in {"failed", "cancelled", "blocked", "dead_letter"} or any(
+            getattr(work, field) is not None for field in ("lease_owner", "lease_token", "lease_expires_at", "active_agent_run_id")
+        ):
+            raise OperationsConflictError("development work is active or not conclusively terminal")
+        # Guard against a newer or active work item for this source, including
+        # revisions created by a concurrent discovery before this row was locked.
+        others = await self._scalars(session, select(AgentWorkItem).where(
+            AgentWorkItem.source_type == work.source_type, AgentWorkItem.source_id == work.source_id,
+            AgentWorkItem.intent_key == work.intent_key, AgentWorkItem.id != work.id))
+        if any(item.created_at > work.created_at or item.state in {"pending", "claimed", "running", "retry_wait", "uncertain", "awaiting_approval"}
+               or any(getattr(item, field) is not None for field in ("lease_owner", "lease_token", "lease_expires_at", "active_agent_run_id")) for item in others):
+            raise OperationsConflictError("another development attempt is active or newer")
+        revision += 1
+        receipts.append({"idempotency_key": key, "request": request, "revision": revision,
+                         "previous_development": development, "work_state": work.state,
+                         "run_status": run.status, "work_result": work.result_summary_json,
+                         "requested_at": datetime.utcnow().isoformat()})
+        metadata["development_recovery_revision"] = revision
+        metadata["development_recovery_receipts"] = receipts
+        metadata["development"] = {"status": "retry_requested", "worker_kind": kind}
+        opportunity.metadata_json = metadata
+        await self._flush_commit(session)
+        return opportunity.to_safe_dict()
 
     async def resolve_development_requirements(
         self,
@@ -1722,6 +2422,7 @@ class OperationsService:
             raise OperationsValidationError("actor and opportunity_id are required")
         opportunity = await self._get_or_404(session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True)
         await self._assert_entity_access(session, actor, opportunity, permission="write")
+        await self._assert_crowdworks_brief(session, opportunity)
         for value, label in (
             (estimated_effort_hours, "estimated_effort_hours"),
             (estimated_cost, "estimated_cost"),
@@ -1799,6 +2500,7 @@ class OperationsService:
             raise OperationsValidationError("actor and opportunity_id are required")
         opportunity = await self._get_or_404(session, EngagementOpportunity, opportunity_id, "opportunity_id", for_update=True)
         await self._assert_entity_access(session, actor, opportunity, permission="write")
+        await self._assert_crowdworks_brief(session, opportunity)
         message_value = _text(message, "message", required=True, max_bytes=OPERATIONS_TEXT_BYTE_LIMITS["message"])
         if offered_price is not None and (
             not isinstance(offered_price, (int, float)) or not math.isfinite(float(offered_price))
@@ -3537,6 +4239,72 @@ class OperationsService:
                 raise OperationsAuthorizationError("connection owner mismatch")
         return connection, draft, opportunity
 
+    async def _assert_crowdworks_brief(
+        self, session: Any, opportunity: EngagementOpportunity
+    ) -> None:
+        connection = (
+            await session.get(ExternalConnection, opportunity.connection_id)
+            if opportunity.connection_id is not None else None
+        )
+        if not _is_crowdworks_opportunity(connection, opportunity):
+            return
+        snapshot = opportunity.source_snapshot_json if isinstance(opportunity.source_snapshot_json, dict) else {}
+        if crowdworks_brief_status(snapshot, opportunity.source_text) != "complete":
+            raise OperationsConflictError("crowdworks_brief_unverified")
+
+    async def _crowdworks_application_block_code(
+        self,
+        session: Any,
+        opportunity: EngagementOpportunity,
+        draft: ApplicationDraft | None,
+    ) -> str | None:
+        _deadline_at, deadline_status = crowdworks_deadline(
+            source_snapshot=opportunity.source_snapshot_json,
+            source_text=opportunity.source_text,
+            captured_at=opportunity.created_at,
+            now=datetime.now(timezone.utc),
+        )
+        if deadline_status == "expired":
+            return "crowdworks_deadline_expired"
+        if deadline_status != "open":
+            return "crowdworks_deadline_unverified"
+        snapshot = opportunity.source_snapshot_json if isinstance(opportunity.source_snapshot_json, dict) else {}
+        if crowdworks_brief_status(snapshot, opportunity.source_text) != "complete":
+            return "crowdworks_brief_unverified"
+        evaluation = await session.scalar(
+            select(OpportunityEvaluation)
+            .where(OpportunityEvaluation.opportunity_id == opportunity.id)
+            .order_by(OpportunityEvaluation.version.desc())
+            .limit(1)
+        )
+        missing = (
+            evaluation.missing_requirements
+            if evaluation is not None and isinstance(evaluation.missing_requirements, (list, tuple))
+            else None
+        )
+        requirements = classify_missing_requirements(missing, brief_text=opportunity.source_text)
+        if requirements["blocking"]:
+            return "crowdworks_requirements_incomplete"
+        metadata = opportunity.metadata_json if isinstance(opportunity.metadata_json, dict) else {}
+        qa = metadata.get("application_qa")
+        if (
+            draft is None
+            or not isinstance(qa, dict)
+            or qa.get("status") != "passed"
+            or evaluation is None
+            or qa.get("evaluation_id") != str(evaluation.id)
+            or qa.get("draft_hash") != draft.draft_hash
+            or qa.get("draft_id") != str(draft.id)
+            or qa.get("draft_version") != int(draft.version)
+            or (requirements["clarifiable"] and (
+                qa.get("clarification_questions_hash") != sha256_json(requirements["clarifiable"])
+                or not isinstance(draft.message, str)
+                or not all(question in draft.message for question in requirements["clarifiable"])
+            ))
+        ):
+            return "crowdworks_application_qa_required"
+        return None
+
     async def create_action(
         self,
         session: Any | None = None,
@@ -3566,6 +4334,12 @@ class OperationsService:
             connection_id=connection_id,
             draft_id=application_draft_id,
         )
+        if _is_crowdworks_opportunity(connection, opportunity):
+            blocked = await self._crowdworks_application_block_code(
+                session, opportunity, draft,
+            )
+            if blocked:
+                raise OperationsConflictError(blocked)
         draft_payload = {
             "operation_key": "engagement.submit_application",
             "connection_id": str(connection.id),
@@ -4051,6 +4825,23 @@ class OperationsService:
         if getattr(action, "legacy_evidence_incomplete", False):
             raise OperationsConflictError("legacy_provider_evidence_incomplete")
         await self._assert_media_action_integrity(session, actor, action)
+        if decision == "approved" and action.action_type == "engagement.submit_application":
+            connection = await session.get(ExternalConnection, action.connection_id)
+            opportunity = await session.get(EngagementOpportunity, action.opportunity_id)
+            is_crowdworks = (
+                connection is not None and connection.provider_key == "crowdworks"
+            ) or _is_crowdworks_url(action.source_url) or (
+                opportunity is not None and _is_crowdworks_opportunity(connection, opportunity)
+            )
+            if is_crowdworks:
+                if opportunity is None:
+                    raise OperationsConflictError("crowdworks_opportunity_missing")
+                draft = await session.get(ApplicationDraft, action.application_draft_id)
+                blocked = await self._crowdworks_application_block_code(
+                    session, opportunity, draft,
+                )
+                if blocked:
+                    raise OperationsConflictError(blocked)
         expected_action_version = int(action.action_version or 1)
         if getattr(action, "action_policy_revision_id", None) is not None:
             # Generic policies never impersonate a human approval. Procurement

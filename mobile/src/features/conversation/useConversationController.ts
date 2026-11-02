@@ -162,8 +162,18 @@ import { useConversationDurableTimeline } from "./useConversationTimeline";
 import { ConversationGenerationEventGate } from "./conversation-generation-events";
 import { ConversationSubmissionQueue, RetainedSubmissionError, conversationMessageIdentity, useSubmissionTimeline } from "./conversation-submissions";
 
+function traceMobileChatRetry(
+  stage: string,
+  details: Record<string, unknown> = {},
+): void {
+  if (process.env.EXPO_PUBLIC_AOITALK_CHAT_RETRY_TRACE !== "1") return;
+  console.info("[mobile-chat-retry]", JSON.stringify({ stage, ...details }));
+}
+
 const DEEP_RESEARCH_PENDING_START_STORAGE_PREFIX =
   "aoitalk:deep-research-pending-start:v1";
+const MODEL_CATALOG_REFRESH_FAILURE_MESSAGE =
+  "モデル一覧を更新できませんでした。現在の選択を保持しています。";
 
 class DeepResearchPendingStartPersistenceError extends Error {
   constructor() {
@@ -636,7 +646,13 @@ export function useConversationController(
   const [activityMessage, setActivityMessage] = useState<string | null>(null);
   const [llmModeSyncStatus, setLlmModeSyncStatus] =
     useState<LlmSelectionSyncStatus>("idle");
-  const [llmSelectionMessage, setLlmSelectionMessage] = useState<string | null>(null);
+  const [llmSelectionMessage, setLlmSelectionMessageState] =
+    useState<string | null>(null);
+  const llmSelectionMessageRef = useRef<string | null>(null);
+  const setLlmSelectionMessage = useCallback((message: string | null) => {
+    llmSelectionMessageRef.current = message;
+    setLlmSelectionMessageState(message);
+  }, []);
   const [llmPreferencesReady, setLlmPreferencesReady] = useState(false);
   const [effectiveGeneration, setEffectiveGeneration] =
     useState<EffectiveGenerationRoute | null>(null);
@@ -808,6 +824,7 @@ export function useConversationController(
   }, [sessionId, authOwner]);
 
   const sessionKind = useMemo(() => inferSessionKind(session), [session]);
+  const protectedConversationRoot = isProtectedConversationRoot(session);
   const effectiveProjectId = session ? session.project_id : selectedProjectId;
   const transportState = buildTransportState({
     isAuthenticated,
@@ -1751,7 +1768,10 @@ export function useConversationController(
 
   const persistLlmPreferences = useCallback(
     (patch: Partial<ChatLlmPreferences>) => {
-      if (disableLlmPreferencePersistence) return;
+      if (
+        disableLlmPreferencePersistence ||
+        isProtectedConversationRoot(sessionStateRef.current)
+      ) return;
       const scope = llmPreferenceScopeRef.current;
       if (!scope) return;
       const next: ChatLlmPreferences = {
@@ -1774,7 +1794,17 @@ export function useConversationController(
 
   const refreshResponseModelOptionsForScope = useCallback(
     async (scope: string, force = false) => {
-      if (!isAuthenticated) return;
+      const canApplyResult = () =>
+        mountedRef.current &&
+        llmPreferenceScopeRef.current === scope &&
+        !disableLlmPreferencePersistence &&
+        !isProtectedConversationRoot(sessionStateRef.current);
+      if (
+        !mountedRef.current ||
+        !isAuthenticated ||
+        disableLlmPreferencePersistence ||
+        isProtectedConversationRoot(sessionStateRef.current)
+      ) return;
       if (force || responseModelOptionsRef.current.length === 0) {
         setResponseModelOptionsLoading(true);
       }
@@ -1782,7 +1812,7 @@ export function useConversationController(
         const catalog = await (force
           ? refreshLlmModelCatalog(scope)
           : getCachedLlmModelCatalog(scope));
-        if (llmPreferenceScopeRef.current !== scope) return;
+        if (!canApplyResult()) return;
 
         const savedTarget = responseTargetRef.current.kind === "server"
           ? responseTargetRef.current.responseModel
@@ -1799,7 +1829,13 @@ export function useConversationController(
           responseTargetRef.current = normalized.target;
           setResponseTarget(normalized.target);
         }
-        if (normalized.message) setLlmSelectionMessage(normalized.message);
+        if (normalized.message) {
+          setLlmSelectionMessage(normalized.message);
+        } else if (
+          llmSelectionMessageRef.current === MODEL_CATALOG_REFRESH_FAILURE_MESSAGE
+        ) {
+          setLlmSelectionMessage(null);
+        }
         persistLlmPreferences({
           responseModelOptions: options,
           responseTarget: normalized.target,
@@ -1807,18 +1843,23 @@ export function useConversationController(
       } catch {
         // offline/timeoutでもcache候補と現在の選択を消さない。次回の
         // 明示更新で同じIDを再評価できるよう、状態だけ通知する。
-        if (llmPreferenceScopeRef.current === scope) {
-          setLlmSelectionMessage(
-            "モデル一覧を更新できませんでした。現在の選択を保持しています。",
-          );
+        if (canApplyResult()) {
+          setLlmSelectionMessage(MODEL_CATALOG_REFRESH_FAILURE_MESSAGE);
         }
       } finally {
-        if (llmPreferenceScopeRef.current === scope) {
+        if (
+          mountedRef.current &&
+          llmPreferenceScopeRef.current === scope
+        ) {
           setResponseModelOptionsLoading(false);
         }
       }
     },
-    [isAuthenticated, persistLlmPreferences],
+    [
+      disableLlmPreferencePersistence,
+      isAuthenticated,
+      persistLlmPreferences,
+    ],
   );
 
   const refreshResponseModelOptions = useCallback(async () => {
@@ -2952,23 +2993,98 @@ export function useConversationController(
 
   const retryPendingMessage = useCallback(
     async (message: ConversationMessage, route: "server" | "direct" = "server") => {
+      traceMobileChatRetry("entry", {
+        route,
+        session_id_present: Boolean(sessionId),
+        authenticated: isAuthenticated,
+        session_user_id_present: Boolean(session?.user_id),
+        session_local_only: Boolean(session?.is_local_only),
+        message_pending: Boolean(message.metadata?.pending),
+        persistence_error: Boolean(message.metadata?.persistence_error),
+        already_retrying: retryingMessageIds.includes(message.id),
+      });
       if (!sessionId) return;
       if (route === "direct" && sessionAgentRequiresServer(sessionStateRef.current)) {
         setError("Agent付きChatの未送信入力はDirectで再試行できません。Serverへ接続して同じ入力を再送してください。");
         return;
       }
-      if (route === "server" && message.metadata?.persistence_error) {
-        const payload = pendingDispatchPayload(message);
-        await sendConversationCommand({ message: message.content, retryMessageId: message.id,
-          projectId: payload.project_id, appId: payload.app_id, appTargetId: payload.app_target_id,
-           contextProjectHintId: payload.context_project_hint_id,
-          includeProjectContext: payload.include_project_context, agentMode: payload.agent_mode,
-          expectedAgentId: payload.expected_agent_id,
-          commandCapabilities: payload.command_capabilities, attachments: payload.attachments,
-          target: { kind: "server", responseModel: payload.response_model ?? undefined },
-        });
+      if (route === "server" && (
+        message.metadata?.persistence_error || !session?.user_id || session.is_local_only
+      )) {
+        traceMobileChatRetry("local_server_flush_branch");
+        if (retryingMessageIds.includes(message.id)) {
+          traceMobileChatRetry("already_retrying_guard");
+          return;
+        }
+        const activeOperation = exclusiveOperationRef.current;
+        const ownsOperation = activeOperation === null &&
+          tryStartConversationOperation(exclusiveOperationRef, "send");
+        const operationBlocked =
+          (activeOperation !== null && activeOperation !== "background-flush") ||
+          (activeOperation === null && !ownsOperation);
+        if (operationBlocked) {
+          traceMobileChatRetry("operation_blocked", {
+            active_operation: activeOperation ?? "none",
+          });
+          setError("別の送信が完了してから再試行してください。");
+          return;
+        }
+        const expectsPromotion = !session?.user_id || session.is_local_only;
+        setError(null);
+        setIsWaiting(true);
+        setRetryingMessageIds((current) => [...current, message.id]);
+        try {
+          // This message is already durable. Re-entering the composer submission
+          // pipeline can be held by native preference/storage initialization
+          // before its local-session promotion starts. Flush the existing row
+          // directly so a retry never depends on appending a second submission.
+          traceMobileChatRetry("repository_flush_start", {
+            user_initiated: true,
+            expects_promotion: Boolean(expectsPromotion),
+          });
+          const flushedSessionId = await flushPendingConversation(sessionId, {
+            userInitiated: true,
+          });
+          traceMobileChatRetry("repository_flush_settled", {
+            promoted: flushedSessionId !== sessionId,
+          });
+          if (expectsPromotion && flushedSessionId === sessionId) {
+            throw new Error("ローカルチャットをServerへ接続できませんでした。入力は未送信キューに保持されています。");
+          }
+          if (flushedSessionId !== sessionId) {
+            promotedSubmissionSessionsRef.current.set(sessionId, flushedSessionId);
+            promoteMessages(sessionId, flushedSessionId);
+            if (activeGenerationSessionRef.current === sessionId &&
+                mountedRef.current && focusedRef.current && authOwnerRef.current === authOwner) {
+              scheduleRefresh(flushedSessionId);
+              onSessionPromotedRef.current?.(flushedSessionId);
+            }
+          }
+          const refreshedMessages = await conversationsRepo.listMessagesLocal(flushedSessionId);
+          if (mountedRef.current) setMessages(refreshedMessages);
+          void refreshFromServer(flushedSessionId).catch(() => undefined);
+        } catch (retryError) {
+          traceMobileChatRetry("retry_error", {
+            error_name: retryError instanceof Error ? retryError.name : "unknown",
+            http_status: retryError && typeof retryError === "object" && "status" in retryError
+              ? (retryError as { status?: unknown }).status
+              : null,
+          });
+          setError(errorTextOf(retryError, "未送信メッセージをServerへ再送できませんでした。入力は保持されています。"));
+        } finally {
+          setRetryingMessageIds((current) => current.filter((id) => id !== message.id));
+          setIsWaiting(false);
+          if (ownsOperation) finishConversationOperation(exclusiveOperationRef, "send");
+        }
         return;
       }
+      traceMobileChatRetry("server_backed_retry_path", {
+        network_connected: networkConnected,
+        server_reachable: networkServerReachable,
+        server_known_unreachable: isServerKnownUnreachable(),
+        active_operation: exclusiveOperationRef.current ?? "none",
+        already_retrying: retryingMessageIds.includes(message.id),
+      });
       if (route === "direct") {
         if (retryingMessageIds.includes(message.id)) return;
         setRetryingMessageIds((current) => [...current, message.id]);
@@ -3003,24 +3119,34 @@ export function useConversationController(
         return;
       }
       if (!isAuthenticated) {
+        traceMobileChatRetry("server_retry_login_blocked");
         setError("サーバーへの再送にはログインが必要です。Directで再試行できます。");
         return;
       }
-      if (
-        shouldHoldServerDispatch({
-          networkConnected,
-          serverKnownUnreachable:
-            !networkServerReachable && isServerKnownUnreachable(),
-          userInitiated: true,
-        })
-      ) {
+      const serverRetryHeld = shouldHoldServerDispatch({
+        networkConnected,
+        serverKnownUnreachable:
+          !networkServerReachable && isServerKnownUnreachable(),
+        userInitiated: true,
+      });
+      if (serverRetryHeld) {
+        traceMobileChatRetry("server_retry_network_blocked", {
+          network_connected: networkConnected,
+          server_reachable: networkServerReachable,
+          server_known_unreachable: isServerKnownUnreachable(),
+        });
         setError(SERVER_RETRY_DEFERRED_ERROR);
         return;
       }
-      if (
-        retryingMessageIds.includes(message.id) ||
-        !tryStartConversationOperation(exclusiveOperationRef, "send")
-      ) {
+      const operationBeforeRetry = exclusiveOperationRef.current;
+      const alreadyRetrying = retryingMessageIds.includes(message.id);
+      const sendOperationStarted = !alreadyRetrying &&
+        tryStartConversationOperation(exclusiveOperationRef, "send");
+      if (alreadyRetrying || !sendOperationStarted) {
+        traceMobileChatRetry("server_retry_operation_blocked", {
+          already_retrying: alreadyRetrying,
+          active_operation: operationBeforeRetry ?? "none",
+        });
         setError("別の送信が完了してから再試行してください。");
         return;
       }
@@ -3032,7 +3158,9 @@ export function useConversationController(
         `retry-${message.id}`,
       );
       if (!retryGeneration) {
+        traceMobileChatRetry("server_retry_generation_blocked");
         setIsWaiting(false);
+        finishConversationOperation(exclusiveOperationRef, "send");
         setError("進行中の応答が完了してから再試行してください。");
         return;
       }
@@ -3043,6 +3171,10 @@ export function useConversationController(
       setRetryingMessageIds((current) => [...current, message.id]);
       try {
         const retryScope = await readConversationRefreshScope();
+        traceMobileChatRetry("server_retry_dispatch_start", {
+          duplicate_check: true,
+          session_is_local_only: Boolean(session?.is_local_only),
+        });
         const result = await attemptPendingRetry(() =>
           dispatchPendingConversationMessage(
             sessionId,
@@ -3058,6 +3190,14 @@ export function useConversationController(
             { checkRemoteDuplicate: true },
           ),
         );
+        traceMobileChatRetry("server_retry_dispatch_settled", {
+          ok: result.ok,
+          connectivity_failure: !result.ok && result.connectivityFailure,
+          http_status: !result.ok && result.error && typeof result.error === "object" && "status" in result.error
+            ? (result.error as { status?: unknown }).status
+            : null,
+          error_name: !result.ok && result.error instanceof Error ? result.error.name : null,
+        });
         if (!result.ok) {
           completeServerGeneration(retryGeneration);
           if (result.connectivityFailure) {
@@ -3110,10 +3250,15 @@ export function useConversationController(
       completeServerGeneration,
       refreshFromServer,
       scheduleRefresh,
+      promoteMessages,
+      setMessages,
+      authOwner,
       retryingMessageIds,
       responseTarget,
       sendConversationCommand,
       effectiveProjectId,
+      session?.user_id,
+      session?.is_local_only,
       session?.app_id,
       session?.app_target_id,
       sessionId,
@@ -3736,10 +3881,6 @@ export function useConversationController(
       // A former global-mode retry must never mutate another model's config.
       llmPreferencesRef.current = { ...preferences, modeSyncPending: false };
 
-      if (isAuthenticated) {
-        // cacheをpaintした後にだけserver revalidationを開始する。
-        void refreshResponseModelOptionsForScope(scope);
-      }
     })().catch(() => {
       if (isCurrent()) setLlmPreferencesReady(true);
     });
@@ -3752,8 +3893,31 @@ export function useConversationController(
   }, [
     disableLlmPreferencePersistence,
     isAuthenticated,
-    refreshResponseModelOptionsForScope,
     userId,
+  ]);
+
+  useEffect(() => {
+    const scope = llmPreferenceScopeRef.current;
+    if (
+      !isAuthenticated ||
+      disableLlmPreferencePersistence ||
+      loading ||
+      protectedConversationRoot ||
+      !llmPreferencesReady ||
+      !scope
+    ) {
+      return;
+    }
+    // Load the session before catalog hydration so an embedded protected root
+    // never requests or reports errors for Chat model options.
+    void refreshResponseModelOptionsForScope(scope);
+  }, [
+    disableLlmPreferencePersistence,
+    isAuthenticated,
+    llmPreferencesReady,
+    loading,
+    protectedConversationRoot,
+    refreshResponseModelOptionsForScope,
   ]);
 
   useEffect(() => {

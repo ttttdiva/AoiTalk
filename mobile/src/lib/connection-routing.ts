@@ -97,6 +97,15 @@ let configuredNetInfo = false;
 let networkSubscription: (() => void) | null = null;
 let cachedConfig: NetworkEndpointRoutingConfig | null = null;
 let routingRevision = 0;
+const routingListeners = new Set<() => void>();
+export function subscribeNetworkEndpointRouting(listener: () => void): () => void {
+  routingListeners.add(listener);
+  return () => { routingListeners.delete(listener); };
+}
+function invalidateRouting(): void {
+  routingRevision += 1;
+  routingListeners.forEach((listener) => listener());
+}
 
 /** Successful route health may be reused briefly; failed probes are never cached. */
 export const NETWORK_ENDPOINT_HEALTH_TTL_MS = 30_000;
@@ -305,19 +314,20 @@ export async function saveNetworkEndpointRoutingConfig(
   config: NetworkEndpointRoutingConfig,
 ): Promise<void> {
   const normalizedConfig = validateNetworkEndpointRoutingConfig(config);
+  invalidateRouting();
   await SecureStore.setItemAsync(
     STORAGE_KEYS.NETWORK_ENDPOINT_ROUTING,
     JSON.stringify(normalizedConfig),
   );
-  routingRevision += 1;
   cachedConfig = normalizedConfig;
   routeHealthCache.clear();
+  invalidateRouting();
 }
 
 export function clearNetworkEndpointRoutingCache(): void {
-  routingRevision += 1;
   cachedConfig = null;
   routeHealthCache.clear();
+  invalidateRouting();
 }
 
 function networkFromState(state: NetInfoState): CurrentNetworkInfo {

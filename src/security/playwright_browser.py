@@ -54,9 +54,11 @@ async def launch_scoped_playwright_browser(
     if scope.lane is not BrowserLane.QA:
         raise BrowserLaneViolation("QA launcher requires the QA lane")
     scope._ensure_active()
-    profiles = Path(__file__).resolve().parents[2] / ".local" / "browser-profiles"
-    profiles.mkdir(parents=True, exist_ok=True)
-    profile_dir = tempfile.mkdtemp(prefix=f"{scope.lane_name}-", dir=profiles)
+    repo_root = Path(__file__).resolve().parents[2]
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if temp_root == repo_root or repo_root in temp_root.parents:
+        raise BrowserLaneViolation("browser profile temp is inside the repository")
+    profile_dir = tempfile.mkdtemp(prefix=f"{scope.lane_name}-", dir=temp_root)
     context = None
     try:
         context = await _await(

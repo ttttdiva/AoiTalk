@@ -2,7 +2,7 @@
 
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from sqlalchemy import (
@@ -33,6 +33,15 @@ from .base import Base, _encrypted_text_property
 _COMPACT_RECURRENCE_OVERRIDE_RE = re.compile(
     r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z?$"
 )
+
+
+def task_audit_iso(value: datetime | None) -> str | None:
+    """Serialize task audit timestamps as UTC with microsecond precision."""
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _legacy_recurrence_override_original_start_at(
@@ -300,8 +309,8 @@ class Task(Base):
                 self.completed_at.isoformat() if self.completed_at else None
             ),
             "archived_at": self.archived_at.isoformat() if self.archived_at else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": task_audit_iso(self.created_at),
+            "updated_at": task_audit_iso(self.updated_at),
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
             "deletion_batch_id": (
                 str(self.deletion_batch_id) if self.deletion_batch_id else None

@@ -39,6 +39,7 @@ from ...memory.models import (
     TaskTag,
     TimeEntry,
     User,
+    ExternalConnection,
     KnowledgeNode,
     KnowledgeNodeSupertag,
     KnowledgeSupertag,
@@ -137,6 +138,52 @@ _KNOWLEDGE_CAPTURE_MAX_MESSAGE = 1000
 _KNOWLEDGE_CAPTURE_PAYLOAD_KEYS = frozenset(
     {"kind", "candidate_id", "question_id", "candidate_version"}
 )
+_CROWDWORKS_NOTIFICATION_REASON_CODES = frozenset(
+    {
+        "skipped_browser_unavailable",
+        "skipped_browser_login_required",
+    }
+)
+_CROWDWORKS_SUPPRESSED_LEGACY_REASONS = frozenset(
+    {"crowdworks_agent_scan_failed", "crowdworks_unit_failure_limit_reached"}
+)
+_CROWDWORKS_NOTIFICATION_DETAIL_CODES = frozenset(
+    {
+        "browser_backend_unavailable",
+        "browser_login_required",
+        "browser_owner_mismatch",
+        "browser_unavailable",
+        "broker_unavailable",
+        "cdp_disconnected",
+        "browser_restart_limit",
+        "gateway_root_missing",
+        "broker_mode_legacy",
+        "broker_mode_unknown",
+        "broker_start_timeout",
+        "broker_executable_missing",
+        "broker_start_failed",
+        "crowdworks_browser_session_unavailable",
+        "bridge_select_a_pc_first",
+        "bridge_device_not_found",
+        "bridge_device_offline",
+        "bridge_disconnected",
+        "bridge_browser_command_unavailable",
+        "bridge_jev_runtime_required",
+    }
+)
+_CROWDWORKS_NOTIFICATION_UNIT_KINDS = frozenset(
+    {
+        "none",
+        "listing",
+        "detail",
+        "evaluation_select",
+        "evaluation",
+        "draft",
+        "contract_monitor",
+        "tick",
+    }
+)
+_CROWDWORKS_NOTIFICATION_DEDUPE_RE = re.compile(r"^[a-z0-9][a-z0-9:_-]{0,150}$")
 
 
 def _notification_field(notification: Any, name: str) -> Any:
@@ -145,6 +192,18 @@ def _notification_field(notification: Any, name: str) -> Any:
     if isinstance(notification, Mapping):
         return notification.get(name)
     return getattr(notification, name, None)
+
+
+def _is_suppressed_crowdworks_legacy_notification(notification: Any) -> bool:
+    payload = _notification_field(notification, "payload")
+    if _notification_field(notification, "notification_type") != "system_alert" or not isinstance(payload, Mapping):
+        return False
+    reason = payload.get("reason_code")
+    return (
+        payload.get("kind") == "crowdworks_scan_alert"
+        and isinstance(reason, str)
+        and reason in _CROWDWORKS_SUPPRESSED_LEGACY_REASONS
+    )
 
 
 def is_project_steward_notification(notification: Any) -> bool:
@@ -537,10 +596,10 @@ async def _insert_notification_if_missing(
     """Insert one durable notification, converging concurrent retries.
 
     ``NotificationDelivery.dedupe_key`` is the sole idempotency boundary for
-    both task reminders and Project Steward alerts.  Keeping this primitive
-    module-level lets the Steward persist an inbox row without constructing a
-    full task-management service (and therefore without opening any task or
-    Docs mutation path).
+    durable notification producers. Keeping this primitive module-level lets
+    focused services persist inbox rows without constructing a full
+    task-management service (and therefore without opening task or Docs
+    mutation paths).
     """
 
     result = await session.execute(
@@ -650,6 +709,181 @@ async def persist_project_steward_notification(
     return delivery
 
 
+async def persist_crowdworks_scan_notification(
+    session: AsyncSession,
+    *,
+    owner_user_id: UUID,
+    connection_id: UUID,
+    dedupe_key: str,
+    reason_code: str,
+    count: int,
+    unit_kind: str | None = None,
+    scheduled_for: datetime | None = None,
+    detail_code: str | None = None,
+) -> bool:
+    """Persist one safe CrowdWorks scan alert in the owner's durable inbox.
+
+    The referenced connection and active owner are revalidated immediately
+    before persistence. The notification is anchored to the owner's oldest
+    active project because ``notification_deliveries.project_id`` is required.
+    Only fixed reason/detail/unit codes and a bounded count enter the visible
+    message or payload; connection and caller dedupe values are used only for
+    the database idempotency key.
+    """
+
+    try:
+        owner_uuid = _coerce_uuid(owner_user_id, "owner_user_id")
+        connection_uuid = _coerce_uuid(connection_id, "connection_id")
+    except TaskManagementError:
+        return False
+
+    if (
+        not isinstance(reason_code, str)
+        or reason_code not in _CROWDWORKS_NOTIFICATION_REASON_CODES
+    ):
+        return False
+    if type(count) is not int or not 0 <= count <= 1_000_000:
+        return False
+
+    if not isinstance(dedupe_key, str):
+        return False
+    normalized_dedupe = dedupe_key.strip()
+    if not _CROWDWORKS_NOTIFICATION_DEDUPE_RE.fullmatch(normalized_dedupe):
+        return False
+    durable_dedupe_key = f"crowdworks_scan:{connection_uuid}:{normalized_dedupe}"
+    if len(durable_dedupe_key) > 255:
+        return False
+
+    safe_unit_kind = (
+        unit_kind
+        if isinstance(unit_kind, str)
+        and unit_kind in _CROWDWORKS_NOTIFICATION_UNIT_KINDS
+        else None
+    )
+    safe_detail_code = (
+        detail_code
+        if isinstance(detail_code, str)
+        and detail_code in _CROWDWORKS_NOTIFICATION_DETAIL_CODES
+        else None
+    )
+    timestamp = scheduled_for or datetime.utcnow()
+    if not isinstance(timestamp, datetime):
+        return False
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    try:
+        connection_result = await session.execute(
+            select(ExternalConnection.id).where(
+                ExternalConnection.id == connection_uuid,
+                ExternalConnection.owner_user_id == owner_uuid,
+                ExternalConnection.provider_key == "crowdworks",
+            )
+        )
+        if connection_result.scalar_one_or_none() is None:
+            logger.warning(
+                "CrowdWorks notification scope unavailable: "
+                "code=crowdworks_notification_scope_unavailable"
+            )
+            return False
+
+        owner_result = await session.execute(
+            select(User.id).where(
+                User.id == owner_uuid,
+                User.is_active.is_(True),
+            )
+        )
+        if owner_result.scalar_one_or_none() is None:
+            logger.warning(
+                "CrowdWorks notification scope unavailable: "
+                "code=crowdworks_notification_scope_unavailable"
+            )
+            return False
+
+        project_result = await session.execute(
+            select(Project.id)
+            .where(
+                Project.owner_id == owner_uuid,
+                Project.deleted_at.is_(None),
+            )
+            .order_by(Project.created_at.asc(), Project.id.asc())
+            .limit(1)
+        )
+        project_uuid = project_result.scalar_one_or_none()
+        if project_uuid is None:
+            logger.warning(
+                "CrowdWorks owner project unavailable: "
+                "code=crowdworks_owner_project_unavailable"
+            )
+            return False
+
+        title = "CrowdWorks巡回の確認が必要です"
+        message = f"巡回アラート: {reason_code}。回数: {count}。"
+        if safe_unit_kind:
+            message += f" 対象: {safe_unit_kind}。"
+        if safe_detail_code:
+            message += f" 詳細: {safe_detail_code}。"
+        payload: dict[str, Any] = {
+            "kind": "crowdworks_scan_alert",
+            "reason_code": reason_code,
+            "count": count,
+        }
+        if safe_unit_kind:
+            payload["unit_kind"] = safe_unit_kind
+        if safe_detail_code:
+            payload["detail_code"] = safe_detail_code
+
+        delivery = await _insert_notification_if_missing(
+            session,
+            dedupe_key=durable_dedupe_key,
+            project_id=project_uuid,
+            task_id=None,
+            occurrence_id=None,
+            user_id=owner_uuid,
+            channel="in_app",
+            notification_type="system_alert",
+            title=title,
+            message=message,
+            scheduled_for=timestamp,
+            payload=payload,
+        )
+        if delivery is None:
+            existing_result = await session.execute(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.dedupe_key == durable_dedupe_key
+                )
+            )
+            delivery = existing_result.scalar_one_or_none()
+            existing_payload = (
+                delivery.payload if delivery is not None else None
+            )
+            if (
+                delivery is None
+                or str(delivery.user_id) != str(owner_uuid)
+                or delivery.channel != "in_app"
+                or delivery.notification_type != "system_alert"
+                or delivery.status == "cancelled"
+                or delivery.task_id is not None
+                or delivery.occurrence_id is not None
+                or not isinstance(existing_payload, Mapping)
+                or existing_payload.get("kind") != "crowdworks_scan_alert"
+            ):
+                return False
+
+        await session.commit()
+        return True
+    except Exception:
+        logger.error(
+            "CrowdWorks notification persistence failed: "
+            "code=crowdworks_notification_persistence_failed"
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        return False
+
+
 def _task_notification_lookahead_minutes() -> int:
     try:
         minutes = int(
@@ -748,6 +982,28 @@ def _task_notification_now(now: Optional[datetime] = None) -> datetime:
     if now.tzinfo is not None:
         return now.astimezone(timezone).replace(tzinfo=None)
     return now
+
+
+def _notification_delivery_storage_time(
+    notification: NotificationDelivery,
+    current_time: datetime,
+) -> datetime:
+    """Store CrowdWorks delivery events as naive UTC while keeping task dates local."""
+    dedupe_key = getattr(notification, "dedupe_key", None)
+    is_crowdworks_scan_alert = (
+        getattr(notification, "notification_type", None) == "system_alert"
+        and isinstance(dedupe_key, str)
+        and dedupe_key.startswith("crowdworks_scan:")
+    )
+    if not is_crowdworks_scan_alert:
+        return current_time
+    task_timezone = ZoneInfo(DEFAULT_TASK_TIMEZONE)
+    aware_time = (
+        current_time.replace(tzinfo=task_timezone)
+        if current_time.tzinfo is None
+        else current_time
+    )
+    return aware_time.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
 
 def _conflict_safe_insert(session: AsyncSession, model: type[Any]):
@@ -1863,6 +2119,12 @@ class NotificationMixin:
             if getattr(notification, "read_at", None) is not None:
                 notification.status = "read"
                 continue
+            if _is_suppressed_crowdworks_legacy_notification(notification):
+                # Retain the dedupe/history row while preventing old technical
+                # scan failures from reaching any delivery channel.
+                notification.status = "cancelled"
+                notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
+                continue
             if is_project_steward_notification(notification):
                 # Project Steward is operational background work, never a
                 # user-notification channel.  Cancel legacy pending rows
@@ -1870,7 +2132,7 @@ class NotificationMixin:
                 # mixed-version workers cannot leak a Steward result.  Keep
                 # the durable dedupe row for bounded cleanup/audit.
                 notification.status = "cancelled"
-                notification.delivered_at = current_time
+                notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
                 continue
             if is_knowledge_capture_notification(notification) and not await self._knowledge_capture_notification_is_current(
                 session,
@@ -1880,7 +2142,7 @@ class NotificationMixin:
                 # loses Project access.  Keep the durable dedupe row for
                 # audit/retry convergence.
                 notification.status = "cancelled"
-                notification.delivered_at = current_time
+                notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
                 continue
             if notification.channel == "in_app":
                 if not await self._project_steward_notification_is_current(
@@ -1891,7 +2153,7 @@ class NotificationMixin:
                     # Steward row.  Preserve its unique dedupe record but do
                     # not broadcast or push stale project intelligence.
                     notification.status = "cancelled"
-                    notification.delivered_at = current_time
+                    notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
                     continue
                 reminder_is_current = True
                 if notification.notification_type == "reminder":
@@ -1903,9 +2165,9 @@ class NotificationMixin:
                         # websocket delivery after an edit, completion, or
                         # cancellation. The list API hides cancelled rows.
                         notification.status = "cancelled"
-                        notification.delivered_at = current_time
+                        notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
                         continue
-                notification.delivered_at = current_time
+                notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
                 notification.status = "delivered"
                 stats["delivered"] += 1
                 await self._broadcast("notification_created", notification.to_dict())
@@ -2055,7 +2317,7 @@ class NotificationMixin:
                         source_kind="task_notification.webhook",
                     )
                     response.raise_for_status()
-                    notification.delivered_at = current_time
+                    notification.delivered_at = _notification_delivery_storage_time(notification, current_time)
                     notification.status = "delivered"
                     stats["delivered"] += 1
                 except (ExternalProviderBlocked, PrivacyError):

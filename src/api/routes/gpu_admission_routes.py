@@ -12,13 +12,15 @@ shared OpenAPI contract, so neither Web nor Mobile types change.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from ...services.gpu_admission import MAX_LEASE_TTL_SECONDS, Conflict
+from ...services.gpu_admission import Conflict
 from ...services.gpu_admission_driver import BackendError
+from ...services.gpu_trial_lease_policy import HARD_MAX_LEASE_SECONDS
 from ..router_helpers import cookie_auth_dependency
 
 if TYPE_CHECKING:
@@ -28,7 +30,18 @@ if TYPE_CHECKING:
 class GpuLeaseRequest(BaseModel):
     owner: str = Field(min_length=1, max_length=64)
     operation_id: str = Field(min_length=1, max_length=128)
-    ttl_seconds: float = Field(gt=0, le=MAX_LEASE_TTL_SECONDS, allow_inf_nan=False)
+    ttl_seconds: float = Field(gt=0, le=HARD_MAX_LEASE_SECONDS, allow_inf_nan=False)
+
+    @field_validator("ttl_seconds", mode="before")
+    @classmethod
+    def reject_coerced_ttl_values(cls, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("invalid lease TTL")
+        if isinstance(value, float) and not math.isfinite(value):
+            # FastAPI serializes rejected inputs into its 422 body; keep that
+            # response JSON-safe instead of echoing NaN or Infinity.
+            return None
+        return value
 
 
 class GpuLeaseCancelRequest(BaseModel):

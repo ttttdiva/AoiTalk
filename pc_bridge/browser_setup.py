@@ -20,18 +20,18 @@ import threading
 import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
-from .edge_cdp import EdgeCdpError, validate_loopback_endpoint
+from .edge_cdp import EdgeCdpError, validate_broker_websocket_endpoint
 
 BACKENDS = ("agent_browser",)
 CHANNELS = ("stable", "beta", "dev", "canary")
 _CONFIG_KEYS = {"server_url", "token", "ca_file", "browser_backend", "agent_browser",
                 "machine_id", "saved_actions"}
-_SETTINGS_KEYS = {"channel", "endpoint", "user_data_dir", "snapshot_scope", "target_id"}
+_SETTINGS_KEYS = {"channel", "broker_endpoint", "user_data_dir", "snapshot_scope", "target_id"}
 MAX_CONFIG_BYTES = 65536
 _WINDOWS = os.name == "nt"
 
 
-def validate_config(value, *, require_connection=False):
+def validate_config(value, *, require_connection=False, allow_broker_endpoint=False):
     """Validate syntax only and return a detached copy of supported local fields."""
     if not isinstance(value, dict) or set(value) - _CONFIG_KEYS:
         raise ValueError("bridge_config_invalid")
@@ -60,20 +60,25 @@ def validate_config(value, *, require_connection=False):
             raise ValueError("bridge_token_required")
     if result.get("browser_backend", "agent_browser") not in {*BACKENDS, "extension", "managed_profile"}:
         raise ValueError("browser_backend_unknown")
-    # Migrate saved mode labels to the sole general helper entry. Media uses
-    # its independent account/profile selection, never this mode field.
+    # Migrate legacy mode labels to the brokered general browser entry. Media
+    # uses its independent account/profile selection, never this mode field.
     result["browser_backend"] = "agent_browser"
     settings = result.get("agent_browser", {})
+    if isinstance(settings, dict) and "endpoint" in settings:
+        raise ValueError("direct_edge_cdp_forbidden")
     if not isinstance(settings, dict) or set(settings) - _SETTINGS_KEYS:
         raise ValueError("agent_browser_config_invalid")
     if settings.get("channel", "stable") not in CHANNELS:
         raise ValueError("edge_channel_invalid")
-    if "endpoint" in settings:
-        # Syntax only: never read an Edge profile or probe the endpoint here.
+    if "broker_endpoint" in settings:
+        if not allow_broker_endpoint:
+            raise ValueError("edge_broker_endpoint_not_persistable")
         try:
-            validate_loopback_endpoint(settings["endpoint"])
-        except EdgeCdpError:
-            raise ValueError("edge_cdp_endpoint_invalid") from None
+            validate_broker_websocket_endpoint(settings["broker_endpoint"])
+        except EdgeCdpError as exc:
+            if str(exc) == "direct_edge_cdp_forbidden":
+                raise ValueError("direct_edge_cdp_forbidden") from None
+            raise ValueError("edge_broker_endpoint_invalid") from None
     if "user_data_dir" in settings:
         profile = settings["user_data_dir"]
         if not isinstance(profile, str) or not profile or "\0" in profile:
@@ -116,12 +121,18 @@ def load_config(path: Path):
         raw = stream.read(MAX_CONFIG_BYTES + 1)
     if len(raw) > MAX_CONFIG_BYTES:
         raise ValueError("bridge_config_invalid")
-    return validate_config(json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
-                                      parse_constant=_reject_constant))
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object,
+                       parse_constant=_reject_constant)
+    # Remove the retired direct-CDP setting in memory only. The user config is
+    # written only by an explicit save after validation, and this value is never
+    # used as a broker endpoint.
+    if isinstance(value, dict) and isinstance(value.get("agent_browser"), dict):
+        value["agent_browser"].pop("endpoint", None)
+    return validate_config(value)
 
 
 def connection_config(current, *, server_url, token, ca_file, backend, channel,
-                      endpoint="", user_data_dir=""):
+                      broker_endpoint="", user_data_dir=""):
     """Keep GUI settings, starting a fresh target selection for each GUI client."""
     result = validate_config(current)
     result.update(server_url=server_url.strip(), token=token.strip(), ca_file=ca_file.strip(),
@@ -130,7 +141,17 @@ def connection_config(current, *, server_url, token, ca_file, backend, channel,
     if backend == "agent_browser":
         settings.pop("target_id", None)
     settings["channel"] = channel
-    for key, value in (("endpoint", endpoint), ("user_data_dir", user_data_dir)):
+    # The broker URL is a short-lived capability. Validate it for the GUI but
+    # keep it only in the live ConnectionController call, never in this config.
+    if broker_endpoint.strip():
+        try:
+            validate_broker_websocket_endpoint(broker_endpoint.strip())
+        except EdgeCdpError as exc:
+            if str(exc) == "direct_edge_cdp_forbidden":
+                raise ValueError("direct_edge_cdp_forbidden") from None
+            raise ValueError("edge_broker_endpoint_invalid") from None
+    settings.pop("broker_endpoint", None)
+    for key, value in (("user_data_dir", user_data_dir),):
         if value.strip():
             settings[key] = value.strip()
         else:
@@ -206,6 +227,24 @@ def _copy_config_dacl(source, destination):
 # Never render arbitrary exception text: it can contain debugger endpoints,
 # profile paths, page contents or credentials. Only fixed diagnostic codes pass.
 _MESSAGES = {
+    "direct_edge_cdp_forbidden": "Edge直結は禁止です。Gateway broker endpointを指定してください",
+    "edge_broker_endpoint_required": "Gateway broker endpointが必要です",
+    "edge_broker_endpoint_invalid": "Gateway broker endpointの形式が無効です",
+    "edge_broker_endpoint_not_persistable": "broker endpointは設定ファイルへ保存できません",
+    "edge_broker_client_connect_failed": "Gateway brokerへ接続できませんでした",
+    "edge_broker_default_context_unavailable": "Gateway brokerに既定ブラウザcontextがありません",
+    "edge_broker_client_command_failed": "Gateway brokerのブラウザ操作に失敗しました",
+    "edge_broker_event_monitor_unavailable": "Gateway brokerの切断監視を開始できませんでした",
+    "edge_broker_browser_disconnected": "Gateway brokerのブラウザ接続が切断されました",
+    "edge_broker_browser_context_closed": "Gateway brokerのブラウザcontextが閉じられました",
+    "edge_broker_operation_outcome_unknown": "ブラウザ操作の結果が不明です。Bridgeは再接続を確認しています",
+    "agent_browser_operation_still_running": "以前のブラウザ操作が終了するまで再接続を待っています",
+    "agent_browser_quiescence_unavailable": "以前のブラウザ操作の終了を確認できず再接続を停止しました",
+    "agent_browser_disconnect_monitor_unavailable": "ブラウザ切断を監視できず再接続を停止しました",
+    "agent_browser_target_open_failed": "CrowdWorksの専用タブを開けませんでした",
+    "agent_browser_target_open_scope_invalid": "専用タブのURLはCrowdWorksのトップページに限られます",
+    "browser_setup_target_open_scope_invalid": "専用タブのURLはCrowdWorksのトップページに限られます",
+    "browser_setup_target_open_rejected": "専用タブを開けませんでした",
     "profile_driver_connection_required": "Bridgeに接続してから人格・アカウントを選んでください",
     "profile_driver_profile_selection_required": "専用ブラウザを開いて対象タブを選んでください",
     "profile_driver_catalog_target_required": "本人のアカウント一覧から選んでください",
@@ -227,10 +266,15 @@ _MESSAGES = {
     "agent_browser_permission_pending": "Edge側の許可を待っています",
     "agent_browser_permission_unknown": "Edge側の許可状態は不明です",
     "agent_browser_target_selection_required": "操作対象のタブを選択してください",
+    "agent_browser_target_unavailable": "選択対象タブに接続できませんでした",
+    "agent_browser_rebind_pending": "選択対象タブの再バインドを確認しています",
     "agent_browser_no_targets": "選択できるページがありません",
     "agent_browser_connection_required": "「Edgeに接続・タブを確認」を押してください",
     "agent_browser_session_faulted": "ブラウザ接続が停止しました",
     "agent_browser_reconnect_required": "ブラウザ接続の再起動が必要です",
+    "agent_browser_helper_unavailable": "Edge用helperの接続コマンドが利用できません",
+    "agent_browser_helper_endpoint_invalid": "Edge用helperがCDP endpointを拒否しました",
+    "agent_browser_helper_arguments_invalid": "Edge用helperがdiscovery引数を拒否しました",
     "agent_browser_cancelled": "ブラウザ接続を停止しました",
     "bridge_command_cancelled": "Bridge接続を停止しています",
     "bridge_busy": "別の操作を実行中です。完了後にもう一度操作してください",
@@ -239,6 +283,9 @@ _MESSAGES = {
     "browser_setup_result_invalid": "ブラウザ設定の応答を確認できませんでした",
     "browser_setup_client_required": "先にBridgeを接続してください",
     "browser_setup_target_invalid": "一覧から操作対象のタブを選択してください",
+    "browser_setup_target_not_found": "指定originに一致するEdgeタブがありません",
+    "browser_setup_target_ambiguous": "指定originに一致するEdgeタブが複数あります",
+    "browser_setup_timeout": "Edgeタブの確認がタイムアウトしました",
 }
 _SAFE_CODES = frozenset(_MESSAGES) | frozenset({
     "edge_active_port_invalid", "edge_active_port_link_rejected", "edge_profile_path_invalid",
@@ -251,9 +298,27 @@ _SAFE_CODES = frozenset(_MESSAGES) | frozenset({
     "agent_browser_binary_size_mismatch", "agent_browser_binary_hash_mismatch",
     "agent_browser_preflight_failed", "agent_browser_bridge_contract_mismatch",
     "agent_browser_runtime_unavailable", "agent_browser_connection_unverified",
+    "agent_browser_connection_blocked", "agent_browser_spawn_failed",
+    "agent_browser_daemon_ownership_lost", "agent_browser_daemon_state_invalid",
+    "agent_browser_config_unavailable", "agent_browser_config_changed", "agent_browser_io_failed",
+    "agent_browser_runtime_closed", "agent_browser_state_path_invalid",
+    "agent_browser_cleanup_failed", "agent_browser_execution_failed", "agent_browser_command_rejected",
+    "agent_browser_session_invalid", "agent_browser_discovery_mode_invalid",
+    "agent_browser_discovery_target_conflict", "agent_browser_capabilities_invalid",
+    "agent_browser_daemon_stamp_invalid", "agent_browser_config_write_failed",
+    "agent_browser_state_create_failed", "agent_browser_private_command_unavailable",
+    "agent_browser_timeout_invalid", "agent_browser_output_limit_invalid", "agent_browser_stdin_invalid",
+    "agent_browser_json_invalid", "agent_browser_initial_target_already_bound",
     "agent_browser_target_gone", "agent_browser_target_changed", "agent_browser_target_mismatch",
     "agent_browser_initial_connect_required", "agent_browser_target_invalid",
+    "agent_browser_target_binding_failed", "agent_browser_local_setup_required",
+    "agent_browser_target_open_failed", "agent_browser_target_open_scope_invalid",
+    "browser_setup_target_open_scope_invalid", "browser_setup_target_open_rejected",
     "agent_browser_scope_invalid", "agent_browser_config_invalid", "browser_backend_unknown",
+    "edge_cdp_source_invalid", "edge_cdp_connection_unverified", "edge_remote_debugging_policy_blocked",
+    "edge_developer_tools_policy_restricted", "edge_http_discovery_unavailable_websocket_unverified",
+    "edge_cdp_endpoint_mismatch", "browser_setup_discovery_rejected", "browser_setup_selection_unverified",
+    "bridge_connection_start_rejected",
     "bridge_config_invalid", "bridge_token_required",
 })
 
@@ -315,6 +380,11 @@ def diagnostic_text(diagnostic, *, busy=False, error=None):
         text += "。現在の接続状態は未確認です"
     if diagnostic.get("blocked") is True:
         text += "。Bridgeを切断してから手動で再接続してください（自動再試行なし）"
+    reconnect_error = diagnostic.get("reconnect_error_code")
+    if isinstance(reconnect_error, str) and re.fullmatch(
+            r"(?:edge_broker|browser_setup|agent_browser)_[a-z0-9_]{1,64}", reconnect_error):
+        reconnect_message = _MESSAGES.get(reconnect_error, "ブラウザ接続の再確認中です")
+        text += "。再接続: " + reconnect_message + " (" + reconnect_error + ")"
     policy = safe_policy_summary(diagnostic.get("edge_policy"))
     if policy:
         notes = []
@@ -336,10 +406,13 @@ def safe_targets(result):
         raise ValueError("browser_setup_result_invalid")
     rows, seen = [], set()
     for item in result["targets"]:
+        target_id = item.get("target_id") if isinstance(item, dict) else None
         if (not isinstance(item, dict) or type(item.get("tab_id")) is not int
                 or not 0 < item["tab_id"] < 2**53 or item["tab_id"] in seen
                 or item.get("type") != "page" or not isinstance(item.get("origin"), str)
-                or type(item.get("selected")) is not bool):
+                or type(item.get("selected")) is not bool
+                or (target_id is not None and (not isinstance(target_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target_id)))):
             raise ValueError("browser_setup_result_invalid")
         title = item.get("title", "")
         if not isinstance(title, str) or len(title) > 512:
@@ -358,8 +431,11 @@ def safe_targets(result):
                 origin = urlunsplit((parsed.scheme, host + (":" + str(parsed.port) if parsed.port else ""), "", "", ""))
         except ValueError:
             origin = "(origin非公開)"
-        rows.append({"tab_id": item["tab_id"], "origin": origin, "title": title,
-                     "type": "page", "selected": item["selected"]})
+        row = {"tab_id": item["tab_id"], "origin": origin, "title": title,
+               "type": "page", "selected": item["selected"]}
+        if target_id is not None:
+            row["target_id"] = target_id
+        rows.append(row)
         seen.add(item["tab_id"])
     return rows
 
@@ -444,6 +520,13 @@ class BrowserSetupController:
             return False
         return self._request("select_target", {"tab_id": tab_id})
 
+    def open_target(self, url):
+        if self.purpose != "general" or not isinstance(url, str) or url not in {
+                "https://crowdworks.jp/", "https://www.crowdworks.jp/"}:
+            self.error = "agent_browser_target_open_scope_invalid"
+            return False
+        return self._request("open_target", {"url": url})
+
     def poll(self):
         while True:
             try:
@@ -456,7 +539,7 @@ class BrowserSetupController:
             if error:
                 continue
             try:
-                if action in {"discover_targets", "open_profile"}:
+                if action in {"discover_targets", "open_profile", "open_target"}:
                     self.targets = safe_targets(result)
                     if not self.targets:
                         self.error = "agent_browser_no_targets"
@@ -465,8 +548,21 @@ class BrowserSetupController:
                       or not any(row["tab_id"] == result["tab_id"] for row in self.targets)):
                     raise ValueError("browser_setup_result_invalid")
                 else:
+                    selected_row = next(row for row in self.targets if row["tab_id"] == result["tab_id"])
                     for row in self.targets:
                         row["selected"] = row["tab_id"] == result["tab_id"]
+                    setter = getattr(self.client, "set_reconnect_target_policy", None)
+                    if (self.purpose == "general" and callable(setter)
+                            and isinstance(selected_row.get("origin"), str)):
+                        try:
+                            # Pin the selected origin without clearing a
+                            # headless startup policy that permits one fixed
+                            # CrowdWorks tab to be opened after a disconnect.
+                            setter(selected_row["origin"])
+                        except ValueError:
+                            # A selected target without a normal origin remains usable,
+                            # but it cannot be safely reselected after a disconnect.
+                            pass
             except ValueError as exc:
                 self.error = safe_error(exc)
                 self.targets = []
@@ -480,6 +576,48 @@ class BrowserSetupController:
                 self.diagnostics["error"] = safe_error(raw["error"]) if raw.get("error") else None
                 count = raw.get("connect_attempts", 0)
                 self.diagnostics["connect_attempts"] = count if type(count) is int and count >= 0 else 0
+                browser_operation = raw.get("browser_operation")
+                self.diagnostics["browser_operation"] = (
+                    browser_operation if browser_operation in {"connect", "target_list", "other"} else None)
+                browser_error_code = raw.get("browser_error_code")
+                safe_browser_codes = {
+                    "unavailable", "invalid_endpoint", "invalid_arguments", "connection_blocked",
+                    "connection_required", "target_unavailable", "EXACT_TARGET_REQUIRED", "STALE_REF",
+                    "STRICT_REF_REQUIRED", "DIALOG_BLOCKED", "FOCUS_CHANGED", "tab_gone", "rebind_pending",
+                    "edge_broker_endpoint_required", "edge_broker_endpoint_invalid",
+                    "edge_broker_client_connect_failed", "edge_broker_default_context_unavailable",
+                    "edge_broker_client_command_failed", "edge_broker_event_monitor_unavailable",
+                    "edge_broker_browser_disconnected", "edge_broker_browser_context_closed",
+                    "edge_broker_operation_outcome_unknown", "agent_browser_session_faulted",
+                    "agent_browser_target_unavailable", "agent_browser_target_gone",
+                    "agent_browser_rebind_pending", "agent_browser_operation_still_running",
+                    "unrecognized",
+                }
+                self.diagnostics["browser_error_code"] = (
+                    browser_error_code if browser_error_code in safe_browser_codes else None)
+                connection_method = raw.get("connection_method")
+                safe_connection_methods = {"gateway_browser_bind_websocket", "unknown"}
+                self.diagnostics["connection_method"] = (connection_method if connection_method in safe_connection_methods
+                                                           else "unknown")
+                reconnect_phase = raw.get("reconnect_phase")
+                if reconnect_phase in {"playwright_disconnect", "playwright_outcome_unknown", "broker_status",
+                                       "broker_endpoint", "playwright_attach", "target_select", "ready"}:
+                    self.diagnostics["reconnect_phase"] = reconnect_phase
+                reconnect_error = raw.get("reconnect_error_code")
+                if (isinstance(reconnect_error, str) and
+                        (reconnect_error in safe_browser_codes or
+                         re.fullmatch(r"(?:browser_setup|edge_broker)_[a-z0-9_]{1,64}",
+                                      reconnect_error))):
+                    self.diagnostics["reconnect_error_code"] = reconnect_error
+                reconnect_operation = raw.get("reconnect_operation")
+                if reconnect_operation in {"connect", "target_list", "other"}:
+                    self.diagnostics["reconnect_operation"] = reconnect_operation
+                reconnect_count = raw.get("match_count")
+                self.diagnostics["reconnect_match_count"] = (
+                    reconnect_count if type(reconnect_count) is int and reconnect_count >= 0 else None)
+                reconnect_total = raw.get("total_target_count")
+                self.diagnostics["reconnect_total_target_count"] = (
+                    reconnect_total if type(reconnect_total) is int and reconnect_total >= 0 else None)
                 verified = raw.get("last_verified_at")
                 self.diagnostics["last_verified_at"] = (verified if type(verified) in (int, float)
                                                          and math.isfinite(verified) else None)

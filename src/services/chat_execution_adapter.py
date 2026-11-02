@@ -10,19 +10,27 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
+import json
+import logging
+import weakref
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Mapping
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from .agent_role_context import build_agent_role_context
 from .agent_model_routing import (
     AgentModelRoute,
     AgentModelRouteError,
+    AgentRoutingPins,
     resolve_agent_role_route,
+    safe_route_projection,
 )
 from .agent_dialogue_workspace import (
     AgentDialogueWorkspace,
@@ -39,17 +47,31 @@ from ..memory.database import get_database_manager
 from ..memory.models import (
     Agent,
     AgentDialogue,
+    AgentExecutionBinding,
     AgentPrivateRoot,
+    AgentRevision,
     AgentRun,
     AgentWorkItem,
     ConversationMessage,
     ConversationSession,
 )
 from .turn_context import (
+    TurnContext,
     get_turn_context,
     reset_turn_context,
     set_turn_context,
 )
+from .agent_delegate_policy import revision_has_new_delegate_policy
+from .agent_revision_v2 import revision_delegate_policy, revision_tool_ids
+
+logger = logging.getLogger(__name__)
+
+_AOI_LEGACY_FALLBACK_WARNING_EMITTED: ContextVar[bool] = ContextVar(
+    "aoi_chat_legacy_fallback_warning_emitted",
+    default=False,
+)
+
+AOIDOTS_MAX_OUTPUT_TOKENS = 8192
 
 if TYPE_CHECKING:
     from .conversation_agent_service import AgentExecutionBindingSnapshot
@@ -62,6 +84,970 @@ class AgentDialogueBudgetUnsupported(RuntimeError):
 
     def __init__(self, message: str = "provider cannot enforce the configured AgentDialogue budget") -> None:
         super().__init__(message)
+
+
+class InteractiveNativeRunRoutePersistenceError(RuntimeError):
+    """A resolved native CLI route could not be pinned to its interactive Run."""
+
+    code = "agent_run_scope_route_persistence_failed"
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = str(code or self.code)[:96]
+
+
+_PERSONAL_DEADLINE_LOCAL_PROVIDERS = frozenset(
+    {"openai_compatible_local", "ollama", "sglang"}
+)
+_PERSONAL_DEADLINE_PROOF_ATTRIBUTE = "_personal_deadline_caller_route_proof"
+_PERSONAL_DEADLINE_PROOF_ISSUER = object()
+_PERSONAL_DEADLINE_FALLBACK_ROUTE_SOURCES = frozenset(
+    {"standard_model", "legacy_profile", "legacy_policy_override", "main_inherit"}
+)
+_PERSONAL_DEADLINE_PROFILE_ID = "personal-firearms-admin"
+_PERSONAL_DEADLINE_CAPABILITY = "personal_deadline_draft"
+_PERSONAL_DEADLINE_TOOL_GATE = "personal.deadline_chat_draft.enabled"
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalDeadlineCallerRouteProof:
+    """Immutable server proof for one personal local Chat caller."""
+
+    owner_user_id: str
+    session_id: str
+    message_id: str
+    agent_id: str
+    agent_revision_id: str
+    agent_role: str
+    binding_id: str
+    binding_snapshot_hash: str
+    binding_object_id: int
+    route_source: str
+    route_effort: str
+    route_backend: str
+    route_inherits_main: bool
+    route_notes: tuple[str, ...]
+    provider: str
+    model: str
+    base_url: str
+    client_object_id: int
+    route_candidates_json: str = "{}"
+    _binding_ref: weakref.ReferenceType[Any] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _client_ref: weakref.ReferenceType[Any] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _issuer_token: object | None = field(default=None, repr=False, compare=False)
+
+def _clear_personal_deadline_caller_route_proof(
+    execution: Any | None,
+    *,
+    source_client: Any | None = None,
+) -> None:
+    """Clear stale request-local proof markers before a new build."""
+
+    binding = getattr(execution, "binding", None)
+    for target in (binding, source_client):
+        if target is None:
+            continue
+        for name in (
+            _PERSONAL_DEADLINE_PROOF_ATTRIBUTE,
+        ):
+            try:
+                object.__delattr__(target, name)
+            except (AttributeError, TypeError):
+                try:
+                    delattr(target, name)
+                except (AttributeError, TypeError):
+                    pass
+
+
+def _clear_private_marker(target: Any, name: str) -> None:
+    if target is None:
+        return
+    try:
+        object.__delattr__(target, name)
+    except (AttributeError, TypeError):
+        try:
+            delattr(target, name)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _personal_deadline_endpoint(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            return ""
+        host = parsed.hostname.rstrip(".").casefold()
+        host = host if ":" not in host else f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return urlunsplit(
+            (parsed.scheme.casefold(), f"{host}{port}", parsed.path.rstrip("/"), "", "")
+        )
+    except (TypeError, ValueError):
+        return ""
+
+
+def _personal_deadline_client_endpoint(client: Any) -> str:
+    value = getattr(client, "base_url", None)
+    if not value:
+        value = getattr(getattr(client, "_openai_client", None), "base_url", None)
+    if not value:
+        value = getattr(getattr(client, "client", None), "base_url", None)
+    return _personal_deadline_endpoint(value)
+
+
+def _personal_deadline_client_provider(client: Any) -> str:
+    value = getattr(client, "provider_label", None)
+    if not value:
+        value = getattr(getattr(client, "_turn_runner", None), "provider_label", None)
+    return str(value or "").strip().casefold()
+
+
+def _personal_deadline_client_model(client: Any) -> str:
+    return str(getattr(client, "model_name", "") or "").strip()
+
+
+def _personal_deadline_cloud_context_is_default() -> bool:
+    """Reject any ambient Cloud Advisor parent scope, including ContextVars."""
+
+    try:
+        from .cloud_advisor_service import (
+            CloudAdvisorEscalationAssessment,
+            CloudAdvisorTriggerOrigin,
+            get_cloud_advisor_invocation_context,
+        )
+
+        invocation = get_cloud_advisor_invocation_context()
+        return (
+            type(invocation.origin) is CloudAdvisorTriggerOrigin
+            and invocation.origin is CloudAdvisorTriggerOrigin.MAIN_AGENT
+            and type(invocation.assessment) is CloudAdvisorEscalationAssessment
+            and invocation.assessment == CloudAdvisorEscalationAssessment()
+        )
+    except Exception:
+        return False
+
+
+def _route_contract_json(route: Mapping[str, Any]) -> str:
+    def plain(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: plain(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [plain(item) for item in value]
+        return value
+
+    return json.dumps(plain({key: route[key] for key in (
+        "candidate_routes", "allow_paid_fallback", "fallback_on"
+    ) if key in route}), sort_keys=True, separators=(",", ":"))
+
+
+def _personal_deadline_route_snapshot_matches(binding: Any, route: Any) -> bool:
+    snapshot = getattr(binding, "route_snapshot", None)
+    if not isinstance(snapshot, Mapping):
+        return False
+    role = str(getattr(route, "role", "") or "").strip().casefold()
+    roles = snapshot.get("roles", snapshot)
+    frozen = roles.get(role) if isinstance(roles, Mapping) else None
+    if not isinstance(frozen, Mapping) or frozen.get("error"):
+        return False
+    actual = route.provenance()
+    if _route_contract_json(frozen) != _route_contract_json(actual):
+        return False
+    for name, expected in frozen.items():
+        if name in {"candidate_routes", "allow_paid_fallback", "fallback_on"}:
+            continue
+        if name == "effort":
+            if str(actual.get(name) or "") != str(expected or ""):
+                return False
+            continue
+        if name == "notes":
+            if list(actual.get(name) or []) != list(expected or []):
+                return False
+            continue
+        if actual.get(name) != expected:
+            return False
+    return all(
+        actual.get(name) == frozen.get(name)
+        for name in (
+            "agent_id",
+            "agent_revision_id",
+            "role",
+            "provider",
+            "model",
+            "route_source",
+            "inherits_main",
+            "backend",
+        )
+    )
+
+
+def _set_personal_deadline_marker(target: Any, name: str, value: Any) -> bool:
+    try:
+        object.__setattr__(target, name, value)
+        return True
+    except Exception:
+        try:
+            setattr(target, name, value)
+            return True
+        except Exception:
+            return False
+
+
+def _personal_deadline_route_ready(
+    *,
+    ambient_turn: Any,
+    execution: Any,
+    client: Any,
+    config: Any,
+    session_id: str | None,
+    project_id: str | None,
+    require_client_scope: bool = True,
+) -> tuple[dict[str, str], str] | None:
+    try:
+        from .conversation_agent_service import AgentExecutionBindingSnapshot
+    except Exception:
+        return None
+    if (
+        type(ambient_turn) is not TurnContext
+        or type(execution) is not ChatAgentExecution
+        or type(execution.binding) is not AgentExecutionBindingSnapshot
+        or type(execution.route) is not AgentModelRoute
+        or ambient_turn.agent_execution_binding is not execution.binding
+    ):
+        return None
+    owner = str(ambient_turn.user_id or "").strip()
+    session = str(ambient_turn.session_id or "").strip()
+    message = str(ambient_turn.message_id or "").strip()
+    if not owner or not session or not message:
+        return None
+    if session_id and str(session_id).strip() != session:
+        return None
+    if project_id or ambient_turn.project_id is not None:
+        return None
+    if ambient_turn.context_project_hint_id:
+        return None
+    if (
+        ambient_turn.cloud_advisor_origin is not None
+        or ambient_turn.cloud_advisor_assessment is not None
+    ):
+        return None
+    if not _personal_deadline_cloud_context_is_default():
+        return None
+
+    binding = execution.binding
+    route = execution.route
+    binding_id = str(binding.binding_id or "").strip()
+    binding_hash = str(binding.snapshot_hash or "").strip()
+    agent_id = str(binding.agent_id or "").strip()
+    revision_id = str(binding.agent_revision_id or "").strip()
+    if (
+        not all((binding_id, binding_hash, agent_id, revision_id))
+        or str(binding.session_id or "").strip() != session
+        or str(route.agent_id or "").strip() != agent_id
+        or str(route.agent_revision_id or "").strip() != revision_id
+    ):
+        return None
+    role = str(route.role or "").strip()
+    provider = str(route.provider or "").strip().casefold()
+    model = str(route.model or "").strip()
+    route_source = str(route.route_source or "").strip()
+    route_effort = str(route.effort or "").strip()
+    route_backend = str(route.backend or "").strip().casefold()
+    route_inherits_main = bool(route.inherits_main)
+    route_notes = tuple(str(item) for item in route.notes)
+    if (
+        role != "operator"
+        or provider not in _PERSONAL_DEADLINE_LOCAL_PROVIDERS
+        or not model
+        or route_backend != "api"
+        or bool(route.inherits_main)
+        or route_source.casefold() in _PERSONAL_DEADLINE_FALLBACK_ROUTE_SOURCES
+        or "fallback" in route_source.casefold()
+        or not _personal_deadline_route_snapshot_matches(binding, route)
+    ):
+        return None
+    for name, expected in (
+        ("agent_id", agent_id),
+        ("agent_revision_id", revision_id),
+        ("agent_role", role),
+    ):
+        observed = str(getattr(ambient_turn, name, "") or "").strip()
+        if not observed:
+            return None
+        if name == "agent_role":
+            if observed.casefold() != expected.casefold():
+                return None
+        elif observed != expected:
+            return None
+
+    actual_provider = _personal_deadline_client_provider(client)
+    actual_model = _personal_deadline_client_model(client)
+    actual_endpoint = _personal_deadline_client_endpoint(client)
+    if actual_provider != provider or actual_model != model or not actual_endpoint:
+        return None
+    try:
+        from .personal_agent_controller import _resolve_local_provider_endpoint
+        from .outbound_privacy_service import (
+            OutboundPrivacyGateway,
+            provider_classification,
+        )
+
+        expected_endpoint = _personal_deadline_endpoint(
+            _resolve_local_provider_endpoint(config, route)
+        )
+        if expected_endpoint != actual_endpoint:
+            return None
+        if provider_classification(provider, base_url=actual_endpoint) != "local":
+            return None
+        gateway = getattr(client, "_privacy_gateway", None)
+        if gateway is None:
+            gateway = getattr(
+                getattr(client, "_turn_runner", None),
+                "privacy_gateway",
+                None,
+            )
+        if not isinstance(gateway, OutboundPrivacyGateway):
+            gateway = OutboundPrivacyGateway(config)
+        if gateway.provider_class(provider, base_url=actual_endpoint) != "local":
+            return None
+    except Exception:
+        return None
+    workspace = execution.workspace
+    if workspace is not None and workspace.project_id is not None:
+        return None
+    client_project = str(getattr(client, "current_project_id", "") or "").strip()
+    client_session = str(getattr(client, "current_session_id", "") or "").strip()
+    client_owner = str(getattr(client, "session_user_id", "") or "").strip()
+    if require_client_scope and (
+        client_owner != owner
+        or client_session != session
+        or client_project
+    ):
+        return None
+    if not require_client_scope and (
+        client_project or (client_session and client_session != session)
+    ):
+        return None
+    return (
+        {
+            "owner_user_id": owner,
+            "session_id": session,
+            "message_id": message,
+            "agent_id": agent_id,
+            "agent_revision_id": revision_id,
+            "agent_role": role,
+            "route_source": route_source,
+            "route_effort": route_effort,
+            "route_backend": route_backend,
+            "route_inherits_main": route_inherits_main,
+            "route_notes": route_notes,
+            "route_candidates_json": _route_contract_json(route.provenance()),
+            "binding_id": binding_id,
+            "binding_snapshot_hash": binding_hash,
+            "provider": provider,
+            "model": model,
+            "base_url": actual_endpoint,
+        },
+        actual_endpoint,
+    )
+
+
+def _issue_personal_deadline_caller_route_proof(
+    *,
+    ambient_turn: Any,
+    execution: Any,
+    client: Any,
+    config: Any,
+    session_id: str | None,
+    project_id: str | None,
+) -> PersonalDeadlineCallerRouteProof | None:
+    ready = _personal_deadline_route_ready(
+        ambient_turn=ambient_turn,
+        execution=execution,
+        client=client,
+        config=config,
+        session_id=session_id,
+        project_id=project_id,
+    )
+    if ready is None:
+        return None
+    values, _ = ready
+    try:
+        binding_ref = weakref.ref(execution.binding)
+        client_ref = weakref.ref(client)
+    except TypeError:
+        return None
+    proof = PersonalDeadlineCallerRouteProof(
+        **values,
+        binding_object_id=id(execution.binding),
+        client_object_id=id(client),
+        _binding_ref=binding_ref,
+        _client_ref=client_ref,
+        _issuer_token=_PERSONAL_DEADLINE_PROOF_ISSUER,
+    )
+    if not _set_personal_deadline_marker(
+        execution.binding,
+        _PERSONAL_DEADLINE_PROOF_ATTRIBUTE,
+        proof,
+    ):
+        return None
+    if not _set_personal_deadline_marker(
+        client,
+        _PERSONAL_DEADLINE_PROOF_ATTRIBUTE,
+        proof,
+    ):
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return None
+    return proof
+
+
+def _personal_deadline_live_route_matches(
+    proof: PersonalDeadlineCallerRouteProof,
+    turn: Any,
+) -> bool:
+    if proof._issuer_token is not _PERSONAL_DEADLINE_PROOF_ISSUER:
+        return False
+    binding = getattr(turn, "agent_execution_binding", None)
+    if binding is None or id(binding) != proof.binding_object_id:
+        return False
+    if proof._binding_ref() is not binding:
+        return False
+    if (
+        str(binding.binding_id or "").strip() != proof.binding_id
+        or str(binding.snapshot_hash or "").strip() != proof.binding_snapshot_hash
+        or str(binding.agent_id or "").strip() != proof.agent_id
+        or str(binding.agent_revision_id or "").strip() != proof.agent_revision_id
+    ):
+        return False
+    if (
+        str(getattr(turn, "user_id", "") or "").strip() != proof.owner_user_id
+        or str(getattr(turn, "session_id", "") or "").strip() != proof.session_id
+        or str(getattr(turn, "message_id", "") or "").strip() != proof.message_id
+        or str(getattr(turn, "agent_id", "") or "").strip() != proof.agent_id
+        or str(getattr(turn, "agent_revision_id", "") or "").strip()
+        != proof.agent_revision_id
+        or str(getattr(turn, "agent_role", "") or "").strip()
+        != proof.agent_role
+        or getattr(turn, "project_id", None) is not None
+        or str(getattr(turn, "context_project_hint_id", "") or "").strip()
+        or getattr(turn, "cloud_advisor_origin", None) is not None
+        or getattr(turn, "cloud_advisor_assessment", None) is not None
+    ):
+        return False
+    if not _personal_deadline_cloud_context_is_default():
+        return False
+    client = proof._client_ref()
+    if (
+        client is None
+        or id(client) != proof.client_object_id
+        or getattr(client, _PERSONAL_DEADLINE_PROOF_ATTRIBUTE, None) is not proof
+        or getattr(client, "_agent_execution_binding", None) is not binding
+        or _personal_deadline_client_provider(client) != proof.provider
+        or _personal_deadline_client_model(client) != proof.model
+        or _personal_deadline_client_endpoint(client) != proof.base_url
+        or str(getattr(client, "session_user_id", "") or "").strip()
+        != proof.owner_user_id
+        or str(getattr(client, "current_project_id", "") or "").strip()
+        or str(getattr(client, "current_session_id", "") or "").strip()
+        != proof.session_id
+    ):
+        return False
+    route = getattr(client, "_agent_route", None)
+    if not isinstance(route, Mapping):
+        return False
+    expected_route = {
+        "agent_id": proof.agent_id,
+        "agent_revision_id": proof.agent_revision_id,
+        "role": proof.agent_role,
+        "provider": proof.provider,
+        "model": proof.model,
+        "effort": proof.route_effort,
+        "route_source": proof.route_source,
+        "inherits_main": proof.route_inherits_main,
+        "backend": proof.route_backend,
+    }
+    for name, expected in expected_route.items():
+        observed = route.get(name)
+        if name == "effort":
+            if str(observed or "") != str(expected or ""):
+                return False
+        elif observed != expected:
+            return False
+    observed_notes = tuple(str(item) for item in route.get("notes") or ())
+    return (observed_notes == proof.route_notes
+            and _route_contract_json(route) == proof.route_candidates_json)
+
+
+def get_personal_deadline_caller_route_proof(
+    turn: Any | None = None,
+) -> PersonalDeadlineCallerRouteProof | None:
+    """Return the live proof for the current exact personal local caller."""
+
+    current = turn if turn is not None else get_turn_context()
+    binding = getattr(current, "agent_execution_binding", None)
+    proof = getattr(binding, _PERSONAL_DEADLINE_PROOF_ATTRIBUTE, None)
+    if not isinstance(proof, PersonalDeadlineCallerRouteProof):
+        return None
+    try:
+        return proof if _personal_deadline_live_route_matches(proof, current) else None
+    except Exception:
+        return None
+
+
+def _personal_deadline_gate_enabled(config: Any) -> bool:
+    """Only a literal server-config ``True`` enables the chat draft seam."""
+
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            if getter(_PERSONAL_DEADLINE_TOOL_GATE, None) is True:
+                return True
+        except (KeyError, TypeError, AttributeError):
+            pass
+    if isinstance(config, Mapping):
+        value: Any = config
+        for part in _PERSONAL_DEADLINE_TOOL_GATE.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                return False
+            value = value[part]
+        return value is True
+    return False
+
+
+def _personal_deadline_turn_has_private_owner_origin(turn: Any) -> bool:
+    """Reject project, shared Dialogue, and Cloud Advisor turn origins."""
+
+    if (
+        type(turn) is not TurnContext
+        or not str(turn.user_id or "").strip()
+        or not str(turn.session_id or "").strip()
+        or not str(turn.message_id or "").strip()
+        or turn.project_id is not None
+        or bool(turn.context_project_hint_id)
+        or bool(turn.include_project_context)
+        or bool(turn.verified_project_attachment)
+        or turn.cloud_advisor_origin is not None
+        or turn.cloud_advisor_assessment is not None
+    ):
+        return False
+    # AgentDialogue turns carry a shared Human/Agent handoff boundary. This
+    # adapter accepts only the owner's private current conversation turn.
+    if any(
+        getattr(turn, name, None) not in (None, "")
+        for name in (
+            "agent_dialogue_id",
+            "agent_dialogue_role",
+            "agent_dialogue_input_id",
+            "agent_dialogue_control_revision",
+            "agent_dialogue_human_anchor",
+            "agent_dialogue_continuation_target",
+            "agent_dialogue_typed_resume_answer",
+            "agent_dialogue_typed_resume_answer_id",
+        )
+    ):
+        return False
+    try:
+        from ..llm.tool_policy import get_current_shared_resource_scope
+
+        if get_current_shared_resource_scope() is not None:
+            return False
+    except Exception:
+        return False
+    return _personal_deadline_cloud_context_is_default()
+
+
+def _personal_deadline_controller_execution_matches(
+    execution: Any,
+    selected: Any,
+    client: Any,
+) -> bool:
+    """Match the Chat build against a fresh profile/capability resolution."""
+
+    try:
+        from .agent_authority import AuthorityDecision
+        from .agent_dialogue_workspace import AgentDialogueWorkspace
+        from .conversation_agent_service import AgentExecutionBindingSnapshot
+        from .personal_agent_controller import PersonalAgentExecution
+    except ImportError:
+        return False
+    if (
+        type(execution) is not ChatAgentExecution
+        or type(execution.binding) is not AgentExecutionBindingSnapshot
+        or type(execution.route) is not AgentModelRoute
+        or execution.root_scope_marker is not None
+        or type(selected) is not PersonalAgentExecution
+        or type(selected.binding_snapshot) is not AgentExecutionBindingSnapshot
+        or type(selected.authority) is not AuthorityDecision
+        or type(selected.route) is not AgentModelRoute
+    ):
+        return False
+    binding = execution.binding
+    resolved = selected.binding_snapshot
+    authority = selected.authority
+    turn = get_turn_context()
+    workspace = execution.workspace
+    if getattr(client, "_agent_dialogue_workspace", None) is not workspace:
+        return False
+    if workspace is not None and (
+        type(workspace) is not AgentDialogueWorkspace
+        or workspace.session_id != str(turn.session_id or "")
+        or workspace.agent_id != str(binding.agent_id)
+        or workspace.owner_id != str(turn.user_id or "")
+        or workspace.project_id is not None
+        or workspace.resource_key is not None
+        or not workspace.readonly
+        or workspace.native_allowed
+        or workspace.run_id
+        != str(getattr(client, "_agent_run_id", "") or "")
+    ):
+        return False
+    capability_ceiling = tuple(
+        str(item or "").strip().casefold() for item in binding.capability_ceiling
+    )
+    if (
+        len(capability_ceiling) != 1
+        or capability_ceiling != (_PERSONAL_DEADLINE_CAPABILITY,)
+        or selected.profile_id != _PERSONAL_DEADLINE_PROFILE_ID
+        or selected.required_capability != _PERSONAL_DEADLINE_CAPABILITY
+        or type(turn) is not TurnContext
+        or selected.owner_id != str(turn.user_id or "")
+        or selected.session_id != str(binding.session_id)
+        or selected.agent_id != str(binding.agent_id)
+        or selected.agent_revision_id != str(binding.agent_revision_id)
+        or selected.binding_id != str(binding.binding_id or "")
+        or selected.revision_version != int(binding.revision_version)
+        or resolved.session_id != str(binding.session_id)
+        or resolved.agent_id != str(binding.agent_id)
+        or resolved.agent_revision_id != str(binding.agent_revision_id)
+        or resolved.binding_id != str(binding.binding_id or "")
+        or resolved.snapshot_hash != binding.snapshot_hash
+        or tuple(
+            str(item or "").strip().casefold()
+            for item in resolved.capability_ceiling
+        ) != (_PERSONAL_DEADLINE_CAPABILITY,)
+        or selected.route.provenance() != execution.route.provenance()
+        or selected.route.role != "operator"
+        or selected.route.backend != "api"
+        or selected.route.inherits_main
+        or authority.allowed is not True
+        or authority.requested_capability != _PERSONAL_DEADLINE_CAPABILITY
+        or authority.capabilities != frozenset({_PERSONAL_DEADLINE_CAPABILITY})
+        or authority.agent_id != str(binding.agent_id)
+        or authority.agent_revision_id != str(binding.agent_revision_id)
+        or authority.project_id is not None
+        or authority.space_id is not None
+        or authority.organization_id is not None
+        or authority.persona_id is not None
+    ):
+        return False
+    return True
+
+
+async def activate_personal_deadline_current_turn_tool_after_persist(
+    client: Any,
+    execution: Any,
+    *,
+    config: Any,
+    session_id: str | None,
+    project_id: str | None,
+) -> bool:
+    """Expose the one personal deadline candidate tool after a canonical row exists.
+
+    TerminalMode calls this only after it has bound the persisted user-message
+    UUID into TurnContext (or has received the already-persisted UUID). All
+    identities come from that trusted current turn and the pinned execution;
+    this hook accepts no owner, message, proposal, or date arguments.
+    """
+
+    if not _personal_deadline_gate_enabled(config):
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
+
+    turn = get_turn_context()
+    execution_binding = getattr(execution, "binding", None)
+    execution_route = getattr(execution, "route", None)
+    if (
+        not _personal_deadline_turn_has_private_owner_origin(turn)
+        or get_turn_context() is not turn
+        or project_id is not None
+        or str(session_id or "").strip() != str(turn.session_id or "").strip()
+        or str(getattr(turn, "agent_role", "") or "").strip().casefold()
+        != "operator"
+        or str(getattr(turn, "agent_id", "") or "").strip()
+        != str(getattr(execution_binding, "agent_id", "") or "").strip()
+        or str(getattr(turn, "agent_revision_id", "") or "").strip()
+        != str(getattr(execution_binding, "agent_revision_id", "") or "").strip()
+        or getattr(turn, "agent_execution_binding", None)
+        is not execution_binding
+        or getattr(turn, "agent_execution_config", None) is not config
+        or str(getattr(client, "agent_id", "") or "").strip()
+        != str(getattr(execution_binding, "agent_id", "") or "").strip()
+        or str(getattr(client, "agent_revision_id", "") or "").strip()
+        != str(getattr(execution_binding, "agent_revision_id", "") or "").strip()
+        or getattr(client, "_agent_execution_binding", None)
+        is not execution_binding
+        or getattr(client, "_agent_dialogue_workspace", None)
+        is not getattr(execution, "workspace", None)
+        or type(execution) is not ChatAgentExecution
+        or type(execution_route) is not AgentModelRoute
+        or str(execution_route.role or "").strip().casefold() != "operator"
+        or str(execution_route.backend or "").strip().casefold() != "api"
+        or bool(execution_route.inherits_main)
+        or set(
+            str(item or "").strip().casefold()
+            for item in getattr(execution_binding, "capability_ceiling", ())
+        )
+        != {_PERSONAL_DEADLINE_CAPABILITY}
+        or getattr(execution, "root_scope_marker", None) is not None
+        or not isinstance(getattr(client, "_agent_route", None), Mapping)
+        or getattr(client, "_agent_route", None)
+        != execution_route.provenance()
+    ):
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
+    try:
+        UUID(str(turn.message_id))
+        owner_id = str(UUID(str(turn.user_id)))
+        sid = str(UUID(str(turn.session_id)))
+    except (TypeError, ValueError, AttributeError):
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
+
+    # These markers are rebound only on the isolated, server-built target
+    # after its binding and route have matched the exact trusted turn.
+    try:
+        client.session_user_id = owner_id
+        client.current_session_id = sid
+        client.current_project_id = None
+        client.current_include_project_context = False
+    except Exception:
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
+
+    try:
+        from .conversation_agent_service import AgentExecutionBindingSnapshot
+    except ImportError:
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
+
+    if (
+        type(execution) is not ChatAgentExecution
+        or type(execution.binding) is not AgentExecutionBindingSnapshot
+        or type(execution.route) is not AgentModelRoute
+        or not _personal_deadline_route_ready(
+            ambient_turn=turn,
+            execution=execution,
+            client=client,
+            config=config,
+            session_id=sid,
+            project_id=None,
+        )
+    ):
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
+
+    try:
+        from .personal_agent_controller import (
+            PersonalAgentExecutionResolver,
+            _resolve_local_provider_endpoint,
+        )
+        from .personal_agent_tools import (
+            PersonalAgentTools,
+            bind_personal_agent_local_route,
+        )
+        from .personal_deadline_chat_draft import PersonalDeadlineChatDraftAdapter
+        from .personal_draft_service import PersonalDraftService
+        from .personal_ledger_service import (
+            LedgerPermissionError,
+            PersonalLedgerService,
+        )
+        from .outbound_privacy_service import OutboundPrivacyGateway
+
+        db_manager = get_database_manager()
+        resolver = PersonalAgentExecutionResolver(db_manager, config=config)
+        initial = await resolver.resolve(
+            owner_id=owner_id,
+            session_id=sid,
+            profile_id=_PERSONAL_DEADLINE_PROFILE_ID,
+            required_capability=_PERSONAL_DEADLINE_CAPABILITY,
+        )
+        if (
+            get_turn_context() is not turn
+            or not _personal_deadline_gate_enabled(config)
+            or not _personal_deadline_turn_has_private_owner_origin(turn)
+            or not _personal_deadline_controller_execution_matches(
+                execution,
+                initial,
+                client,
+            )
+            or _personal_deadline_endpoint(initial.base_url)
+            != _personal_deadline_client_endpoint(client)
+            or _personal_deadline_endpoint(
+                _resolve_local_provider_endpoint(config, execution.route)
+            )
+            != _personal_deadline_endpoint(initial.base_url)
+        ):
+            _clear_personal_deadline_caller_route_proof(
+                execution,
+                source_client=client,
+            )
+            return False
+
+        _issue_personal_deadline_caller_route_proof(
+            ambient_turn=turn,
+            execution=execution,
+            client=client,
+            config=config,
+            session_id=sid,
+            project_id=None,
+        )
+        proof = get_personal_deadline_caller_route_proof(turn)
+        if proof is None:
+            return False
+
+        gateway = OutboundPrivacyGateway(
+            config,
+            user_id=owner_id,
+            session_id=sid,
+            session_context={"privacy_mode": "local_only"},
+            project_metadata=None,
+        )
+
+        async def current_authority_guard():
+            if (
+                not _personal_deadline_gate_enabled(config)
+                or get_turn_context() is not turn
+                or not _personal_deadline_turn_has_private_owner_origin(turn)
+                or get_personal_deadline_caller_route_proof(turn) is not proof
+            ):
+                raise LedgerPermissionError("personal deadline turn authority changed")
+            current = await resolver.resolve(
+                owner_id=owner_id,
+                session_id=sid,
+                profile_id=_PERSONAL_DEADLINE_PROFILE_ID,
+                required_capability=_PERSONAL_DEADLINE_CAPABILITY,
+            )
+            if (
+                get_turn_context() is not turn
+                or get_personal_deadline_caller_route_proof(turn) is not proof
+                or not _personal_deadline_controller_execution_matches(
+                    execution,
+                    current,
+                    client,
+                )
+                or current.fingerprint() != initial.fingerprint()
+            ):
+                raise LedgerPermissionError("personal deadline authority was revoked")
+            return True
+
+        def tool_available() -> str | None:
+            if not _personal_deadline_gate_enabled(config):
+                return "personal deadline chat draft is disabled"
+            if (
+                get_turn_context() is not turn
+                or not _personal_deadline_turn_has_private_owner_origin(turn)
+                or get_personal_deadline_caller_route_proof(turn) is not proof
+                or getattr(client, "_agent_execution_binding", None)
+                is not execution.binding
+                or getattr(client, "_agent_route", None)
+                != execution.route.provenance()
+            ):
+                return "personal deadline current-turn proof is stale"
+            return None
+
+        session_factory = db_manager.get_session
+        personal_tools = PersonalAgentTools(
+            PersonalLedgerService(session_factory),
+            PersonalDraftService(session_factory),
+            enabled=True,
+        )
+        route_context = {
+            "profile_id": _PERSONAL_DEADLINE_PROFILE_ID,
+            "gateway": gateway,
+            "provider": proof.provider,
+            "base_url": proof.base_url,
+            "allow_external_fallback": False,
+            "current_authority_guard": current_authority_guard,
+        }
+        with bind_personal_agent_local_route(**route_context):
+            actor = await personal_tools._authorize_current(
+                "private.draft.propose",
+                "deadline",
+            )
+            pinned_guard = personal_tools._pinned_guard(
+                "private.draft.propose",
+                "deadline",
+                actor,
+            )
+            # The canonical current user row is checked before the schema can
+            # become visible. No history/ledger rows are read here.
+            await PersonalDeadlineChatDraftAdapter(
+                personal_tools
+            )._read_current_message(turn, pinned_guard)
+            await pinned_guard()
+
+        async def create_personal_deadline_candidate():
+            if tool_available() is not None:
+                raise LedgerPermissionError("personal deadline current-turn tool is unavailable")
+            with bind_personal_agent_local_route(**route_context):
+                return await PersonalDeadlineChatDraftAdapter(
+                    personal_tools
+                ).create_current_turn_draft()
+
+        from ..llm.runtime_tool_registry import (
+            register_personal_deadline_current_turn_tool,
+        )
+
+        return register_personal_deadline_current_turn_tool(
+            client,
+            handler=create_personal_deadline_candidate,
+            activation_enabled=True,
+            availability_check=tool_available,
+        )
+    except Exception:
+        logger.debug(
+            "Personal deadline current-turn tool was not exposed",
+            exc_info=True,
+        )
+        _clear_personal_deadline_caller_route_proof(
+            execution,
+            source_client=client,
+        )
+        return False
 
 
 @dataclass(frozen=True)
@@ -89,6 +1075,65 @@ class InitialAoiDotsRootProof:
             "agent_run_id": self.run_id,
             "work_item_id": self.work_item_id,
         }
+
+
+from .default_team_graph_service import RoutingContext
+
+
+@dataclass(frozen=True)
+class DefaultRoutingSnapshot:
+    proof: InitialAoiDotsRootProof
+    context: RoutingContext | None
+    status: str
+
+
+async def _capture_default_routing_snapshot(binding: Any, proof: InitialAoiDotsRootProof, session: Any, db_manager: Any) -> None:
+    from .default_team_graph_service import decode_run_snapshot
+
+    context = None
+    try:
+        run = await session.get(AgentRun, UUID(proof.run_id))
+        if run is not None:
+            context = decode_run_snapshot(run, proof)
+    except Exception:
+        pass
+    object.__setattr__(binding, "_default_routing_snapshot", DefaultRoutingSnapshot(
+        proof, context, "available" if context is not None else "unavailable"
+    ))
+
+
+def is_bound_initial_aoidots_root_turn(turn: Any, binding: Any) -> bool:
+    """Check the server-issued Root proof against the live turn and run."""
+    if (
+        str(getattr(turn, "project_id", "") or "").strip()
+        or str(getattr(turn, "agent_dialogue_id", "") or "").strip()
+        or str(getattr(turn, "agent_dialogue_role", "") or "").strip()
+        or binding is None
+        or binding is not getattr(turn, "agent_execution_binding", None)
+    ):
+        return False
+    try:
+        from .agent_run_service import get_current_agent_run_id
+
+        proof = getattr(binding, "_initial_aoidots_root_proof", None)
+        current_run_id = get_current_agent_run_id()
+    except Exception:
+        return False
+    if not isinstance(proof, InitialAoiDotsRootProof) or not current_run_id:
+        return False
+    marker = getattr(binding, "_root_scope_marker", None)
+    if not isinstance(marker, Mapping) or dict(marker) != proof.marker():
+        return False
+    return all((
+        str(getattr(turn, "user_id", "") or "") == proof.owner_user_id,
+        str(getattr(turn, "session_id", "") or "") == proof.session_id,
+        str(getattr(turn, "agent_id", "") or "") == proof.agent_id,
+        str(getattr(turn, "agent_revision_id", "") or "") == proof.agent_revision_id,
+        str(current_run_id) == proof.run_id,
+        str(getattr(binding, "agent_id", "") or "") == proof.agent_id,
+        str(getattr(binding, "session_id", "") or "") == proof.session_id,
+        str(getattr(binding, "agent_revision_id", "") or "") == proof.agent_revision_id,
+    ))
 
 
 def _initial_aoidots_root_proof(
@@ -307,14 +1352,18 @@ async def refresh_initial_aoidots_root_proof(
             client_binding = getattr(client, "_agent_execution_binding", binding)
             if client_binding is not binding:
                 return None
+            if not _project_initial_aoidots_output_cap(client):
+                return None
         marker = proof.marker()
         # AgentExecutionBindingSnapshot and ChatAgentExecution are frozen
         # dataclasses, so these private request-local attributes are attached
         # deliberately with object.__setattr__.  The same binding object is
         # already held by TurnContext and the isolated provider client.
         object.__setattr__(binding, "_initial_aoidots_root_proof", proof)
+        await _capture_default_routing_snapshot(binding, proof, session, db_manager)
         object.__setattr__(binding, "_root_scope_marker", dict(marker))
         object.__setattr__(execution, "root_scope_marker", dict(marker))
+        object.__setattr__(execution, "aoidots_output_cap_eligible", True)
         if client is not None:
             client._agent_root_scope_marker = dict(marker)
         return proof
@@ -345,6 +1394,10 @@ def _clear_initial_aoidots_root_snapshot(
         object.__setattr__(execution, "root_scope_marker", None)
     except Exception:
         pass
+    try:
+        object.__setattr__(execution, "aoidots_output_cap_eligible", False)
+    except Exception:
+        pass
     if client is not None and (
         binding is None
         or getattr(client, "_agent_execution_binding", binding) is binding
@@ -353,6 +1406,36 @@ def _clear_initial_aoidots_root_snapshot(
             client._agent_root_scope_marker = None
         except Exception:
             pass
+
+
+def _project_initial_aoidots_output_cap(client: Any) -> bool:
+    """Apply the AoiDots cap to an already-built request-local client.
+
+    The direct WebSocket fallback builds its isolated provider client before
+    the canonical Human row is persisted.  Its Root proof is therefore only
+    complete in ``refresh_initial_aoidots_root_proof``.  Keep the cap on that
+    isolated client's config, and fail closed if the config cannot confirm
+    the projection.
+    """
+
+    target_config = getattr(client, "config", None)
+    getter = getattr(target_config, "get", None)
+    setter = getattr(target_config, "set", None)
+    if not callable(getter) or not callable(setter):
+        return False
+    try:
+        raw_current = getter("runtime.target_max_output_tokens", None)
+        current = int(raw_current) if raw_current not in (None, "") else None
+        cap = (
+            min(current, AOIDOTS_MAX_OUTPUT_TOKENS)
+            if current and current > 0
+            else AOIDOTS_MAX_OUTPUT_TOKENS
+        )
+        setter("runtime.target_max_output_tokens", cap)
+        projected = getter("runtime.target_max_output_tokens", None)
+        return int(projected) == cap
+    except Exception:
+        return False
 
 
 async def bind_initial_aoidots_human_run(
@@ -524,6 +1607,21 @@ class ChatAgentExecution:
     workspace: AgentDialogueWorkspace | None = None
     root_scope_marker: Mapping[str, Any] | None = None
     dialogue_budget: Mapping[str, Any] | None = None
+    # P2 fields are optional during the rolling deployment. ``None`` keeps the
+    # existing capability based exposure for legacy revisions; an empty tuple
+    # is an intentional "show no tools" policy on a migrated revision.
+    tool_ids: tuple[str, ...] | None = None
+    model_overrides: Mapping[str, Any] | None = None
+    delegate_policy: Mapping[str, Any] | None = None
+    # Set only by the durable private-Root / AgentDialogue proof below. This
+    # request-local fact scopes the AoiDots output cap without changing global
+    # Chat settings or trusting caller metadata.
+    aoidots_output_cap_eligible: bool = False
+    # Exact caller/worker revision intersection issued by the locked Dialogue.
+    # ``None`` is reserved for historical capability-only dialogues.
+    dialogue_tool_ids: tuple[str, ...] | None = None
+    required_tool_name: str | None = None
+    required_tool_graph_context: Mapping[str, Any] | None = None
 
     @property
     def agent_id(self) -> str:
@@ -541,8 +1639,6 @@ class ChatAgentExecution:
             "agent_id": self.binding.agent_id,
             "agent_revision_id": self.binding.agent_revision_id,
             "agent_revision_version": self.binding.revision_version,
-            "team_id": self.binding.agent_team_id,
-            "execution_profile_id": self.binding.execution_profile_id,
             "capabilities": list(self.binding.capability_ceiling),
             "route_snapshot": dict(pins.route_snapshot or {}),
         }
@@ -568,9 +1664,6 @@ class ChatAgentExecution:
             "agent_id": self.binding.agent_id,
             "agent_revision_id": self.binding.agent_revision_id,
             "agent_revision_version": self.binding.revision_version,
-            "agent_team_id": self.binding.agent_team_id,
-            "execution_profile_id": self.binding.execution_profile_id,
-            "allowed_subagent_ids": list(self.binding.allowed_subagent_ids),
             "capability_ceiling": list(self.binding.capability_ceiling),
             "route": self.route.provenance(),
             **(
@@ -595,7 +1688,69 @@ class ChatAgentExecution:
                 if self.dialogue_budget is not None
                 else {}
             ),
+            **(
+                {"tool_ids": list(self.tool_ids)}
+                if self.tool_ids is not None
+                else {}
+            ),
         }
+
+
+async def persist_interactive_native_run_route(
+    agent_run_service: Any,
+    run_id: str,
+    execution: ChatAgentExecution,
+) -> Mapping[str, Any]:
+    """Persist and verify a resolved native CLI route before issuing its scope.
+
+    ``execution`` is produced by the server-side route resolver. The caller
+    invokes this only on the native CLI path, so user-supplied route data is
+    never accepted here. A missing or mismatched read-back fails closed.
+    """
+
+    if not isinstance(execution, ChatAgentExecution):
+        raise InteractiveNativeRunRoutePersistenceError(
+            "native CLI route was not resolved by the Agent execution adapter",
+            code="agent_run_scope_route_unverified",
+        )
+    route = execution.route
+    provider = str(getattr(route, "provider", "") or "").strip().casefold()
+    model = str(getattr(route, "model", "") or "").strip()
+    if provider not in {
+        "claude-cli",
+        "codex-cli",
+        "grok-cli",
+        "antigravity-cli",
+    } or not model:
+        raise InteractiveNativeRunRoutePersistenceError(
+            "resolved native CLI route is incomplete",
+            code="agent_run_scope_route_unverified",
+        )
+
+    try:
+        saved = await agent_run_service.update_runtime_route(
+            run_id,
+            provider=provider,
+            model=model,
+            route_source=str(getattr(route, "route_source", "") or "agent_revision"),
+            reasoning_effort=str(getattr(route, "effort", "") or "") or None,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise InteractiveNativeRunRoutePersistenceError(
+            "resolved native CLI route could not be persisted"
+        ) from exc
+
+    if (
+        not isinstance(saved, Mapping)
+        or str(saved.get("provider") or "").strip().casefold() != provider
+        or str(saved.get("model") or "").strip() != model
+    ):
+        raise InteractiveNativeRunRoutePersistenceError(
+            "resolved native CLI route could not be verified"
+        )
+    return saved
 
 
 def _read(value: Any, name: str, default: Any = None) -> Any:
@@ -612,10 +1767,453 @@ def _clean(value: Any) -> str:
     return ""
 
 
+async def _is_aoidots_dialogue_worker_run(
+    *,
+    session: Any,
+    dialogue: Any,
+    binding: Any,
+    run: Any,
+    session_id: str,
+) -> bool:
+    """Prove a worker Run belongs to a live Dialogue from a private AoiDots Root.
+
+    The AgentDialogue's unique worker session is the durable link from the
+    receiver Run to its parent Root. All mismatches and unavailable rows fail
+    closed so unrelated Dialogue workers retain their existing limits.
+    """
+
+    try:
+        from sqlalchemy import select
+
+        dialogue_id = _clean(_read(dialogue, "id"))
+        owner_id = _clean(_read(dialogue, "owner_user_id"))
+        root_session_id = _clean(_read(dialogue, "root_session_id"))
+        root_agent_id = _clean(_read(dialogue, "root_agent_id"))
+        worker_agent_id = _clean(_read(dialogue, "worker_agent_id"))
+        worker_revision_id = _clean(_read(dialogue, "worker_agent_revision_id"))
+        run_id = _clean(_read(run, "id"))
+        if not all(
+            (
+                dialogue_id,
+                owner_id,
+                root_session_id,
+                root_agent_id,
+                worker_agent_id,
+                worker_revision_id,
+                run_id,
+            )
+        ):
+            return False
+        if (
+            _clean(_read(run, "run_type")).casefold() != "chat_turn"
+            or _clean(_read(run, "status")).casefold()
+            not in {"queued", "running", "awaiting_approval"}
+            or _clean(_read(run, "session_id")) != session_id
+            or _clean(_read(run, "user_id")) != owner_id
+            or _clean(_read(run, "agent_id")) != worker_agent_id
+            or _clean(_read(run, "agent_revision_id")) != worker_revision_id
+            or _clean(_read(binding, "session_id")) != session_id
+            or _clean(_read(binding, "agent_id")) != worker_agent_id
+            or _clean(_read(binding, "agent_revision_id")) != worker_revision_id
+            or _clean(_read(dialogue, "worker_session_id")) != session_id
+            or _clean(_read(dialogue, "worker_agent_id")) != worker_agent_id
+            or _clean(_read(dialogue, "worker_agent_revision_id"))
+            != worker_revision_id
+            or _clean(_read(dialogue, "state")).casefold()
+            not in {"queued", "running", "waiting"}
+        ):
+            return False
+
+        worker_session = await session.get(ConversationSession, UUID(session_id))
+        root_session = await session.get(
+            ConversationSession,
+            UUID(root_session_id),
+        )
+        if worker_session is None or root_session is None:
+            return False
+        if (
+            _clean(_read(worker_session, "id")) != session_id
+            or _clean(_read(worker_session, "user_id")) != owner_id
+            or _clean(_read(worker_session, "agent_id")) != worker_agent_id
+            or _read(worker_session, "deleted_at") is not None
+            or _clean(_read(root_session, "id")) != root_session_id
+            or _clean(_read(root_session, "user_id")) != owner_id
+            or _clean(_read(root_session, "agent_id")) != root_agent_id
+            or bool(_read(root_session, "is_group_chat", False))
+            or _read(root_session, "deleted_at") is not None
+        ):
+            return False
+
+        root_result = await session.execute(
+            select(AgentPrivateRoot)
+            .where(
+                AgentPrivateRoot.session_id == UUID(root_session_id),
+                AgentPrivateRoot.agent_id == UUID(root_agent_id),
+                AgentPrivateRoot.owner_user_id == UUID(owner_id),
+                AgentPrivateRoot.purpose == "aoidots",
+                AgentPrivateRoot.state == "active",
+            )
+            .limit(1)
+        )
+        private_root = root_result.scalars().first()
+        if private_root is not None:
+            return bool(
+                _clean(_read(private_root, "session_id")) == root_session_id
+                and _clean(_read(private_root, "agent_id")) == root_agent_id
+                and _clean(_read(private_root, "owner_user_id")) == owner_id
+                and _clean(_read(private_root, "purpose")) == "aoidots"
+                and _clean(_read(private_root, "state")) == "active"
+            )
+
+        # P3 generic Agent-to-Agent delegation keeps this same Dialogue row
+        # and worker session lifecycle, but its caller can be any owner-bound
+        # Agent session.  The exact source Revision and immutable session
+        # binding are required; legacy rows without the P2 tool columns remain
+        # private-root-only.
+        root_agent = await session.get(Agent, UUID(root_agent_id))
+        root_revision = await session.get(AgentRevision, UUID(_clean(_read(dialogue, "root_agent_revision_id"))))
+        if (
+            root_agent is None
+            or str(getattr(root_agent, "state", "")).casefold() != "active"
+            or getattr(root_agent, "created_by", None) not in (None, UUID(owner_id))
+            or root_revision is None
+            or _clean(getattr(root_revision, "agent_id", None)) != root_agent_id
+            or not revision_has_new_delegate_policy(root_revision)
+        ):
+            return False
+        if _read(root_session, "project_id") is not None:
+            from ..memory.project_repository import ProjectRepository
+
+            if not await ProjectRepository.has_permission(
+                session,
+                UUID(_clean(_read(root_session, "project_id"))),
+                UUID(owner_id),
+                "read",
+            ):
+                return False
+        root_binding = (
+            await session.execute(
+                select(AgentExecutionBinding)
+                .where(
+                    AgentExecutionBinding.session_id == UUID(root_session_id),
+                    AgentExecutionBinding.agent_id == UUID(root_agent_id),
+                    AgentExecutionBinding.agent_revision_id
+                    == UUID(_clean(_read(dialogue, "root_agent_revision_id"))),
+                )
+                .order_by(AgentExecutionBinding.created_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        return bool(
+            root_binding is not None
+            and _clean(_read(root_binding, "session_id")) == root_session_id
+            and _clean(_read(root_binding, "agent_id")) == root_agent_id
+            and _clean(_read(root_binding, "agent_revision_id"))
+            == _clean(_read(dialogue, "root_agent_revision_id"))
+        )
+    except Exception:
+        return False
+
+
 def _system_prompt(binding: "AgentExecutionBindingSnapshot") -> str:
     """Compatibility wrapper around the shared immutable role builder."""
 
     return build_agent_role_context(binding).text
+
+
+def _chat_route_from_mapping(
+    raw_route: Any,
+    *,
+    pins: Any,
+    source: str,
+) -> AgentModelRoute | None:
+    """Adapt a P2 model-role route to the existing Chat route DTO."""
+
+    if isinstance(raw_route, AgentModelRoute):
+        return raw_route.with_role("chat")
+    if not isinstance(raw_route, Mapping):
+        return None
+    # ``kind=pool`` is represented by the existing routing-profile client.
+    kind = str(raw_route.get("kind") or "llm").strip().casefold()
+    route_notes: tuple[str, ...] = ()
+    if kind == "pool":
+        provider = "routing-profile"
+        pool_id = str(raw_route.get("pool_id") or "").strip()
+        model = "free-team"
+        if pool_id:
+            route_notes = (f"pool_id:{pool_id[:96]}",)
+    else:
+        provider = str(raw_route.get("provider") or "").strip().casefold()
+        model = str(raw_route.get("model") or "").strip()
+        pool_id = str(raw_route.get("pool_id") or "").strip()
+        if provider == "routing-profile" and pool_id:
+            route_notes = (f"pool_id:{pool_id[:96]}",)
+    if not provider or not model:
+        return None
+    effort = str(
+        raw_route.get("effort") or raw_route.get("reasoning_effort") or ""
+    ).strip()
+    acting_subagent = str(raw_route.get("acting_subagent_id") or "").strip()
+    backend = str(raw_route.get("backend") or "").strip().casefold()
+    if not backend:
+        backend = "remote" if provider == "muse-remote" else (
+            "cli" if provider.endswith("-cli") else "api"
+        )
+    return AgentModelRoute(
+        agent_team_id=pins.agent_team_id,
+        execution_profile_id=pins.execution_profile_id,
+        acting_subagent_id=acting_subagent,
+        provider=provider,
+        model=model,
+        effort=effort or None,
+        route_source=str(source or "agent_revision")[:96],
+        inherits_main=bool(raw_route.get("inherit_model", False)),
+        backend=backend,
+        role="chat",
+        agent_id=pins.agent_id,
+        agent_revision_id=pins.agent_revision_id,
+        notes=route_notes,
+    )
+
+
+def _route_pool_id(route: Any) -> str:
+    """Read a trusted Free Team pool id preserved in route notes."""
+
+    notes = getattr(route, "notes", ())
+    for note in notes if isinstance(notes, (list, tuple)) else ():
+        text = str(note or "").strip()
+        if text.startswith("pool_id:"):
+            return text[len("pool_id:") :].strip()[:128]
+    return ""
+
+
+def _session_route_mapping(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    provider = str(value.get("provider") or "").strip().casefold()
+    model = str(value.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    effort = str(value.get("effort") or value.get("reasoning_effort") or "").strip()
+    result = {"kind": "llm", "provider": provider, "model": model}
+    pool_id = str(value.get("pool_id") or "").strip()
+    if pool_id:
+        result["pool_id"] = pool_id[:128]
+    if effort:
+        result["effort"] = effort
+    return result
+
+
+def _warn_aoi_legacy_chat_fallback() -> None:
+    """Emit one rolling-deployment warning for the current Chat turn."""
+
+    if _AOI_LEGACY_FALLBACK_WARNING_EMITTED.get():
+        return
+    _AOI_LEGACY_FALLBACK_WARNING_EMITTED.set(True)
+    logger.warning(
+        "Aoi Chat revision settings unavailable; using legacy Chat execution path"
+    )
+
+
+async def _load_session_chat_route(
+    session: Any,
+    session_id: str,
+) -> Mapping[str, Any] | None:
+    """Read the persisted session model picker without changing its state."""
+
+    try:
+        row = await session.get(ConversationSession, UUID(session_id))
+    except (TypeError, ValueError, AttributeError):
+        row = None
+    if row is None:
+        return None
+    try:
+        from .conversation_session_selection import (
+            read_session_llm_settings,
+            session_main_route_override_for_binding,
+        )
+
+        settings = read_session_llm_settings(getattr(row, "context", None))
+        return session_main_route_override_for_binding(settings)
+    except Exception:
+        return None
+
+
+async def resolve_default_chat_agent_runtime(
+    *,
+    owner_user_id: str | None,
+    config: Any | None = None,
+    session_route: Mapping[str, Any] | None = None,
+    db_manager: Any | None = None,
+    db_session: Any | None = None,
+) -> Mapping[str, Any] | None:
+    """Read the owner's migrated Aoi revision for an ordinary Chat turn.
+
+    This is intentionally a read-only, request-local seam.  Ordinary Chat
+    keeps its existing streaming/voice/history path and does not create an
+    AgentRun or WorkItem merely to obtain Aoi's route and prompt.  Before P2,
+    the nullable fields are absent and this returns ``None`` so callers retain
+    the legacy Chat configuration unchanged.
+    """
+
+    owner = _clean(owner_user_id)
+    if not owner:
+        return None
+    try:
+        owner_uuid = UUID(owner)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    try:
+        from sqlalchemy import desc, select
+
+        from .agent_identity_service import aoi_default_agent_idempotency_key
+    except (ImportError, AttributeError):
+        return None
+    try:
+        key = aoi_default_agent_idempotency_key(owner_uuid)
+    except Exception:
+        key = f"private-agent:chat_default:{owner}:v1"
+    own = db_session is None
+    try:
+        session = db_session or await _session_db(db_manager)
+    except Exception:
+        _warn_aoi_legacy_chat_fallback()
+        logger.debug("Aoi default Chat database read was unavailable", exc_info=True)
+        return None
+    try:
+        # Lazy, owner-scoped provisioning is idempotent and uses the same
+        # session when the caller already owns one. In a pre-P2 database the
+        # row is still created, but the nullable readers below return None and
+        # the turn keeps the legacy runtime.
+        try:
+            from .agent_private_provisioning import AgentPrivateProvisioningService
+
+            await AgentPrivateProvisioningService(
+                db_manager=db_manager,
+                config=config,
+            ).ensure_default_chat_agent(
+                owner_uuid,
+                config=config,
+                # A resolver-owned read session may already have autobegun
+                # while provisioning validates the Human owner. Let the
+                # provisioner open and commit its own transaction in that
+                # case; only reuse an explicitly caller-owned session.
+                session_factory=(None if own else session),
+            )
+        except Exception:
+            _warn_aoi_legacy_chat_fallback()
+            logger.debug("Aoi default Chat provisioning failed", exc_info=True)
+            # Do not continue with an existing/stale Aoi row after a failed
+            # provisioning validation. The legacy Chat path is the only safe
+            # fallback when the current concrete tool projection is unknown.
+            return None
+        agent = (
+            await session.execute(
+                select(Agent)
+                .where(
+                    Agent.idempotency_key == key,
+                    Agent.created_by == owner_uuid,
+                    Agent.state == "active",
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if agent is None:
+            _warn_aoi_legacy_chat_fallback()
+            return None
+        revision = (
+            await session.execute(
+                select(AgentRevision)
+                .where(AgentRevision.agent_id == agent.id)
+                .order_by(desc(AgentRevision.version), desc(AgentRevision.id))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if revision is None:
+            _warn_aoi_legacy_chat_fallback()
+            return None
+        from .agent_revision_v2 import (
+            revision_delegate_policy,
+            revision_model_overrides,
+            revision_tool_ids,
+        )
+
+        tool_ids = revision_tool_ids(revision)
+        model_overrides = revision_model_overrides(revision)
+        delegate_policy = revision_delegate_policy(revision)
+        if tool_ids is None or model_overrides is None or delegate_policy is None:
+            _warn_aoi_legacy_chat_fallback()
+            return None
+        pins = AgentRoutingPins.from_revision(revision)
+        route = _resolve_p2_chat_route(
+            config,
+            revision=revision,
+            pins=pins,
+            session_route=session_route,
+        )
+        if route is None:
+            _warn_aoi_legacy_chat_fallback()
+            return None
+        return {
+            "agent_id": str(agent.id),
+            "agent_revision_id": str(revision.id),
+            "revision": revision,
+            "route": route,
+            "tool_ids": tuple(tool_ids),
+            "model_overrides": model_overrides,
+            "delegate_policy": delegate_policy,
+            "operational_instructions": str(
+                getattr(revision, "operational_instructions", "") or ""
+            ).strip(),
+        }
+    except Exception:
+        _warn_aoi_legacy_chat_fallback()
+        logger.debug("Aoi default Chat runtime read failed", exc_info=True)
+        return None
+    finally:
+        if own:
+            await session.close()
+
+
+def _resolve_p2_chat_route(
+    config: Any,
+    *,
+    revision: Any,
+    pins: Any,
+    session_route: Mapping[str, Any] | None,
+) -> AgentModelRoute | None:
+    """Resolve session first, then P2 override, model_roles, and legacy routes."""
+
+    if session_route is not None:
+        route = _chat_route_from_mapping(
+            _session_route_mapping(session_route),
+            pins=pins,
+            source="session_main_route",
+        )
+        if route is not None:
+            return route
+
+    try:
+        from .agent_revision_v2 import resolve_agent_role_route_v2
+    except (ImportError, AttributeError):
+        return None
+    try:
+        resolved = resolve_agent_role_route_v2(config, revision, "chat")
+    except Exception:
+        logger.debug(
+            "Aoi Chat model route could not be resolved; keeping legacy Chat route",
+            exc_info=True,
+        )
+        return None
+    source = "agent_revision"
+    raw_route = resolved
+    if isinstance(resolved, tuple) and len(resolved) == 2:
+        raw_route, source = resolved
+    return _chat_route_from_mapping(
+        raw_route,
+        pins=pins,
+        source=str(source or "agent_revision"),
+    )
 
 
 async def _session_db(db_manager: Any | None = None) -> Any:
@@ -695,6 +2293,92 @@ def _route_snapshot_matches(actual: Any, evidence: Any) -> bool:
     return True
 
 
+async def _persisted_delegation_review(session: Any, run: Any, run_id: str | None) -> bool:
+    """Prove the Review phase from durable rows, never from a caller's role."""
+    from ..memory.models.agent_delegation import AgentDelegation
+    from .agent_delegation_service import source_revision
+
+    if not isinstance(run, AgentRun) or not run_id or _clean(run.id) != _clean(run_id):
+        return False
+    try:
+        stored = await session.get(AgentRun, UUID(str(run_id)), populate_existing=True)
+        if stored is None or stored.work_item_id is None:
+            return False
+        work = await session.get(AgentWorkItem, stored.work_item_id, populate_existing=True)
+        if work is None or work.source_type != "employee_delegation":
+            return False
+        order = await session.get(AgentDelegation, UUID(str(work.source_id)), populate_existing=True)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    if order is None:
+        return False
+    metadata = work.metadata_json if isinstance(work.metadata_json, Mapping) else {}
+    run_metadata = stored.run_metadata if isinstance(stored.run_metadata, Mapping) else {}
+    work_binding = metadata.get("agent_binding")
+    run_binding = run_metadata.get("agent_binding")
+    if not isinstance(work_binding, Mapping) or not isinstance(run_binding, Mapping):
+        return False
+    if any(not work_binding.get(key) or str(work_binding.get(key)) != str(run_binding.get(key))
+           for key in ("binding_id", "snapshot_hash", "session_id", "agent_id", "agent_revision_id")):
+        return False
+    manifest = stored.resolved_execution_manifest
+    if not isinstance(manifest, Mapping) or not stored.execution_manifest_hash:
+        return False
+    digest = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+    return bool(
+        digest == str(stored.execution_manifest_hash).lower()
+        and stored.id == run.id and stored.session_id == run.session_id
+        and stored.agent_id == run.agent_id and stored.agent_revision_id == run.agent_revision_id
+        and stored.work_item_id == run.work_item_id and stored.project_id == run.project_id
+        and stored.user_id == run.user_id
+        and stored.resolved_execution_manifest == run.resolved_execution_manifest
+        and stored.execution_manifest_hash == run.execution_manifest_hash
+        and stored.run_metadata == run.run_metadata
+        and work.active_agent_run_id == stored.id
+        and work.execution_adapter == "employee_delegation"
+        and work.intent_key == "review"
+        and work.source_revision == source_revision(order, "review")
+        and metadata.get("delegation_id") == str(order.id)
+        and metadata.get("phase") == "review"
+        and str(metadata.get("round")) == str(order.round)
+        and work.assigned_agent_id == stored.agent_id == order.reviewer_agent_id
+        and work.agent_revision_id == stored.agent_revision_id == order.reviewer_revision_id
+        and work.project_id == stored.project_id == order.project_id
+        and str(stored.user_id) == str(order.created_by)
+        and str(stored.session_id) == str(work_binding.get("session_id"))
+        and str(stored.agent_id) == str(work_binding.get("agent_id"))
+        and str(stored.agent_revision_id) == str(work_binding.get("agent_revision_id"))
+        and str(metadata.get("owner_user_id")) == str(order.created_by)
+        and str(metadata.get("project_id")) == str(order.project_id)
+    )
+
+
+def _review_route_snapshot_matches(actual: Any, evidence: Any) -> bool:
+    """Compare the complete reviewer route and all non-role policy fields."""
+    from .agent_model_routing import OPERATIONS_WORK_ROLES
+
+    if not isinstance(actual, Mapping) or not isinstance(evidence, Mapping):
+        return False
+    def split(snapshot: Mapping[str, Any]) -> tuple[Mapping[str, Any], dict[str, Any]]:
+        roles = snapshot.get("roles")
+        if isinstance(roles, Mapping):
+            return roles, {k: v for k, v in snapshot.items() if k != "roles"}
+        return snapshot, {k: v for k, v in snapshot.items() if k not in OPERATIONS_WORK_ROLES}
+
+    actual_roles, actual_policy = split(actual)
+    evidence_roles, evidence_policy = split(evidence)
+    # A binding wraps the flat historical manifest routes with revision
+    # metadata.  Those binding-only fields remain covered by its hash and
+    # exact revision checks; any policy present in both must still match.
+    for key in ("schema_version", "agent_id", "agent_revision_id", "agent_revision_v2"):
+        if key not in evidence_policy:
+            actual_policy.pop(key, None)
+    return ("reviewer" in actual_roles and "reviewer" in evidence_roles
+            and actual_roles["reviewer"] == evidence_roles["reviewer"]
+            and actual_policy == evidence_policy)
+
+
 async def resolve_chat_agent_execution(
     *,
     session_id: str | None,
@@ -705,6 +2389,7 @@ async def resolve_chat_agent_execution(
     workspace: AgentDialogueWorkspace | None = None,
     run_id: str | None = None,
     dialogue_role: str | None = None,
+    session_route_override: Mapping[str, Any] | None = None,
 ) -> ChatAgentExecution | None:
     """Resolve a canonical session Agent and exact run revision.
 
@@ -736,6 +2421,15 @@ async def resolve_chat_agent_execution(
     run_revision_id = _clean(_read(run, "agent_revision_id"))
     dialogue_budget: Mapping[str, Any] | None = None
     dialogue_marker: Mapping[str, Any] | None = None
+    effective_revision_tool_ids: tuple[str, ...] | None = None
+    effective_revision_delegate_policy: Mapping[str, Any] | None = None
+    dialogue_tool_ids: tuple[str, ...] | None = None
+    required_tool_name: str | None = None
+    required_tool_graph_context: Mapping[str, Any] | None = None
+    aoidots_output_cap_eligible = False
+    p2_revision: Any | None = None
+    p2_fields_available = False
+    p2_is_default_chat_agent = False
     # A durable human run has no typed Agent identity.  Do not query the
     # session binding in that case: a Character compatibility turn must remain
     # independent from whatever Agent is selected for a later turn.
@@ -800,7 +2494,7 @@ async def resolve_chat_agent_execution(
                             continue
                 raw_rate_card = raw_budget.get("server_rate_card")
                 if isinstance(raw_rate_card, Mapping):
-                    safe_rate_card: dict[str, str] = {}
+                    safe_rate_card: dict[str, Any] = {}
                     for rate_key in (
                         "provider",
                         "model",
@@ -812,6 +2506,15 @@ async def resolve_chat_agent_execution(
                         rate_value = raw_rate_card.get(rate_key)
                         if rate_value not in (None, ""):
                             safe_rate_card[rate_key] = str(rate_value)[:160]
+                    if "image_price" in raw_rate_card:
+                        from src.llm.image_budget import validate_image_price_projection
+
+                        try:
+                            safe_rate_card["image_price"] = validate_image_price_projection(
+                                raw_rate_card["image_price"]
+                            )
+                        except ValueError:
+                            pass
                     if (
                         "input_per_1k" in safe_rate_card
                         and "output_per_1k" in safe_rate_card
@@ -845,9 +2548,78 @@ async def resolve_chat_agent_execution(
             actual_snapshot_hash = _clean(getattr(binding, "snapshot_hash", None))
             if actual_snapshot_hash != _clean(snapshot_hash):
                 raise ValueError("typed AgentRun binding snapshot_hash mismatch")
-            current_agent = await session.get(Agent, run_agent_id)
+            exact_revision = await session.get(AgentRevision, UUID(run_revision_id))
+            if (
+                exact_revision is None
+                or _clean(getattr(exact_revision, "agent_id", None)) != run_agent_id
+            ):
+                raise ValueError("typed AgentRun AgentRevision is unavailable")
+            revision_is_new_shape = revision_has_new_delegate_policy(exact_revision)
+            raw_tool_ids = revision_tool_ids(exact_revision) if revision_is_new_shape else None
+            effective_revision_tool_ids = (
+                tuple(
+                    item.strip()
+                    for item in raw_tool_ids
+                    if isinstance(item, str) and item.strip()
+                )
+                if raw_tool_ids is not None
+                else None
+            )
+            raw_delegate_policy = (
+                revision_delegate_policy(exact_revision)
+                if revision_is_new_shape
+                else None
+            )
+            effective_revision_delegate_policy = (
+                dict(raw_delegate_policy)
+                if raw_delegate_policy is not None
+                else None
+            )
+            try:
+                agent_key = UUID(run_agent_id)
+            except ValueError:
+                agent_key = run_agent_id
+            current_agent = await session.get(Agent, agent_key)
             if current_agent is None or str(getattr(current_agent, "state", "")) != "active":
                 raise ValueError("conversation Agent is no longer active")
+            try:
+                from .agent_identity_service import AgentIdentityService
+
+                p2_is_default_chat_agent = bool(
+                    AgentIdentityService.is_default_chat_agent(
+                        current_agent,
+                        owner_user_id=_read(run, "user_id"),
+                    )
+                )
+            except Exception:
+                owner_id = _clean(_read(run, "user_id"))
+                p2_is_default_chat_agent = bool(
+                    owner_id
+                    and str(getattr(current_agent, "created_by", "") or "")
+                    == owner_id
+                    and str(getattr(current_agent, "idempotency_key", "") or "")
+                    == f"private-agent:chat_default:{owner_id}:v1"
+                )
+            try:
+                p2_revision = await session.get(AgentRevision, UUID(run_revision_id))
+            except (TypeError, ValueError, AttributeError):
+                p2_revision = None
+            if p2_revision is not None:
+                try:
+                    from .agent_revision_v2 import (
+                        revision_delegate_policy as _p2_revision_delegate_policy,
+                        revision_model_overrides,
+                        revision_tool_ids as _p2_revision_tool_ids,
+                    )
+
+                    p2_values = (
+                        revision_model_overrides(p2_revision),
+                        _p2_revision_tool_ids(p2_revision),
+                        _p2_revision_delegate_policy(p2_revision),
+                    )
+                    p2_fields_available = all(value is not None for value in p2_values)
+                except Exception:
+                    p2_fields_available = False
             persisted_manifest = _read(run, "resolved_execution_manifest") or _read(
                 run, "execution_manifest"
             )
@@ -856,21 +2628,98 @@ async def resolve_chat_agent_execution(
                 if isinstance(manifest_route, Mapping) and _manifest_has_route_fields(
                     manifest_route
                 ):
-                    if not _route_snapshot_matches(
-                        binding.routing_pins().route_snapshot,
-                        manifest_route,
-                    ):
+                    binding_route = binding.routing_pins().route_snapshot
+                    review_proven = (
+                        _clean(dialogue_role).casefold() == "reviewer"
+                        and await _persisted_delegation_review(session, run, run_id)
+                    )
+                    matches = (_review_route_snapshot_matches(binding_route, manifest_route)
+                               if review_proven else _route_snapshot_matches(binding_route, manifest_route))
+                    if not matches:
                         raise ValueError("typed AgentRun route snapshot mismatch")
         if binding is None:
             return None
         pins = binding.routing_pins()
         route = None
         route_errors: list[str] = []
+        p2_applied = False
+        p2_tool_ids: tuple[str, ...] | None = None
+        p2_model_overrides: Mapping[str, Any] | None = None
+        p2_delegate_policy: Mapping[str, Any] | None = None
         normalized_dialogue_role = _clean(dialogue_role).casefold()
         if not normalized_dialogue_role and isinstance(dialogue_marker, Mapping):
             normalized_dialogue_role = _clean(
                 dialogue_marker.get("role") or dialogue_marker.get("dialogue_role")
             ).casefold()
+        if (
+            p2_fields_available
+            and p2_revision is not None
+            and p2_is_default_chat_agent
+            and normalized_dialogue_role not in {"worker", "root", "reviewer"}
+        ):
+            try:
+                from .agent_revision_v2 import (
+                    revision_model_overrides,
+                    revision_delegate_policy as _p2_revision_delegate_policy,
+                    revision_tool_ids as _p2_revision_tool_ids,
+                )
+
+                p2_tool_ids = tuple(_p2_revision_tool_ids(p2_revision) or ())
+                p2_model_overrides = revision_model_overrides(p2_revision)
+                p2_delegate_policy = _p2_revision_delegate_policy(p2_revision)
+                selected_session_route = _session_route_mapping(session_route_override)
+                if selected_session_route is None:
+                    selected_session_route = await _load_session_chat_route(
+                        session,
+                        sid,
+                    )
+                route = _resolve_p2_chat_route(
+                    config,
+                    revision=p2_revision,
+                    pins=pins,
+                    session_route=selected_session_route,
+                )
+                p2_applied = route is not None
+                if not p2_applied and p2_is_default_chat_agent:
+                    _warn_aoi_legacy_chat_fallback()
+            except Exception:
+                if p2_is_default_chat_agent:
+                    _warn_aoi_legacy_chat_fallback()
+                logger.debug("Aoi Chat revision settings could not be applied", exc_info=True)
+                route = None
+                p2_applied = False
+        elif (
+            run_agent_id
+            and run_revision_id
+            and normalized_dialogue_role not in {"worker", "root", "reviewer"}
+        ):
+            # This is the normal rolling deployment case: the exact revision
+            # predates the nullable P2 columns. Keep the legacy route and tool
+            # policy byte-for-byte compatible for the whole run.
+            if p2_is_default_chat_agent:
+                _warn_aoi_legacy_chat_fallback()
+            p2_tool_ids = None
+        if normalized_dialogue_role == "reviewer":
+            snapshot = pins.route_snapshot
+            roles = snapshot.get("roles", snapshot) if isinstance(snapshot, Mapping) else {}
+            reviewer = roles.get("reviewer") if isinstance(roles, Mapping) else None
+            if reviewer is None:
+                raise AgentModelRouteError("agent_route_snapshot_role_missing")
+            reviewer_route = safe_route_projection(reviewer)
+            if (
+                reviewer_route is None
+                or reviewer_route.get("role", "reviewer") != "reviewer"
+                or reviewer_route.get("inherits_main", False)
+                or reviewer_route.get("route_source") == "inherit_chat"
+            ):
+                raise AgentModelRouteError("agent_route_snapshot_invalid")
+            route = resolve_agent_role_route(config, pins, "reviewer")
+            if (
+                route.inherits_main
+                or route.role != "reviewer"
+                or route.route_source == "inherit_chat"
+            ):
+                raise AgentModelRouteError("agent_route_snapshot_invalid")
         if normalized_dialogue_role == "worker":
             # AgentDialogue worker turns are admitted/readied against the
             # pinned ``general_worker`` role.  Keep that role first so an
@@ -901,12 +2750,13 @@ async def resolve_chat_agent_execution(
                 "data_worker",
                 "code_worker",
             )
-        for role in route_roles:
-            try:
-                route = resolve_agent_role_route(config, pins, role)
-                break
-            except AgentModelRouteError as exc:
-                route_errors.append(exc.code)
+        if route is None:
+            for role in route_roles:
+                try:
+                    route = resolve_agent_role_route(config, pins, role)
+                    break
+                except AgentModelRouteError as exc:
+                    route_errors.append(exc.code)
         if route is None:
             raise AgentModelRouteError(
                 route_errors[-1] if route_errors else "agent_route_role_unavailable"
@@ -1055,6 +2905,9 @@ async def resolve_chat_agent_execution(
                         ),
                         "work_item_id": _clean(_read(run, "work_item_id")),
                     }
+                    aoidots_output_cap_eligible = (
+                        _clean(_read(run, "run_type")).casefold() == "chat_turn"
+                    )
             elif not root_dialogue_requested:
                 root = (
                     await session.execute(
@@ -1101,7 +2954,12 @@ async def resolve_chat_agent_execution(
                         # A typed request-local proof cannot be supplied by
                         # public config JSON. Execution still rechecks ORM ACLs.
                         object.__setattr__(binding, "_initial_aoidots_root_proof", proof)
+                        await _capture_default_routing_snapshot(binding, proof, session, db_manager)
                         root_scope_marker = proof.marker()
+                        aoidots_output_cap_eligible = (
+                            _clean(_read(run, "run_type")).casefold()
+                            == "chat_turn"
+                        )
             if root_scope_marker is None and not root_dialogue_requested:
                 worker_dialogue = (
                     await session.execute(
@@ -1120,22 +2978,169 @@ async def resolve_chat_agent_execution(
                         .limit(1)
                     )
                 ).scalars().first()
-                if worker_dialogue is not None:
-                    root_scope_marker = {
-                        "scope_kind": "agent_dialogue",
-                        "agent_dialogue_id": str(worker_dialogue.id),
-                        "dialogue_role": "worker",
-                        "root_session_id": str(worker_dialogue.root_session_id),
-                        "worker_session_id": str(worker_dialogue.worker_session_id),
-                        "worker_agent_id": str(worker_dialogue.worker_agent_id),
-                        "worker_agent_revision_id": str(
-                            worker_dialogue.worker_agent_revision_id
-                        ),
-                    }
+                if worker_dialogue is not None and await _is_aoidots_dialogue_worker_run(
+                    session=session,
+                    dialogue=worker_dialogue,
+                    binding=binding,
+                    run=run,
+                    session_id=sid,
+                ):
+                    source_revision = await session.get(
+                        AgentRevision, UUID(_clean(worker_dialogue.root_agent_revision_id))
+                    )
+                    authorization = (
+                        worker_dialogue.authorization_json
+                        if isinstance(worker_dialogue.authorization_json, Mapping)
+                        else {}
+                    )
+                    tool_policy = authorization.get("tool_policy")
+                    if isinstance(tool_policy, Mapping):
+                        source_revision_is_new_shape = revision_has_new_delegate_policy(
+                            source_revision
+                        )
+                        expected_hash = hashlib.sha256(
+                            json.dumps(
+                                authorization,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode()
+                        ).hexdigest()
+                        raw_effective_tool_ids = tool_policy.get(
+                            "agent_dialogue_tool_ids"
+                        )
+                        if not source_revision_is_new_shape:
+                            raw_effective_tool_ids = None
+                        if (
+                            expected_hash
+                            != _clean(worker_dialogue.authorization_hash)
+                            or _clean(tool_policy.get("source_agent_revision_id"))
+                            != _clean(worker_dialogue.root_agent_revision_id)
+                            or _clean(tool_policy.get("worker_agent_revision_id"))
+                            != _clean(worker_dialogue.worker_agent_revision_id)
+                            or (
+                                source_revision_is_new_shape
+                                and not isinstance(raw_effective_tool_ids, list)
+                            )
+                            or (
+                                raw_effective_tool_ids is not None
+                                and (
+                                    not isinstance(raw_effective_tool_ids, list)
+                                    or any(
+                                        not isinstance(item, str)
+                                        or not item.strip()
+                                        for item in raw_effective_tool_ids
+                                    )
+                                )
+                            )
+                        ):
+                            worker_dialogue = None
+                        elif isinstance(raw_effective_tool_ids, list):
+                            dialogue_tool_ids = tuple(
+                                item.strip() for item in raw_effective_tool_ids
+                            )
+                    if worker_dialogue is not None:
+                        from .agent_delegate_policy import dialogue_worker_tool_ids
+
+                        worker_revision = await session.get(
+                            AgentRevision,
+                            UUID(_clean(worker_dialogue.worker_agent_revision_id)),
+                        )
+                        dialogue_tool_ids = dialogue_worker_tool_ids(
+                            worker_dialogue, source_revision, worker_revision
+                        )
+                        # Only the first, server-dispatched Graph request carries
+                        # this internal requirement. Recheck its durable delivery
+                        # and work links; caller text and UI metadata are irrelevant.
+                        from ..memory.models import AgentDialogueDelivery
+
+                        graph = authorization.get("team_graph")
+                        marker = dialogue_marker if isinstance(dialogue_marker, Mapping) else {}
+                        delivery_id = _clean(marker.get("delivery_id"))
+                        work_id = _clean(_read(run, "work_item_id"))
+                        delivery = await session.get(AgentDialogueDelivery, UUID(delivery_id)) if graph and delivery_id else None
+                        work = await session.get(AgentWorkItem, UUID(work_id)) if graph and work_id else None
+                        graph = graph if isinstance(graph, Mapping) else {}
+                        pins = graph.get("nodepins")
+                        leader = pins.get(graph.get("leader_key")) if isinstance(pins, Mapping) else None
+                        ref = graph.get("ref")
+                        if (
+                            normalized_dialogue_role == "worker"
+                            and isinstance(leader, Mapping)
+                            and isinstance(ref, Mapping)
+                            and graph.get("execution_kind") in {"generic", "software_code"}
+                            and isinstance(graph.get("compiled"), Mapping)
+                            and all(_clean(ref.get(key)) for key in ("graph_id", "revision_id", "group_key"))
+                            and _clean(graph.get("graph_hash"))
+                            and marker.get("team_graph_ref") == ref
+                            and marker.get("team_graph_compiled") == graph.get("compiled")
+                            and marker.get("team_graph_execution_kind") == graph.get("execution_kind")
+                            and _clean(leader.get("agent_id")) == run_agent_id
+                            and _clean(leader.get("revision_id")) == run_revision_id
+                            and "delegate_plan" in (revision_tool_ids(worker_revision) or ())
+                            and dialogue_tool_ids is not None
+                            and "delegate_plan" in dialogue_tool_ids
+                            and delivery is not None and work is not None
+                            and _clean(marker.get("dialogue_id")) == _clean(worker_dialogue.id)
+                            and marker.get("source_role") == "root"
+                            and marker.get("receiver_role") == "worker"
+                            and _clean(delivery.dialogue_id) == _clean(worker_dialogue.id)
+                            and delivery.kind == "request" and delivery.sequence == 0
+                            and _clean(delivery.source_session_id) == _clean(worker_dialogue.root_session_id)
+                            and _clean(delivery.source_agent_id) == _clean(worker_dialogue.root_agent_id)
+                            and _clean(marker.get("source_run_id")) == _clean(delivery.source_run_id)
+                            and _clean(marker.get("source_agent_revision_id")) == _clean(delivery.source_agent_revision_id)
+                            and _clean(delivery.source_run_id)
+                            and _clean(delivery.source_agent_revision_id)
+                            and _clean(delivery.receiver_session_id) == sid
+                            and _clean(delivery.receiver_agent_id) == run_agent_id
+                            and _clean(delivery.receiver_agent_revision_id) == run_revision_id
+                            and _clean(delivery.receiver_run_id) == _clean(_read(run, "id"))
+                            and _clean(delivery.receiver_work_item_id) == work_id
+                            and _clean(work.active_agent_run_id) == _clean(_read(run, "id"))
+                            and _clean(work.conversation_session_id) == sid
+                            and _clean(work.assigned_agent_id) == run_agent_id
+                            and _clean(work.agent_revision_id) == run_revision_id
+                            and _clean(work.source_type) == "chat_turn"
+                            and _clean(work.execution_adapter) == "interactive_chat"
+                            and _clean(work.source_id) == _clean(_read(run, "id"))
+                            and _clean(work.source_revision) == run_revision_id
+                        ):
+                            required_tool_name = "delegate_plan"
+                            required_tool_graph_context = {
+                                "ref": dict(ref), "graph_hash": graph["graph_hash"],
+                                "source": {
+                                    "source_run_id": _clean(_read(run, "id")),
+                                    "source_work_item_id": work_id,
+                                    "source_agent_id": run_agent_id,
+                                    "source_revision_id": run_revision_id,
+                                    "source_session_id": sid,
+                                },
+                            }
+                        root_scope_marker = {
+                            "scope_kind": "agent_dialogue",
+                            "agent_dialogue_id": str(worker_dialogue.id),
+                            "dialogue_role": "worker",
+                            "root_session_id": str(worker_dialogue.root_session_id),
+                            "worker_session_id": str(worker_dialogue.worker_session_id),
+                            "worker_agent_id": str(worker_dialogue.worker_agent_id),
+                            "worker_agent_revision_id": str(
+                                worker_dialogue.worker_agent_revision_id
+                            ),
+                            **(
+                                {"agent_dialogue_tool_ids": list(dialogue_tool_ids)}
+                                if dialogue_tool_ids is not None
+                                else {}
+                            ),
+                        }
+                        aoidots_output_cap_eligible = True
         except Exception:
             # Lightweight/fake DB sessions may not expose the root table. The
             # authority guard will fail closed when a dialogue tool is used.
             root_scope_marker = None
+            required_tool_name = None
+            required_tool_graph_context = None
+            aoidots_output_cap_eligible = False
         if root_scope_marker is not None:
             # TerminalMode carries this immutable binding into TurnContext
             # directly, while its normal Config remains an object rather than
@@ -1145,6 +3150,9 @@ async def resolve_chat_agent_execution(
                 object.__setattr__(binding, "_root_scope_marker", dict(root_scope_marker))
             except Exception:
                 root_scope_marker = None
+                required_tool_name = None
+                required_tool_graph_context = None
+                aoidots_output_cap_eligible = False
         return ChatAgentExecution(
             binding=binding,
             route=route,
@@ -1152,6 +3160,21 @@ async def resolve_chat_agent_execution(
             workspace=selected_workspace,
             root_scope_marker=root_scope_marker,
             dialogue_budget=dialogue_budget,
+            tool_ids=(
+                p2_tool_ids
+                if p2_applied
+                else effective_revision_tool_ids
+            ),
+            delegate_policy=(
+                p2_delegate_policy
+                if p2_applied
+                else effective_revision_delegate_policy
+            ),
+            dialogue_tool_ids=dialogue_tool_ids,
+            required_tool_name=required_tool_name,
+            required_tool_graph_context=required_tool_graph_context,
+            aoidots_output_cap_eligible=aoidots_output_cap_eligible,
+            model_overrides=p2_model_overrides if p2_applied else None,
         )
     finally:
         if own:
@@ -1207,6 +3230,12 @@ def build_agent_chat_turn_client(
 
     from ..llm.manager import create_llm_client_for_target
     from .pricing.providers import is_cli_provider
+
+    ambient_turn = get_turn_context()
+    _clear_personal_deadline_caller_route_proof(
+        execution,
+        source_client=source_client,
+    )
 
     budget = execution.dialogue_budget or {}
     configured_ceiling = (
@@ -1270,6 +3299,11 @@ def build_agent_chat_turn_client(
         target_output_cap = aggregate_output_cap
     else:
         target_output_cap = min(aggregate_output_cap, configured_output_cap)
+    if execution.aoidots_output_cap_eligible:
+        target_output_cap = min(
+            target_output_cap or AOIDOTS_MAX_OUTPUT_TOKENS,
+            AOIDOTS_MAX_OUTPUT_TOKENS,
+        )
 
     selected_workspace = (
         workspace
@@ -1331,8 +3365,20 @@ def build_agent_chat_turn_client(
         provider=execution.route.provider,
         model=execution.route.model,
         effort=execution.route.effort,
+        **(
+            {"allow_construction_fallback": False}
+            if execution.route.candidate_routes is not None
+            else {}
+        ),
         provider_options={
             "ephemeral_session_client": True,
+            **(
+                {"pool_id": _route_pool_id(execution.route)}
+                if str(execution.route.provider or "").strip().casefold()
+                == "routing-profile"
+                and _route_pool_id(execution.route)
+                else {}
+            ),
             **(
                 {"max_output_tokens": target_output_cap}
                 if target_output_cap is not None
@@ -1346,6 +3392,16 @@ def build_agent_chat_turn_client(
             ),
         },
     )
+    # Capture reuse before this factory overwrites the exact binding and route
+    # markers below. Reused targets remain usable for ordinary Chat, but cannot
+    # receive a fresh personal caller proof.
+    client_reused_for_personal_proof = client is source_client or any(
+        hasattr(client, marker)
+        for marker in ("_agent_execution_binding", "_agent_route")
+    )
+    # A test/embedding factory may reuse a request-local object.  Never carry
+    # that object's previous proof into this construction attempt.
+    _clear_private_marker(client, _PERSONAL_DEADLINE_PROOF_ATTRIBUTE)
     for attr in (
         "current_session_id",
         "session_user_id",
@@ -1386,6 +3442,20 @@ def build_agent_chat_turn_client(
         if execution.dialogue_budget is not None
         else None
     )
+    # Seed the Run-id keyed budget before the first provider call. The
+    # current character client may be reused by concurrent Runs, so the
+    # provider adapters share this ledger by trusted Run id rather than by
+    # client instance.
+    if run_id is not None:
+        from ..llm.agent_run_budget import get_agent_run_budget
+
+        get_agent_run_budget(
+            client,
+            run_id=str(run_id),
+            config=getattr(client, "config", config),
+            dialogue_budget=client._agent_dialogue_budget,
+            require_typed_agent=False,
+        )
     # OpenAI-compatible/local engines receive the target Config rather than
     # this client when they enter the shared tool loop.  Project the same
     # server-issued round ceiling onto that request-local Config, while the
@@ -1446,6 +3516,23 @@ def build_agent_chat_turn_client(
     client._agent_dialogue_capability_ceiling = tuple(
         execution.binding.capability_ceiling
     )
+    # P2 ``tool_ids`` is an exposure restriction layered on top of the
+    # existing capability ceiling and authority guard.  ``None`` is kept for
+    # pre-P2 revisions so the old provider catalog remains unchanged.
+    client._agent_tool_ids = (
+        list(
+            execution.dialogue_tool_ids
+            if execution.dialogue_tool_ids is not None
+            else execution.tool_ids
+        )
+        if execution.dialogue_tool_ids is not None or execution.tool_ids is not None
+        else None
+    )
+    client._agent_required_tool_name = execution.required_tool_name
+    client._agent_required_tool_graph_context = (
+        dict(execution.required_tool_graph_context)
+        if execution.required_tool_graph_context is not None else None
+    )
     client._agent_dialogue_native_scope = (
         selected_workspace.native_scope if selected_workspace is not None else None
     )
@@ -1504,6 +3591,50 @@ def build_agent_chat_turn_client(
             history.clear()
     if hasattr(client, "_provider_state"):
         client._provider_state = {}
+    if not client_reused_for_personal_proof:
+        try:
+            candidate = _personal_deadline_route_ready(
+                ambient_turn=ambient_turn,
+                execution=execution,
+                client=client,
+                config=config,
+                session_id=session_id,
+                project_id=project_id,
+                require_client_scope=False,
+            )
+            if candidate is not None:
+                # The factory's target is fresh and the full trusted current
+                # context has already matched the exact personal route. Bind
+                # these request markers before the proof issuer rechecks the
+                # live client, while leaving all other Chat routes untouched.
+                client.session_user_id = str(ambient_turn.user_id)
+                client.current_session_id = str(ambient_turn.session_id)
+                client.current_project_id = None
+                _issue_personal_deadline_caller_route_proof(
+                    ambient_turn=ambient_turn,
+                    execution=execution,
+                    client=client,
+                    config=config,
+                    session_id=session_id,
+                    project_id=project_id,
+                )
+        except Exception:
+            # The proof is an optional capability marker.  A malformed optional
+            # route/config/client projection must never change normal Chat setup.
+            _clear_personal_deadline_caller_route_proof(
+                execution,
+                source_client=client,
+            )
+    if execution.route.candidate_routes is not None:
+        client._frozen_candidate_execution = execution
+        client._frozen_candidate_source = source_client
+        client._frozen_candidate_factory_kwargs = {
+            "workspace": selected_workspace,
+            "session_id": session_id,
+            "project_id": project_id,
+            "run_id": run_id,
+            "tool_generation_max_tokens": tool_generation_max_tokens,
+        }
     return client
 
 
@@ -1598,6 +3729,13 @@ def _apply_agent_dialogue_provider_budget(
     budget = getattr(client, "_agent_dialogue_budget", None)
     if not isinstance(budget, Mapping):
         return args, dict(kwargs)
+    from ..llm.image_budget import bind_image_cost_limit
+    try:
+        bind_image_cost_limit(budget)
+    except ValueError as exc:
+        from .free_team_service import ComplimentaryMediaUnboundedError
+
+        raise ComplimentaryMediaUnboundedError() from exc
     from ..llm.agent_runtime import dialogue_provider_invocation_budget
 
     mutable_kwargs = dict(kwargs)
@@ -1706,7 +3844,12 @@ def _root_scope_config(
     if marker is None:
         return config
     result = dict(config) if isinstance(config, Mapping) else {}
-    result.update({str(key): str(value) for key, value in marker.items()})
+    for key, value in marker.items():
+        normalized_key = str(key)
+        if normalized_key == "agent_dialogue_tool_ids" and isinstance(value, list):
+            result[normalized_key] = [str(item) for item in value]
+        else:
+            result[normalized_key] = str(value)
     return result
 
 
@@ -1779,10 +3922,16 @@ async def bind_chat_agent_execution(
         if not isinstance(selected_workspace, AgentDialogueWorkspace):
             raise TypeError("workspace must be an AgentDialogueWorkspace")
         selected_workspace.assert_lease_active()
+    tool_scope_kwargs: dict[str, Any] = {"revalidate": _revalidate}
+    if execution.dialogue_tool_ids is not None:
+        tool_scope_kwargs["tool_ids"] = execution.dialogue_tool_ids
+    elif execution.tool_ids is not None:
+        tool_scope_kwargs["tool_ids"] = execution.tool_ids
     tool_scope_token = set_current_agent_tool_scope(
         execution.binding.capability_ceiling,
         allowed_subagent_ids=execution.binding.allowed_subagent_ids,
-        revalidate=_revalidate,
+        **tool_scope_kwargs,
+        delegate_policy=execution.delegate_policy,
     )
     workspace_token = (
         bind_agent_dialogue_workspace(selected_workspace)
@@ -1857,6 +4006,7 @@ async def settle_interactive_chat_work(
     cancelled: bool = False,
     awaiting_approval: bool = False,
     error: str | None = None,
+    error_code: str | None = None,
 ) -> Any:
     if claim is None:
         return None
@@ -1896,7 +4046,7 @@ async def settle_interactive_chat_work(
             {
                 "classification": "permanent",
                 "success": False,
-                "error_code": "interactive_chat_failed",
+                "error_code": error_code or "interactive_chat_failed",
                 "error_message": error or "interactive chat failed",
             }
         )
@@ -1905,11 +4055,14 @@ async def settle_interactive_chat_work(
 
 __all__ = [
     "ChatAgentExecution",
+    "InteractiveNativeRunRoutePersistenceError",
     "bind_chat_agent_execution",
     "build_agent_chat_turn_client",
+    "persist_interactive_native_run_route",
     "bind_initial_aoidots_human_run",
     "resolve_canonical_session_agent_id",
     "resolve_chat_agent_execution",
+    "resolve_default_chat_agent_runtime",
     "refresh_initial_aoidots_root_proof",
     "settle_interactive_chat_work",
     "start_interactive_chat_work",

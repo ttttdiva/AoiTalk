@@ -68,7 +68,7 @@ function reviewPolicyLabel(
 
 /**
  * Cloud Advisor is intentionally a first-class settings surface rather than
- * another Execution Team route.  This component only edits non-secret routing
+ * another Agent route.  This component only edits non-secret routing
  * fields and exposes privacy diagnostics; it never displays payloads or
  * credentials returned by the backend.
  */
@@ -104,7 +104,7 @@ export function LlmCloudAdvisorSettings({
             {mode === "disabled" ? "無効" : mode === "manual" ? "手動" : "自動"}
           </Badge>
           <HelpPopover label="Cloud Advisor">
-            Main Agent専用の読み取り専用相談先です。Execution Team v3の構成や通常のモデル経路は変更しません。
+            Main Agent専用の読み取り専用相談先です。通常のモデル経路は変更しません。
           </HelpPopover>
         </CardTitle>
       </CardHeader>
@@ -192,7 +192,7 @@ export function LlmCloudAdvisorSettings({
             <div className="text-xs font-medium">Web ChatGPT接続設定</div>
             <p className="text-[11px] text-muted-foreground">
               Cloud Advisorではテキスト相談だけを、既存の親専用ブラウザプロファイルから送信します。
-              ログイン確認とプロファイル変更は Execution Team の Director設定と共有されます。
+              ログイン確認とプロファイル変更は親の接続設定と共有されます。
             </p>
             <dl className="grid gap-2 text-[11px] sm:grid-cols-3">
               <div className="rounded border border-border/70 bg-background/60 p-2">
@@ -209,7 +209,7 @@ export function LlmCloudAdvisorSettings({
               </div>
               <div className="rounded border border-border/70 bg-background/60 p-2">
                 <dt className="text-muted-foreground">ログイン/設定</dt>
-                <dd className="font-medium">Director設定で確認</dd>
+                <dd className="font-medium">接続設定で確認</dd>
               </div>
             </dl>
           </div>

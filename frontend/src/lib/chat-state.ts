@@ -17,6 +17,17 @@ export type ChatTimelineAction =
       type: "hydrate_persisted";
       sessionId: string;
       messages: ConversationMessage[];
+      /**
+       * A latest-page refresh replaces the previously loaded history.  Rows
+       * appended while that request was in flight are still kept by id.
+       */
+      preserveMessageIds?: string[];
+    }
+  | {
+      /** Add an older server page before the currently rendered timeline. */
+      type: "prepend_persisted";
+      sessionId: string;
+      messages: ConversationMessage[];
     }
   | {
       type: "promote_client_message";
@@ -181,6 +192,51 @@ function upsertMessage(
   return next;
 }
 
+function messageTimestampMs(message: ConversationMessage): number {
+  const value = message.created_at;
+  if (!value) return 0;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sortTimelineMessages(
+  messages: ConversationMessage[],
+): ConversationMessage[] {
+  return [...messages].sort((a, b) => {
+    const timeDifference = messageTimestampMs(a) - messageTimestampMs(b);
+    if (timeDifference !== 0) return timeDifference;
+    return a.id.localeCompare(b.id);
+  });
+}
+
+/**
+ * Merge a server page containing older rows into the rendered timeline.
+ * Persisted rows are reconciled by stable identity, while optimistic/live
+ * rows remain in the list and are ordered by their timestamp.  This keeps a
+ * concurrent new message visible when an older page resolves later.
+ */
+export function mergeOlderPersistedMessages(
+  currentMessages: ConversationMessage[],
+  olderMessages: ConversationMessage[],
+  sessionId: string,
+): ConversationMessage[] {
+  let merged = currentMessages.filter(
+    (message) => message.session_id === sessionId,
+  );
+
+  for (const incoming of olderMessages) {
+    if (
+      incoming.session_id !== sessionId ||
+      incoming.is_active_branch === false
+    ) {
+      continue;
+    }
+    merged = upsertMessage(merged, incoming);
+  }
+
+  return sortTimelineMessages(merged);
+}
+
 function findHydrationEquivalentIndex(
   localMessages: ConversationMessage[],
   persisted: ConversationMessage,
@@ -285,8 +341,25 @@ export function chatTimelineReducer(
         ),
       };
     case "hydrate_persisted":
+      {
+        const preservedPersisted = action.preserveMessageIds?.length
+          ? state.messages.filter(
+              (message) =>
+                action.preserveMessageIds?.includes(message.id) &&
+                message.session_id === action.sessionId &&
+                !isTransientChatMessage(message),
+            )
+          : [];
+        const hydrated = mergePersistedChatMessages(
+          state.messages,
+          [...action.messages, ...preservedPersisted],
+          action.sessionId,
+        );
+        return { messages: hydrated };
+      }
+    case "prepend_persisted":
       return {
-        messages: mergePersistedChatMessages(
+        messages: mergeOlderPersistedMessages(
           state.messages,
           action.messages,
           action.sessionId,

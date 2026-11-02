@@ -21,7 +21,8 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
+import httpx
+from openai import APIConnectionError, AsyncOpenAI, DefaultAsyncHttpxClient
 
 from ..tools.core import ToolDefinition, ensure_tool_definition, safe_argument_rejection
 from ..tools.registry import ToolRegistry
@@ -70,6 +71,11 @@ from .generation_error import (
     classify_generation_error,
     empty_response_failure,
 )
+from .agent_run_budget import (
+    AgentRunBudgetStop,
+    budget_failure_generation_failure,
+    get_agent_run_budget,
+)
 from .provider_terminal import (
     FAILED_TERMINAL_STATES,
     protocol_error_terminal,
@@ -81,9 +87,8 @@ from .generation_cancellation import (
     AgentDialogueInputPending,
     PlanningInteractionTerminated,
 )
-from ..services.agent_team_service import ToolFailureCircuitBreaker
+from ..services.runtime_policy_utils import ToolFailureCircuitBreaker
 from ..services.provider_failure_metadata import extract_provider_failure
-from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
 from ..services.outbound_privacy_service import (
     EgressDescriptor,
     ExternalProviderBlocked,
@@ -393,7 +398,11 @@ def _normalized_usage(
     )
     if not normalized:
         return None
-    if normalized.get("input_tokens") is None and normalized.get("output_tokens") is None:
+    if (
+        normalized.get("input_tokens") is None
+        and normalized.get("output_tokens") is None
+        and normalized.get("total_tokens") is None
+    ):
         return None
     # Keep the long-standing compact shape for SDK payloads that only expose
     # prompt/completion tokens.  Rich fields are included when the provider
@@ -546,6 +555,17 @@ class NativeRunResult:
     provider_failure: dict[str, Any] | None = None
 
 
+def _bounded_interruption_reason(error: Exception) -> str | None:
+    from .generation_cancellation import GenerationCancelled
+
+    reason = getattr(error, "interruption_reason", None)
+    if isinstance(error, GenerationCancelled) and reason == "request_limit":
+        return "request_limit"
+    if isinstance(error, TimeoutError) and reason == "budget_deadline":
+        return "budget_deadline"
+    return None
+
+
 def _safe_observed_value(value: Any, *, limit: int = 240) -> str:
     """Render provider fields for diagnostics without assuming a schema."""
 
@@ -624,6 +644,15 @@ def _empty_response_failure(
 # 設定 `agentic_completion.max_tool_rounds` が無い場合はこの値を使う。
 DEFAULT_MAX_TOOL_ROUNDS = 24
 
+# The shared budget lease is per physical sender invocation.  Keep hidden SDK
+# retries disabled so transport failures remain attributable to that lease.
+OPENAI_SDK_MAX_RETRIES = 0
+# The SDK/httpx default is 5 seconds.  Keep the provider pool's idle lifetime
+# below the observed short inter-request gaps so stale sockets are discarded.
+OPENAI_KEEPALIVE_EXPIRY_SECONDS = 1.0
+OPENAI_MAX_CONNECTIONS = 1000
+OPENAI_MAX_KEEPALIVE_CONNECTIONS = 100
+
 
 def _resolve_max_tool_rounds(explicit: int | None, config: Any | None) -> int:
     """ツールループ上限を解決する。明示値 > 設定 > 既定値 の順。"""
@@ -660,13 +689,12 @@ def _new_native_turn_failure_breaker(
 ) -> ToolFailureCircuitBreaker | None:
     """Create the one breaker shared by all routers in one native turn.
 
-    Preserve RegistryToolRouter's existing opt-in semantics: ordinary chat
-    remains unchanged, while Agent Team v3 delegation gets one breaker for
-    the entire turn instead of one fresh breaker per provider round.
+    Tool failure accounting belongs to the native turn boundary.  Delegate
+    and delegate_worker are ordinary v2 tools now, so the breaker must not be
+    gated by the retired Team configuration section.
     """
 
-    if config is None or not agent_team_v3_delegation_enabled(config):
-        return None
+    del config
     return ToolFailureCircuitBreaker(max_same_failure=2, failed_tool_budget=8)
 
 
@@ -1067,82 +1095,6 @@ class AgentTurnRunner:
         )
 
     @staticmethod
-    def _buffered_chat_retry_safe(payload: Any) -> bool:
-        """Prove the final wire shape has only buffered, local function tools."""
-        if not isinstance(payload, dict):
-            return False
-        allowed = {
-            "model", "messages", "tools", "tool_choice", "parallel_tool_calls",
-            "temperature", "top_p", "max_tokens", "max_completion_tokens",
-            "frequency_penalty", "presence_penalty", "stop", "seed",
-            "response_format", "user", "reasoning_effort", "service_tier",
-            "logprobs", "top_logprobs", "logit_bias", "n", "store", "stream",
-            "extra_body",
-        }
-        if set(payload) - allowed or payload.get("stream", False) is not False:
-            return False
-        if payload.get("store", False) is not False:
-            return False
-        tools = payload.get("tools", [])
-        if not isinstance(tools, list):
-            return False
-        for tool in tools:
-            if not isinstance(tool, dict) or set(tool) - {"type", "function"} or tool.get("type") != "function":
-                return False
-            function = tool.get("function")
-            if not isinstance(function, dict) or set(function) - {"name", "description", "parameters", "strict"}:
-                return False
-            if not isinstance(function.get("name"), str) or not function["name"]:
-                return False
-        choice = payload.get("tool_choice", "auto")
-        if isinstance(choice, str):
-            if choice not in ("none", "auto", "required"):
-                return False
-        elif isinstance(choice, dict):
-            function = choice.get("function")
-            if set(choice) != {"type", "function"} or choice.get("type") != "function":
-                return False
-            if not isinstance(function, dict) or set(function) != {"name"}:
-                return False
-            if function.get("name") not in [tool["function"]["name"] for tool in tools]:
-                return False
-        else:
-            return False
-        extra = payload.get("extra_body", {})
-        if not isinstance(extra, dict) or set(extra) - {"usage", "provider", "reasoning"}:
-            return False
-        usage = extra.get("usage", {})
-        if not isinstance(usage, dict) or set(usage) - {"include"} or any(type(v) is not bool for v in usage.values()):
-            return False
-        routing = extra.get("provider", {})
-        if not isinstance(routing, dict) or set(routing) - {"only", "order", "allow_fallbacks", "require_parameters", "zdr", "max_price"}:
-            return False
-        for key, value in routing.items():
-            if key in {"only", "order"}:
-                if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                    return False
-            elif key == "max_price":
-                if not isinstance(value, dict) or set(value) - {"prompt", "completion"}:
-                    return False
-                if any(type(item) not in (int, float) or item != 0 for item in value.values()):
-                    return False
-            elif type(value) is not bool:
-                return False
-        reasoning = extra.get("reasoning", {})
-        if not isinstance(reasoning, dict) or set(reasoning) - {"effort", "max_tokens", "enabled", "exclude"}:
-            return False
-        for key, value in reasoning.items():
-            if key == "effort":
-                if value not in ("none", "minimal", "low", "medium", "high", "xhigh"):
-                    return False
-            elif key == "max_tokens":
-                if type(value) is not int or value < 0:
-                    return False
-            elif type(value) is not bool:
-                return False
-        return True
-
-    @staticmethod
     def _safe_transport_causes(error: BaseException) -> list[dict[str, Any]]:
         known = {
             "APIConnectionError", "APITimeoutError", "ReadError", "WriteError",
@@ -1165,6 +1117,46 @@ class AgentTurnRunner:
             current = current.__cause__
         return result
 
+    @staticmethod
+    def _connection_establishment_cause(error: BaseException) -> BaseException | None:
+        """Return an HTTPX connect failure, if the cause chain proves one."""
+
+        try:
+            import httpx
+        except Exception:
+            return None
+        current = error.__cause__
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if type(current) in {httpx.ConnectError, httpx.ConnectTimeout}:
+                return current
+            # A different concrete HTTPX transport failure is the operative
+            # stage; do not reinterpret an inner cause as a connect proof.
+            if isinstance(current, httpx.RequestError):
+                return None
+            current = current.__cause__
+        return None
+
+    @staticmethod
+    def _response_read_failure_cause(error: BaseException) -> BaseException | None:
+        """Return the HTTPX failure when the connection dropped before a full response."""
+
+        try:
+            import httpx
+        except Exception:
+            return None
+        current = error.__cause__
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if type(current) in {httpx.ReadError, httpx.RemoteProtocolError}:
+                return current
+            if isinstance(current, httpx.RequestError):
+                return None
+            current = current.__cause__
+        return None
+
     def _single_attempt_client(self) -> Any:
         """Client whose SDK never retries a governed endpoint on its own.
 
@@ -1173,30 +1165,217 @@ class AgentTurnRunner:
         """
         from .provider_rate_governor import is_loopback_endpoint
 
+        from .frozen_candidate_transport import current_frozen_transport
+
         client = self.client
         with_options = getattr(client, "with_options", None)
-        if callable(with_options) and not is_loopback_endpoint(getattr(client, "base_url", "")):
-            return with_options(max_retries=0)
+        if callable(with_options) and (
+            current_frozen_transport() is not None
+            or not is_loopback_endpoint(getattr(client, "base_url", ""))
+        ):
+            single_attempt = with_options(max_retries=OPENAI_SDK_MAX_RETRIES)
+            try:
+                single_attempt._aoitalk_httpx_transport_retries = getattr(
+                    client, "_aoitalk_httpx_transport_retries", None
+                )
+            except Exception:
+                pass
+            return single_attempt
         return client
+
+    def _responses_tool_followup_streaming_enabled(self) -> bool:
+        """Read the opt-out for streaming Responses follow-ups after tools."""
+
+        setting_key = "runtime.openai_tool_followup_streaming_enabled"
+        value: Any = True
+        if isinstance(self.config, Mapping):
+            if setting_key in self.config:
+                value = self.config[setting_key]
+            else:
+                nested: Any = self.config
+                for part in setting_key.split("."):
+                    if not isinstance(nested, Mapping) or part not in nested:
+                        nested = None
+                        break
+                    nested = nested[part]
+                if nested is not None:
+                    value = nested
+        getter = getattr(self.config, "get", None)
+        if callable(getter) and value is True:
+            try:
+                value = getter(setting_key, True)
+            except Exception:
+                value = True
+        if type(value) is bool:
+            return value
+        if type(value) is int and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"false", "off", "no", "0"}:
+                return False
+            if normalized in {"true", "on", "yes", "1"}:
+                return True
+        return True
+
+    def _should_stream_responses_tool_followup(self, base_url: Any) -> bool:
+        """Restrict the opt-in to official, non-loopback OpenAI Responses."""
+
+        if str(self.provider_label or "").strip().casefold() != "openai":
+            return False
+        if not self._responses_tool_followup_streaming_enabled():
+            return False
+        from .provider_rate_governor import is_loopback_endpoint
+
+        endpoint = str(base_url or "")
+        if is_loopback_endpoint(endpoint):
+            return False
+        try:
+            parsed = urlsplit(endpoint)
+        except ValueError:
+            return False
+        return (
+            parsed.scheme.casefold() == "https"
+            and (parsed.hostname or "").casefold() == "api.openai.com"
+        )
+
+    @staticmethod
+    def _responses_stream_bytes_received(stream: Any) -> int:
+        """Read HTTPX's raw download counter from the pinned SDK stream."""
+
+        try:
+            raw_stream = getattr(stream, "_raw_stream", None)
+            response = getattr(raw_stream, "response", None)
+            received = getattr(response, "num_bytes_downloaded", 0)
+            if type(received) is int and received >= 0:
+                return received
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def _safe_responses_stream_event_type(event: Any) -> str | None:
+        raw = getattr(event, "type", None)
+        if not isinstance(raw, str):
+            return None
+        value = raw[:80]
+        if not value or any(
+            not (character.isascii() and (character.isalnum() or character in "._-"))
+            for character in value
+        ):
+            return "unknown"
+        return value
+
+    async def _stream_responses_tool_followup(
+        self,
+        request_kwargs: dict[str, Any],
+        *,
+        stream_callback: StreamCallback | None,
+        model: str,
+        round_index: int,
+    ) -> Any:
+        """Buffer one streamed tool follow-up into the SDK's Response object.
+
+        The SDK's stream wrapper assembles ``response.completed`` (including
+        usage) into a ParsedResponse consumed by the existing native pipeline.
+        Its HTTPX response counter records body bytes without retaining body
+        text or exposing exception messages.
+        """
+
+        started_at = time.monotonic()
+        response_stream: Any = None
+        events_received = 0
+        last_event_type: str | None = None
+        completed = False
+        protocol_incomplete = False
+        terminal_response: Any = None
+        client = self._single_attempt_client()
+        try:
+            async with client.responses.stream(**request_kwargs) as response_stream:
+                async for event in response_stream:
+                    events_received += 1
+                    event_type = self._safe_responses_stream_event_type(event)
+                    last_event_type = event_type
+                    if event_type == "response.completed":
+                        completed = True
+                    elif event_type in {"response.incomplete", "response.failed"}:
+                        terminal_response = getattr(event, "response", None)
+
+                if not completed and terminal_response is not None:
+                    result = terminal_response
+                else:
+                    protocol_incomplete = not completed
+                    result = await response_stream.get_final_response()
+            await emit_timing_event(
+                stream_callback,
+                "generation_transport",
+                "stream_end",
+                model=model,
+                round=round_index,
+                bytes_received=self._responses_stream_bytes_received(response_stream),
+                events_received=events_received,
+                last_event_type=last_event_type or "none",
+            )
+            return result
+        except Exception as error:
+            if not protocol_incomplete and not isinstance(
+                error, (APIConnectionError, httpx.RequestError)
+            ):
+                raise
+            connect_cause = self._connection_establishment_cause(error)
+            details = {
+                "bytes_received": self._responses_stream_bytes_received(response_stream),
+                "events_received": events_received,
+                "last_event_type": last_event_type or "none",
+                "elapsed_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+                "retry_eligible": False,
+                "retry_proof": "connect_failure" if connect_cause is not None else "unproved",
+                "request_sent": False if connect_cause is not None else None,
+                "cause_chain": self._safe_transport_causes(error),
+            }
+            try:
+                await emit_timing_event(
+                    stream_callback,
+                    "generation_transport",
+                    "error",
+                    model=model,
+                    round=round_index,
+                    **details,
+                )
+            except Exception:
+                # Diagnostics must not replace the transport exception.
+                pass
+            raise
 
     async def _execute_model_request(
         self, payload: dict[str, Any], *, allow_connection_retry: bool = True,
-        allow_buffered_chat_retry: bool = False,
         transport_failure_callback: Any = None,
         **options: Any,
     ) -> Any:
-        """Retry one current request, never replay already settled tool effects.
+        """Retry a request whose response never arrived, at most once.
 
-        Post-tool retries require an explicit Chat sender boundary and a proven
-        buffered/function-only final payload. Every send re-enters privacy,
-        request budgets and the provider governor with hidden SDK retries off.
+        A connection-establishment failure proves nothing was sent.  A dropped
+        read is unproved, but a model request has no side effect of its own:
+        tools only run after a complete response, so sending it again can cost
+        tokens and cannot repeat a tool.  One short network drop must not end
+        the Run, even after earlier tools in the same turn.
         """
         from ..services.free_team_service import openai_credential_identity
         from .generation_budget import current_generation_budget
+        from .agent_run_budget import get_agent_run_budget, is_http_429_error
         from .provider_rate_governor import (
             GOVERNOR, MAX_PHYSICAL_ATTEMPTS, budget_exhausted_after_429, governor_key,
             is_loopback_endpoint, should_retry_429,
         )
+
+        from .frozen_candidate_transport import (
+            classify_frozen_transport_failure, current_frozen_transport,
+        )
+
+        frozen_attempt = current_frozen_transport()
+        first_frozen_request = frozen_attempt is not None and frozen_attempt.requests == 0
+        if frozen_attempt is not None:
+            frozen_attempt.requests += 1
 
         identity = openai_credential_identity(self.client, self.config)
         base_url = str(getattr(self.client, "base_url", "") or "")
@@ -1207,18 +1386,61 @@ class AgentTurnRunner:
             budget = current_generation_budget.get()
             return budget.checkpoint() if budget is not None else None
 
+        image_attempt_state = options.pop('_image_cost_attempt_state', None)
         original_sender = options.get("sender") or options.get("send")
+        attribution_consumer_id = options.pop("provider_key_consumer_id", None)
+        attribution_identity = getattr(
+            self.client, "_aoitalk_provider_key_identity", None
+        )
+        attribution_consumer_id = (
+            attribution_consumer_id
+            or getattr(self.client, "_aoitalk_provider_key_consumer_id", None)
+            or "base_model:openai"
+        )
         attempt_state: dict[str, Any] = {}
+        run_budget = get_agent_run_budget(self, config=self.config)
+
+        def settle_failed_attempt(error: BaseException, *, rejected_without_usage: bool = False) -> None:
+            if run_budget is None:
+                return
+            if isinstance(image_attempt_state, dict) and image_attempt_state.get('begun'):
+                image_attempt_state['begun'] = False
+                if image_attempt_state.get('sent'):
+                    run_budget.mark_provider_usage_unknown()
+                else:
+                    run_budget.abort_provider_request()
+                return
+            request_count_before = attempt_state.get("budget_request_count_before")
+            if (
+                not isinstance(request_count_before, int)
+                or run_budget.request_count <= request_count_before
+            ):
+                return
+            if rejected_without_usage or is_http_429_error(error):
+                run_budget.record_provider_response({"total_tokens": 0})
+            else:
+                run_budget.mark_token_usage_unavailable()
+
         if callable(original_sender):
             async def guarded_sender(final_payload: Any) -> Any:
                 checkpoint()
                 lease = await GOVERNOR.acquire_async(key, checkpoint) if governed else None
                 try:
-                    attempt_state["buffered"] = allow_buffered_chat_retry and self._buffered_chat_retry_safe(final_payload)
                     attempt_state["entered"] = True
                     attempt_state["started"] = time.monotonic()
-                    sent = original_sender(final_payload)
-                    response = await sent if inspect.isawaitable(sent) else sent
+                    if attribution_identity is not None:
+                        from ..services.provider_key_attribution_service import (
+                            call_with_provider_key_attribution,
+                        )
+
+                        response = await call_with_provider_key_attribution(
+                            lambda: original_sender(final_payload),
+                            identity=attribution_identity,
+                            consumer_id=attribution_consumer_id,
+                        )
+                    else:
+                        sent = original_sender(final_payload)
+                        response = await sent if inspect.isawaitable(sent) else sent
                     attempt_state["response_returned"] = True
                     return response
                 finally:
@@ -1235,20 +1457,70 @@ class AgentTurnRunner:
             checkpoint()
             physical += 1
             attempt_state.clear()
+            if isinstance(image_attempt_state, dict):
+                image_attempt_state.clear()
+            attempt_state["budget_request_count_before"] = (
+                run_budget.request_count if run_budget is not None else 0
+            )
             attempt_started = time.monotonic()
             try:
                 if governed:
                     await GOVERNOR.wait_cooldown_async(key, checkpoint)
+                attempt_client = self._single_attempt_client()
+                attempt_state["sdk_max_retries"] = getattr(
+                    attempt_client, "max_retries", None
+                )
+                attempt_state["httpx_transport_retries"] = getattr(
+                    attempt_client, "_aoitalk_httpx_transport_retries", None
+                )
+                single_attempt_client = (
+                    attempt_client
+                    if str(self.provider_label or "").lower() == "openai"
+                    else None
+                )
                 return await self.privacy_gateway.execute(payload, **options,
-                    credential_identity=identity)
+                    credential_identity=identity,
+                    sdk_max_retries=getattr(single_attempt_client, "max_retries", None),
+                    httpx_transport_retries=getattr(
+                        single_attempt_client, "_aoitalk_httpx_transport_retries", None
+                    ))
             except APIConnectionError as error:
                 cause = error.__cause__
+                connect_cause = self._connection_establishment_cause(error)
+                read_failure = self._response_read_failure_cause(error) is not None
+                sdk_single_attempt = (
+                    type(attempt_state.get("sdk_max_retries")) is int
+                    and attempt_state.get("sdk_max_retries") == OPENAI_SDK_MAX_RETRIES
+                )
+                retry_contract = (
+                    sdk_single_attempt
+                    and type(attempt_state.get("httpx_transport_retries")) is int
+                    and attempt_state.get("httpx_transport_retries") == 0
+                )
                 retry = (
-                    (allow_connection_retry or bool(attempt_state.get("entered") and attempt_state.get("buffered")))
+                    (
+                        (read_failure and sdk_single_attempt)
+                        or (
+                            allow_connection_retry
+                            and connect_cause is not None
+                            and retry_contract
+                        )
+                    )
                     and not attempt_state.get("response_returned", False)
+                    and frozen_attempt is None
                     and not connection_retried
                     and physical < MAX_PHYSICAL_ATTEMPTS
-                    and not isinstance(error, APITimeoutError)
+                )
+                settle_failed_attempt(
+                    error,
+                    rejected_without_usage=(
+                        retry
+                        or (
+                            connect_cause is not None
+                            and retry_contract
+                            and not attempt_state.get("response_returned", False)
+                        )
+                    ),
                 )
                 connection_retried = connection_retried or retry
                 logger.warning(
@@ -1265,12 +1537,28 @@ class AgentTurnRunner:
                     "cause_chain": self._safe_transport_causes(error),
                     "elapsed_ms": max(0, int((time.monotonic() - attempt_state.get("started", attempt_started)) * 1000)),
                     "retry_eligible": retry,
-                    "retry_proof": "buffered_functions" if attempt_state.get("buffered") else "pre_tool_legacy" if allow_connection_retry else "unproved",
+                    "retry_proof": (
+                        "connect_failure"
+                        if connect_cause is not None and retry_contract
+                        else "read_failure"
+                        if read_failure and sdk_single_attempt
+                        else "unproved"
+                    ),
+                    "request_sent": False if connect_cause is not None and retry_contract else None,
+                    "response_bytes": 0 if connect_cause is not None and retry_contract else None,
+                    "retry_contract": retry_contract,
                     "response_returned": bool(attempt_state.get("response_returned")),
                 }
                 if callable(transport_failure_callback):
                     await transport_failure_callback(details)
                 if not retry:
+                    if frozen_attempt is not None:
+                        failure = classify_frozen_transport_failure(
+                            error, first_request=first_frozen_request,
+                            proven_single_transport=retry_contract,
+                        )
+                        if failure is not None:
+                            raise failure from error
                     raise
                 remaining = checkpoint()
                 if remaining is not None and remaining <= 0.5:
@@ -1282,6 +1570,16 @@ class AgentTurnRunner:
                 # output exists. The shared cooldown is waited at the loop top.
                 if budget_exhausted_after_429(error, prior_429):
                     raise prior_429 from None
+                if isinstance(error, AgentRunBudgetStop):
+                    raise
+                settle_failed_attempt(error)
+                if frozen_attempt is not None:
+                    failure = classify_frozen_transport_failure(
+                        error, first_request=first_frozen_request, proven_single_transport=False,
+                    )
+                    if failure is not None:
+                        raise failure from error
+                    raise
                 if not (governed and should_retry_429(error, physical, key, checkpoint)):
                     raise
                 prior_429 = error
@@ -1289,6 +1587,9 @@ class AgentTurnRunner:
                     "Native model request rate limited: provider=%s model=%s attempt=%d; retrying",
                     self.provider_label, options.get("model", ""), physical,
                 )
+            except BaseException as error:
+                settle_failed_attempt(error)
+                raise
 
     async def run(
         self,
@@ -1298,6 +1599,7 @@ class AgentTurnRunner:
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
         tool_free: bool = False,
+        tool_result_completion_check: Callable[[ToolExecutionRecord], str | None] | None = None,
         cloud_advisor_origin: Any | None = None,
         cloud_advisor_assessment: Any | None = None,
     ) -> NativeRunResult:
@@ -1396,6 +1698,7 @@ class AgentTurnRunner:
                     stream_callback=stream_callback,
                     tools_provider=tools_provider,
                     tool_free=tool_free,
+                    tool_result_completion_check=tool_result_completion_check,
                 )
         finally:
             _NATIVE_TIMING_ID.reset(timing_id_token)
@@ -1418,6 +1721,7 @@ class AgentTurnRunner:
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
         tool_free: bool = False,
+        tool_result_completion_check: Callable[[ToolExecutionRecord], str | None] | None = None,
     ) -> NativeRunResult:
         # local_only changes the execution deployment, not just the payload.
         # Resolve the configured privacy sidecar explicitly and fail closed
@@ -1436,16 +1740,20 @@ class AgentTurnRunner:
                 stream_callback=stream_callback,
                 tools_provider=tools_provider,
                 tool_free=tool_free,
+                tool_result_completion_check=tool_result_completion_check,
             )
-        # 公式 OpenAI 経路は Responses API を使う。openrouter など base_url を差し替えた
-        # OpenAI 互換プロバイダは従来の chat.completions を維持する。
-        if self.provider_label == "openai":
+        # The verified image cost contract is for Chat Completions; other
+        # official OpenAI turns continue using Responses as before.
+        from .image_budget import current_image_price
+
+        if self.provider_label == "openai" and current_image_price() is None:
             return await self._run_core_responses(
                 agent,
                 user_input,
                 stream_callback=stream_callback,
                 tools_provider=tools_provider,
                 tool_free=tool_free,
+                tool_result_completion_check=tool_result_completion_check,
             )
         return await self._run_core_chat(
             agent,
@@ -1453,6 +1761,7 @@ class AgentTurnRunner:
             stream_callback=stream_callback,
             tools_provider=tools_provider,
             tool_free=tool_free,
+            tool_result_completion_check=tool_result_completion_check,
         )
 
     async def _run_core_chat(
@@ -1463,6 +1772,7 @@ class AgentTurnRunner:
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
         tool_free: bool = False,
+        tool_result_completion_check: Callable[[ToolExecutionRecord], str | None] | None = None,
     ) -> NativeRunResult:
         await _emit(stream_callback, "stream_start", {"message": "応答を生成しています"})
         suppress_automatic_context = _help_turn_is_isolated()
@@ -1494,6 +1804,7 @@ class AgentTurnRunner:
         )
         current_tool_choice = requested_tool_choice
         final_output = ""
+        completion_ack: str | None = None
         failure_breaker = _new_native_turn_failure_breaker(self.config)
         no_progress_guard = (
             current_tool_no_progress_guard() or ToolNoProgressGuard()
@@ -1695,13 +2006,45 @@ class AgentTurnRunner:
                 **_timing_request_stats(kwargs.get("messages")),
             )
 
+            image_cost_reservation = None
+            image_attempt_state: dict[str, bool] = {}
             async def send_chat_request(outbound_kwargs: dict[str, Any]) -> Any:
+                nonlocal image_cost_reservation
                 from .generation_budget import record_bounded_model_request
                 record_bounded_model_request(outbound_kwargs)
+                run_budget = get_agent_run_budget(self, config=self.config)
+                if run_budget is not None and not run_budget.begin_provider_request():
+                    failure = run_budget.failure
+                    if failure is not None:
+                        raise AgentRunBudgetStop(failure)
+                from .image_budget import current_image_cost_limit, current_image_price, quote_image_cost_micros
+
+                image_limit = current_image_cost_limit()
+                if image_limit is not None:
+                    if run_budget is not None:
+                        image_attempt_state['begun'] = True
+                    from ..services.free_team_service import (
+                        ComplimentaryImageCostExceeded, request_budget_estimate,
+                    )
+                    if run_budget is None or image_limit <= 0:
+                        raise ComplimentaryImageCostExceeded()
+                    estimate = request_budget_estimate(outbound_kwargs)
+                    quote = quote_image_cost_micros(
+                        current_image_price(), input_tokens=int(estimate['input_tokens']),
+                        output_tokens=int(estimate['output_tokens']),
+                    )
+                    run_budget.tighten(cost_limit_micros=image_limit)
+                    reservation_key = f"image-provider:{uuid.uuid4().hex}"
+                    remaining = run_budget.reserve_delegation_cost_micros(reservation_key, quote)
+                    if remaining is None:
+                        raise ComplimentaryImageCostExceeded()
+                    image_cost_reservation = (run_budget, reservation_key)
                 # The sender is intentionally nested inside the gateway
                 # transaction.  It can therefore receive only the final
                 # reviewed payload and cannot accidentally send ``kwargs``
                 # captured before redaction.
+                if image_limit is not None:
+                    image_attempt_state['sent'] = True
                 return await self._single_attempt_client().chat.completions.create(**outbound_kwargs)
 
             async def record_transport_failure(details: dict[str, Any]) -> None:
@@ -1714,7 +2057,6 @@ class AgentTurnRunner:
                 response = await self._execute_model_request(
                     kwargs,
                     allow_connection_retry=not bool(tool_records),
-                    allow_buffered_chat_retry=True,
                     transport_failure_callback=record_transport_failure,
                     provider=self.provider_label,
                     descriptor=descriptor,
@@ -1722,8 +2064,25 @@ class AgentTurnRunner:
                     base_url=base_url,
                     source_kind="model_request",
                     model=agent.model,
+                    _image_cost_attempt_state=image_attempt_state,
                 )
             except Exception as error:
+                if isinstance(error, AgentRunBudgetStop):
+                    failure = budget_failure_generation_failure(error.failure)
+                    await _emit(
+                        stream_callback,
+                        "stream_end",
+                        {"content": failure.user_message if failure else ""},
+                    )
+                    return NativeRunResult(
+                        final_output=failure.user_message if failure else "",
+                        messages=list(messages),
+                        tool_calls=list(tool_records),
+                        usage_records=list(usage_records),
+                        context_snapshots=list(context_snapshots),
+                        generation_failure=failure,
+                        stopped_reason=error.failure.code,
+                    )
                 await emit_timing_event(
                     stream_callback,
                     "generation",
@@ -1740,6 +2099,7 @@ class AgentTurnRunner:
                 failure = replace(
                     classify_generation_error(error),
                     user_message="モデルの応答が正常に完了しなかったため、自動処理を停止しました。途中の結果と保存状態を確認してください。",
+                    interruption_reason=_bounded_interruption_reason(error),
                 )
                 provider_terminal = interrupted_terminal("chat.completions")
                 await _emit(
@@ -1761,6 +2121,24 @@ class AgentTurnRunner:
                 provider=self.provider_label,
                 resolved_model=getattr(response, "model", None),
             )
+            from .image_budget import current_image_price, normalize_openai_image_response
+
+            image_price = current_image_price()
+            if image_price is not None:
+                # The verified image receipt carries the actual price through
+                # the native OpenAI collector to the existing Run ledger.
+                image_usage = normalize_openai_image_response(response, image_price)
+                usage = {**(usage or {}), **image_usage} if image_usage is not None else None
+            run_budget = get_agent_run_budget(self, config=self.config)
+            budget_failure = (
+                run_budget.record_provider_response(
+                    usage,
+                    **({'cost_reservation_key': image_cost_reservation[1]}
+                       if image_cost_reservation is not None else {}),
+                )
+                if run_budget is not None
+                else None
+            )
             if usage:
                 usage_records.append(usage)
                 if request_snapshot is not None:
@@ -1768,6 +2146,27 @@ class AgentTurnRunner:
                         request_snapshot,
                         usage.get("input_tokens"),
                     )
+            if budget_failure is not None:
+                failure = budget_failure_generation_failure(budget_failure)
+                message = response.choices[0].message
+                calls = list(getattr(message, "tool_calls", None) or [])
+                if calls and run_budget is not None:
+                    run_budget.count_unexecuted_tool_calls(len(calls))
+                terminal_content = failure.user_message if failure else ""
+                await _emit(
+                    stream_callback,
+                    "stream_end",
+                    {"content": terminal_content},
+                )
+                return NativeRunResult(
+                    final_output=terminal_content,
+                    messages=list(messages),
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                    stopped_reason=budget_failure.code,
+                )
             await emit_timing_event(
                 stream_callback,
                 "generation",
@@ -1830,6 +2229,32 @@ class AgentTurnRunner:
                 message,
                 registry=tool_registry,
             )
+
+            if tool_free and tool_calls:
+                run_budget = get_agent_run_budget(self, config=self.config)
+                if run_budget is not None:
+                    overflow = False
+                    for _ in tool_calls:
+                        if not run_budget.record_tool_call():
+                            overflow = True
+                    if overflow:
+                        failure = budget_failure_generation_failure(
+                            run_budget.failure
+                        )
+                        terminal_content = failure.user_message if failure else ""
+                        return NativeRunResult(
+                            final_output=terminal_content,
+                            messages=list(messages),
+                            tool_calls=list(tool_records),
+                            usage_records=list(usage_records),
+                            context_snapshots=list(context_snapshots),
+                            generation_failure=failure,
+                            stopped_reason=(
+                                run_budget.failure.code
+                                if run_budget.failure
+                                else "run_budget_exceeded:tool_calls"
+                            ),
+                        )
 
             if tool_free and tool_calls:
                 content = str(self.privacy_gateway.restore_aliases(content))
@@ -1925,6 +2350,74 @@ class AgentTurnRunner:
                 tool_name = _tool_call_name(tool_call)
                 observable_name = observable_tool_name(tool_registry, tool_name)
                 provider_call_id = _tool_call_id(tool_call)
+                run_budget = get_agent_run_budget(self, config=self.config)
+                if run_budget is not None and not run_budget.record_tool_call():
+                    run_budget.count_unexecuted_tool_calls(
+                        len(tool_calls) - tool_call_index - 1
+                    )
+                    budget_failure = run_budget.failure
+                    failure = budget_failure_generation_failure(budget_failure)
+                    terminal_content = failure.user_message if failure else ""
+                    await _emit(
+                        stream_callback,
+                        "tool_end",
+                        {
+                            "tool": "run_budget_exceeded",
+                            "tool_call_id": "run_budget_exceeded_tool_calls",
+                            "tool_args": {},
+                            "tool_result": {
+                                "tool": "run_budget_exceeded",
+                                "tool_call_id": "run_budget_exceeded_tool_calls",
+                                "arguments": {},
+                                "output": json.dumps(
+                                    {
+                                        "success": False,
+                                        "error_code": (
+                                            budget_failure.code
+                                            if budget_failure
+                                            else "run_budget_exceeded:tool_calls"
+                                        ),
+                                        "budget_exceeded": (
+                                            budget_failure.to_dict()
+                                            if budget_failure
+                                            else {}
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                ),
+                                "error": (
+                                    budget_failure.code
+                                    if budget_failure
+                                    else "run_budget_exceeded:tool_calls"
+                                ),
+                                "success": False,
+                                "executed": False,
+                                "synthetic": True,
+                            },
+                            "message": "Run全体のツール呼び出し上限に達しました",
+                            "executed": False,
+                            "synthetic": True,
+                        },
+                    )
+                    await _emit(
+                        stream_callback,
+                        "stream_end",
+                        {"content": terminal_content},
+                    )
+                    return NativeRunResult(
+                        final_output=terminal_content,
+                        messages=list(messages),
+                        tool_calls=list(tool_records),
+                        usage_records=list(usage_records),
+                        context_snapshots=list(context_snapshots),
+                        generation_failure=failure,
+                        stopped_reason=(
+                            budget_failure.code
+                            if budget_failure
+                            else "run_budget_exceeded:tool_calls"
+                        ),
+                    )
                 call_id = (
                     approved_directive.call_id
                     if approved_directive is not None
@@ -2067,6 +2560,28 @@ class AgentTurnRunner:
                     if tool_turn_terminal:
                         terminal_reason = tool_result.terminal_reason
                         terminal_status_message = tool_result.status_message
+                    if run_budget is not None:
+                        run_budget.record_tool_outcome(
+                            observable_name,
+                            bool(execution_success),
+                        )
+                        circuit_failure = run_budget.failure
+                        if (
+                            getattr(circuit_failure, "kind", "")
+                            == "tool_failure_circuit_open"
+                        ):
+                            if tool_generation_failure is None:
+                                tool_generation_failure = (
+                                    budget_failure_generation_failure(
+                                        circuit_failure
+                                    )
+                                )
+                            terminal_reason = "tool_failure_circuit_open"
+                            terminal_status_message = (
+                                tool_generation_failure.user_message
+                                if tool_generation_failure is not None
+                                else "ツールの連続失敗を検出したため停止しました"
+                            )
                     audit_args = _observable_tool_arguments(
                         tool_registry,
                         tool_name,
@@ -2197,6 +2712,10 @@ class AgentTurnRunner:
                             or "ツール実行を停止しました"
                         )
                     skip_reason = _native_terminal_skip_reason(terminal_reason)
+                    if run_budget is not None:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(tool_calls) - tool_call_index - 1
+                        )
                     for skipped in tool_calls[tool_call_index + 1 :]:
                         skipped_id = _tool_call_id(skipped)
                         skipped_name = observable_tool_name(
@@ -2248,6 +2767,10 @@ class AgentTurnRunner:
                     # approval response activates execution, every remaining
                     # call in that same batch is acknowledged as not executed;
                     # the next provider round receives only action[0].
+                    if run_budget is not None:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(tool_calls) - tool_call_index - 1
+                        )
                     for skipped in tool_calls[tool_call_index + 1 :]:
                         await _record_native_chat_skipped_call(
                             stream_callback=stream_callback,
@@ -2260,9 +2783,35 @@ class AgentTurnRunner:
                         )
                     break
 
+                if (
+                    tool_result_completion_check is not None
+                    and tool_executed and not tool_synthetic and execution_success
+                    and not hard_stop and not terminal_reason
+                    and terminal_generation_failure is None
+                    and tool_generation_failure is None
+                ):
+                    completion_ack = tool_result_completion_check(tool_records[-1])
+                    if completion_ack:
+                        if run_budget is not None:
+                            run_budget.count_unexecuted_tool_calls(
+                                len(tool_calls) - tool_call_index - 1
+                            )
+                        for skipped in tool_calls[tool_call_index + 1 :]:
+                            await _record_native_chat_skipped_call(
+                                stream_callback=stream_callback, tool_records=tool_records,
+                                messages=messages, registry=tool_registry, skipped=skipped,
+                                reason="workflow_complete", message="ワークフローは受理済みです。",
+                            )
+                        final_output = completion_ack
+                        break
+
                 if hard_stop or authoritative_task_complete:
                     if terminal_generation_failure is not None or terminal_reason:
                         break
+                    if run_budget is not None:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(tool_calls) - tool_call_index - 1
+                        )
                     for skipped in tool_calls[tool_call_index + 1 :]:
                         messages.append(
                             {
@@ -2278,8 +2827,19 @@ class AgentTurnRunner:
 
             if round_index == 0 and current_tool_choice == "required":
                 current_tool_choice = "auto"
-            if hard_stop:
+            if hard_stop or completion_ack:
                 break
+
+        if completion_ack and terminal_generation_failure is None and not terminal_reason:
+            await _emit(stream_callback, "stream_token", {"content": completion_ack})
+            await _emit(stream_callback, "stream_end", {"content": completion_ack})
+            return NativeRunResult(
+                final_output=completion_ack,
+                messages=[*messages, {"role": "assistant", "content": completion_ack}],
+                tool_calls=list(tool_records), usage_records=list(usage_records),
+                context_snapshots=list(context_snapshots), provider_terminal=provider_terminal,
+                stopped_reason="final",
+            )
 
         if terminal_generation_failure is not None or terminal_reason:
             terminal_output = str(
@@ -2338,6 +2898,7 @@ class AgentTurnRunner:
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
         tool_free: bool = False,
+        tool_result_completion_check: Callable[[ToolExecutionRecord], str | None] | None = None,
     ) -> NativeRunResult:
         settings = self.privacy_gateway.settings
         provider = settings.local_provider
@@ -2404,6 +2965,7 @@ class AgentTurnRunner:
             stream_callback=stream_callback,
             tools_provider=tools_provider,
             tool_free=tool_free,
+            tool_result_completion_check=tool_result_completion_check,
         )
 
     async def _run_core_responses(
@@ -2414,6 +2976,7 @@ class AgentTurnRunner:
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
         tool_free: bool = False,
+        tool_result_completion_check: Callable[[ToolExecutionRecord], str | None] | None = None,
     ) -> NativeRunResult:
         """公式 OpenAI Responses API でエージェントターンを実行する。
 
@@ -2472,6 +3035,7 @@ class AgentTurnRunner:
         current_tool_choice = requested_tool_choice
         effort = getattr(agent.model_settings.reasoning, "effort", None)
         final_output = ""
+        completion_ack: str | None = None
         failure_breaker = _new_native_turn_failure_breaker(self.config)
         no_progress_guard = (
             current_tool_no_progress_guard() or ToolNoProgressGuard()
@@ -2652,8 +3216,22 @@ class AgentTurnRunner:
             async def send_response_request(outbound_kwargs: dict[str, Any]) -> Any:
                 from .generation_budget import record_bounded_model_request
                 record_bounded_model_request(outbound_kwargs)
+                run_budget = get_agent_run_budget(self, config=self.config)
+                if run_budget is not None and not run_budget.begin_provider_request():
+                    failure = run_budget.failure
+                    if failure is not None:
+                        raise AgentRunBudgetStop(failure)
                 # Keep the provider sender inside the privacy transaction so
                 # approval/redaction is applied to the exact request sent.
+                if tool_records and self._should_stream_responses_tool_followup(
+                    base_url
+                ):
+                    return await self._stream_responses_tool_followup(
+                        outbound_kwargs,
+                        stream_callback=stream_callback,
+                        model=agent.model,
+                        round_index=round_index,
+                    )
                 return await self._single_attempt_client().responses.create(**outbound_kwargs)
 
             try:
@@ -2899,11 +3477,28 @@ class AgentTurnRunner:
                 Turns with no evidence retain the historical exception path.
                 """
 
+                if isinstance(error, AgentRunBudgetStop):
+                    failure = budget_failure_generation_failure(error.failure)
+                    await _emit(
+                        stream_callback,
+                        "stream_end",
+                        {"content": failure.user_message if failure else ""},
+                    )
+                    return NativeRunResult(
+                        final_output=failure.user_message if failure else "",
+                        messages=list(chat_messages),
+                        tool_calls=list(tool_records),
+                        usage_records=list(usage_records),
+                        context_snapshots=list(context_snapshots),
+                        generation_failure=failure,
+                        stopped_reason=error.failure.code,
+                    )
                 if not tool_records and not usage_records:
                     raise error
                 failure = replace(
                     classify_generation_error(error),
                     user_message="モデルの応答が正常に完了しなかったため、自動処理を停止しました。途中の結果と保存状態を確認してください。",
+                    interruption_reason=_bounded_interruption_reason(error),
                 )
                 provider_terminal = interrupted_terminal("responses")
                 await _emit(
@@ -2924,6 +3519,9 @@ class AgentTurnRunner:
             try:
                 response = await create_response(kwargs)
             except Exception as first_error:
+                from ..services.agent_route_fallback_policy import RoutePreflightFailure
+                if isinstance(first_error, RoutePreflightFailure):
+                    raise
                 await emit_timing_event(
                     stream_callback,
                     "generation",
@@ -2974,6 +3572,12 @@ class AgentTurnRunner:
                 provider=self.provider_label,
                 resolved_model=getattr(response, "model", None),
             )
+            run_budget = get_agent_run_budget(self, config=self.config)
+            budget_failure = (
+                run_budget.record_provider_response(usage)
+                if run_budget is not None
+                else None
+            )
             if usage:
                 usage_records.append(usage)
                 if request_snapshot is not None:
@@ -2981,6 +3585,27 @@ class AgentTurnRunner:
                         request_snapshot,
                         usage.get("input_tokens"),
                     )
+            if budget_failure is not None:
+                failure = budget_failure_generation_failure(budget_failure)
+                output_items = list(_responses_item_get(response, "output") or [])
+                requested_calls = _responses_function_calls(output_items)
+                if requested_calls and run_budget is not None:
+                    run_budget.count_unexecuted_tool_calls(len(requested_calls))
+                terminal_content = failure.user_message if failure else ""
+                await _emit(
+                    stream_callback,
+                    "stream_end",
+                    {"content": terminal_content},
+                )
+                return NativeRunResult(
+                    final_output=terminal_content,
+                    messages=list(chat_messages),
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                    stopped_reason=budget_failure.code,
+                )
             await emit_timing_event(
                 stream_callback,
                 "generation",
@@ -2998,6 +3623,31 @@ class AgentTurnRunner:
             function_calls = _responses_function_calls(output_items)
             content = responses_output_text(response, output_items)
             final_output = content
+            if tool_free and function_calls:
+                run_budget = get_agent_run_budget(self, config=self.config)
+                if run_budget is not None:
+                    overflow = False
+                    for _ in function_calls:
+                        if not run_budget.record_tool_call():
+                            overflow = True
+                    if overflow:
+                        failure = budget_failure_generation_failure(
+                            run_budget.failure
+                        )
+                        terminal_content = failure.user_message if failure else ""
+                        return NativeRunResult(
+                            final_output=terminal_content,
+                            messages=list(chat_messages),
+                            tool_calls=list(tool_records),
+                            usage_records=list(usage_records),
+                            context_snapshots=list(context_snapshots),
+                            generation_failure=failure,
+                            stopped_reason=(
+                                run_budget.failure.code
+                                if run_budget.failure
+                                else "run_budget_exceeded:tool_calls"
+                            ),
+                        )
             if provider_terminal["state"] in {"incomplete", "interrupted"}:
                 content = str(self.privacy_gateway.restore_aliases(content))
                 failure = classify_generation_error(
@@ -3163,6 +3813,74 @@ class AgentTurnRunner:
                 tool_name = _responses_call_name(function_call)
                 observable_name = observable_tool_name(tool_registry, tool_name)
                 provider_call_id = _responses_call_id(function_call)
+                run_budget = get_agent_run_budget(self, config=self.config)
+                if run_budget is not None and not run_budget.record_tool_call():
+                    run_budget.count_unexecuted_tool_calls(
+                        len(function_calls) - function_call_index - 1
+                    )
+                    budget_failure = run_budget.failure
+                    failure = budget_failure_generation_failure(budget_failure)
+                    terminal_content = failure.user_message if failure else ""
+                    await _emit(
+                        stream_callback,
+                        "tool_end",
+                        {
+                            "tool": "run_budget_exceeded",
+                            "tool_call_id": "run_budget_exceeded_tool_calls",
+                            "tool_args": {},
+                            "tool_result": {
+                                "tool": "run_budget_exceeded",
+                                "tool_call_id": "run_budget_exceeded_tool_calls",
+                                "arguments": {},
+                                "output": json.dumps(
+                                    {
+                                        "success": False,
+                                        "error_code": (
+                                            budget_failure.code
+                                            if budget_failure
+                                            else "run_budget_exceeded:tool_calls"
+                                        ),
+                                        "budget_exceeded": (
+                                            budget_failure.to_dict()
+                                            if budget_failure
+                                            else {}
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                ),
+                                "error": (
+                                    budget_failure.code
+                                    if budget_failure
+                                    else "run_budget_exceeded:tool_calls"
+                                ),
+                                "success": False,
+                                "executed": False,
+                                "synthetic": True,
+                            },
+                            "message": "Run全体のツール呼び出し上限に達しました",
+                            "executed": False,
+                            "synthetic": True,
+                        },
+                    )
+                    await _emit(
+                        stream_callback,
+                        "stream_end",
+                        {"content": terminal_content},
+                    )
+                    return NativeRunResult(
+                        final_output=terminal_content,
+                        messages=list(chat_messages),
+                        tool_calls=list(tool_records),
+                        usage_records=list(usage_records),
+                        context_snapshots=list(context_snapshots),
+                        generation_failure=failure,
+                        stopped_reason=(
+                            budget_failure.code
+                            if budget_failure
+                            else "run_budget_exceeded:tool_calls"
+                        ),
+                    )
                 call_id = (
                     approved_directive.call_id
                     if approved_directive is not None
@@ -3306,6 +4024,28 @@ class AgentTurnRunner:
                     if tool_turn_terminal:
                         terminal_reason = tool_result.terminal_reason
                         terminal_status_message = tool_result.status_message
+                    if run_budget is not None:
+                        run_budget.record_tool_outcome(
+                            observable_name,
+                            bool(execution_success),
+                        )
+                        circuit_failure = run_budget.failure
+                        if (
+                            getattr(circuit_failure, "kind", "")
+                            == "tool_failure_circuit_open"
+                        ):
+                            if tool_generation_failure is None:
+                                tool_generation_failure = (
+                                    budget_failure_generation_failure(
+                                        circuit_failure
+                                    )
+                                )
+                            terminal_reason = "tool_failure_circuit_open"
+                            terminal_status_message = (
+                                tool_generation_failure.user_message
+                                if tool_generation_failure is not None
+                                else "ツールの連続失敗を検出したため停止しました"
+                            )
                     audit_args = _observable_tool_arguments(
                         tool_registry,
                         tool_name,
@@ -3448,6 +4188,10 @@ class AgentTurnRunner:
                             or "ツール実行を停止しました"
                         )
                     skip_reason = _native_terminal_skip_reason(terminal_reason)
+                    if run_budget is not None:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(function_calls) - function_call_index - 1
+                        )
                     for skipped in function_calls[function_call_index + 1 :]:
                         skipped_id = _responses_call_id(skipped)
                         skipped_name = observable_tool_name(
@@ -3503,6 +4247,10 @@ class AgentTurnRunner:
                     and (state := get_current_planning_run_state()) is not None
                     and state.phase == PlanningRunPhase.EXECUTING
                 ):
+                    if run_budget is not None:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(function_calls) - function_call_index - 1
+                        )
                     for skipped in function_calls[function_call_index + 1 :]:
                         await _record_native_responses_skipped_call(
                             stream_callback=stream_callback,
@@ -3517,9 +4265,36 @@ class AgentTurnRunner:
                         )
                     break
 
+                if (
+                    tool_result_completion_check is not None
+                    and tool_executed and not tool_synthetic and execution_success
+                    and not hard_stop and not terminal_reason
+                    and terminal_generation_failure is None
+                    and tool_generation_failure is None
+                ):
+                    completion_ack = tool_result_completion_check(tool_records[-1])
+                    if completion_ack:
+                        if run_budget is not None:
+                            run_budget.count_unexecuted_tool_calls(
+                                len(function_calls) - function_call_index - 1
+                            )
+                        for skipped in function_calls[function_call_index + 1 :]:
+                            await _record_native_responses_skipped_call(
+                                stream_callback=stream_callback, tool_records=tool_records,
+                                input_items=input_items, stateless_input_items=stateless_input_items,
+                                chat_messages=chat_messages, registry=tool_registry, skipped=skipped,
+                                reason="workflow_complete", message="ワークフローは受理済みです。",
+                            )
+                        final_output = completion_ack
+                        break
+
                 if hard_stop or authoritative_task_complete:
                     if terminal_generation_failure is not None or terminal_reason:
                         break
+                    if run_budget is not None:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(function_calls) - function_call_index - 1
+                        )
                     for skipped in function_calls[function_call_index + 1 :]:
                         skipped_output = {
                             "type": "function_call_output",
@@ -3542,8 +4317,19 @@ class AgentTurnRunner:
 
             if round_index == 0 and current_tool_choice == "required":
                 current_tool_choice = "auto"
-            if hard_stop:
+            if hard_stop or completion_ack:
                 break
+
+        if completion_ack and terminal_generation_failure is None and not terminal_reason:
+            await _emit(stream_callback, "stream_token", {"content": completion_ack})
+            await _emit(stream_callback, "stream_end", {"content": completion_ack})
+            return NativeRunResult(
+                final_output=completion_ack,
+                messages=[*chat_messages, {"role": "assistant", "content": completion_ack}],
+                tool_calls=list(tool_records), usage_records=list(usage_records),
+                context_snapshots=list(context_snapshots), provider_terminal=provider_terminal,
+                stopped_reason="final",
+            )
 
         if terminal_generation_failure is not None or terminal_reason:
             terminal_output = str(
@@ -3914,6 +4700,16 @@ def _sanitize_transport_diagnostic(
     proxy_mode = str(raw.get("proxy_mode") or "").strip().casefold()
     if proxy_mode == "sdk_environment":
         result["proxy_mode"] = proxy_mode
+    elif proxy_mode == "explicit_no_proxy":
+        # This describes the constructed HTTPX client, not environment
+        # proxy configuration or evidence that any request was sent.
+        result["proxy_mode"] = proxy_mode
+        result["proxy_configured"] = False
+        result["proxy_bypassed"] = True
+        client_type = str(raw.get("client_type") or "").strip()
+        if client_type in {"OpenAI", "AsyncOpenAI"}:
+            result["client_type"] = client_type
+        return result
 
     proxy_source = str(raw.get("proxy_source") or "").strip().casefold()
     if proxy_source in {"http_proxy", "https_proxy", "all_proxy"}:
@@ -3928,7 +4724,7 @@ def _sanitize_transport_diagnostic(
 
 
 def openai_transport_diagnostic(client: Any) -> dict[str, Any]:
-    """Return the secret-free transport observation for a constructed client."""
+    """Return safe configured-client transport facts, not proof of a request."""
 
     stored = getattr(client, "_aoitalk_transport_diagnostic", None)
     if isinstance(stored, dict):
@@ -3949,23 +4745,58 @@ def create_async_openai_client(
     base_url: Optional[str] = None,
     default_headers: Optional[dict[str, str]] = None,
     http_client: Any | None = None,
+    provider_key_attribution_enabled: bool = False,
 ) -> AsyncOpenAI:
     # The privacy gateway owns retry/review semantics for every model
     # request.  Disable the SDK's implicit retries so a reviewed payload is
     # never replayed behind the gateway's back.
+    owns_http_client = http_client is None
+    if owns_http_client:
+        # Use the SDK-supported client class so its timeout and redirect
+        # defaults remain intact; only the idle keep-alive lifetime changes.
+        http_client = DefaultAsyncHttpxClient(
+            limits=httpx.Limits(
+                max_connections=OPENAI_MAX_CONNECTIONS,
+                max_keepalive_connections=OPENAI_MAX_KEEPALIVE_CONNECTIONS,
+                keepalive_expiry=OPENAI_KEEPALIVE_EXPIRY_SECONDS,
+            )
+        )
     kwargs: dict[str, Any] = {
         "api_key": api_key or os.getenv("OPENAI_API_KEY"),
-        "max_retries": 0,
+        "max_retries": OPENAI_SDK_MAX_RETRIES,
     }
     if base_url:
         kwargs["base_url"] = base_url
     if default_headers:
         kwargs["default_headers"] = default_headers
-    if http_client is not None:
-        # Tests and local transport adapters may inject an already configured
-        # async HTTP client.  Production callers keep the SDK-owned transport.
-        kwargs["http_client"] = http_client
+    # Tests and local transport adapters may inject an already configured async
+    # HTTP client; otherwise pass our SDK-supported owned client explicitly.
+    kwargs["http_client"] = http_client
     client = AsyncOpenAI(**kwargs)
+    try:
+        # The SDK-owned HTTPX transport uses AsyncHTTPTransport(retries=0).
+        # Custom injected clients do not carry that proof contract.
+        client._aoitalk_httpx_transport_retries = 0 if owns_http_client else None
+    except Exception:
+        pass
+    try:
+        if provider_key_attribution_enabled:
+            from urllib.parse import urlsplit
+
+            from ..services.provider_key_attribution_service import (
+                prepare_provider_key_identity,
+            )
+
+            endpoint = str(getattr(client, "base_url", "") or "")
+            if urlsplit(endpoint).hostname == "api.openai.com":
+                identity = prepare_provider_key_identity(getattr(client, "api_key", None))
+            else:
+                identity = None
+            if identity:
+                setattr(client, "_aoitalk_provider_key_identity", identity)
+    except Exception:
+        # Attribution must never prevent a provider client from being created.
+        pass
     diagnostic = _sanitize_transport_diagnostic(
         _environment_proxy_diagnostic(
             getattr(client, "base_url", None)
@@ -4003,6 +4834,7 @@ async def run_native_agent_once(
             api_key=api_key,
             base_url=base_url,
             default_headers=default_headers,
+            provider_key_attribution_enabled=provider_label == "openai",
         ),
         provider_label=provider_label,
         config=config,
@@ -4054,16 +4886,46 @@ def _resolve_runtime_tools(
     # ``AgentTurnRunner`` is also a public low-level entrypoint.  Do not rely
     # solely on TerminalMode/tool-exposure filtering: a direct Help caller can
     # supply a static AgentDefinition containing arbitrary mutation tools.
-    # The trusted controller scope is always tool-free, including resolver
-    # failure paths where the normal compatibility fallback would reuse those
-    # static definitions.
+    # Trusted controller scopes stay tool-free unless their server boundary
+    # explicitly binds a native allowlist alongside the strict execution
+    # allowlist.  This is used by pinned background Work adapters that need a
+    # small, validated tool surface while continuing to suppress chat context.
+    suppress_automatic_context = False
     try:
         from ..services.turn_context import get_turn_context
 
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            return []
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            from .tool_exposure import (
+                get_strict_tool_allowlist,
+                get_suppressed_native_tool_allowlist,
+            )
+
+            controller_allowlist = get_suppressed_native_tool_allowlist()
+            strict_allowlist = get_strict_tool_allowlist()
+            if controller_allowlist is None or strict_allowlist is None:
+                return []
+            allowed = controller_allowlist & strict_allowlist
+            if not allowed:
+                return []
+            candidates = (
+                tools_provider(agent)
+                if tools_provider is not None
+                else agent.tools
+            )
+            definitions = [ensure_tool_definition(tool) for tool in candidates]
+            return [tool for tool in definitions if tool.name in allowed]
     except Exception:
-        pass
+        # A suppressed controller scope must not fall through to its static
+        # tool list if the explicit bounded resolver is unavailable.
+        if suppress_automatic_context:
+            logger.warning(
+                "suppressed native controller tool resolution failed closed",
+                exc_info=True,
+            )
+            return []
     if tools_provider is None:
         return list(agent.tools)
     try:

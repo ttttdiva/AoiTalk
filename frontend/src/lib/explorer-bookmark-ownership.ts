@@ -499,19 +499,17 @@ export type ExplorerBookmarkProjectionContext =
     scopeRoot?: string | null;
     filerTab?: "workspace" | "user" | string;
     includePersonalAbsolute?: boolean;
+    /** Allow an authorized admin view to show personal paths outside the active Files scope. */
+    includePersonalUnscoped?: boolean;
     includeEmptyFolders?: boolean;
     /** Additional owner whose otherwise-unprojected folders belong in the current view. */
     emptyFolderOwner?: ExplorerBookmarkOwner | BookmarkOwnerLike;
   };
 
-function pathWithinRoot(path: string, root: string): boolean {
-  if (!path || !root) return false;
-  const normalizedPath = normalizePath(path).replace(/\/+$/g, "");
-  const normalizedRoot = normalizePath(root).replace(/\/+$/g, "");
-  return (
-    normalizedPath === normalizedRoot ||
-    normalizedPath.startsWith(`${normalizedRoot}/`)
-  );
+function isSafeRelativeReference(path: string): boolean {
+  const parts = path.replace(/\\/g, "/").split("/");
+  return Boolean(path && !isAbsolutePathText(path) && !path.toLowerCase().startsWith("remote://") &&
+    parts.every((part) => part !== "." && part !== ".." && ![".git", ".trash"].includes(part.toLowerCase())));
 }
 
 function directPersonalProjectionEligible(
@@ -519,37 +517,28 @@ function directPersonalProjectionEligible(
   context: ExplorerBookmarkProjectionContext,
 ): boolean {
   const path = item.path?.trim() ?? "";
-  const classification = classifyBookmarkTarget(path, context);
-  if (classification.kind !== "personal") return false;
-  if (classification.reason === "absolute") {
+  if (isAbsolutePathText(path)) {
     // Absolute targets are local Files entries.  They may be projected into
     // Workspace/User views (including while a shared Project is selected).
     return context.includePersonalAbsolute !== false &&
       (!context.filerTab || context.filerTab === "workspace" || context.filerTab === "user");
   }
-  if (classification.reason === "user") {
-    if (context.filerTab && context.filerTab !== "user") return false;
-    return context.scopeRoot ? pathWithinRoot(path, context.scopeRoot) : true;
-  }
-  return false;
+  // Personal rows were fetched for this principal; opening still rechecks the
+  // target's Files authorization, independent of the selected Space.
+  return isSafeRelativeReference(path);
 }
 
 function directSharedProjectionEligible(
   item: ProjectionOwnerItem,
   owner: ExplorerBookmarkOwner,
-  context: ExplorerBookmarkProjectionContext,
 ): boolean {
   if (owner.scope !== "shared") return false;
   const itemOwner = bookmarkOwnerFromItem(item, owner);
   if (!sameBookmarkOwner(itemOwner, owner)) return false;
-  const classification = classifyBookmarkTarget(item.path, {
-    ...context,
-    owner,
-  });
-  return (
-    classification.kind === "shared" &&
-    sameBookmarkOwner(classification.owner, owner)
-  );
+  // The shared collection endpoint filters every reference for this reader.
+  // Reject malformed legacy projections locally as well.
+  const path = item.path?.trim() ?? "";
+  return isSafeRelativeReference(path);
 }
 
 /**
@@ -602,7 +591,7 @@ export function projectExplorerBookmarks(
       ? activeOwner.scope === "shared"
         ? directPersonalProjectionEligible(item, options)
         : directPersonalProjectionEligible(item, options)
-      : directSharedProjectionEligible(item, activeOwner, options);
+      : directSharedProjectionEligible(item, activeOwner);
     if (eligible) {
       visible.add(item);
       if (item.id) directIds.add(item.id);

@@ -163,13 +163,12 @@ def _resolve_shortcut(lnk_path: Path) -> Optional[Path]:
 
 
 def get_root_dir() -> Path:
-    """Get the workspace root directory (user_files)"""
+    """Resolve the workspace root directory without creating it."""
     override = _WORKSPACE_ROOT_OVERRIDE.get()
     files_dir = override or Path(
         os.environ.get("AOITALK_WORKSPACES_DIR", "./workspaces")
     )
     path = Path(files_dir)
-    path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
 
 
@@ -183,7 +182,6 @@ def workspace_root_context(root: Path | str):
     """
 
     selected = Path(root).expanduser().resolve()
-    selected.mkdir(parents=True, exist_ok=True)
     token = _WORKSPACE_ROOT_OVERRIDE.set(selected)
     try:
         yield selected
@@ -905,19 +903,27 @@ def list_directory(path: str = "", is_admin: bool = False) -> Dict[str, Any]:
     if not valid:
         return {"success": False, "error": "無効なパスです"}
 
+    root = get_root_dir()
     if not target.exists():
-        # ワークスペース内のパスなら自動作成して空ディレクトリを返す（初回アクセス時）
-        root = get_root_dir()
-        try:
-            target.relative_to(root)
-            target.mkdir(parents=True, exist_ok=True)
-        except (ValueError, OSError):
-            return {"success": False, "error": f"パス「{path}」が見つかりません"}
+        if target == root:
+            parent_path = (
+                str(root.parent).replace("\\", "/") if is_admin else None
+            )
+            return {
+                "success": True,
+                "current_path": "",
+                "parent_path": parent_path,
+                "can_go_up": is_admin,
+                "directories": [],
+                "files": [],
+                "total_items": 0,
+                "is_admin_mode": is_admin,
+            }
+        return {"success": False, "error": f"パス「{path}」が見つかりません"}
 
     if not target.is_dir():
         return {"success": False, "error": "指定されたパスはディレクトリではありません"}
 
-    root = get_root_dir()
     directories: List[Dict[str, Any]] = []
     files: List[Dict[str, Any]] = []
 
@@ -4036,10 +4042,23 @@ def get_directory_tree(max_depth: int = 3, root_path: str = "") -> Dict[str, Any
         actual_root, valid = _resolve_path(root_path, is_admin=False)
         if not valid:
             return {"success": False, "error": "Invalid workspace path."}
-        if not actual_root.exists():
-            actual_root.mkdir(parents=True, exist_ok=True)
     else:
         actual_root = workspace_root
+
+    if not actual_root.exists():
+        if actual_root == workspace_root:
+            return {
+                "success": True,
+                "tree": {
+                    "name": "Workspace",
+                    "path": "",
+                    "type": "directory",
+                    "children": [],
+                },
+            }
+        return {"success": False, "error": "Path is not an existing directory."}
+    if not actual_root.is_dir():
+        return {"success": False, "error": "Path is not an existing directory."}
 
     def build_tree(path: Path, depth: int = 0) -> Dict[str, Any]:
         if depth > max_depth:

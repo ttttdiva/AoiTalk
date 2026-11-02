@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from ...uuid_http import parse_uuid_or_400
@@ -22,6 +23,14 @@ from ....services.task_management_service import TaskManagementError
 from ._shared import TaskRouterContext, _parse_browse_scope
 
 logger = logging.getLogger(__name__)
+
+
+class TaskAttachmentLookupResponse(BaseModel):
+    attachment_id: str
+    task_id: str
+    project_id: str
+    display_name: str
+    url: str
 
 
 def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
@@ -40,6 +49,79 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
     _unique_target_path = ctx.unique_target_path
     _write_unique_target_file = ctx.write_unique_target_file
     _attachment_kind = ctx.attachment_kind
+
+    @router.get(
+        "/task-attachments/{attachment_id}",
+        response_model=TaskAttachmentLookupResponse,
+    )
+    async def lookup_task_attachment(
+        attachment_id: str,
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id, _ = await _get_current_user(request)
+        attachment_uuid = parse_uuid_or_400(attachment_id, "attachment_id")
+        session = await get_db_manager().get_session()
+        try:
+            result = await session.execute(
+                select(TaskAttachment).where(TaskAttachment.id == attachment_uuid)
+            )
+            attachment = result.scalar_one_or_none()
+            if attachment is None:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+
+            try:
+                task = await _load_task_for_attachment(
+                    session,
+                    user_id=user_id,
+                    task_id=str(attachment.task_id),
+                    permission="read",
+                )
+            except TaskManagementError as exc:
+                if exc.status_code in {403, 404}:
+                    raise HTTPException(
+                        status_code=404, detail="Attachment not found"
+                    ) from exc
+                raise _translate_service_error(exc)
+
+            if task is None or task.project_id != attachment.project_id:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            scoped_project_ids = None
+            if browse_project_id is not None or browse_space_id is not None:
+                try:
+                    scoped_project_ids = await service.resolve_browse_project_ids(
+                        session,
+                        user_id=user_id,
+                        browse_project_id=browse_project_id,
+                        browse_space_id=browse_space_id,
+                    )
+                except TaskManagementError as exc:
+                    if exc.status_code in {403, 404}:
+                        raise HTTPException(
+                            status_code=404, detail="Attachment not found"
+                        ) from exc
+                    raise _translate_service_error(exc)
+            if scoped_project_ids is not None and task.project_id not in scoped_project_ids:
+                raise HTTPException(status_code=404, detail="Attachment not found")
+
+            task_id = str(task.id)
+            return TaskAttachmentLookupResponse(
+                attachment_id=str(attachment.id),
+                task_id=task_id,
+                project_id=str(task.project_id),
+                display_name=attachment.display_name,
+                url=f"/api/tasks/{task_id}/attachments/{attachment.id}",
+            )
+        except TaskManagementError as exc:
+            if exc.status_code in {403, 404}:
+                raise HTTPException(
+                    status_code=404, detail="Attachment not found"
+                ) from exc
+            raise _translate_service_error(exc)
+        finally:
+            await session.close()
 
     @router.post("/tasks/{task_id}/agent-triage")
     async def run_task_agent_triage(

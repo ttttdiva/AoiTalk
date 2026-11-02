@@ -5,10 +5,7 @@ const MAIN_ROUTE = { provider: "mock", model: "mock-model" } as const;
 const MESSAGE = "新規通常チャットの回復確認";
 
 const EMPTY_SETTINGS = {
-  agent_team_selection: { mode: "auto", team_id: "", loaded_team_ids: [] },
   main_route: {},
-  special_routing: {},
-  execution_profile_id: "",
 };
 
 const CREATED_SESSION = {
@@ -92,14 +89,6 @@ async function installRecoveryFixture(
 
   await page.route("**/api/python-proxy/characters", async (route) => {
     await route.fulfill({ json: { characters: ["aoi"], current: "aoi" } });
-  });
-  await page.route("**/api/python-proxy/agent-team/config", async (route) => {
-    await route.fulfill({ json: { teams: {} } });
-  });
-  await page.route("**/api/python-proxy/llm/execution-profiles", async (route) => {
-    await route.fulfill({
-      json: { active_profile_id: "manual", profiles: [], effective_main: MAIN_ROUTE },
-    });
   });
   await page.route(
     "**/api/python-proxy/llm/new-chat-defaults",

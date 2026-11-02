@@ -39,6 +39,17 @@ class BridgeReply(BaseModel):
 
 def register_pc_bridge_routes(app: FastAPI, server) -> None:
     hub = get_pc_bridge_hub()
+
+    def remote_enabled():
+        return server.config.get("pc_bridge.remote_enabled", False) is True
+
+    # Read by resolve_control_bridge: other PCs are only a target while this is on.
+    hub.remote_control_enabled = remote_enabled
+
+    def require_remote_enabled():
+        if not remote_enabled():
+            raise HTTPException(status_code=403, detail="pc_bridge_remote_disabled")
+
     def dedicated_enabled():
         from ...services.browser_agent_models import BrowserAgentSettings
         try:
@@ -56,10 +67,12 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
 
     @app.get('/api/pc-bridge/devices', response_model=BridgeReply, operation_id='pc_bridge_list_devices')
     async def devices(request: Request):
+        require_remote_enabled()
         return BridgeReply(result=await hub.devices(await owner(request)))
 
     @app.post('/api/pc-bridge/devices', response_model=BridgeReply, operation_id='pc_bridge_register_device')
     async def register(body: BridgeRegistration, request: Request):
+        require_remote_enabled()
         try:
             result = await hub.store.register(await owner(request), body.name.strip(),
                                               body.machine_id.strip() if body.machine_id else None)
@@ -69,6 +82,7 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
 
     @app.put('/api/pc-bridge/selection', response_model=BridgeReply, operation_id='pc_bridge_select_device')
     async def select(body: BridgeSelection, request: Request):
+        require_remote_enabled()
         user_id = await owner(request)
         if body.session_id and not await server._websocket_session_allowed(body.session_id, user_id):
             raise HTTPException(403, 'Conversation access denied')
@@ -80,6 +94,7 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
 
     @app.delete('/api/pc-bridge/devices/{device_id}', response_model=BridgeReply, operation_id='pc_bridge_revoke_device')
     async def revoke(device_id: str, request: Request):
+        require_remote_enabled()
         try:
             await hub.revoke(await owner(request), device_id)
         except PcBridgeError as exc:
@@ -88,6 +103,7 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
 
     @app.post('/api/pc-bridge/devices/{device_id}/command', response_model=BridgeReply, operation_id='pc_bridge_command')
     async def command(device_id: str, body: BridgeCommand, request: Request):
+        require_remote_enabled()
         user_id = await owner(request)
         if body.channel == 'browser' and body.action.startswith('media_prepare_'):
             raise HTTPException(403, 'media preparation requires an approved MediaAction')
@@ -101,6 +117,7 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
     @app.get('/api/pc-bridge/devices/{device_id}/screen', operation_id='pc_bridge_screenshot',
              responses={200: {'content': {'image/jpeg': {}}}})
     async def screenshot(device_id: str, request: Request):
+        require_remote_enabled()
         user_id = await owner(request)
         try:
             await hub.store.resolve(user_id, device_id)
@@ -113,6 +130,7 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
     @app.get('/api/pc-bridge/download', operation_id='pc_bridge_download')
     async def download(request: Request):
         from pathlib import Path
+        require_remote_enabled()
         await owner(request)
         binary = Path(__file__).resolve().parents[3] / 'AoiTalk-PC-Bridge.exe'
         if not binary.is_file():
@@ -124,6 +142,9 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
         import asyncio
         connection = None
         try:
+            if server.config.get('pc_bridge.remote_enabled', False) is not True:
+                await socket.close(code=4403, reason='pc_bridge_remote_disabled')
+                return
             header = socket.headers.get('authorization', '')
             if not header.startswith('Bearer '):
                 await socket.close(code=4401)
@@ -143,6 +164,9 @@ def register_pc_bridge_routes(app: FastAPI, server) -> None:
                         or not isinstance(hello.get('boot_id'), str) or not hello.get('boot_id')):
                     await socket.close(code=4403)
                     return
+            if server.config.get('pc_bridge.remote_enabled', False) is not True:
+                await socket.close(code=4403, reason='pc_bridge_remote_disabled')
+                return
             connection = hub.attach(user_id, device['id'], socket, hello)
             ready = {'type': 'ready', 'device_id': device['id'], 'name': device['name'],
                      'connection_epoch': connection.epoch}

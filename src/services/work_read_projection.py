@@ -937,7 +937,11 @@ class WorkReadProjectionService:
                 if row.agent_revision_id
                 else None,
                 agent_display_name=None,
-                acting_subagent_id=code(row.acting_subagent_id),
+                legacy=(
+                    {"acting_subagent_id": code(row.acting_subagent_id)}
+                    if row.acting_subagent_id
+                    else None
+                ),
                 work_item_attempt=row.work_item_attempt,
                 started_at=iso(row.started_at),
                 ended_at=iso(row.ended_at),

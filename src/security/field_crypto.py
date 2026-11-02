@@ -43,7 +43,7 @@ _KEY_FILE_MODE_ERROR = (
     "rotate the key file before retrying"
 )
 _SENSITIVE_KEY_RE = re.compile(
-    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|credential|client[_-]?secret|pass)",
+    r"((?:api|admin)[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|credential|client[_-]?secret|pass)",
     re.IGNORECASE,
 )
 
@@ -120,12 +120,21 @@ def _close_key_provider_stdout(
 
 
 def _run_key_provider(command: Any, *, shell: bool, provider: str) -> bytes:
+    # Enterprise startup may invoke the field-key provider before the normal
+    # application config has moved OPENAI_ADMIN_KEY out of os.environ.  Keep
+    # that Usage API credential out of every helper subprocess as defense in
+    # depth; the AoiTalk parent retains it for the fixed Usage API client.
+    child_env = dict(os.environ)
+    for name in tuple(child_env):
+        if str(name).upper() in {"OPENAI_ADMIN_KEY", "OPENAI_ADMIN_KEY_FILE"}:
+            child_env.pop(name, None)
     try:
         process = subprocess.Popen(
             command,
             shell=shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=child_env,
         )
     except OSError:
         raise FieldCryptoError(f"{provider} failed") from None

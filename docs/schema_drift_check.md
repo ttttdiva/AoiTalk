@@ -46,9 +46,9 @@ venv\Scripts\python.exe scripts\check_schema_drift.py
 
 実 DB を手作業で直して Alembic history との不一致を残さないでください。
 
-## CI
+## ローカル検証
 
-`.github/workflows/ci.yml` の schema-drift 系 job が、空の PostgreSQL service に migration を適用したうえで checker を実行します。job 名や package 数をこの文書へ固定せず、workflow file を正本とします。
+`scripts/run_canonical_verification.ps1` の手動フル検証は、一時 PostgreSQL に migration を適用し checker と PostgreSQL 統合テストを実行します。通常は変更範囲に応じて本書の手順で検証します。
 
 通常の変更では AGENTS.md に従って local targeted verification → `main` push → リモートSHA確認を行います。GitHub Actions / CI の完了は待たず、成功を完了条件にしません。`scripts/run_canonical_verification.ps1` は手動専用の用途に限定します。
 

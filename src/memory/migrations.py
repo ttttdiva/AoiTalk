@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import uuid
+import logging
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import and_, create_engine, or_, select
+from sqlalchemy import and_, create_engine, or_, select, text
 from sqlalchemy.orm import Session
 
 from ..models.ecc_models import Character
@@ -20,6 +21,121 @@ from .config import postgres_search_path
 
 _startup_timer = get_startup_timer()
 _UNSET_SCHEMA = object()
+_logger = logging.getLogger(__name__)
+_P5_STARTUP_ADVISORY_LOCK_KEY = 0x414F49545035  # stable ``AOITP5`` namespace
+
+
+def _run_agent_runtime_p5_migration(
+    sync_database_url: str,
+    *,
+    postgres_schema: str | None | object = _UNSET_SCHEMA,
+) -> None:
+    """Run the P5 legacy-reference preservation pass after Alembic is ready.
+
+    This is deliberately a startup application migration rather than an
+    Alembic data migration: it needs the current Agent/Run/Work models. The P5
+    pass counts unfinished rows pinned to legacy revisions and preserves their
+    references, statuses, payloads, and event history.
+    """
+
+    from ..app_config_store import (
+        AGENT_RUNTIME_REMOVAL_SCHEMA_VERSION,
+        GLOBAL_CONFIG_KEY,
+        _config_schema_version,
+        _migrate_app_config_value,
+    )
+    from ..config_defaults import load_default_config
+    from .models import AppConfigSetting
+    from ..security.field_crypto import (
+        decrypt_json_secret_leaves,
+        encrypt_json_secret_leaves,
+    )
+    from ..services.agent_runtime_p5_migration import (
+        AgentRuntimeMigrationReport,
+        migrate_legacy_agent_runtime_references,
+    )
+
+    engine = create_engine(
+        sync_database_url,
+        pool_pre_ping=True,
+        connect_args=_schema_connect_args(postgres_schema),
+    )
+    try:
+        with Session(engine) as session:
+            # ``FOR UPDATE`` cannot lock a missing singleton row.  Serialize
+            # the first-start path on PostgreSQL; transaction advisory locks
+            # release automatically on commit/rollback.  SQLite test sessions
+            # deliberately skip this PostgreSQL-only statement.
+            session_bind = getattr(session, "bind", None)
+            dialect_name = getattr(
+                getattr(session_bind, "dialect", None), "name", None
+            )
+            if dialect_name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": _P5_STARTUP_ADVISORY_LOCK_KEY},
+                )
+            row = session.execute(
+                select(AppConfigSetting)
+                .where(AppConfigSetting.key == GLOBAL_CONFIG_KEY)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                # A missing config row is treated as pre-P5.  Seed the current
+                # schema marker in this transaction before repairing any old
+                # Work/Run references.
+                config = _migrate_app_config_value(load_default_config())
+                row = AppConfigSetting(
+                    key=GLOBAL_CONFIG_KEY,
+                    value=encrypt_json_secret_leaves(
+                        config,
+                        aad_prefix="app_config_settings.value",
+                    ),
+                )
+                session.add(row)
+                should_migrate = True
+                schema_version = 0
+            else:
+                stored_value = row.value if isinstance(row.value, dict) else {}
+                decrypted = decrypt_json_secret_leaves(
+                    stored_value,
+                    aad_prefix="app_config_settings.value",
+                )
+                config = decrypted if isinstance(decrypted, dict) else {}
+                schema_version = _config_schema_version(config)
+                should_migrate = schema_version < AGENT_RUNTIME_REMOVAL_SCHEMA_VERSION
+                if should_migrate:
+                    config = _migrate_app_config_value(config)
+                    row.value = encrypt_json_secret_leaves(
+                        config,
+                        aad_prefix="app_config_settings.value",
+                    )
+
+            if should_migrate:
+                report = migrate_legacy_agent_runtime_references(session)
+            else:
+                report = AgentRuntimeMigrationReport()
+                _logger.info(
+                    "P5 Agent runtime migration skipped: app_config_schema_version=%s",
+                    schema_version,
+                )
+            session.commit()
+    except Exception as exc:
+        _logger.error(
+            "P5 Agent runtime startup migration failed: exception_type=%s",
+            type(exc).__name__,
+        )
+        raise
+    finally:
+        engine.dispose()
+
+    if should_migrate:
+        _logger.info(
+            "P5 Agent runtime migration preserved unfinished legacy "
+            "references: work_items=%s runs=%s",
+            report.preserved_work_items,
+            report.preserved_runs,
+        )
 
 
 def _schema_connect_args(postgres_schema: object = _UNSET_SCHEMA) -> dict[str, str]:
@@ -92,6 +208,11 @@ def run_migrations(
         )
     with _startup_timer.phase("startup.database.migrations.default_character"):
         _ensure_default_character(sync_database_url, postgres_schema=resolved_schema)
+    with _startup_timer.phase("startup.database.migrations.agent_runtime_p5"):
+        _run_agent_runtime_p5_migration(
+            sync_database_url,
+            postgres_schema=resolved_schema,
+        )
     return True
 
 

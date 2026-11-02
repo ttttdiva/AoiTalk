@@ -3,9 +3,9 @@ import { employeeRequest, employeeScopeRequest, type Employee, type EmployeeCata
 import type { BrandPortfolio } from "./media-brand-portfolio-api";
 
 type S = components["schemas"];
-export type OrganizationEntry = Pick<S["OrganizationSetupEmployee"], "key" | "display_name"> & Partial<Omit<S["OrganizationSetupEmployee"], "key" | "display_name">>;
+export type OrganizationEntry = Pick<S["OrganizationSetupEmployee"], "key" | "display_name"> & Partial<Omit<S["OrganizationSetupEmployee"], "key" | "display_name" | "revision">> & { revision?: Record<string, unknown> | null };
 export type OrganizationManifest = { employees: OrganizationEntry[] };
-export type OrganizationNode = { agent: Employee; organization_profile: Record<string, unknown> | null; revision: Record<string, unknown> | null };
+export type OrganizationNode = { agent: Omit<Employee, "slug"> & { slug: string | null }; organization_profile: Record<string, unknown> | null; revision: Record<string, unknown> | null };
 export type OrganizationGraph = { success: true; nodes: OrganizationNode[]; edges: Record<string, string>[] };
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const identifier = (value: unknown) => typeof value === "string" && /^[a-z0-9][a-z0-9_.-]{0,99}$/.test(value);
@@ -20,7 +20,7 @@ export const employeeOrganizationApi = {
   },
   async graph(): Promise<OrganizationGraph> {
     const value = await employeeRequest<S["OrganizationGraphResponse"]>("/api/agent-organization");
-    if (value?.success !== true || !Array.isArray(value.nodes) || !Array.isArray(value.edges) || value.nodes.some(n => !object(n.agent) || typeof n.agent.id !== "string" || typeof n.agent.display_name !== "string" || typeof n.agent.slug !== "string" || typeof n.agent.state !== "string" || n.organization_profile != null && !object(n.organization_profile) || n.revision != null && !object(n.revision))) throw new Error("組織の保存状態を照合できません。");
+    if (value?.success !== true || !Array.isArray(value.nodes) || !Array.isArray(value.edges) || value.nodes.some(n => !object(n.agent) || typeof n.agent.id !== "string" || !n.agent.id.trim() || typeof n.agent.display_name !== "string" || !n.agent.display_name.trim() || n.agent.slug !== null && typeof n.agent.slug !== "string" || typeof n.agent.state !== "string" || n.organization_profile != null && !object(n.organization_profile) || n.revision != null && !object(n.revision))) throw new Error("組織の保存状態を照合できません。");
     return value as OrganizationGraph;
   },
   setup: (body: OrganizationManifest) => employeeRequest<S["OrganizationSetupResponse"]>("/api/agent-organization/setup", "POST", body),
@@ -31,8 +31,10 @@ export function parseOrganizationManifest(raw: string, graph: OrganizationGraph,
   let value: unknown;
   try { value = JSON.parse(raw); } catch { throw new Error("設定内容をJSON形式で入力してください。"); }
   if (!object(value) || Object.keys(value).some(k => k !== "employees") || !Array.isArray(value.employees) || value.employees.length < 1 || value.employees.length > 64) throw new Error("employeesには1〜64人の設定を指定してください。Project・grant・credentialはこの保存の対象外です。");
+  const hasCredential = (v: unknown): boolean => Array.isArray(v) ? v.some(hasCredential) : object(v) && Object.entries(v).some(([k, item]) => /^(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|credential|authorization)$/i.test(k) || hasCredential(item));
+  if (hasCredential(value)) throw new Error("認証情報は組織設定に含められません。");
   const allowed = ["key", "agent_id", "slug", "display_name", "manager_key", "job_title", "responsibility_summary", "revision", "activate"];
-  const revisionKeys = ["agent_team_id", "execution_profile_id", "display_name", "mission", "operational_instructions", "responsibility_summary", "allowed_subagent_ids", "capability_ceiling", "budget_policy", "concurrency_policy", "wake_policy", "version", "content_hash", "idempotency_key"];
+  const revisionKeys = ["display_name", "mission", "operational_instructions", "responsibility_summary", "model_overrides", "tool_ids", "delegate_policy", "capability_ceiling", "budget_policy", "concurrency_policy", "wake_policy", "version", "content_hash", "idempotency_key"];
   const keys = new Set<string>(); const refs = new Set<string>();
   for (const entry of value.employees) {
     if (!object(entry) || Object.keys(entry).some(k => !allowed.includes(k)) || !identifier(entry.key) || typeof entry.display_name !== "string" || !entry.display_name.trim() || entry.display_name.length > 160 || (!entry.agent_id && !identifier(entry.slug)) || entry.agent_id != null && typeof entry.agent_id !== "string" || entry.slug != null && !identifier(entry.slug) || entry.activate != null && typeof entry.activate !== "boolean") throw new Error("Agentのkey・名前・既存IDまたはslugと正規の設定項目を確認してください。");
@@ -45,8 +47,10 @@ export function parseOrganizationManifest(raw: string, graph: OrganizationGraph,
     if (!reconcile && entry.activate === true && (!existing || existing.agent.state === "draft") && !existing?.revision && !entry.revision) throw new Error("draftの有効化には職務revisionが必要です。Agentの職務・モデルを先に設定してください。");
     if (entry.revision != null) {
       const revision = entry.revision;
-      if (!object(revision) || Object.keys(revision).some(k => !revisionKeys.includes(k)) || typeof revision.agent_team_id !== "string" || typeof revision.execution_profile_id !== "string" || !revision.execution_profile_id || !catalog.teams.some(t => t.team_id === revision.agent_team_id)) throw new Error("未設定Agentの職務には既存Teamと明示したProfileを指定してください。");
-      for (const key of ["capability_ceiling", "allowed_subagent_ids"]) if (revision[key] != null && (!Array.isArray(revision[key]) || revision[key].some(v => typeof v !== "string"))) throw new Error("職務の権限上限・担当subagentは文字列の配列で指定してください。");
+      if (!object(revision) || Object.keys(revision).some(k => !revisionKeys.includes(k))) throw new Error("職務の設定項目を確認してください。");
+      for (const key of ["capability_ceiling", "tool_ids"]) if (revision[key] != null && (!Array.isArray(revision[key]) || revision[key].some(v => typeof v !== "string"))) throw new Error("職務の権限上限・toolは文字列の配列で指定してください。");
+      if (revision.model_overrides != null && !object(revision.model_overrides)) throw new Error("役割ごとのモデル設定が不正です。");
+      if (revision.delegate_policy != null && !object(revision.delegate_policy)) throw new Error("委任方針が不正です。");
     }
   }
   const entries = value.employees as OrganizationEntry[];
@@ -92,12 +96,12 @@ async function digest(value: unknown): Promise<string> {
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 type PendingEmployee = { key: string; id?: string; slug?: string; name: string; state: string; agentHash?: string; revisionHash?: string; revisionFields?: Record<string, string>; profileFields: Record<string, string>; managerKey?: string | null };
-export type OrganizationPending = { version: 2; owner: string; manifestHash: string; employees: PendingEmployee[] };
+export type OrganizationPending = { version: 2; owner: string; manifestHash: string; body?: OrganizationManifest; employees: PendingEmployee[] };
 export const legacyOrganizationPendingKey = "aoitalk-employee-organization-setup-pending-v1";
 export const organizationPendingKey = (owner: string) => `aoitalk-employee-organization-setup-pending-v2:${owner}`;
 async function fields(value: Record<string, unknown>): Promise<Record<string, string>> { return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await digest(v)]))); }
 
-/** 永続記録には入力本文を残さず、owner・参照・保全条件と内容hashだけを保持する。 */
+/** 本文と保全条件を同じownerの記録に保持する。 */
 export async function createOrganizationPending(body: OrganizationManifest, before: OrganizationGraph, owner: string): Promise<OrganizationPending> {
   const employees = await Promise.all(body.employees.map(async e => {
     const existing = before.nodes.find(n => e.agent_id ? n.agent.id === e.agent_id : n.agent.slug === e.slug);
@@ -106,20 +110,21 @@ export async function createOrganizationPending(body: OrganizationManifest, befo
     for (const k of ["job_title", "responsibility_summary"] as const) if (k in e) expected[k] = e[k];
     if ("manager_key" in e) { delete expected.manager_agent_id; expected.manager_user_id = null; }
     const revisionFields = e.revision ? await fields(omit(e.revision as Record<string, unknown>, ["idempotency_key", "content_hash"])) : undefined;
-    return { key: e.key, id: existing?.agent.id, slug: e.slug ?? existing?.agent.slug, name: e.display_name,
+    return { key: e.key, id: existing?.agent.id, slug: e.slug ?? existing?.agent.slug ?? undefined, name: e.display_name,
       state: e.activate && (!existing || existing.agent.state === "draft") ? "active" : existing?.agent.state ?? "draft",
       ...(existing ? { agentHash: await digest(omit(existing.agent as unknown as Record<string, unknown>, ["updated_at", "state"])) } : {}),
       ...(!e.revision ? { revisionHash: await digest(existing?.revision ? omit(existing.revision, ["route_warnings"]) : null) } : { revisionFields }),
       profileFields: await fields(expected), ...("manager_key" in e ? { managerKey: e.manager_key } : {}) };
   }));
-  return { version: 2, owner, manifestHash: await digest(body), employees };
+  return { version: 2, owner, manifestHash: await digest(body), body, employees };
 }
 
 export function readOrganizationPending(raw: string, owner: string): OrganizationPending {
   let value: unknown; try { value = JSON.parse(raw); } catch { throw new Error("送信記録のowner・内容hash・保全条件を確認できません。"); }
   const hash = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
   const profileKeys = ["job_title", "responsibility_summary", "primary_space_id", "manager_user_id", "autonomy_level", "company_permission_ceiling", "employment_state"];
-  if (!object(value) || value.version !== 2 || value.owner !== owner || !hash(value.manifestHash) || !Array.isArray(value.employees) || !value.employees.length || value.employees.length > 64 || value.employees.some(e => !object(e) || !identifier(e.key) || typeof e.name !== "string" || !e.name || !["draft", "active", "paused", "retired"].includes(String(e.state)) || !(typeof e.id === "string" && e.id || identifier(e.slug)) || e.id != null && !hash(e.agentHash) || e.slug != null && !identifier(e.slug) || (hash(e.revisionHash) === object(e.revisionFields)) || e.revisionFields != null && (!object(e.revisionFields) || !hash(e.revisionFields.agent_team_id) || !hash(e.revisionFields.execution_profile_id) || Object.values(e.revisionFields).some(h => !hash(h))) || e.managerKey != null && !identifier(e.managerKey) || !object(e.profileFields) || profileKeys.some(k => !hash((e.profileFields as Record<string, unknown>)[k])) || !("managerKey" in e) && !hash(e.profileFields.manager_agent_id) || Object.values(e.profileFields).some(h => !hash(h))) || new Set(value.employees.map(e => (e as Record<string, unknown>).key)).size !== value.employees.length) throw new Error("送信記録のowner・内容hash・保全条件を確認できません。");
+  if (!object(value) || value.version !== 2 || value.owner !== owner || !hash(value.manifestHash) || !Array.isArray(value.employees) || !value.employees.length || value.employees.length > 64 || value.employees.some(e => !object(e) || !identifier(e.key) || typeof e.name !== "string" || !e.name || !["draft", "active", "paused", "retired"].includes(String(e.state)) || !(typeof e.id === "string" && e.id || identifier(e.slug)) || e.id != null && !hash(e.agentHash) || e.slug != null && !identifier(e.slug) || (hash(e.revisionHash) === object(e.revisionFields)) || e.revisionFields != null && (!object(e.revisionFields) || Object.values(e.revisionFields).some(h => !hash(h))) || e.managerKey != null && !identifier(e.managerKey) || !object(e.profileFields) || profileKeys.some(k => !hash((e.profileFields as Record<string, unknown>)[k])) || !("managerKey" in e) && !hash(e.profileFields.manager_agent_id) || Object.values(e.profileFields).some(h => !hash(h))) || new Set(value.employees.map(e => (e as Record<string, unknown>).key)).size !== value.employees.length) throw new Error("送信記録のowner・内容hash・保全条件を確認できません。");
+  if (value.body != null && (!object(value.body) || !Array.isArray(value.body.employees) || value.body.employees.some(e => !object(e) || typeof e.display_name !== "string" || typeof e.key !== "string"))) throw new Error("送信記録の保存内容を確認できません。");
   return value as OrganizationPending;
 }
 
@@ -146,7 +151,10 @@ export function organizationSetupReadback(body: OrganizationManifest, result: S[
     const saved = result.employees[entry.key]; const node = graph.nodes.find(n => n.agent.id === saved?.id);
     if (!node || entry.agent_id && node.agent.id !== entry.agent_id || entry.slug && node.agent.slug !== entry.slug || node.agent.display_name !== entry.display_name) return false;
     ids.set(entry.key, node.agent.id);
-    if (entry.revision && (node.revision?.agent_team_id !== entry.revision.agent_team_id || node.revision?.execution_profile_id !== entry.revision.execution_profile_id)) return false;
+    if (entry.revision) {
+      const revision = node.revision ?? {};
+      for (const [key, value] of Object.entries(entry.revision)) if (revision[key] !== value) return false;
+    }
   }
   return body.employees.every(entry => {
     if (!("manager_key" in entry) || result.blockers.some(b => b.key === entry.key && b.code === "manager_activation_required")) return true;

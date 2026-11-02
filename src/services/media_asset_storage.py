@@ -202,7 +202,9 @@ def remove_asset(root: StorageRoot, relative: str, *, expected_inode=None):
 
 def publish_asset(root: StorageRoot, stage: str, destination: str, expected_inode):
     # Both names live in the same pinned parent; no path-based replace.
-    if stage.rsplit("/", 1)[0] != destination.rsplit("/", 1)[0]:
+    # rpartition keeps "" as the parent of root-level names; rsplit()[0] would
+    # return the whole name and reject two valid root-level siblings.
+    if stage.rpartition("/")[0] != destination.rpartition("/")[0]:
         raise StorageError("invalid_path", "素材保存先が一致しません", 403)
     with open_asset(
         root, stage, flags=os.O_WRONLY | os.O_APPEND, expected_inode=expected_inode

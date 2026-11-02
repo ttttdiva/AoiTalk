@@ -6,10 +6,13 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   useState,
   useEffect,
+  useLayoutEffect,
   useCallback,
   useMemo,
+  useRef,
   type FormEvent,
   type MouseEvent,
+  type UIEvent,
 } from "react";
 import {
   Plus,
@@ -87,6 +90,63 @@ import {
 
 const CHAT_HISTORY_VIEW_KEY = "aoitalk-chat-history-view";
 const CHAT_LAST_SESSION_KEY = "aoitalk_last_session_id";
+const CHAT_HISTORY_SCROLL_KEY = "aoitalk-chat-history-scroll";
+const HISTORY_RESTORE_SCROLL_SUPPRESSION_MS = 300;
+
+type ChatHistoryScrollAnchor = {
+  sessionId: string | null;
+  offset: number;
+  scrollTop: number;
+};
+
+const useClientLayoutEffect =
+  typeof window === "undefined" ? useEffect : useLayoutEffect;
+
+function getChatHistoryScrollStorageKey(
+  userId: string | null | undefined,
+  historyView: ChatHistoryView,
+  historyStatus: ChatHistoryStatusFilter,
+): string {
+  const owner =
+    userId === undefined
+      ? { kind: "pending" }
+      : userId === null
+        ? { kind: "anonymous" }
+        : { kind: "user", id: userId };
+  return `${CHAT_HISTORY_SCROLL_KEY}:${JSON.stringify([
+    owner,
+    historyView,
+    historyStatus,
+  ])}`;
+}
+
+function readChatHistoryScrollAnchor(
+  storageKey: string,
+): ChatHistoryScrollAnchor | null {
+  try {
+    const saved = window.sessionStorage.getItem(storageKey);
+    if (!saved) return null;
+    const parsed: unknown = JSON.parse(saved);
+    if (!parsed || typeof parsed !== "object") return null;
+    const value = parsed as Partial<ChatHistoryScrollAnchor>;
+    if (
+      typeof value.scrollTop !== "number" ||
+      !Number.isFinite(value.scrollTop) ||
+      (value.sessionId !== null && typeof value.sessionId !== "string") ||
+      typeof value.offset !== "number" ||
+      !Number.isFinite(value.offset)
+    ) {
+      return null;
+    }
+    return {
+      sessionId: value.sessionId ?? null,
+      offset: value.offset,
+      scrollTop: value.scrollTop,
+    };
+  } catch {
+    return null;
+  }
+}
 
 function readChatHistoryView(): ChatHistoryView | null {
   if (typeof window === "undefined") return null;
@@ -155,6 +215,12 @@ export function ChatSidebar() {
   const {
     sessions,
     sessionsError,
+    sessionsLoadMoreError,
+    hasLoadedSessions,
+    hasMoreSessions,
+    isLoadingMoreSessions,
+    loadMoreSessions,
+    fetchSessions,
     addSession,
     removeSession,
     markSessionRead,
@@ -171,26 +237,55 @@ export function ChatSidebar() {
   const [historyView, setHistoryView] = useState<ChatHistoryView>("timeline");
   const [historyStatus, setHistoryStatus] =
     useState<ChatHistoryStatusFilter>("all");
+  const [historyPreferencesReady, setHistoryPreferencesReady] = useState(false);
+  const historyContainerRef = useRef<HTMLDivElement | null>(null);
+  const historyScrollStorageKey = getChatHistoryScrollStorageKey(
+    userId,
+    historyView,
+    historyStatus,
+  );
+  const pendingHistoryScrollRestoreRef = useRef<{
+    storageKey: string;
+    anchor: ChatHistoryScrollAnchor;
+  } | null>(null);
+  const restoredHistoryScrollKeyRef = useRef<string | null>(null);
+  const suppressHistoryAutoLoadUntilRef = useRef(0);
+  const lastAutoScrolledSessionRef = useRef<string | null>(null);
 
   useEffect(() => {
     const saved = readChatHistoryView();
+    // Browser-only preferences are applied after hydration to avoid a server mismatch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (saved) setHistoryView(saved);
+    const savedStatus = readChatHistoryStatusFilter();
+    if (savedStatus) setHistoryStatus(savedStatus);
+    setHistoryPreferencesReady(true);
   }, []);
 
   useEffect(() => {
-    const saved = readChatHistoryStatusFilter();
-    if (saved) setHistoryStatus(saved);
-  }, []);
-
-  useEffect(() => {
+    if (!historyPreferencesReady) return;
     persistChatHistoryView(historyView);
-  }, [historyView]);
+  }, [historyPreferencesReady, historyView]);
 
   useEffect(() => {
+    if (!historyPreferencesReady) return;
     persistChatHistoryStatusFilter(historyStatus);
-  }, [historyStatus]);
+  }, [historyPreferencesReady, historyStatus]);
+
+  useClientLayoutEffect(() => {
+    if (!historyPreferencesReady) return;
+    const anchor = readChatHistoryScrollAnchor(historyScrollStorageKey);
+    pendingHistoryScrollRestoreRef.current = anchor
+      ? { storageKey: historyScrollStorageKey, anchor }
+      : null;
+    restoredHistoryScrollKeyRef.current = anchor
+      ? null
+      : historyScrollStorageKey;
+  }, [historyPreferencesReady, historyScrollStorageKey]);
 
   useEffect(() => {
+    // Keep the active row aligned with Next's query state after route changes.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setActiveSessionId(searchParamSessionId);
   }, [searchParamSessionId]);
 
@@ -395,13 +490,134 @@ export function ChatSidebar() {
       ])
     : sortedSessions.map((session) => ({ kind: "session" as const, session }));
 
-  useEffect(() => {
-    if (!activeSessionId) return;
-    const row = [...document.querySelectorAll<HTMLElement>("[data-chat-session-id]")].find(
-      (element) => element.dataset.chatSessionId === activeSessionId,
-    );
-    row?.scrollIntoView({ block: "nearest" });
-  }, [activeSessionId, historyView, visibleRows.length]);
+  const persistHistoryScrollAnchor = useCallback(
+    (container: HTMLDivElement) => {
+      const containerTop = container.getBoundingClientRect().top;
+      const containerBottom = container.getBoundingClientRect().bottom;
+      const firstVisibleSession = Array.from(
+        container.querySelectorAll<HTMLElement>("[data-chat-session-id]"),
+      ).find((row) => {
+        const rect = row.getBoundingClientRect();
+        return rect.bottom > containerTop && rect.top < containerBottom;
+      });
+      const anchor: ChatHistoryScrollAnchor = {
+        sessionId: firstVisibleSession?.dataset.chatSessionId ?? null,
+        offset: firstVisibleSession
+          ? firstVisibleSession.getBoundingClientRect().top - containerTop
+          : 0,
+        scrollTop: container.scrollTop,
+      };
+      try {
+        window.sessionStorage.setItem(
+          historyScrollStorageKey,
+          JSON.stringify(anchor),
+        );
+      } catch {
+        // Storageが使えない場合でも現在の履歴操作を続ける。
+      }
+      pendingHistoryScrollRestoreRef.current = null;
+      restoredHistoryScrollKeyRef.current = historyScrollStorageKey;
+    },
+    [historyScrollStorageKey],
+  );
+
+  const handleHistoryScroll = useCallback(
+    (event: UIEvent<HTMLDivElement>) => {
+      const element = event.currentTarget;
+      if (historyPreferencesReady) persistHistoryScrollAnchor(element);
+      if (Date.now() < suppressHistoryAutoLoadUntilRef.current) return;
+      if (!hasMoreSessions || isLoadingMoreSessions) return;
+      if (element.scrollHeight - element.scrollTop - element.clientHeight > 160) {
+        return;
+      }
+      void loadMoreSessions();
+    },
+    [
+      hasMoreSessions,
+      historyPreferencesReady,
+      isLoadingMoreSessions,
+      loadMoreSessions,
+      persistHistoryScrollAnchor,
+    ],
+  );
+
+  useClientLayoutEffect(() => {
+    if (!historyPreferencesReady) return;
+    if (restoredHistoryScrollKeyRef.current === historyScrollStorageKey) return;
+    if (!hasLoadedSessions) return;
+    const pending = pendingHistoryScrollRestoreRef.current;
+    const container = historyContainerRef.current;
+    if (!container || !pending || pending.storageKey !== historyScrollStorageKey) {
+      return;
+    }
+
+    const row = pending.anchor.sessionId
+      ? Array.from(
+          container.querySelectorAll<HTMLElement>("[data-chat-session-id]"),
+        ).find((element) => element.dataset.chatSessionId === pending.anchor.sessionId)
+      : null;
+    if (row) {
+      const rowOffset =
+        row.getBoundingClientRect().top - container.getBoundingClientRect().top;
+      const nextScrollTop = Math.max(
+        0,
+        container.scrollTop + rowOffset - pending.anchor.offset,
+      );
+      // Restoring an anchor near the list end can emit multiple browser scroll
+      // events as layout settles. Do not interpret those as a user's request
+      // to fetch another page.
+      suppressHistoryAutoLoadUntilRef.current =
+        Date.now() + HISTORY_RESTORE_SCROLL_SUPPRESSION_MS;
+      container.scrollTop = nextScrollTop;
+      pendingHistoryScrollRestoreRef.current = null;
+      restoredHistoryScrollKeyRef.current = historyScrollStorageKey;
+      return;
+    }
+
+    // The saved row may live on a page not loaded yet. Keep the anchor pending
+    // for the user's next page append instead of fetching pages eagerly.
+    if (!hasMoreSessions) {
+      const targetScrollTop = pending.anchor.scrollTop;
+      suppressHistoryAutoLoadUntilRef.current =
+        Date.now() + HISTORY_RESTORE_SCROLL_SUPPRESSION_MS;
+      container.scrollTop = targetScrollTop;
+      if (
+        Math.abs(container.scrollTop - targetScrollTop) > 1 &&
+        container.scrollHeight - container.clientHeight >= targetScrollTop
+      ) {
+        return;
+      }
+      pendingHistoryScrollRestoreRef.current = null;
+      restoredHistoryScrollKeyRef.current = historyScrollStorageKey;
+    }
+  }, [
+    hasLoadedSessions,
+    hasMoreSessions,
+    historyPreferencesReady,
+    historyScrollStorageKey,
+    sessions,
+  ]);
+
+  useClientLayoutEffect(() => {
+    if (!activeSessionId || activeSessionId !== searchParamSessionId) {
+      lastAutoScrolledSessionRef.current = null;
+      return;
+    }
+    const autoScrollKey = JSON.stringify([userId, activeSessionId, historyView]);
+    if (lastAutoScrolledSessionRef.current === autoScrollKey) return;
+    const row = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-chat-session-id]"),
+    ).find((element) => element.dataset.chatSessionId === activeSessionId);
+    if (!row) return;
+    row.scrollIntoView({ block: "nearest" });
+    lastAutoScrolledSessionRef.current = autoScrollKey;
+  }, [
+    activeSessionId,
+    historyView,
+    searchParamSessionId,
+    userId,
+    visibleRows.length,
+  ]);
 
   return (
     <>
@@ -488,22 +704,40 @@ export function ChatSidebar() {
             </DropdownMenu>
           </div>
         </div>
-        <SidebarGroupContent className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
+        <SidebarGroupContent
+          ref={historyContainerRef}
+          onScroll={handleHistoryScroll}
+          data-testid="chat-history-scroll-container"
+          className="min-h-0 flex-1 overflow-y-auto px-2 py-3"
+        >
           <SidebarMenu className="gap-1">
             {sessionsError && (
-              <li className="px-4 py-6 text-center text-xs text-destructive">
-                {sessionsError}
+              <li className="flex flex-col items-center gap-2 px-4 py-6 text-center text-xs text-destructive">
+                <span>{sessionsError}</span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void fetchSessions()}
+                  data-testid="chat-history-retry"
+                >
+                  再試行
+                </Button>
               </li>
             )}
-            {!sessionsError && sortedSessions.length === 0 && (
+            {!sessionsError && !hasLoadedSessions && sessions.length === 0 && (
+              <li className="px-4 py-6 text-center text-xs text-muted-foreground">
+                会話履歴を読み込み中…
+              </li>
+            )}
+            {!sessionsError && hasLoadedSessions && sortedSessions.length === 0 && (
               <li className="px-4 py-6 text-center text-xs text-muted-foreground">
                 {historyStatus === "all"
                   ? "会話がありません"
                   : "この状態の会話はありません"}
               </li>
             )}
-            {!sessionsError &&
-              visibleRows.map((row) => {
+            {visibleRows.map((row) => {
                 if (row.kind === "group") {
                   return (
               <li key={row.key} className="list-none px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-text-secondary first:pt-0">
@@ -639,6 +873,50 @@ export function ChatSidebar() {
                   </SidebarMenuItem>
                 );
               })}
+            {sessionsLoadMoreError && (
+              <li className="flex flex-col items-center gap-2 px-4 py-4 text-center text-xs text-destructive">
+                <span>{sessionsLoadMoreError}</span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void loadMoreSessions()}
+                  disabled={isLoadingMoreSessions}
+                  data-testid="chat-history-load-more-retry"
+                >
+                  再試行
+                </Button>
+              </li>
+            )}
+            {hasMoreSessions && !sessionsLoadMoreError && (
+              <li className="flex justify-center px-2 py-3">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void loadMoreSessions()}
+                  disabled={isLoadingMoreSessions}
+                  data-testid="chat-history-load-more"
+                >
+                  {isLoadingMoreSessions ? (
+                    <>
+                      <Loader2 className="mr-2 size-3.5 animate-spin" />
+                      読み込み中…
+                    </>
+                  ) : (
+                    "さらに読み込む"
+                  )}
+                </Button>
+              </li>
+            )}
+            {hasLoadedSessions && sessions.length > 0 && !hasMoreSessions && !sessionsLoadMoreError && (
+              <li
+                className="px-4 py-3 text-center text-[11px] text-muted-foreground"
+                data-testid="chat-history-end"
+              >
+                履歴の末尾
+              </li>
+            )}
           </SidebarMenu>
         </SidebarGroupContent>
       </SidebarGroup>

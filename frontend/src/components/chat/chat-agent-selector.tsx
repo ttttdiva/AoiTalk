@@ -215,8 +215,8 @@ export function ChatAgentSelector({
         </span>
       )}
       {sessionId && currentValue && !missingCurrentBinding && (
-        <span className="hidden max-w-[22rem] truncate text-[10px] text-muted-foreground lg:inline" title="Agent管理の職務・Execution Team・Profileを正本として次の依頼から反映します">
-          職務 / Execution Team / ProfileはAgent管理が正本（次の依頼から反映）
+        <span className="hidden max-w-[22rem] truncate text-[10px] text-muted-foreground lg:inline" title="Agent管理の職務・モデル・tool設定を次の依頼から反映します">
+          職務 / モデル / tool設定はAgent管理が正本（次の依頼から反映）
         </span>
       )}
       {isGroupChat && (

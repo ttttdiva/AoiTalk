@@ -9,9 +9,9 @@ query parameters preserve the selected Agent and editor panel.
 
 Execution Team, Subagent, and Execution Profile retain their execution roles. The
 code-owned `employee` Execution Team is opt-in (`manual` activation). Its
-`employee_operator` declares `external_action_propose` and `telephony_control`;
-these declarations do not grant provider execution or substitute for approval.
-The General Execution Team has not gained these capabilities.
+`employee_operator` declares `external_action_propose`; this declaration does
+not grant provider execution or substitute for approval. The General Execution
+Team has not gained this capability.
 
 ## Model routing
 
@@ -114,7 +114,6 @@ Implementation entrypoints:
 | Rule management, event capture, discovery and evaluator | `src/services/agent_automation_{service,events,runtime,invoker}.py` |
 | Registered actions, authorization and fenced execution | `src/services/integration_action_registry.py`, `agent_action_policy_service.py`, `external_action_execution_service.py`, `external_action_work_source.py`, `procurement_action.py` |
 | Encrypted credentials | `src/services/integration_credential_vault_service.py`, `src/security/integration_credential_crypto.py` |
-| Phone ingress and Live Voice bridge | `src/services/telephony_{service,provider,runtime}.py`, `src/services/live_voice_service.py` |
 | Agent editor | `frontend/src/components/operations/agents/`, `frontend/src/lib/agent-employees-api.ts` |
 | Persistence | `src/memory/models/{agent_automation,integration_credentials,telephony,operations}.py`, migrations `0002` and `0004` |
 | Safe activity projection | `src/services/operations_employee_observability.py` |
@@ -151,9 +150,8 @@ button evaluates only and creates no event, work, external action or provider
 submission.
 Source conversation and Project privacy policies are bound for both runtime
 evaluation and dry run. Unsupported model routes remain diagnosable as drafts
-and cannot activate a semantic rule. The `employee` Execution Team's explicit `realtime` profile
-selects the existing Live Voice model for phone reception without changing the
-ordinary chat Main model.
+and cannot activate a semantic rule. The `employee` Execution Team has no
+implicit execution profile; configured profiles remain administrator-owned.
 
 ## Management APIs
 
@@ -166,7 +164,6 @@ ordinary chat Main model.
 | Code-owned action catalog | `GET /api/integrations/actions` |
 | Logical connections | Existing `/api/operations/connections/*` |
 | Write-only credential lifecycle | `/api/integrations/connections/{id}/credential/*` |
-| Phone routes, readiness, calls and signed ingress | `/api/telephony/*` |
 | Read-only monitoring | `GET /api/operations/command-center` |
 
 Administrative writes resolve an authenticated administrator human on the
@@ -219,35 +216,13 @@ uses the existing field-encryption data key. Versioned key commands and key IDs
 support deployment-managed rotation. Preserve older keys while older ciphertext
 still refers to them. Existing Media credentials remain unchanged.
 
-Provider verification is code-owned. OpenAI model access verification alone
-does not attest a reachable webhook, SIP trunk, or phone number. Removing a
-constructor-injected test verifier makes its stored test verification unusable.
-
-## Telephone reception
-
-`TelephonyRoute` binds a server-configured route selector to an exact Agent
-revision. `TelephonyCall` stores safe routing/session/run evidence. Ingress
-verifies a bounded raw body before trusting the OpenAI incoming-call event.
-Call and event IDs dedupe repeated delivery. Route state, feature gates, current
-authority, working hours and provider prerequisites are checked before accept.
-
-The session extends existing Live Voice sideband, turn, transcript and tool-call
-machinery. It does not create a second speech/LLM stack or poll audio through
-AgentWorkItems. Transfers accept only a configured `destination_key` and run
-synchronously through the shared action authorization/Attempt/Receipt boundary.
-Ambiguous controls become uncertain rather than repeated REFER/hangup requests.
-Caller identities are masked/hashed; raw webhook headers and audio are not
-persisted. Transcript retention follows canonical Conversation/Live Voice rules.
-
-Phone numbers, carrier/PSTN trunks, public webhook configuration and safe live
-test targets are external deployment prerequisites. They are not provisioned
-by the local implementation or test harness.
-
 ## Migration and verification
 
 The Agent platform migration is `20260908_0002`, following `20260908_0001`. It adds
-automation/policy/credential/telephony state and extends the existing action
-ledger. Later independent migrations may follow it; always inspect the actual
+automation/policy/credential state and extends the existing action ledger. The
+historical migration also creates telephony tables; their ORM models remain
+registered for existing database metadata, while no telephony API or service
+uses them. Later independent migrations may follow it; always inspect the actual
 Alembic graph rather than resetting to the design packet's research revision.
 `20260908_0004` adds bounded discovery sweep columns after the concurrent
 Knowledge migration `0003`; it preserves all event/work/action evidence.
@@ -260,10 +235,10 @@ the migration transaction, re-enabled afterward, and `foreign_key_check`.
 
 Core verification is in `test_ai_employee_models`, `test_agent_automation_*`,
 `test_integration_action_execution`, `test_integration_credential_vault`,
-`test_operations_employee_observability`, and `test_telephony_*`. Existing
+`test_operations_employee_observability`, and `test_telephony_removed`. Existing
 identity/authority, Operations/Media, feature, conversation and Live Voice
 regressions remain part of acceptance. Web component tests cover the Agent
 editors. The isolated QA harness is `scripts/verification/ai_employee_qa.py`;
 credentials come only from repo-root `.env.qa-login`.
 
-Fresh verification evidence is maintained in the private development repository. Unit/mock evidence is not evidence of a real order or a live PSTN/SIP call.
+Fresh verification evidence is maintained in the private development repository. Unit/mock evidence is not evidence of a real provider order.

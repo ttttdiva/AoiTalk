@@ -8,10 +8,11 @@ import {
 } from "@codemirror/view";
 import { type Range, StateEffect } from "@codemirror/state";
 import { fetchOgp, type OgpData } from "@/lib/explorer-api";
+import { withBasePath } from "@/lib/base-path";
 
 const URL_REGEX = /https?:\/\/[^\s<>"')\]]+/g;
 
-const OGP_STORAGE_KEY = "aoitalk.linkEmbed.metadata.v2";
+const OGP_STORAGE_KEY = "aoitalk.linkEmbed.metadata.v3";
 const OGP_MAX_ENTRIES = 128;
 const OGP_SUCCESS_TTL = 6 * 60 * 60 * 1000;
 const OGP_FAILURE_TTL = 60 * 1000;
@@ -334,12 +335,16 @@ function isUnsafeIpLiteral(hostname: string): boolean {
  * are only accepted when they resolve same-origin against the page URL.
  */
 export function sanitizeMetadataImageUrl(
-  value: string | undefined,
+  value: string | null | undefined,
   pageUrl?: string,
 ): string | null {
   const raw = value?.trim();
   if (!raw) return null;
-  if (raw.startsWith("/api/python-proxy/ogp/media?")) return raw;
+  const proxyPath = "/api/python-proxy/ogp/media";
+  const deployedProxyPath = withBasePath(proxyPath);
+  if (raw.startsWith(`${proxyPath}?`) || raw.startsWith(`${deployedProxyPath}?`)) {
+    return withBasePath(raw);
+  }
 
   let base: URL | undefined;
   try {
@@ -364,16 +369,16 @@ export function sanitizeMetadataImageUrl(
       return null;
     }
     if (
-      parsed.pathname === "/api/python-proxy/ogp/media" &&
+      (parsed.pathname === proxyPath || parsed.pathname === deployedProxyPath) &&
       typeof window !== "undefined" &&
       parsed.origin === window.location.origin
     ) {
-      return `${parsed.pathname}${parsed.search}`;
+      return withBasePath(`${parsed.pathname}${parsed.search}`);
     }
     if (!hasScheme && !isNetworkPath && base && parsed.origin !== base.origin) {
       return null;
     }
-    return `/api/python-proxy/ogp/media?url=${encodeURIComponent(parsed.toString())}`;
+    return withBasePath(`${proxyPath}?url=${encodeURIComponent(parsed.toString())}`);
   } catch {
     return null;
   }

@@ -7,7 +7,7 @@ import { ExternalLink, MessageSquare, RefreshCcw } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { HelpPopover } from "@/components/ui/help-popover";
-import { AgentRunDetailSheet, type AgentRunDetailView } from "@/components/chat/agent-run-detail-sheet";
+import { AgentRunDetailSheet } from "@/components/chat/agent-run-detail-sheet";
 import type { AgentRun } from "@/lib/chat-api";
 import {
   conversationAgentApi,
@@ -54,8 +54,11 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
   const chatSessions = useChatSessionsOptional();
   const { mutate: mutateSWR } = useSWRConfig();
   const [creating, setCreating] = useState(false);
-  const [detailViews, setDetailViews] = useState<AgentRunDetailView[]>([]);
-  const [detailRun, setDetailRun] = useState<AgentRun | null>(null);
+  const [detailSelection, setDetailSelection] = useState<{
+    authScopeKey: string;
+    agentId: string;
+    runId: string;
+  } | null>(null);
   const [sessionsScopeError, setSessionsScopeError] = useState<unknown>(null);
   const [runsScopeError, setRunsScopeError] = useState<unknown>(null);
   const authScopeKey = authenticatedScopeKey(userId);
@@ -87,6 +90,8 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
       shouldRetryOnError: false,
       keepPreviousData: false,
       revalidateOnMount: true,
+      onError: setSessionsScopeError,
+      onSuccess: () => setSessionsScopeError(null),
     },
   );
   const runs = useSWR(
@@ -96,22 +101,10 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
       shouldRetryOnError: false,
       keepPreviousData: false,
       revalidateOnMount: true,
+      onError: setRunsScopeError,
+      onSuccess: () => setRunsScopeError(null),
     },
   );
-  useEffect(() => {
-    if (sessions.error) {
-      setSessionsScopeError(sessions.error);
-    } else if (sessions.data && !sessions.isValidating) {
-      setSessionsScopeError(null);
-    }
-  }, [sessions.data, sessions.error, sessions.isValidating]);
-  useEffect(() => {
-    if (runs.error) {
-      setRunsScopeError(runs.error);
-    } else if (runs.data && !runs.isValidating) {
-      setRunsScopeError(null);
-    }
-  }, [runs.data, runs.error, runs.isValidating]);
   useEffect(() => {
     if (sessions.error && authScopeKey) {
       void mutateSWR(["conversation-agent-sessions", authScopeKey, agentId], undefined, {
@@ -131,13 +124,19 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
   // SWR may retain a same-key value while a revalidation is in flight or after
   // a 403. Hide it until the current authenticated scope has a fresh response.
   const relatedSessions =
-    authScopeKey && !sessionsScopeError && !sessionsLoading && sessions.data
+    authScopeKey && !sessions.error && !sessionsScopeError && !sessionsLoading && sessions.data
       ? unwrapAgentConversations(sessions.data)
       : [];
   const relatedRuns =
-    authScopeKey && !runsScopeError && !runsLoading && runs.data
+    authScopeKey && !runs.error && !runsScopeError && !runsLoading && runs.data
       ? unwrapAgentRuns(runs.data)
       : [];
+  // Detail caches must have the same owner/Agent boundary as the list. Unmount
+  // them while revalidating or after access is lost, including in-flight reads.
+  const detailRun = detailSelection?.authScopeKey === authScopeKey
+    && detailSelection?.agentId === agentId
+    ? relatedRuns.find((run) => run.id === detailSelection.runId) ?? null
+    : null;
   const canCreate = agentState === undefined || agentState === "active";
 
   const createChat = async () => {
@@ -160,8 +159,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
   };
 
   const openRun = (run: AgentRun) => {
-    setDetailRun(run);
-    setDetailViews([{ kind: "run", runId: run.id }]);
+    if (authScopeKey) setDetailSelection({ authScopeKey, agentId, runId: run.id });
   };
 
   return (
@@ -171,7 +169,7 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
           <h3 className="inline-flex items-center gap-1 font-semibold">
             このAgentとChat
             <HelpPopover label="このAgentとChat">
-              {agentName || "このAgent"}に紐づくChatと実行履歴です。Character（表示・音声）とは別に、Agentの職務・Execution Team・Profileを次の依頼から適用します。
+              {agentName || "このAgent"}に紐づくChatと実行履歴です。Character（表示・音声）とは別に、Agentの職務・モデル・tool設定を次の依頼から適用します。
             </HelpPopover>
           </h3>
         </div>
@@ -207,8 +205,12 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
             </a>
           </div>
           {sessionsLoading && <p className="text-sm text-muted-foreground">読み込み中…</p>}
-          {!sessionsLoading && authScopeKey && !sessionsScopeError && relatedSessions.length === 0 && (
-            <p className="rounded border border-dashed p-3 text-sm text-muted-foreground">このAgentのChatはまだありません。</p>
+          {!sessionsLoading && !runsLoading && authScopeKey && !sessions.error && !runs.error && !sessionsScopeError && !runsScopeError && relatedSessions.length === 0 && (
+            <p className="rounded border border-dashed p-3 text-sm text-muted-foreground">
+              {relatedRuns.some((run) => run.session_id)
+                ? "履歴のあるChatは関連活動から開けます。"
+                : "このAgentのChatはまだありません。"}
+            </p>
           )}
           {relatedSessions.map((session) => (
             <a
@@ -275,13 +277,15 @@ export function EmployeeChatActivity({ agentId, agentName, agentState }: Employe
         </div>
       </div>
 
-      <AgentRunDetailSheet
-        key={detailViews.map((view) => `${view.kind}:${view.runId}:${"itemId" in view ? view.itemId : ""}`).join("|") || "closed"}
-        open={detailViews.length > 0}
-        onOpenChange={(open) => { if (!open) { setDetailViews([]); setDetailRun(null); } }}
-        views={detailViews}
-        fallbackRun={detailRun}
-      />
+      {detailRun && (
+        <AgentRunDetailSheet
+          key={`${authScopeKey}:${agentId}:${detailRun.id}`}
+          open
+          onOpenChange={(open) => { if (!open) setDetailSelection(null); }}
+          views={[{ kind: "run", runId: detailRun.id }]}
+          fallbackRun={detailRun}
+        />
+      )}
     </section>
   );
 }

@@ -65,7 +65,11 @@ from ..services.app_manifest_service import (
     validate_manifest_text,
     validate_manifest_workspace,
 )
-from ..services.app_operation_lock import app_operation_lock, project_operation_lock
+from ..services.app_operation_lock import (
+    app_job_input_reference_lock,
+    app_operation_lock,
+    project_operation_lock,
+)
 from ..services.app_release_service import AppReleaseError, create_app_release
 from ..services.app_business_analysis_service import (
     analyze_app_workspace,
@@ -2905,8 +2909,9 @@ def create_apps_router(
                     input_json=payload.input_json,
                     started_by=_user_id(user),
                 )
-                session.add(job)
-                await session.commit()
+                async with app_job_input_reference_lock(workspace_root=workspace_root):
+                    session.add(job)
+                    await session.commit()
                 job_id = job.id
                 asyncio.create_task(execute_app_job(
                     get_db_manager(),

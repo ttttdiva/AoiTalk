@@ -30,7 +30,7 @@ export function prepareExecution(data: WorkExecution, workName?: string) {
   });
   for (const run of data.runs) nodes.push({
     id: `run:${run.id}`, parent: run.parent_run_id ? `run:${run.parent_run_id}` : context,
-    kind: "run", title: `${run.acting_subagent_id || "担当未記録"} · Run ${run.id}`, state: run.status,
+    kind: "run", title: `${run.legacy?.acting_subagent_id ? `旧実行: ${run.legacy.acting_subagent_id}` : "旧実行"} · Run ${run.id}`, state: run.status,
     workId: run.work_item_id, runId: run.id, phase: run.phase, tool: run.tool, activity: run.last_event_at,
     elapsed: run.elapsed_seconds, attempt: run.work_item_attempt, reason: run.error_code,
     warning: run.parent_run_id && !runIds.has(run.parent_run_id) ? "上位実行は未取得" : undefined,

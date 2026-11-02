@@ -27,23 +27,31 @@ export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => vo
     return (
       <View style={styles.root}>
         <Text variant="titleSmall">旧版データの移行を完了できませんでした</Text>
-        <Text variant="bodyMedium">エラーコード: {legacy.errorCode ?? "-"}</Text>
+        <Text variant="bodyMedium">詳細エラーは非表示です。データ状態を確認してください。</Text>
         <Text variant="bodyMedium">データは変更されていません。</Text>
+        <CaptureMetadata legacy={legacy} />
       </View>
     );
   }
 
   if (legacy.state === "capturing") {
-    return <Text variant="bodyMedium">旧版データを退避しています…</Text>;
+    return <View style={styles.root}>
+      <Text variant="bodyMedium">旧版データを退避しています…</Text>
+      <CaptureMetadata legacy={legacy} />
+    </View>;
   }
   if (legacy.state === "migrating") {
-    return <Text variant="bodyMedium">旧版データを移行しています…</Text>;
+    return <View style={styles.root}>
+      <Text variant="bodyMedium">旧版データを移行しています…</Text>
+      <CaptureMetadata legacy={legacy} />
+    </View>;
   }
   if (legacy.state === "migrated") {
     return (
       <View style={styles.root}>
         <Text variant="bodyMedium">旧版データの移行が完了しました。</Text>
         <Text variant="bodySmall">所有者不明: {legacy.ownerUnknownCount ?? 0}件（別ユーザーへ割り当てず保持）</Text>
+        <CaptureMetadata legacy={legacy} />
         {onCopy ? (
           <Button onPress={() => {
             void getSyncV3LegacyExport().then((value) => { if (value) onCopy(value); });
@@ -80,6 +88,7 @@ export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => vo
       <Text variant="bodyMedium">
         所有者不明: {legacy.ownerUnknownCount ?? 0}件（保持され、削除されません）
       </Text>
+      <CaptureMetadata legacy={legacy} />
       {sha ? (
         <>
           <Text variant="bodyMedium">確認用ハッシュ: {sha.slice(0, 16)}</Text>
@@ -90,9 +99,7 @@ export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => vo
         </>
       ) : null}
       {legacy.captureFile ? (
-        <Text variant="bodySmall" selectable>
-          退避ファイル: {legacy.captureFile}
-        </Text>
+        <Text variant="bodySmall">退避ファイルがあります（pathは非表示）</Text>
       ) : null}
       {onCopy ? (
         <Button onPress={() => {
@@ -108,6 +115,41 @@ export function LegacyMigrationPanel({ onCopy }: { onCopy?: (text: string) => vo
   );
 }
 
+function count(value: number | null | undefined): string {
+  return value == null ? "UNKNOWN" : `${value}件`;
+}
+
+function CaptureMetadata({ legacy }: { legacy: NonNullable<SyncV3Status["legacy"]> }) {
+  const metadata = legacy.metadata;
+  if (!metadata) {
+    return <Text variant="bodySmall">capture metadata: UNKNOWN</Text>;
+  }
+  return (
+    <View testID="legacy-capture-metadata" style={styles.metadata}>
+      <Text variant="bodySmall">capture metadata: {metadata.available ? "available" : "UNKNOWN"}</Text>
+      <Text variant="bodySmall">
+        capture generation: {metadata.generation ?? "UNKNOWN"} / updated: {metadata.updatedAt == null ? "UNKNOWN" : new Date(metadata.updatedAt).toLocaleString("ja-JP")}
+      </Text>
+      <Text variant="bodySmall">
+        total op/dirty: {count(metadata.opCount)} / {count(metadata.dirtyCount)}
+      </Text>
+      <Text variant="bodySmall">
+        active op/dirty: {count(metadata.active?.opCount)} / {count(metadata.active?.dirtyCount)}
+      </Text>
+      <Text variant="bodySmall">
+        archived snapshots/op/dirty: {metadata.archived?.snapshotCount ?? "UNKNOWN"} / {count(metadata.archived?.opCount)} / {count(metadata.archived?.dirtyCount)}
+      </Text>
+      <Text variant="bodySmall">
+        comparison_available: {metadata.comparisonAvailable ? "true" : "false"}
+        {metadata.comparisonAvailable && metadata.comparison
+          ? ` (capture/op/dirty Δ ${metadata.comparison.captureCount}/${metadata.comparison.opCount}/${metadata.comparison.dirtyCount}; added row variants ${metadata.comparison.addedOutboxVariants}/${metadata.comparison.addedDirtyVariants})`
+          : " (delta UNKNOWN)"}
+      </Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   root: { gap: 6 },
+  metadata: { gap: 2 },
 });

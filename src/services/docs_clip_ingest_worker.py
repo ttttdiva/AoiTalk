@@ -102,6 +102,8 @@ class DocsClipIngestWorker:
             self.storage = ClipIngestStorage(
                 workspace_root,
                 defer_staging_cleanup=True,
+                create_root=False,
+                allow_missing_root=True,
             )
         else:
             self.storage = storage

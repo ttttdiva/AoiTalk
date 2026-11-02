@@ -38,6 +38,11 @@ export type EngagementOpportunity = {
   source_snapshot_hash?: string | null;
   source_untrusted?: boolean;
   status?: string | null;
+  deadline_at?: string | null;
+  deadline_status?: "open" | "expired" | "unverified" | string | null;
+  application_qa_status?: string | null;
+  approval_available?: boolean;
+  approval_block_reason?: string | null;
   workflow_stage?: string | null;
   compensation_yen?: number | null;
   compensation_type?: string | null;
@@ -60,6 +65,7 @@ export type EngagementOpportunity = {
   development_requirements_resolved?: boolean;
   development_requirements_revision?: number | null;
   development_requirements_note?: string | null;
+  ai_review_status?: string | null;
   external_action_id?: string | null;
   external_action_status?: string | null;
   created_at?: string | null;
@@ -112,7 +118,7 @@ export type DevelopmentArtifactRef = {
 export type DevelopmentResult = {
   status?: "running" | "ready_for_review" | "blocked" | "verification_failed" | "uncertain" | string | null;
   worker_kind?: string | null;
-  agent?: { id?: string | null; display_name?: string | null; execution_profile_id?: string | null } | null;
+  agent?: { id?: string | null; display_name?: string | null; legacy?: { execution_profile_id?: string | null; agent_team_id?: string | null } | null } | null;
   runner?: { runner?: string | null; provider?: string | null; model?: string | null; source?: string | null } | null;
   workspace?: { name?: string | null; isolated_git?: boolean } | null;
   project_id?: string | null;

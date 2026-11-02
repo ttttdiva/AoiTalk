@@ -6,7 +6,7 @@
  * 画面固有のアクション（検索・追加・表示範囲切替など）は `right` に渡す。
  */
 
-import React, { useCallback, useContext, useEffect, useState } from "react";
+import React, { useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
   Alert,
   BackHandler,
@@ -84,6 +84,7 @@ export function ScreenHeader({
   const aoiDots = useContext(AoiDotsContext);
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [overflowOpen, setOverflowOpen] = useState(false);
+  const settingsNavigationPending = useRef(false);
   const overflowActions = Boolean(right)
     && Number.isFinite(windowWidth)
     && windowWidth <= NARROW_HEADER_WIDTH;
@@ -91,11 +92,12 @@ export function ScreenHeader({
   const overflowPanelMaxHeight = Number.isFinite(windowHeight) && windowHeight > 0
     ? Math.max(96, Math.floor(windowHeight - overflowPanelTop - insets.bottom - 8))
     : 320;
-  const overflowActionsMaxHeight = Math.max(44, overflowPanelMaxHeight - 68);
+  const overflowActionsMaxHeight = Math.max(44, overflowPanelMaxHeight - 8);
   const settingsTarget = onSettings ? "custom" : "settings";
 
   useFocusEffect(
     useCallback(() => {
+      settingsNavigationPending.current = false;
       return () => setOverflowOpen(false);
     }, []),
   );
@@ -147,6 +149,11 @@ export function ScreenHeader({
         return;
       }
 
+      // Keep the latch through blur: a queued native press can arrive after
+      // Settings is focused and otherwise push a second Settings stack entry.
+      // Refocus (normal Back/return) re-arms this screen's settings action.
+      if (settingsNavigationPending.current) return;
+      settingsNavigationPending.current = true;
       reportSettingsInteraction({
         phase: "route-request",
         at: Date.now(),
@@ -154,6 +161,7 @@ export function ScreenHeader({
       });
       router.push("/(tabs)/settings");
     } catch (error) {
+      settingsNavigationPending.current = false;
       reportSettingsInteraction({
         phase: "route-error",
         at: Date.now(),
@@ -241,7 +249,9 @@ export function ScreenHeader({
               size={22}
               iconColor={MUTED}
               style={styles.moreButton}
-              onPress={() => setOverflowOpen(true)}
+              onPress={() => setOverflowOpen((open) => !open)}
+              accessibilityRole="button"
+              accessibilityState={{ expanded: overflowOpen }}
               accessibilityLabel="その他の操作"
               accessibilityHint="この画面の追加操作を開きます"
             />
@@ -249,17 +259,27 @@ export function ScreenHeader({
             right
           )}
           <AoiDotsTrigger compact />
-          {showSettings ? (
-            <IconButton
-              icon="cog-outline"
-              size={22}
-              iconColor={MUTED}
-              style={styles.settingsButton}
-              onPressIn={handleSettingsPressIn}
-              onPress={handleSettings}
-              accessibilityLabel="設定"
-            />
-          ) : null}
+          {/* Keep the neighboring AoiDots target out of a queued gear tap's
+              position when the Settings root hides its own gear. */}
+          <View
+            testID="screen-header-settings-slot"
+            style={styles.settingsButton}
+            pointerEvents={showSettings ? "auto" : "none"}
+            accessibilityElementsHidden={!showSettings}
+            importantForAccessibility={showSettings ? "auto" : "no-hide-descendants"}
+          >
+            {showSettings ? (
+              <IconButton
+                icon="cog-outline"
+                size={22}
+                iconColor={MUTED}
+                style={styles.settingsButton}
+                onPressIn={handleSettingsPressIn}
+                onPress={handleSettings}
+                accessibilityLabel="設定"
+              />
+            ) : null}
+          </View>
         </View>
       </View>
       {overflowActions ? (
@@ -284,13 +304,14 @@ export function ScreenHeader({
                 style={styles.overflowOverlay}
               >
                 <Pressable
+                  testID="screen-header-overflow-dismiss"
                   style={styles.overflowBackdrop}
+                  accessibilityRole="button"
                   onPress={() => setOverflowOpen(false)}
                   accessibilityLabel="その他の操作を閉じる"
                 />
                 <View
                   testID="screen-header-overflow-panel"
-                  accessibilityViewIsModal={overflowOpen}
                   style={[
                     styles.overflowPanel,
                     {
@@ -300,17 +321,6 @@ export function ScreenHeader({
                     },
                   ]}
                 >
-                  <View style={styles.overflowHeader}>
-                    <Text style={styles.overflowTitle}>その他の操作</Text>
-                    <IconButton
-                      icon="close"
-                      size={22}
-                      iconColor={MUTED}
-                      style={styles.closeButton}
-                      onPress={() => setOverflowOpen(false)}
-                      accessibilityLabel="その他の操作を閉じる"
-                    />
-                  </View>
                   <ScrollView
                     testID="screen-header-overflow-scroll"
                     style={[styles.overflowActionsScroll, { maxHeight: overflowActionsMaxHeight }]}
@@ -411,34 +421,16 @@ const styles = StyleSheet.create({
   },
   overflowBackdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(0, 0, 0, 0.35)",
+    backgroundColor: "transparent",
   },
   overflowPanel: {
     position: "absolute",
-    minWidth: 220,
+    minWidth: 0,
     maxWidth: "92%",
     borderRadius: 12,
-    padding: 8,
+    padding: 4,
     backgroundColor: SURFACE,
     elevation: 6,
-  },
-  overflowHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    minHeight: 44,
-  },
-  overflowTitle: {
-    color: TEXT,
-    fontWeight: "600",
-    paddingLeft: 8,
-  },
-  closeButton: {
-    width: 44,
-    height: 44,
-    minWidth: 44,
-    minHeight: 44,
-    margin: 0,
   },
   overflowActions: {
     flexDirection: "row",

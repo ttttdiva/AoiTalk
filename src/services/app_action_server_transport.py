@@ -17,13 +17,14 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 
@@ -37,6 +38,9 @@ from .app_action_server_journal import (
     MAX_LOG_BYTES,
     ServerActionJournal,
     ServerActionJournalError,
+    cleanup_owned_directory,
+    cleanup_unjournaled_run,
+    owned_directory_identity,
     runtime_tree_sha256,
 )
 from .app_job_execution_policy import (
@@ -60,6 +64,26 @@ _COMMAND_FORBIDDEN_CHARS = set("\x00\r\n;&|<>`%")
 _SAFE_COMMAND_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
 _MAX_BUNDLE_FILES = 10_000
 _MAX_BUNDLE_BYTES = 512 * 1024 * 1024
+_INPUT_STAGING_MARKER = "owner.json"
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    """Inspect one storage entry without following a link/reparse point."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _entry_exists(path: Path) -> bool:
+    return path.exists() or _is_link_or_reparse(path)
 
 
 class ServerActionPreparationError(RuntimeError):
@@ -81,6 +105,23 @@ class PreparedServerAction:
     output_manifest_path: Path
     log_path: Path
     isolation_config: dict[str, Any]
+    runtime_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _InputStagingReservation:
+    run_id: str
+    run_root: Path
+    staging_root: Path
+    file_root: Path
+    marker_path: Path
+    marker_token: str
+    owner_user_id: str
+    manifest_sha256: str
+    owns_staging: bool
+    complete: bool
+    staging_identity: tuple[int, int] | None
+    start_token: str | None = None
 
 
 def _canonical(value: Any) -> bytes:
@@ -171,15 +212,24 @@ def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
 
 def _extract_runtime_bundle(
     *, artifact_path: Path, runtime_root: Path, expected_sha256: str, expected_size_bytes: int
-) -> None:
+) -> tuple[int, int]:
     verify_file_integrity(
         artifact_path,
         expected_sha256=expected_sha256,
         expected_size_bytes=expected_size_bytes,
     )
-    if runtime_root.exists():
-        shutil.rmtree(runtime_root)
-    runtime_root.mkdir(parents=True, exist_ok=True)
+    if _is_link_or_reparse(runtime_root) or runtime_root.exists():
+        # A retry must first prove that the prior attempt's exact transient
+        # tree is removable.  Do not replace an existing directory here: a
+        # collision may belong to an active/unknown run or another owner.
+        raise ServerActionPreparationError("app_action_server_runtime_collision")
+    try:
+        runtime_root.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise ServerActionPreparationError("app_action_server_runtime_collision") from exc
+    runtime_identity = owned_directory_identity(runtime_root)
+    if runtime_identity is None:
+        raise ServerActionPreparationError("app_action_server_runtime_unavailable")
     total = 0
     seen: set[str] = set()
     try:
@@ -213,9 +263,15 @@ def _extract_runtime_bundle(
                 with archive.open(info) as source, destination.open("xb") as target:
                     shutil.copyfileobj(source, target)
     except ServerActionPreparationError:
+        cleanup_owned_directory(runtime_root, runtime_identity)
         raise
     except (OSError, zipfile.BadZipFile) as exc:
+        cleanup_owned_directory(runtime_root, runtime_identity)
         raise ServerActionPreparationError("app_action_server_runtime_invalid") from exc
+    except BaseException:
+        cleanup_owned_directory(runtime_root, runtime_identity)
+        raise
+    return runtime_identity
 
 
 def _read_runtime_manifest(runtime_root: Path, release: AppRelease) -> dict[str, Any]:
@@ -365,7 +421,7 @@ class ServerAppActionTransport:
         self.deployment_config = deployment_config if isinstance(deployment_config, Mapping) else {}
         self.supervisor_factory = supervisor_factory or spawn_supervisor_process
         action_root = get_workspaces_root(workspace_root) / "_app_action_runs"
-        if action_root.is_symlink():
+        if _is_link_or_reparse(action_root):
             raise ServerActionPreparationError("app_action_server_storage_link_invalid")
         self._journal_path = action_root / "server-actions.sqlite3"
         self._connection_epoch = self._new_connection_epoch()
@@ -380,7 +436,23 @@ class ServerAppActionTransport:
             boot = f"process-{os.getpid()}"
         return f"server-{boot}-{os.getpid()}"[:128]
 
-    def _journal(self) -> ServerActionJournal:
+    def _ensure_journal_namespace(self) -> None:
+        namespace = self._journal_path.parent
+        if _is_link_or_reparse(namespace):
+            raise ServerActionPreparationError("app_action_server_storage_link_invalid")
+        namespace.mkdir(parents=True, exist_ok=True)
+        if _is_link_or_reparse(namespace):
+            raise ServerActionPreparationError("app_action_server_storage_link_invalid")
+
+    def _journal(self, *, create: bool = False) -> ServerActionJournal | None:
+        """Open the durable journal; read probes never create its namespace."""
+
+        if create:
+            self._ensure_journal_namespace()
+        elif _is_link_or_reparse(self._journal_path):
+            raise ServerActionPreparationError("app_action_server_journal_link_invalid")
+        elif not self._journal_path.is_file():
+            return None
         return ServerActionJournal(self._journal_path)
 
     def _execution_targets(self) -> Mapping[str, Any]:
@@ -560,61 +632,95 @@ class ServerAppActionTransport:
             raise ServerActionPreparationError("app_action_server_release_unavailable") from exc
         finally:
             await session.close()
-        root = get_workspaces_root(self.workspace_root) / "_app_action_runs" / f"run_{run_id}"
+        root = self._run_root(self.workspace_root, run_id)
         runtime_root = root / "runtime"
-        await asyncio.to_thread(
-            _extract_runtime_bundle,
-            artifact_path=artifact_path,
-            runtime_root=runtime_root,
-            expected_sha256=artifact_sha,
-            expected_size_bytes=artifact_size,
+        extract_task = asyncio.create_task(
+            asyncio.to_thread(
+                _extract_runtime_bundle,
+                artifact_path=artifact_path,
+                runtime_root=runtime_root,
+                expected_sha256=artifact_sha,
+                expected_size_bytes=artifact_size,
+            )
         )
-        manifest = _read_runtime_manifest(runtime_root, release)
-        _verify_release_contract_hashes(
-            manifest,
-            runtime_root,
-            target,
-            action_key=action_key,
-            target_key=target_key,
-            expected_action_spec_hash=str(payload.get("action_spec_hash") or ""),
-            expected_target_contract_hash=str(payload.get("contract_hash") or ""),
-            runtime_bundle_sha256=artifact_sha,
-            runtime_bundle_size_bytes=artifact_size,
-        )
-        command = _target_command_from_manifest(
-            manifest,
-            action_key=action_key,
-            target_key=target_key,
-            execution_target_id=execution_target_id,
-            mode=mode,
-        )
-        command = _resolve_command_paths(command, runtime_root)
-        input_path = root / "input.json"
-        output_path = root / "result.json"
-        output_manifest_path = root / "output-manifest.json"
-        log_path = root / "run.log"
-        return PreparedServerAction(
-            runtime_root=runtime_root,
-            runtime_tree_sha256=runtime_tree_sha256(runtime_root),
-            command=tuple(command),
-            command_sha256=_sha256_bytes(command),
-            input_path=input_path,
-            output_path=output_path,
-            output_manifest_path=output_manifest_path,
-            log_path=log_path,
-            isolation_config=isolation_config,
-        )
+        runtime_identity: tuple[int, int] | None = None
+        try:
+            runtime_identity = await asyncio.shield(extract_task)
+            manifest = _read_runtime_manifest(runtime_root, release)
+            _verify_release_contract_hashes(
+                manifest,
+                runtime_root,
+                target,
+                action_key=action_key,
+                target_key=target_key,
+                expected_action_spec_hash=str(payload.get("action_spec_hash") or ""),
+                expected_target_contract_hash=str(payload.get("contract_hash") or ""),
+                runtime_bundle_sha256=artifact_sha,
+                runtime_bundle_size_bytes=artifact_size,
+            )
+            command = _target_command_from_manifest(
+                manifest,
+                action_key=action_key,
+                target_key=target_key,
+                execution_target_id=execution_target_id,
+                mode=mode,
+            )
+            command = _resolve_command_paths(command, runtime_root)
+            input_path = root / "input.json"
+            output_path = root / "result.json"
+            output_manifest_path = root / "output-manifest.json"
+            log_path = root / "run.log"
+            return PreparedServerAction(
+                runtime_root=runtime_root,
+                runtime_tree_sha256=runtime_tree_sha256(runtime_root),
+                command=tuple(command),
+                command_sha256=_sha256_bytes(command),
+                input_path=input_path,
+                output_path=output_path,
+                output_manifest_path=output_manifest_path,
+                log_path=log_path,
+                isolation_config=isolation_config,
+                runtime_identity=runtime_identity,
+            )
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(extract_task)
+            except BaseException:
+                pass
+            if runtime_identity is None and extract_task.done() and not extract_task.cancelled():
+                try:
+                    runtime_identity = extract_task.result()
+                except BaseException:
+                    runtime_identity = None
+            if runtime_identity is not None:
+                cleanup_owned_directory(runtime_root, runtime_identity)
+            raise
+        except BaseException:
+            if runtime_identity is not None:
+                cleanup_owned_directory(runtime_root, runtime_identity)
+            raise
 
     @staticmethod
     def _run_root(workspace_root: str | os.PathLike[str] | None, run_id: str | UUID) -> Path:
         root = get_workspaces_root(workspace_root)
         namespace = root / "_app_action_runs"
-        if namespace.is_symlink():
+        if _is_link_or_reparse(namespace):
             raise ServerActionPreparationError("app_action_server_storage_link_invalid")
         run_root = namespace / f"run_{UUID(str(run_id))}"
-        if run_root.is_symlink():
+        if _is_link_or_reparse(run_root):
             raise ServerActionPreparationError("app_action_server_run_link_invalid")
         return run_root
+
+    def _cleanup_unjournaled(self, run_id: str | UUID, *, remove_dirs: tuple[str, ...]) -> None:
+        """Best-effort cleanup for the current pre-journal write boundary."""
+
+        try:
+            cleanup_unjournaled_run(self._journal_path, run_id, remove_dirs=remove_dirs)
+        except Exception:
+            # Cleanup is fail-closed.  The original operation's error remains
+            # the caller-visible result and an ambiguous tree is left for the
+            # ownership-aware workspace inventory.
+            return
 
     async def stage_inputs(
         self,
@@ -624,12 +730,262 @@ class ServerAppActionTransport:
         chunks: Any,
         **_kwargs: Any,
     ) -> None:
-        """Persist verified input chunks before the supervisor start fence."""
+        try:
+            await self._stage_inputs_impl(
+                run_id=run_id,
+                manifest=manifest,
+                chunks=chunks,
+                context=_kwargs,
+            )
+        except AppActionTransportError:
+            raise
+        except ServerActionPreparationError as exc:
+            raise AppActionTransportError(code=exc.code, definitely_not_sent=True) from exc
+        except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise AppActionTransportError(
+                code="app_action_input_unavailable", definitely_not_sent=True
+            ) from exc
 
+    @staticmethod
+    def _input_staging_fingerprint(
+        run_id: str,
+        files: list[Any],
+        context: Mapping[str, Any],
+    ) -> dict[str, str]:
+        payload = context.get("payload") if isinstance(context.get("payload"), Mapping) else {}
+        return {
+            "run_id": str(run_id),
+            "owner_user_id": str(context.get("owner_user_id") or ""),
+            "app_id": str(context.get("app_id") or payload.get("app_id") or ""),
+            "action_ref": str(context.get("action_ref") or payload.get("action_ref") or ""),
+            "manifest_sha256": hashlib.sha256(_canonical(files)).hexdigest(),
+        }
+
+    @staticmethod
+    def _validate_staged_input_files(file_root: Path, files: list[Any]) -> None:
+        expected = {
+            str(item.get("file_id")): item
+            for item in files
+            if isinstance(item, Mapping) and item.get("file_id")
+        }
+        for file_id, item in expected.items():
+            if not re.fullmatch(r"af_[A-Za-z0-9_-]{32}", file_id):
+                raise AppActionTransportError(code="app_action_input_file_id_invalid", definitely_not_sent=True)
+            path = file_root / f"{file_id}.bin"
+            if not path.is_file() or _is_link_or_reparse(path):
+                raise AppActionTransportError(code="app_action_input_missing", definitely_not_sent=True)
+            if path.stat().st_size != int(item.get("size_bytes") or -1):
+                raise AppActionTransportError(code="app_action_input_size_mismatch", definitely_not_sent=True)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest.casefold() != str(item.get("sha256") or "").casefold():
+                raise AppActionTransportError(code="app_action_input_hash_mismatch", definitely_not_sent=True)
+
+    def _claim_input_staging(
+        self,
+        run_id: str,
+        files: list[Any],
+        context: Mapping[str, Any],
+    ) -> _InputStagingReservation:
         try:
             root = self._run_root(self.workspace_root, run_id)
         except (TypeError, ValueError, AttributeError) as exc:
             raise AppActionTransportError(code="app_action_input_run_invalid", definitely_not_sent=True) from exc
+        staging = root / "input-staging"
+        file_root = staging / "files"
+        marker_path = staging / _INPUT_STAGING_MARKER
+        if _is_link_or_reparse(staging) or _is_link_or_reparse(file_root) or _is_link_or_reparse(marker_path):
+            raise AppActionTransportError(code="app_action_input_path_invalid", definitely_not_sent=True)
+        fingerprint = self._input_staging_fingerprint(run_id, files, context)
+        if _entry_exists(staging):
+            if not staging.is_dir() or not _entry_exists(marker_path) or not marker_path.is_file():
+                raise ServerActionPreparationError("app_action_input_staging_collision")
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, TypeError, ValueError) as exc:
+                raise ServerActionPreparationError("app_action_input_staging_collision") from exc
+            if not isinstance(marker, Mapping) or any(marker.get(key) != value for key, value in fingerprint.items()):
+                raise ServerActionPreparationError("app_action_input_staging_owner_mismatch")
+            raw_identity = marker.get("staging_identity")
+            try:
+                marker_identity = (int(raw_identity[0]), int(raw_identity[1]))
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ServerActionPreparationError("app_action_input_staging_collision") from exc
+            if owned_directory_identity(staging) != marker_identity:
+                raise ServerActionPreparationError("app_action_input_staging_collision")
+            status = str(marker.get("status") or "")
+            if status == "writing":
+                raise ServerActionPreparationError("app_action_input_staging_busy")
+            if status != "complete":
+                raise ServerActionPreparationError("app_action_input_staging_collision")
+            self._validate_staged_input_files(file_root, files)
+            return _InputStagingReservation(
+                run_id=str(run_id),
+                run_root=root,
+                staging_root=staging,
+                file_root=file_root,
+                marker_path=marker_path,
+                marker_token=str(marker.get("token") or ""),
+                owner_user_id=fingerprint["owner_user_id"],
+                manifest_sha256=fingerprint["manifest_sha256"],
+                owns_staging=False,
+                complete=True,
+                staging_identity=marker_identity,
+            )
+        try:
+            staging.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise ServerActionPreparationError("app_action_input_staging_busy") from exc
+        staging_identity = owned_directory_identity(staging)
+        if staging_identity is None:
+            raise ServerActionPreparationError("app_action_input_staging_unavailable")
+        marker_token = uuid4().hex
+        marker = {
+            **fingerprint,
+            "status": "writing",
+            "token": marker_token,
+            "staging_identity": list(staging_identity),
+        }
+        try:
+            with marker_path.open("x", encoding="utf-8", newline="\n") as stream:
+                json.dump(marker, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            file_root.mkdir(parents=False, exist_ok=False)
+        except BaseException:
+            cleanup_owned_directory(staging, staging_identity)
+            raise
+        return _InputStagingReservation(
+            run_id=str(run_id),
+            run_root=root,
+            staging_root=staging,
+            file_root=file_root,
+            marker_path=marker_path,
+            marker_token=marker_token,
+            owner_user_id=fingerprint["owner_user_id"],
+            manifest_sha256=fingerprint["manifest_sha256"],
+            owns_staging=True,
+            complete=False,
+            staging_identity=staging_identity,
+        )
+
+    def _cleanup_staging_reservation(self, reservation: _InputStagingReservation) -> None:
+        if not reservation.owns_staging or reservation.staging_identity is None:
+            return
+        try:
+            marker = json.loads(reservation.marker_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, TypeError, ValueError):
+            return
+        if not isinstance(marker, Mapping) or str(marker.get("token") or "") != reservation.marker_token:
+            return
+        raw_identity = marker.get("staging_identity")
+        try:
+            marker_identity = (int(raw_identity[0]), int(raw_identity[1]))
+        except (IndexError, TypeError, ValueError):
+            return
+        if marker_identity != reservation.staging_identity:
+            return
+        if cleanup_owned_directory(reservation.staging_root, reservation.staging_identity):
+            self._cleanup_unjournaled(reservation.run_id, remove_dirs=())
+
+    def _claim_staging_for_start(
+        self,
+        run_id: str,
+        payload: Mapping[str, Any],
+        owner_user_id: str,
+    ) -> _InputStagingReservation | None:
+        files = payload.get("input_files")
+        if not isinstance(files, list) or not files:
+            return None
+        root = self._run_root(self.workspace_root, run_id)
+        staging = root / "input-staging"
+        marker_path = staging / _INPUT_STAGING_MARKER
+        file_root = staging / "files"
+        if not _entry_exists(staging):
+            return None
+        if (
+            _is_link_or_reparse(staging)
+            or _is_link_or_reparse(marker_path)
+            or _is_link_or_reparse(file_root)
+            or not marker_path.is_file()
+        ):
+            raise ServerActionPreparationError("app_action_input_staging_collision")
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            raise ServerActionPreparationError("app_action_input_staging_collision") from exc
+        fingerprint = self._input_staging_fingerprint(
+            run_id,
+            files,
+            {
+                "owner_user_id": owner_user_id,
+                "app_id": payload.get("app_id"),
+                "action_ref": payload.get("action_ref"),
+            },
+        )
+        if not isinstance(marker, Mapping) or any(marker.get(key) != value for key, value in fingerprint.items()):
+            raise ServerActionPreparationError("app_action_input_staging_owner_mismatch")
+        if str(marker.get("status") or "") != "complete":
+            raise ServerActionPreparationError("app_action_input_staging_busy")
+        raw_identity = marker.get("staging_identity")
+        try:
+            staging_identity = (int(raw_identity[0]), int(raw_identity[1]))
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ServerActionPreparationError("app_action_input_staging_collision") from exc
+        if owned_directory_identity(staging) != staging_identity:
+            raise ServerActionPreparationError("app_action_input_staging_collision")
+        start_token = uuid4().hex
+        updated = dict(marker)
+        updated["status"] = "starting"
+        updated["start_token"] = start_token
+        marker_path.write_text(
+            json.dumps(updated, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+            newline="\n",
+        )
+        return _InputStagingReservation(
+            run_id=str(run_id),
+            run_root=root,
+            staging_root=staging,
+            file_root=file_root,
+            marker_path=marker_path,
+            marker_token=str(marker.get("token") or ""),
+            owner_user_id=fingerprint["owner_user_id"],
+            manifest_sha256=fingerprint["manifest_sha256"],
+            owns_staging=False,
+            complete=True,
+            staging_identity=staging_identity,
+            start_token=start_token,
+        )
+
+    def _cleanup_start_staging(self, reservation: _InputStagingReservation | None) -> None:
+        if reservation is None or reservation.start_token is None or reservation.staging_identity is None:
+            return
+        try:
+            marker = json.loads(reservation.marker_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, TypeError, ValueError):
+            return
+        if not isinstance(marker, Mapping) or str(marker.get("start_token") or "") != reservation.start_token:
+            return
+        raw_identity = marker.get("staging_identity")
+        try:
+            marker_identity = (int(raw_identity[0]), int(raw_identity[1]))
+        except (IndexError, TypeError, ValueError):
+            return
+        if marker_identity != reservation.staging_identity:
+            return
+        if cleanup_owned_directory(reservation.staging_root, reservation.staging_identity):
+            self._cleanup_unjournaled(reservation.run_id, remove_dirs=())
+
+    async def _stage_inputs_impl(
+        self,
+        *,
+        run_id: str,
+        manifest: Mapping[str, Any],
+        chunks: Any,
+        context: Mapping[str, Any],
+    ) -> None:
+        """Persist verified input chunks before the supervisor start fence."""
+
         files = manifest.get("files") if isinstance(manifest, Mapping) else None
         if not isinstance(files, list):
             raise AppActionTransportError(code="app_action_input_manifest_invalid", definitely_not_sent=True)
@@ -638,59 +994,62 @@ class ServerAppActionTransport:
             for item in files
             if isinstance(item, Mapping) and item.get("file_id")
         }
-        staging = root / "input-staging"
-        file_root = staging / "files"
-        if staging.is_symlink() or file_root.is_symlink():
-            raise AppActionTransportError(code="app_action_input_path_invalid", definitely_not_sent=True)
-        file_root.mkdir(parents=True, exist_ok=True)
-        for chunk in chunks:
-            if not isinstance(chunk, Mapping) or str(chunk.get("run_id")) != str(run_id):
-                raise AppActionTransportError(code="app_action_input_chunk_invalid", definitely_not_sent=True)
-            file_id = str(chunk.get("file_id") or "")
-            if not re.fullmatch(r"af_[A-Za-z0-9_-]{32}", file_id):
-                raise AppActionTransportError(code="app_action_input_file_id_invalid", definitely_not_sent=True)
-            item = expected.get(file_id)
-            raw = chunk.get("data")
-            if item is None or not isinstance(raw, (bytes, bytearray, memoryview)):
-                raise AppActionTransportError(code="app_action_input_chunk_invalid", definitely_not_sent=True)
-            expected_ref = f"files/{file_id}.bin"
-            if str(chunk.get("ref") or expected_ref) != expected_ref:
-                raise AppActionTransportError(code="app_action_input_ref_invalid", definitely_not_sent=True)
-            try:
-                offset = int(chunk.get("offset"))
-            except (TypeError, ValueError) as exc:
-                raise AppActionTransportError(code="app_action_input_offset_invalid", definitely_not_sent=True) from exc
-            if offset < 0:
-                raise AppActionTransportError(code="app_action_input_offset_invalid", definitely_not_sent=True)
-            path = file_root / f"{file_id}.bin"
-            if path.is_symlink():
-                raise AppActionTransportError(code="app_action_input_path_invalid", definitely_not_sent=True)
-            data = bytes(raw)
-            if len(data) > 4 * 1024 * 1024:
-                raise AppActionTransportError(code="app_action_input_chunk_too_large", definitely_not_sent=True)
-            current_size = path.stat().st_size if path.exists() else 0
-            if current_size != offset:
-                raise AppActionTransportError(code="app_action_input_offset_conflict", definitely_not_sent=True)
-            with path.open("ab") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-        for file_id, item in expected.items():
-            path = file_root / f"{file_id}.bin"
-            if not path.is_file() or path.is_symlink():
-                raise AppActionTransportError(code="app_action_input_missing", definitely_not_sent=True)
-            if path.stat().st_size != int(item.get("size_bytes") or -1):
-                raise AppActionTransportError(code="app_action_input_size_mismatch", definitely_not_sent=True)
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if digest.casefold() != str(item.get("sha256") or "").casefold():
-                raise AppActionTransportError(code="app_action_input_hash_mismatch", definitely_not_sent=True)
-        (staging / "manifest.json").write_text(
-            json.dumps(files, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            encoding="utf-8",
-            newline="\n",
-        )
+        reservation = self._claim_input_staging(run_id, files, context)
+        if reservation.complete:
+            return
+        try:
+            for chunk in chunks:
+                if not isinstance(chunk, Mapping) or str(chunk.get("run_id")) != str(run_id):
+                    raise AppActionTransportError(code="app_action_input_chunk_invalid", definitely_not_sent=True)
+                file_id = str(chunk.get("file_id") or "")
+                if not re.fullmatch(r"af_[A-Za-z0-9_-]{32}", file_id):
+                    raise AppActionTransportError(code="app_action_input_file_id_invalid", definitely_not_sent=True)
+                item = expected.get(file_id)
+                raw = chunk.get("data")
+                if item is None or not isinstance(raw, (bytes, bytearray, memoryview)):
+                    raise AppActionTransportError(code="app_action_input_chunk_invalid", definitely_not_sent=True)
+                expected_ref = f"files/{file_id}.bin"
+                if str(chunk.get("ref") or expected_ref) != expected_ref:
+                    raise AppActionTransportError(code="app_action_input_ref_invalid", definitely_not_sent=True)
+                try:
+                    offset = int(chunk.get("offset"))
+                except (TypeError, ValueError) as exc:
+                    raise AppActionTransportError(code="app_action_input_offset_invalid", definitely_not_sent=True) from exc
+                if offset < 0:
+                    raise AppActionTransportError(code="app_action_input_offset_invalid", definitely_not_sent=True)
+                path = reservation.file_root / f"{file_id}.bin"
+                if _is_link_or_reparse(path):
+                    raise AppActionTransportError(code="app_action_input_path_invalid", definitely_not_sent=True)
+                data = bytes(raw)
+                if len(data) > 4 * 1024 * 1024:
+                    raise AppActionTransportError(code="app_action_input_chunk_too_large", definitely_not_sent=True)
+                current_size = path.stat().st_size if path.exists() else 0
+                if current_size != offset:
+                    raise AppActionTransportError(code="app_action_input_offset_conflict", definitely_not_sent=True)
+                with path.open("ab") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            self._validate_staged_input_files(reservation.file_root, files)
+            (reservation.staging_root / "manifest.json").write_text(
+                json.dumps(files, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+                newline="\n",
+            )
+            marker = json.loads(reservation.marker_path.read_text(encoding="utf-8"))
+            marker["status"] = "complete"
+            reservation.marker_path.write_text(
+                json.dumps(marker, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+                newline="\n",
+            )
+        except BaseException:
+            self._cleanup_staging_reservation(reservation)
+            raise
 
-    def _materialize_staged_inputs(self, run_id: str, input_files: Any, run_root: Path) -> None:
+    def _materialize_staged_inputs(
+        self, run_id: str, input_files: Any, run_root: Path
+    ) -> tuple[int, int] | None:
         staging = self._run_root(self.workspace_root, run_id) / "input-staging"
         manifest = input_files
         if not isinstance(manifest, list):
@@ -698,31 +1057,44 @@ class ServerAppActionTransport:
             if manifest_path.is_file():
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, list) or not manifest:
-            return
+            return None
         source_root = staging / "files"
-        destination_root = run_root / "inputs" / "files"
-        destination_root.mkdir(parents=True, exist_ok=True)
-        for item in manifest:
-            if not isinstance(item, Mapping):
-                raise ServerActionPreparationError("app_action_server_input_manifest_invalid")
-            file_id = str(item.get("file_id") or "")
-            if not re.fullmatch(r"af_[A-Za-z0-9_-]{32}", file_id):
-                raise ServerActionPreparationError("app_action_server_input_file_id_invalid")
-            source = source_root / f"{file_id}.bin"
-            destination = destination_root / f"{file_id}.bin"
-            if not source.is_file() or source.is_symlink():
-                raise ServerActionPreparationError("app_action_server_input_missing")
-            expected_size = int(item.get("size_bytes") or -1)
-            if source.stat().st_size != expected_size:
-                raise ServerActionPreparationError("app_action_server_input_size_mismatch")
-            digest = hashlib.sha256(source.read_bytes()).hexdigest()
-            if digest.casefold() != str(item.get("sha256") or "").casefold():
-                raise ServerActionPreparationError("app_action_server_input_hash_mismatch")
-            if destination.exists():
-                if destination.stat().st_size != expected_size or hashlib.sha256(destination.read_bytes()).hexdigest().casefold() != digest.casefold():
-                    raise ServerActionPreparationError("app_action_server_input_conflict")
-                continue
-            shutil.copyfile(source, destination)
+        if _is_link_or_reparse(staging) or _is_link_or_reparse(source_root):
+            raise ServerActionPreparationError("app_action_server_input_path_invalid")
+        input_root = run_root / "inputs"
+        destination_root = input_root / "files"
+        if _entry_exists(input_root) or _is_link_or_reparse(destination_root):
+            raise ServerActionPreparationError("app_action_server_input_collision")
+        try:
+            input_root.mkdir(parents=False, exist_ok=False)
+        except FileExistsError as exc:
+            raise ServerActionPreparationError("app_action_server_input_collision") from exc
+        input_identity = owned_directory_identity(input_root)
+        if input_identity is None:
+            raise ServerActionPreparationError("app_action_server_input_unavailable")
+        try:
+            destination_root.mkdir(parents=False, exist_ok=False)
+            for item in manifest:
+                if not isinstance(item, Mapping):
+                    raise ServerActionPreparationError("app_action_server_input_manifest_invalid")
+                file_id = str(item.get("file_id") or "")
+                if not re.fullmatch(r"af_[A-Za-z0-9_-]{32}", file_id):
+                    raise ServerActionPreparationError("app_action_server_input_file_id_invalid")
+                source = source_root / f"{file_id}.bin"
+                destination = destination_root / f"{file_id}.bin"
+                if not source.is_file() or _is_link_or_reparse(source):
+                    raise ServerActionPreparationError("app_action_server_input_missing")
+                expected_size = int(item.get("size_bytes") or -1)
+                if source.stat().st_size != expected_size:
+                    raise ServerActionPreparationError("app_action_server_input_size_mismatch")
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                if digest.casefold() != str(item.get("sha256") or "").casefold():
+                    raise ServerActionPreparationError("app_action_server_input_hash_mismatch")
+                shutil.copyfile(source, destination)
+        except BaseException:
+            cleanup_owned_directory(input_root, input_identity)
+            raise
+        return input_identity
 
     async def capture_outputs(
         self,
@@ -737,6 +1109,8 @@ class ServerAppActionTransport:
         """Capture worker output bytes/path entries into opaque file storage."""
 
         journal = self._journal()
+        if journal is None:
+            raise AppActionTransportError(code="app_action_run_unknown")
         try:
             row = journal.get(run_id)
             if row is None:
@@ -754,6 +1128,8 @@ class ServerAppActionTransport:
                 action_id=action_ref or row.get("action_ref"),
                 allowed_root=str(Path(row["runtime_root"]).resolve().parent),
             )
+            if row.get("status") in {"succeeded", "failed", "cancelled"}:
+                journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
             return [item.to_dict() for item in captured]
         except AppActionTransportError:
             raise
@@ -772,6 +1148,8 @@ class ServerAppActionTransport:
         """Resolve result file paths to byte payloads for FileAware capture."""
 
         journal = self._journal()
+        if journal is None:
+            raise AppActionTransportError(code="app_action_run_unknown")
         try:
             row = journal.get(run_id)
             if row is None:
@@ -838,7 +1216,9 @@ class ServerAppActionTransport:
             run_id = str(UUID(str(payload.get("run_id"))))
         except (TypeError, ValueError, AttributeError) as exc:
             raise AppActionTransportError(code="app_action_server_run_id_invalid", definitely_not_sent=True) from exc
-        journal = self._journal()
+        journal = self._journal(create=True)
+        if journal is None:  # pragma: no cover - create=True always opens it
+            raise AppActionTransportError(code="app_action_server_journal_unavailable", definitely_not_sent=True)
         try:
             input_json = payload.get("input")
             if not isinstance(input_json, dict):
@@ -863,7 +1243,10 @@ class ServerAppActionTransport:
             if reserved:
                 existing = journal.get(run_id)
                 if existing is not None:
-                    return journal.remote_snapshot(run_id)
+                    snapshot = journal.remote_snapshot(run_id)
+                    if snapshot.get("status") in {"succeeded", "failed", "cancelled"}:
+                        journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
+                    return snapshot
                 pending = journal.pending_snapshot(run_id)
                 if pending is not None:
                     # The first caller still owns materialization.  Return a
@@ -876,7 +1259,16 @@ class ServerAppActionTransport:
                     pending["connection_epoch"] = str(expected_connection_epoch or self._connection_epoch)
                     return pending
                 raise AppActionTransportError(code="app_action_start_reserved", definitely_not_sent=False)
+            prepared: PreparedServerAction | None = None
+            materialize_task: asyncio.Task[Any] | None = None
+            staging_reservation: _InputStagingReservation | None = None
+            materialized_inputs_identity: tuple[int, int] | None = None
             try:
+                staging_reservation = self._claim_staging_for_start(
+                    run_id,
+                    payload,
+                    str(owner_user_id),
+                )
                 prepared = await self._prepare(
                     payload,
                     owner_user_id=str(owner_user_id),
@@ -885,14 +1277,58 @@ class ServerAppActionTransport:
                     machine_id=str(machine_id),
                     expected_epoch=expected_connection_epoch,
                 )
-                await asyncio.to_thread(
-                    self._materialize_staged_inputs,
-                    run_id,
-                    payload.get("input_files"),
-                    prepared.runtime_root.parent,
+                materialize_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._materialize_staged_inputs,
+                        run_id,
+                        payload.get("input_files"),
+                        prepared.runtime_root.parent,
+                    )
                 )
-            except (ServerActionPreparationError, ServerJobExecutionDenied, AppJobIsolationError, AppStorageError) as exc:
+                try:
+                    materialized_inputs_identity = await asyncio.shield(materialize_task)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.shield(materialize_task)
+                    except BaseException:
+                        pass
+                    if materialize_task.done() and not materialize_task.cancelled():
+                        try:
+                            materialized_inputs_identity = materialize_task.result()
+                        except BaseException:
+                            materialized_inputs_identity = None
+                    raise
+            except asyncio.CancelledError:
+                journal.abort_reservation(run_id, "app_action_server_prepare_cancelled")
+                if prepared is not None:
+                    cleanup_owned_directory(prepared.runtime_root, prepared.runtime_identity)
+                if materialized_inputs_identity is not None:
+                    cleanup_owned_directory(
+                        prepared.runtime_root.parent / "inputs" if prepared is not None else self._run_root(self.workspace_root, run_id) / "inputs",
+                        materialized_inputs_identity,
+                    )
+                self._cleanup_start_staging(staging_reservation)
+                raise
+            except (
+                ServerActionPreparationError,
+                ServerJobExecutionDenied,
+                AppJobIsolationError,
+                AppStorageError,
+                ServerActionJournalError,
+                OSError,
+                TypeError,
+                ValueError,
+                UnicodeError,
+            ) as exc:
                 journal.abort_reservation(run_id, getattr(exc, "code", "app_action_server_prepare_failed"))
+                if prepared is not None:
+                    cleanup_owned_directory(prepared.runtime_root, prepared.runtime_identity)
+                if materialized_inputs_identity is not None:
+                    cleanup_owned_directory(
+                        prepared.runtime_root.parent / "inputs" if prepared is not None else self._run_root(self.workspace_root, run_id) / "inputs",
+                        materialized_inputs_identity,
+                    )
+                self._cleanup_start_staging(staging_reservation)
                 raise AppActionTransportError(
                     code=getattr(exc, "code", "app_action_server_prepare_failed"),
                     definitely_not_sent=True,
@@ -927,17 +1363,27 @@ class ServerAppActionTransport:
             }
             _row, replayed = journal.prepare(record)
             if replayed:
-                return journal.remote_snapshot(run_id)
+                snapshot = journal.remote_snapshot(run_id)
+                if snapshot.get("status") in {"succeeded", "failed", "cancelled"}:
+                    journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
+                return snapshot
             journal.finish_reservation(run_id)
             if not journal.claim_spawn(run_id):
-                return journal.remote_snapshot(run_id)
+                snapshot = journal.remote_snapshot(run_id)
+                if snapshot.get("status") in {"succeeded", "failed", "cancelled"}:
+                    journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
+                return snapshot
             try:
                 supervisor = self.supervisor_factory(journal.path, run_id)
             except (OSError, subprocess.SubprocessError, TypeError) as exc:
                 journal.update(run_id, status="failed", execution_status="failed", error="supervisor_spawn_failed:" + type(exc).__name__)
+                journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
                 return journal.remote_snapshot(run_id)
             journal.update(run_id, supervisor_pid=int(supervisor.pid))
-            return journal.remote_snapshot(run_id)
+            snapshot = journal.remote_snapshot(run_id)
+            if snapshot.get("status") in {"succeeded", "failed", "cancelled"}:
+                journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
+            return snapshot
         finally:
             journal.close()
 
@@ -957,6 +1403,8 @@ class ServerAppActionTransport:
         **_kwargs: Any,
     ) -> Mapping[str, Any]:
         journal = self._journal()
+        if journal is None:
+            raise AppActionTransportError(code="app_action_run_unknown")
         try:
             row = journal.get(run_id)
             if row is None:
@@ -986,7 +1434,10 @@ class ServerAppActionTransport:
                     age = max(0.0, __import__("time").time() - float(row.get("updated_at") or 0))
                     if age > 5:
                         journal.mark_unknown_if_active(run_id, "supervisor_unobserved")
-            return journal.remote_snapshot(run_id)
+            snapshot = journal.remote_snapshot(run_id)
+            if snapshot.get("status") in {"succeeded", "failed", "cancelled"}:
+                journal.cleanup_run_artifacts(run_id, owner_user_id=owner_user_id)
+            return snapshot
         except ServerActionJournalError as exc:
             raise AppActionTransportError(code=exc.code) from exc
         finally:
@@ -1005,6 +1456,8 @@ class ServerAppActionTransport:
         **_kwargs: Any,
     ) -> Mapping[str, Any]:
         journal = self._journal()
+        if journal is None:
+            raise AppActionTransportError(code="app_action_run_unknown")
         try:
             row = journal.get(run_id)
             if row is None:
@@ -1027,6 +1480,8 @@ class ServerAppActionTransport:
         **_kwargs: Any,
     ) -> Mapping[str, Any]:
         journal = self._journal()
+        if journal is None:
+            raise AppActionTransportError(code="app_action_run_unknown")
         try:
             row = journal.get(run_id)
             if row is None:

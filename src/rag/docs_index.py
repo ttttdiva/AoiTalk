@@ -226,6 +226,8 @@ class DocsIndexService:
         return await self._do_initialize()
 
     async def _do_initialize(self) -> bool:
+        from ..utils import qdrant_readiness
+
         try:
             if not await self.embedding.initialize():
                 logger.warning(
@@ -242,6 +244,7 @@ class DocsIndexService:
                     SharedQdrantClient.get_client, self.config.qdrant.local_path
                 )
             else:
+                await qdrant_readiness.await_ready()
                 self.client = QdrantClient(
                     host=self.config.qdrant.host,
                     port=self.config.qdrant.port,
@@ -253,6 +256,10 @@ class DocsIndexService:
             self._disabled = False
             self._disabled_at = None
             return True
+        except qdrant_readiness.QdrantNotReady:
+            # Preparing, not broken: the next call tries again.
+            logger.info("Docs index: Qdrant is still starting")
+            return False
         except Exception:
             logger.exception("Docs index: failed to initialize; disabling for this process")
             self._mark_disabled()

@@ -429,7 +429,7 @@ export function RelatedInformationPanel({
         <section className="space-y-3 border-b border-border-subtle px-4 py-4">
           <div className="flex items-center justify-between gap-2">
             <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-text-secondary">
-              サブエージェント
+              旧実行の記録
               {subagents.length > 0 && (
                 <span className="ml-1 font-normal">({subagents.length})</span>
               )}
@@ -446,7 +446,7 @@ export function RelatedInformationPanel({
               <div className="flex items-start gap-2">
                 <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
                 <div className="min-w-0 flex-1">
-                  <p>サブエージェント情報を取得できませんでした</p>
+                  <p>旧実行の記録を取得できませんでした</p>
                   <Button
                     type="button"
                     variant="ghost"
@@ -462,16 +462,16 @@ export function RelatedInformationPanel({
             </div>
           ) : !agentRunId ? (
             <p className="py-2 text-xs text-text-secondary">
-              実行中のサブエージェントはいません
+              このChatに旧実行の記録はありません
             </p>
           ) : agentRunLoading && !agentRun ? (
             <p className="flex items-center gap-2 py-2 text-xs text-text-secondary">
               <Loader2 className="size-3.5 animate-spin" />
-              サブエージェント情報を読み込み中…
+              旧実行の記録を読み込み中…
             </p>
           ) : subagents.length === 0 ? (
             <p className="py-2 text-xs text-text-secondary">
-              この実行ではサブエージェントを使用していません
+              この実行には旧実行の記録がありません
             </p>
           ) : (
             <div className="space-y-2">

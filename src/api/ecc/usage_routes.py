@@ -11,7 +11,11 @@ from fastapi.responses import JSONResponse
 
 from ...services import token_tracking_service
 from ..ecc_helpers import parse_date as _parse_date
-from .usage_schemas import TokenUsageDetail
+from .usage_schemas import (
+    ProviderKeyAttributionResponse,
+    ProviderKeyAttestationRequest,
+    TokenUsageDetail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,57 @@ def build_usage_router(app_instance: Any, require_auth: Callable[..., Any]) -> A
         _, is_admin = await _usage_scope(request)
         if not is_admin:
             raise HTTPException(status_code=403, detail="Admin access required")
+
+    @usage_router.get(
+        "/provider-keys",
+        response_model=ProviderKeyAttributionResponse,
+    )
+    async def get_provider_key_attribution(
+        request: Request,
+        _=Depends(require_auth),
+    ):
+        """Owner-only, body-free provider key attribution and health projection."""
+        await _require_admin(request)
+        from ...services.provider_key_attribution_service import (
+            AttributionStoreError,
+            get_provider_key_attribution_store,
+        )
+
+        try:
+            return get_provider_key_attribution_store().read_projection()
+        except AttributionStoreError as exc:
+            raise HTTPException(status_code=503, detail="Provider key ledger unavailable") from exc
+
+    @usage_router.post(
+        "/provider-keys/attestation",
+        response_model=ProviderKeyAttributionResponse,
+    )
+    async def attest_provider_key(
+        body: ProviderKeyAttestationRequest,
+        request: Request,
+        _=Depends(require_auth),
+    ):
+        """Attach an owner-provided, non-secret Tracking ID digest to a seen key."""
+        await _require_admin(request)
+        from ...services.provider_key_attribution_service import (
+            AttributionStoreError,
+            get_provider_key_attribution_store,
+        )
+
+        store = get_provider_key_attribution_store()
+        try:
+            store.attest(
+                body.local_digest,
+                body.provider_key_id_digest,
+                body.state,
+            )
+            return store.read_projection()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Provider key not found") from exc
+        except AttributionStoreError as exc:
+            raise HTTPException(status_code=503, detail="Provider key ledger unavailable") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Provider key attestation invalid") from exc
 
     @usage_router.get("/records/{usage_id}", response_model=TokenUsageDetail)
     async def get_usage_record(

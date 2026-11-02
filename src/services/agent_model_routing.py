@@ -5,21 +5,19 @@ Agent uses is::
 
     Operations Agent
       -> exact AgentRevision (pinned by AgentWorkItem / AgentRun)
-      -> Agent Team (agent_team_id)
-      -> Team Execution Profile (execution_profile_id)
-      -> Subagent (acting_subagent_id; per-Subagent override > Default Route)
+      -> AgentRevision v2 model_overrides
+      -> global model_roles (with Chat inheritance)
       -> provider / model / effort
 
 Domain services (CrowdWorks, Web制作, アプリ開発, 調査 ...) never call
 ``create_llm_client(config)`` for Agent work and never copy this resolution.
 They ask for a *work role* (planner / worker / reviewer ...) and receive an
-``AgentModelRoute`` for a Subagent that is a member of the pinned Team and
-explicitly allowed by the pinned revision.
+``AgentModelRoute`` from the pinned v2 role route. Historical Team/Profile
+pins remain available only in audit snapshots and legacy display projections.
 
-Resolution is fail-closed: a missing/disabled Team, Profile or Subagent
-raises ``AgentModelRouteError`` instead of falling back to the global Base
-Model.  The ``manual`` system profile ("標準モデル") is an explicit user choice
-of the configured Main model and is reported as such in provenance.
+Resolution is fail-closed: a missing v2 role route raises
+``AgentModelRouteError`` instead of falling back to the retired Team/Profile
+runtime.
 
 This module is pure configuration logic plus one exact-revision DB lookup; it
 never creates provider clients, reads credentials or persists anything.
@@ -35,23 +33,20 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .agent_team_v3 import (
-    AGENT_TEAM_DEFAULT_LLM_PROFILES,
-    AGENT_TEAM_DEFAULT_TEAMS,
-    AGENT_TEAM_SUBAGENT_CATALOG,
-    _apply_execution_route,
-    agent_team_v3_subagents,
-    agent_team_v3_teams,
-)
-from .execution_profile_service import (
-    FREE_TEAM_PROFILE_ID,
-    MANUAL_EXECUTION_PROFILE_ID,
-    list_team_execution_profiles,
-    resolve_execution_main_route,
-)
 from .session_llm_runtime_context import (
     bind_session_main_route_override,
     reset_session_main_route_override,
+)
+from .agent_revision_v2 import (
+    model_role_for_legacy_subagent,
+    model_role_for_work_role,
+    revision_delegate_policy,
+    revision_model_overrides,
+    revision_role_route_candidates,
+    revision_role_fallback_policy,
+    revision_tool_ids,
+    revision_v2_fields_present,
+    resolve_agent_role_route_v2,
 )
 
 # Providers that ``llm.manager.create_llm_client_for_target`` can construct.
@@ -147,6 +142,12 @@ class AgentRoutingPins:
     # record).  ``None`` means the revision default; then
     # ``execution_profile_id`` is the revision's own value.
     execution_selection: Mapping[str, Any] | None = None
+    # Additive AgentRevision v2 policy fields.  They remain ``None`` for
+    # legacy revisions, which is the compatibility switch for the resolver.
+    model_overrides: Mapping[str, Any] | None = None
+    tool_ids: tuple[str, ...] | None = None
+    delegate_policy: Mapping[str, Any] | None = None
+    complete_p2: bool = False
 
     def with_execution_selection(
         self, selection: "AgentExecutionSelection"
@@ -172,7 +173,26 @@ class AgentRoutingPins:
                 return revision.get(name)
             return getattr(revision, name, None)
 
+        # Validate the raw revision before the compatibility projections below
+        # can normalize malformed fields into apparently valid empty values.
+        from .agent_identity_service import AgentIdentityValidationError, _delegate_policy, _model_overrides, _tool_ids
+
+        complete_p2 = revision_v2_fields_present(revision)
+        if complete_p2:
+            try:
+                raw_models, raw_tools, raw_policy = read("model_overrides"), read("tool_ids"), read("delegate_policy")
+                if not isinstance(raw_models, dict) or not isinstance(raw_tools, list) or not isinstance(raw_policy, dict):
+                    complete_p2 = False
+                else:
+                    _model_overrides(raw_models)
+                    _tool_ids(raw_tools, allow_concrete=True)
+                    _delegate_policy(raw_policy)
+            except AgentIdentityValidationError:
+                complete_p2 = False
         allowed = read("allowed_subagent_ids") or []
+        model_overrides = revision_model_overrides(revision)
+        tool_ids = revision_tool_ids(revision)
+        delegate_policy = revision_delegate_policy(revision)
         return cls(
             agent_id=str(read("agent_id")) if read("agent_id") else None,
             agent_revision_id=str(read("id")) if read("id") else None,
@@ -181,6 +201,10 @@ class AgentRoutingPins:
             allowed_subagent_ids=tuple(
                 dict.fromkeys(str(item).strip() for item in allowed if str(item).strip())
             ),
+            model_overrides=model_overrides,
+            tool_ids=tuple(tool_ids) if tool_ids is not None else None,
+            delegate_policy=delegate_policy,
+            complete_p2=complete_p2,
         )
 
 
@@ -201,6 +225,13 @@ class AgentModelRoute:
     agent_id: str | None = None
     agent_revision_id: str | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
+    # None identifies a historical route without a frozen candidate contract.
+    fallback_routes: tuple[Mapping[str, Any], ...] = field(default_factory=tuple, compare=False)
+    allow_paid_fallback: bool = field(default=False, compare=False)
+    pool_id: str | None = field(default=None, compare=False)
+    candidate_routes: tuple[Mapping[str, Any], ...] | None = field(default=None, compare=False)
+    fallback_on: tuple[str, ...] | None = field(default=None, compare=False)
+    selected_candidate_index: int | None = field(default=None, compare=False)
 
     def provenance(self) -> dict[str, Any]:
         """Safe audit projection: identifiers and model names only.
@@ -212,9 +243,6 @@ class AgentModelRoute:
         result: dict[str, Any] = {
             "agent_id": self.agent_id,
             "agent_revision_id": self.agent_revision_id,
-            "agent_team_id": self.agent_team_id,
-            "execution_profile_id": self.execution_profile_id,
-            "acting_subagent_id": self.acting_subagent_id,
             "role": self.role,
             "provider": self.provider,
             "model": self.model,
@@ -223,8 +251,26 @@ class AgentModelRoute:
             "inherits_main": self.inherits_main,
             "backend": self.backend,
         }
+        # These keys belong only to old persisted route records.  Current P2
+        # routes omit them; historical readers still surface them when a
+        # snapshot supplied the original values.
+        if self.agent_team_id:
+            result["agent_team_id"] = self.agent_team_id
+        if self.execution_profile_id:
+            result["execution_profile_id"] = self.execution_profile_id
+        if self.acting_subagent_id:
+            result["acting_subagent_id"] = self.acting_subagent_id
         if self.notes:
             result["notes"] = list(self.notes)
+        if self.candidate_routes is not None:
+            result["candidate_routes"] = [dict(route) for route in self.candidate_routes]
+            result["allow_paid_fallback"] = self.allow_paid_fallback
+            if self.fallback_on is not None:
+                result["fallback_on"] = list(self.fallback_on)
+        if self.selected_candidate_index is not None:
+            result["selected_candidate_index"] = self.selected_candidate_index
+            if self.pool_id is not None:
+                result["pool_id"] = self.pool_id
         return result
 
     def with_role(self, role: str | None) -> "AgentModelRoute":
@@ -233,177 +279,6 @@ class AgentModelRoute:
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
-
-
-def known_agent_teams(config: Any) -> dict[str, dict[str, Any]]:
-    """Code-owned default Teams overlaid by the saved canonical topology."""
-
-    teams = {key: copy.deepcopy(value) for key, value in AGENT_TEAM_DEFAULT_TEAMS.items()}
-    try:
-        for item in agent_team_v3_teams(config):
-            if isinstance(item, Mapping) and _clean(item.get("team_id")):
-                teams[_clean(item["team_id"])] = dict(item)
-    except Exception:
-        # A malformed optional config must never broaden membership; the
-        # code-owned defaults remain the only known Teams.
-        pass
-    return teams
-
-
-def known_agent_subagents(config: Any) -> dict[str, dict[str, Any]]:
-    """Code catalog overlaid by saved Subagents (saved disabled state wins)."""
-
-    subagents = {key: copy.deepcopy(value) for key, value in AGENT_TEAM_SUBAGENT_CATALOG.items()}
-    try:
-        for item in agent_team_v3_subagents(config, include_disabled=True):
-            if isinstance(item, Mapping) and _clean(item.get("subagent_id")):
-                subagents[_clean(item["subagent_id"])] = dict(item)
-    except Exception:
-        pass
-    return subagents
-
-
-def _require_pins(pins: AgentRoutingPins) -> None:
-    for value in (pins.agent_team_id, pins.execution_profile_id):
-        if not value or len(value) > 128 or value != value.strip():
-            raise AgentModelRouteError("agent_route_pins_invalid")
-
-
-def _team_for(config: Any, pins: AgentRoutingPins) -> dict[str, Any]:
-    team = known_agent_teams(config).get(pins.agent_team_id)
-    if not team or team.get("enabled", True) is False:
-        raise AgentModelRouteError("agent_route_team_unavailable")
-    return team
-
-
-def _main_route(
-    config: Any,
-    main_route_override: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    # Operations work must not inherit an ambient Chat session's Main model
-    # override (the request-scoped model picker of a conversation).  Only an
-    # explicit override handed in by the caller applies: a conversation's own
-    # persisted Main route, resolved when its Agent binding is snapshotted.
-    token = bind_session_main_route_override(main_route_override)
-    try:
-        return dict(resolve_execution_main_route(config))
-    finally:
-        reset_session_main_route_override(token)
-
-
-def _route_spec(
-    config: Any,
-    pins: AgentRoutingPins,
-    subagent_id: str,
-) -> tuple[dict[str, Any] | None, str]:
-    """Return (execution route spec, route_source); None spec means Main."""
-
-    profile_id = pins.execution_profile_id
-    if profile_id == MANUAL_EXECUTION_PROFILE_ID:
-        return None, "standard_model"
-    if profile_id == FREE_TEAM_PROFILE_ID:
-        return (
-            {"inherit_model": False, "provider": "routing-profile", "model": "free-team",
-             "effort_policy": "default", "effort": ""},
-            "free_team",
-        )
-    profile = next(
-        (
-            item
-            for item in list_team_execution_profiles(config, pins.agent_team_id)
-            if _clean(item.get("profile_id")) == profile_id
-        ),
-        None,
-    )
-    if profile is None:
-        legacy = AGENT_TEAM_DEFAULT_LLM_PROFILES.get(profile_id)
-        if legacy is None:
-            raise AgentModelRouteError("agent_route_profile_unavailable")
-        # Pre-Team-profile revisions (heavy/light/coding) were all Main-
-        # inheriting LLM Profiles; keep their effort policy only.
-        return (
-            {"inherit_model": True, "effort_policy": legacy.get("effort_policy") or "same"},
-            "legacy_profile",
-        )
-    if profile.get("enabled", True) is False:
-        raise AgentModelRouteError("agent_route_profile_unavailable")
-    overrides = profile.get("overrides") if isinstance(profile.get("overrides"), Mapping) else {}
-    if subagent_id in overrides:
-        return dict(overrides[subagent_id] or {}), "subagent_override"
-    default_route = profile.get("default_route")
-    return (dict(default_route) if isinstance(default_route, Mapping) else None), "profile_default"
-
-
-def _route_spec_is_well_formed(spec: Mapping[str, Any]) -> bool:
-    """Reject malformed persisted explicit routes before inherit normalization."""
-
-    inherit_model = spec.get("inherit_model")
-    if inherit_model is not None and not isinstance(inherit_model, bool):
-        return False
-    for key in ("provider", "model"):
-        value = spec.get(key)
-        if value not in (None, "") and not isinstance(value, str):
-            return False
-    provider = _clean(spec.get("provider")).lower()
-    model = _clean(spec.get("model"))
-    effort = _clean(spec.get("effort") or spec.get("reasoning_effort"))
-    backend = spec.get("backend")
-    if backend not in (None, "") and not isinstance(backend, str):
-        return False
-    declared_backend = _clean(backend).lower()
-    if declared_backend not in {"", "api", "cli", "remote"}:
-        return False
-    if provider == "muse-remote":
-        # Remote turns are explicit provider-only routes.  A model/effort is
-        # not meaningful for Muse and must never be fabricated from Main.
-        return (
-            inherit_model is False
-            and not model
-            and not effort
-            and declared_backend in {"", "remote"}
-            and str(spec.get("effort_policy") or "").strip().lower()
-            in {"", "none", "not_applicable", "default"}
-        )
-    if declared_backend == "remote":
-        return False
-    # An explicit route must not silently collapse to Main when corruption
-    # removes either half of its provider/model pair.  Inherit routes may omit
-    # both values, as intended by the manual and legacy compatibility paths.
-    if inherit_model is False and (not provider or not model):
-        return False
-    if inherit_model is not True and bool(provider) != bool(model):
-        return False
-    return True
-
-
-def _raw_persisted_route_spec(
-    config: Any,
-    pins: AgentRoutingPins,
-    subagent_id: str,
-) -> tuple[Any, bool]:
-    """Read the unnormalized persisted route for corruption checks only."""
-
-    if isinstance(config, Mapping):
-        section = config.get("agent_team", {})
-    else:
-        getter = getattr(config, "get", None)
-        section = getter("agent_team", {}) if callable(getter) else {}
-    if not isinstance(section, Mapping):
-        return None, False
-    teams = section.get("teams")
-    team = teams.get(pins.agent_team_id) if isinstance(teams, Mapping) else None
-    profile, present = _raw_team_profile(config, pins.agent_team_id, pins.execution_profile_id)
-    if not present:
-        return None, False
-    if not isinstance(profile, Mapping) or not _raw_profile_is_well_formed(profile):
-        # Non-mapping marker: the caller rejects it instead of normalizing.
-        return "corrupt-profile", True
-    overrides = profile.get("overrides")
-    if isinstance(overrides, Mapping) and subagent_id in overrides:
-        return overrides.get(subagent_id), True
-    if "default_route" in profile:
-        return profile.get("default_route"), True
-    return None, False
 
 
 def resolve_agent_subagent_route(
@@ -417,101 +292,122 @@ def resolve_agent_subagent_route(
 ) -> AgentModelRoute:
     """Resolve provider/model/effort for one Subagent of a pinned revision."""
 
-    _require_pins(pins)
+    # New revisions are self-contained role routes.  Team/Profile pins may be
+    # NULL after the P5 schema transition; only historical snapshots or the
+    # retired legacy resolver require those old values.
+    if pins.route_snapshot is None and not revision_v2_fields_present(pins):
+        raise AgentModelRouteError("agent_route_legacy_revision_retired")
     sid = _clean(subagent_id)
     if pins.route_snapshot is not None:
+        # A per-turn snapshot is the frozen execution contract.  It must win
+        # over the revision/global resolver even for v2 revisions, because
+        # model_roles can change after the binding or run was created.
         if role:
             return _resolve_snapshot_role_route(pins, role, expected_subagent_id=sid)
         for raw_role, raw_route in _snapshot_roles(pins.route_snapshot).items():
             if _clean(raw_route.get("acting_subagent_id")) == sid:
                 return _resolve_snapshot_role_route(pins, raw_role, expected_subagent_id=sid)
         raise AgentModelRouteError("agent_route_snapshot_role_missing")
-    team = _team_for(config, pins)
-    members = {_clean(item) for item in (team.get("subagent_ids") or []) if _clean(item)}
-    subagent = known_agent_subagents(config).get(sid)
-    if (
-        not sid
-        or sid not in members
-        or subagent is None
-        or subagent.get("enabled", True) is False
-        or (require_allowed and sid not in pins.allowed_subagent_ids)
-    ):
-        raise AgentModelRouteError("agent_route_subagent_unavailable")
-    raw_spec, raw_spec_present = _raw_persisted_route_spec(config, pins, sid)
-    if raw_spec_present and raw_spec is not None and (
-        not isinstance(raw_spec, Mapping)
-        or not _route_spec_is_well_formed(raw_spec)
-    ):
-        raise AgentModelRouteError("agent_route_model_unavailable")
-    spec, source = _route_spec(config, pins, sid)
-    if spec is not None and not _route_spec_is_well_formed(spec):
-        raise AgentModelRouteError("agent_route_model_unavailable")
-    is_remote = (
-        isinstance(spec, Mapping)
-        and _clean(spec.get("provider")).lower() == "muse-remote"
+    # P2 keeps legacy Subagent entry points available while route ownership
+    # moves to the revision's role table.  Resolve the canonical role once,
+    # then retain the requested Subagent id in the returned route so callers
+    # and audit records keep their established identity shape.
+    if revision_v2_fields_present(pins):
+        model_role = model_role_for_legacy_subagent(sid)
+        if not model_role:
+            # A v2 revision must never silently fall back to the old Team
+            # resolver for a custom/unknown Subagent id.  That would allow a
+            # legacy profile to bypass the revision's role table.
+            raise AgentModelRouteError("agent_route_subagent_unavailable")
+        route = _resolve_v2_model_route(
+            config,
+            pins,
+            model_role,
+            main_route_override=main_route_override,
+        )
+        if route is None:
+            raise AgentModelRouteError("agent_route_model_unavailable")
+        return replace(route, acting_subagent_id=sid, role=role or model_role)
+    raise AgentModelRouteError("agent_route_legacy_revision_retired")
+
+
+def _resolve_v2_model_route(
+    config: Any,
+    pins: AgentRoutingPins,
+    role: str,
+    *,
+    main_route_override: Mapping[str, Any] | None = None,
+) -> AgentModelRoute | None:
+    """Adapt the strict v2 tuple contract to the historical route object."""
+
+    strict, source = resolve_agent_role_route_v2(
+        config,
+        pins,
+        role,
+        main_route_override=main_route_override,
     )
-    # Remote routes do not inherit the local Main route and therefore do not
-    # need a model or effort resolved from it.
-    main = {} if is_remote else _main_route(config, main_route_override)
-    if spec is None:
-        route = dict(main)
-        route["inherit_model"] = True
-    else:
-        route = _apply_execution_route(spec, main, config=config)
-    provider = _clean(route.get("provider")).lower()
-    model = _clean(route.get("model"))
-    if provider == "muse-remote":
-        if route.get("backend") not in (None, "", "remote"):
-            raise AgentModelRouteError("agent_route_backend_mismatch")
-        model = None
-        effort = None
-        backend = "remote"
-    elif not provider or not model:
+    if source == "legacy":
+        return None
+    try:
+        candidates, allow_paid, _ = revision_role_route_candidates(
+            config,
+            pins,
+            role,
+            main_route_override=main_route_override,
+        )
+    except ValueError as exc:
+        raise AgentModelRouteError("agent_route_model_unavailable") from exc
+    if not isinstance(strict, Mapping) or not candidates:
         raise AgentModelRouteError("agent_route_model_unavailable")
-    if provider not in ROUTABLE_PROVIDERS:
-        raise AgentModelRouteError("agent_route_provider_unsupported")
-    if provider != "muse-remote":
-        effort = _clean(route.get("effort") or route.get("reasoning_effort"))
-        backend = "cli" if provider.endswith("-cli") else "api"
+    primary = candidates[0]
+    kind = _clean(strict.get("kind")).casefold()
+    if kind == "pool":
+        provider = "routing-profile"
+        model: str | None = "free-team"
+        backend = "api"
+        effort: str | None = ""
+        pool_id = _clean(strict.get("pool_id")) or _clean(primary.get("pool_id")) or None
+    else:
+        provider = _clean(strict.get("provider")).casefold()
+        model_value = strict.get("model")
+        model = _clean(model_value) if model_value not in (None, "") else None
+        if provider == "muse-remote":
+            backend = "remote"
+            effort = None
+            model = None
+        else:
+            if provider not in ROUTABLE_PROVIDERS or not model:
+                raise AgentModelRouteError("agent_route_model_unavailable")
+            backend = "cli" if provider.endswith("-cli") else "api"
+            effort = _clean(strict.get("effort") or primary.get("effort"))
+        pool_id = None
     return AgentModelRoute(
         agent_id=pins.agent_id,
         agent_revision_id=pins.agent_revision_id,
         agent_team_id=pins.agent_team_id,
         execution_profile_id=pins.execution_profile_id,
-        acting_subagent_id=sid,
-        role=role,
+        acting_subagent_id="",
         provider=provider,
         model=model,
         effort=effort,
         route_source=source,
-        inherits_main=bool(route.get("inherit_model", spec is None)),
+        inherits_main=False,
         backend=backend,
+        role=_clean(role),
+        fallback_routes=tuple(copy.deepcopy(candidates[1:])),
+        allow_paid_fallback=allow_paid,
+        pool_id=pool_id,
+        candidate_routes=tuple(copy.deepcopy(candidates)),
+        fallback_on=revision_role_fallback_policy(pins, role),
     )
 
 
-def select_role_subagent(config: Any, pins: AgentRoutingPins, role: str) -> str:
-    """Pick the Subagent that acts for ``role`` inside the pinned revision."""
-
-    candidates = OPERATIONS_WORK_ROLES.get(_clean(role))
-    if not candidates:
-        raise AgentModelRouteError("agent_route_role_unknown")
-    if pins.route_snapshot is not None:
-        route = _resolve_snapshot_role_route(pins, role)
-        return route.acting_subagent_id
-    team = _team_for(config, pins)
-    members = [_clean(item) for item in (team.get("subagent_ids") or []) if _clean(item)]
-    subagents = known_agent_subagents(config)
-    usable = {
-        sid
-        for sid in members
-        if sid in pins.allowed_subagent_ids
-        and (subagents.get(sid) or {}).get("enabled", True) is not False
-        and sid in subagents
-    }
-    for candidate in candidates:
-        if candidate in usable:
-            return candidate
-    raise AgentModelRouteError("agent_route_role_unavailable")
+def resolve_native_code_route(config: Any, pins: AgentRoutingPins) -> AgentModelRoute:
+    """Resolve the revision's native code route without generic work-role snapshots."""
+    route = _resolve_v2_model_route(config, pins, "code")
+    if route is None or route.route_source != "agent":
+        raise AgentModelRouteError("agent_route_model_unavailable")
+    return route
 
 
 def resolve_agent_role_route(
@@ -525,22 +421,21 @@ def resolve_agent_role_route(
 
     if pins.route_snapshot is not None:
         return _resolve_snapshot_role_route(pins, role)
-    subagent_id = select_role_subagent(config, pins, role)
-    return resolve_agent_subagent_route(
-        config,
-        pins,
-        subagent_id,
-        role=role,
-        main_route_override=main_route_override,
-    )
+    if revision_v2_fields_present(pins):
+        route = _resolve_v2_model_route(
+            config,
+            pins,
+            role,
+            main_route_override=main_route_override,
+        )
+        if route is None:
+            raise AgentModelRouteError("agent_route_model_unavailable")
+        return route
+    raise AgentModelRouteError("agent_route_legacy_revision_retired")
 
 
 EXECUTION_SELECTION_SOURCE_DEFAULT = "revision_default"
 EXECUTION_SELECTION_SOURCE_EXPLICIT = "explicit"
-# Formal system ExecutionProfiles selectable for any Team.  Legacy
-# pre-Team-profile ids (heavy/light/coding) are deliberately excluded: an
-# explicit selection never takes a legacy fallback.
-SYSTEM_EXECUTION_PROFILE_IDS = frozenset({MANUAL_EXECUTION_PROFILE_ID, FREE_TEAM_PROFILE_ID})
 _SELECTION_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -571,98 +466,19 @@ class AgentExecutionSelection:
         }
 
 
-def _raw_team_profile(config: Any, team_id: str, profile_id: str) -> tuple[Any, bool]:
-    """Find the raw stored profile by storage key or embedded ``profile_id``.
-
-    A key/id mismatch or an ambiguous match is returned as a non-mapping so
-    callers treat it as corruption instead of normalizing it away.
-    """
-
-    if isinstance(config, Mapping):
-        section = config.get("agent_team", {})
-    else:
-        getter = getattr(config, "get", None)
-        section = getter("agent_team", {}) if callable(getter) else {}
-    teams = section.get("teams") if isinstance(section, Mapping) else None
-    team = teams.get(team_id) if isinstance(teams, Mapping) else None
-    profiles = team.get("execution_profiles") if isinstance(team, Mapping) else None
-    if not isinstance(profiles, Mapping):
-        return None, False
-    matches = []
-    for key, raw in profiles.items():
-        embedded = _clean(raw.get("profile_id")) if isinstance(raw, Mapping) else ""
-        if key == profile_id or embedded == profile_id:
-            if isinstance(raw, Mapping) and embedded and embedded != key:
-                return None, True
-            matches.append(raw)
-    if not matches:
-        return None, False
-    if len(matches) > 1:
-        return None, True
-    return matches[0], True
-
-
-def _raw_profile_is_well_formed(raw: Any) -> bool:
-    if not isinstance(raw, Mapping):
-        return False
-    if not isinstance(raw.get("enabled", True), bool):
-        return False
-    default_route = raw.get("default_route")
-    if default_route is not None and (
-        not isinstance(default_route, Mapping) or not _route_spec_is_well_formed(default_route)
-    ):
-        return False
-    overrides = raw.get("overrides")
-    if overrides is None:
-        return True
-    if not isinstance(overrides, Mapping):
-        return False
-    return all(
-        isinstance(spec, Mapping) and _route_spec_is_well_formed(spec)
-        for spec in overrides.values()
-    )
-
-
 def resolve_agent_execution_selection(
     config: Any,
     pins: AgentRoutingPins,
     execution_profile_id: Any = None,
 ) -> AgentExecutionSelection:
-    """Validate an optional per-invocation ExecutionProfile selection.
+    """Keep the historical selection seam while rejecting new EP choices."""
 
-    ``None`` keeps the revision default (legacy behavior).  An explicit value
-    must be a formal system Profile or an enabled, well-formed Profile of the
-    pinned revision's own Team.  Empty/unknown/disabled/foreign/corrupt
-    values raise ``AgentModelRouteError`` and never fall back.
-    """
-
-    _require_pins(pins)
-    if pins.execution_selection is not None:
-        raise AgentModelRouteError("agent_route_selection_invalid")
-    default_id = pins.execution_profile_id
-    if execution_profile_id is None:
-        return AgentExecutionSelection(default_id, default_id)
-    if not isinstance(execution_profile_id, str):
-        raise AgentModelRouteError("agent_execution_profile_invalid")
-    selected = execution_profile_id
-    if not _SELECTION_PROFILE_ID_RE.fullmatch(selected):
-        raise AgentModelRouteError("agent_execution_profile_invalid")
-    _team_for(config, pins)
-    if selected not in SYSTEM_EXECUTION_PROFILE_IDS:
-        profile = next(
-            (
-                item
-                for item in list_team_execution_profiles(config, pins.agent_team_id)
-                if _clean(item.get("profile_id")) == selected
-            ),
-            None,
-        )
-        if profile is None or profile.get("enabled", True) is not True:
-            raise AgentModelRouteError("agent_execution_profile_unavailable")
-        raw, present = _raw_team_profile(config, pins.agent_team_id, selected)
-        if present and not _raw_profile_is_well_formed(raw):
-            raise AgentModelRouteError("agent_execution_profile_unavailable")
-    return AgentExecutionSelection(default_id, selected, EXECUTION_SELECTION_SOURCE_EXPLICIT)
+    del config
+    if not revision_v2_fields_present(pins):
+        raise AgentModelRouteError("agent_route_legacy_revision_retired")
+    if execution_profile_id is not None:
+        raise AgentModelRouteError("agent_execution_profile_removed")
+    return AgentExecutionSelection("", "")
 
 
 def _roles_digest(roles: Mapping[str, Any]) -> str:
@@ -844,57 +660,6 @@ def execution_manifest_route_fields(route_snapshot: Any) -> dict[str, Any]:
     return fields
 
 
-def preview_execution_profile_routes(
-    config: Any,
-    agent_team_id: str,
-    execution_profile_id: str,
-    *,
-    subagent_ids: Iterable[str] | None = None,
-) -> list[dict[str, Any]]:
-    """Read-only effective route per Team member for UI previews.
-
-    Errors are reported per Subagent as a safe code; no credential, base URL
-    or path is ever included.
-    """
-
-    team = known_agent_teams(config).get(_clean(agent_team_id)) or {}
-    members = [_clean(item) for item in (team.get("subagent_ids") or []) if _clean(item)]
-    if subagent_ids is not None:
-        wanted = {_clean(item) for item in subagent_ids}
-        members = [sid for sid in members if sid in wanted]
-    pins = AgentRoutingPins(
-        agent_id=None,
-        agent_revision_id=None,
-        agent_team_id=_clean(agent_team_id),
-        execution_profile_id=_clean(execution_profile_id),
-        allowed_subagent_ids=tuple(members),
-    )
-    subagents = known_agent_subagents(config)
-    result: list[dict[str, Any]] = []
-    for sid in members:
-        item: dict[str, Any] = {
-            "subagent_id": sid,
-            "name": str((subagents.get(sid) or {}).get("name") or sid),
-        }
-        try:
-            route = resolve_agent_subagent_route(config, pins, sid)
-        except AgentModelRouteError as exc:
-            item["error_code"] = exc.code
-        except Exception:
-            item["error_code"] = "agent_route_unavailable"
-        else:
-            item.update(
-                provider=route.provider,
-                model=route.model,
-                effort=route.effort or None,
-                route_source=route.route_source,
-                inherits_main=route.inherits_main,
-                backend=route.backend,
-            )
-        result.append(item)
-    return result
-
-
 _PROVENANCE_KEYS = (
     "agent_id",
     "agent_revision_id",
@@ -925,6 +690,55 @@ def safe_route_projection(value: Any) -> dict[str, Any] | None:
             result[key] = item
         elif isinstance(item, str) and item.strip():
             result[key] = item.strip()[:160]
+    contract_keys = {"candidate_routes", "allow_paid_fallback", "fallback_on", "selected_candidate_index"}
+    if contract_keys.intersection(value):
+        candidates = value.get("candidate_routes")
+        paid = value.get("allow_paid_fallback")
+        if not isinstance(candidates, (list, tuple)) or not candidates or not isinstance(paid, bool):
+            return None
+        clean_candidates = []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                return None
+            kind = candidate.get("kind")
+            allowed = {"kind", "pool_id", "provider", "model"} if kind == "pool" else {"kind", "provider", "model", "effort"}
+            if set(candidate) - allowed or kind not in ("pool", "llm"):
+                return None
+            if any(not isinstance(v, str) or not v.strip() or v != v.strip() or len(v) > 160 for v in candidate.values()):
+                return None
+            if kind == "pool":
+                if not candidate.get("pool_id") or candidate.get("provider") != "routing-profile" or candidate.get("model") != "free-team":
+                    return None
+            elif candidate.get("provider") not in ROUTABLE_PROVIDERS or not candidate.get("model"):
+                return None
+            elif candidate.get("provider") == "muse-remote" and (candidate.get("model") != "muse-chat" or "effort" in candidate):
+                return None
+            clean_candidates.append(dict(candidate))
+        index = value.get("selected_candidate_index", 0)
+        if type(index) is not int or index < 0 or index >= len(clean_candidates):
+            return None
+        primary = clean_candidates[index]
+        if primary.get("provider") != result.get("provider"):
+            return None
+        if primary.get("provider") != "muse-remote" and (primary.get("model") != result.get("model") or (primary.get("effort") or None) != (result.get("effort") or None)):
+            return None
+        if "selected_candidate_index" in value:
+            if value.get("pool_id") != primary.get("pool_id"):
+                return None
+            result["selected_candidate_index"] = index
+            if primary.get("pool_id") is not None:
+                result["pool_id"] = primary["pool_id"]
+        result["candidate_routes"] = clean_candidates
+        result["allow_paid_fallback"] = paid
+        if "fallback_on" in value:
+            from .agent_route_fallback_policy import normalize_fallback_on
+            try:
+                policy = normalize_fallback_on(value["fallback_on"])
+            except ValueError:
+                return None
+            if policy is None:
+                return None
+            result["fallback_on"] = list(policy)
     from ..llm.generation_budget import safe_generation_provenance
 
     generation = safe_generation_provenance(value.get("generation"))
@@ -989,7 +803,7 @@ def build_agent_routing_snapshot(
     roles: Iterable[str] | None = None,
     main_route_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Capture every requested role against the current Profile exactly once.
+    """Capture every requested role against current P2 routing exactly once.
 
     Missing roles are retained as safe ``agent_route_*`` errors.  This is
     intentional: a later retry must not re-read App Config and turn a role
@@ -1003,30 +817,31 @@ def build_agent_routing_snapshot(
     raw_routes: dict[str, dict[str, Any]] = {}
     for role in selected_roles:
         try:
-            raw_routes[role] = resolve_agent_role_route(
+            route = resolve_agent_role_route(
                 config,
                 pins,
                 role,
                 main_route_override=main_route_override,
-            ).provenance()
+            )
+            provenance = route.provenance()
+            # Newly written snapshots contain only the P2 role route.  The
+            # shared safe reader still accepts the old keys below so runs
+            # created before P5 remain inspectable.
+            for legacy_key in (
+                "agent_team_id",
+                "execution_profile_id",
+                "acting_subagent_id",
+            ):
+                provenance.pop(legacy_key, None)
+            raw_routes[role] = provenance
         except AgentModelRouteError as exc:
             raw_routes[role] = {"error": exc.code}
     snapshot: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "agent_id": pins.agent_id,
         "agent_revision_id": pins.agent_revision_id,
-        "team_id": pins.agent_team_id,
-        "execution_profile_id": pins.execution_profile_id,
         "roles": safe_route_snapshot(raw_routes),
     }
-    if pins.execution_selection is not None:
-        # Only explicit selections add a block, so revision-default snapshots
-        # keep exactly their historical hash material.
-        snapshot["execution_selection"] = _selection_record(
-            pins.execution_selection,
-            team_id=pins.agent_team_id,
-            roles=snapshot["roles"],
-        )
     return snapshot
 
 
@@ -1046,22 +861,40 @@ def _resolve_snapshot_role_route(
     role_name = _clean(role)
     if role_name not in OPERATIONS_WORK_ROLES:
         raise AgentModelRouteError("agent_route_role_unknown")
-    raw = _snapshot_roles(pins.route_snapshot).get(role_name)
+    snapshot = pins.route_snapshot
+    roles = snapshot.get("roles", snapshot) if isinstance(snapshot, Mapping) else {}
+    raw = roles.get(role_name) if isinstance(roles, Mapping) else None
     if raw is None:
         raise AgentModelRouteError("agent_route_snapshot_role_missing")
+    if not isinstance(raw, Mapping):
+        raise AgentModelRouteError("agent_route_snapshot_invalid")
     error = _clean(raw.get("error"))
     if error:
         raise AgentModelRouteError(error if error.startswith("agent_route_") else "agent_route_snapshot_invalid")
     route = safe_route_projection(raw)
     if route is None:
         raise AgentModelRouteError("agent_route_snapshot_invalid")
+    if route.get("role") and route["role"] != role_name:
+        raise AgentModelRouteError("agent_route_snapshot_invalid")
     acting_subagent_id = _clean(route.get("acting_subagent_id"))
-    if not acting_subagent_id or (
-        expected_subagent_id and acting_subagent_id != _clean(expected_subagent_id)
-    ):
+    if expected_subagent_id and acting_subagent_id != _clean(expected_subagent_id):
         raise AgentModelRouteError("agent_route_snapshot_subagent_mismatch")
-    if acting_subagent_id not in pins.allowed_subagent_ids:
-        raise AgentModelRouteError("agent_route_subagent_unavailable")
+    # Old complete P2 snapshots stored the canonical role as an audit label.
+    # Accept only its original pinned provenance, without reviving an actor.
+    if acting_subagent_id:
+        canonical_p2 = (
+            pins.complete_p2
+            and acting_subagent_id == role_name
+            and route.get("role") == role_name
+            and route.get("agent_id") == pins.agent_id
+            and route.get("agent_revision_id") == pins.agent_revision_id
+            and route.get("agent_team_id") == pins.agent_team_id
+            and route.get("execution_profile_id") == pins.execution_profile_id
+            and bool(pins.agent_id and pins.agent_revision_id)
+        )
+        if not canonical_p2:
+            raise AgentModelRouteError("agent_route_subagent_unavailable")
+        acting_subagent_id = ""
     provider = _clean(route.get("provider")).lower()
     is_remote = provider == "muse-remote"
     model = _clean(route.get("model")) if not is_remote else None
@@ -1087,6 +920,12 @@ def _resolve_snapshot_role_route(
         inherits_main=bool(route.get("inherits_main", False)),
         backend=("remote" if is_remote else (_clean(route.get("backend")) or ("cli" if provider.endswith("-cli") else "api"))),
         notes=tuple(str(item) for item in notes if isinstance(item, str)) if isinstance(notes, list) else (),
+        candidate_routes=tuple(route["candidate_routes"]) if "candidate_routes" in route else None,
+        fallback_routes=tuple(route["candidate_routes"][1:]) if "candidate_routes" in route else (),
+        allow_paid_fallback=route.get("allow_paid_fallback", False),
+        fallback_on=tuple(route["fallback_on"]) if "fallback_on" in route else None,
+        pool_id=route["candidate_routes"][route.get("selected_candidate_index", 0)].get("pool_id") if "candidate_routes" in route else None,
+        selected_candidate_index=route.get("selected_candidate_index"),
     )
 
 
@@ -1105,8 +944,23 @@ def _run_route_snapshot(
         return None
     expected_hash = _clean(run.get("execution_manifest_hash")).lower()
     if expected_hash:
+        hash_manifest = dict(manifest)
+        legacy_manifest = hash_manifest.pop("legacy", None)
+        if isinstance(legacy_manifest, Mapping):
+            # AgentRun.to_dict groups historical route pins under ``legacy``
+            # at the API boundary. Rebuild the stored pre-projection keys for
+            # integrity verification without exposing them as current fields.
+            for current_key, stored_key in (
+                ("agent_team_id", "team_id"),
+                ("execution_profile_id", "execution_profile_id"),
+                ("acting_subagent_id", "subagent_id"),
+                ("execution_selection", "execution_selection"),
+            ):
+                value = legacy_manifest.get(current_key)
+                if current_key in legacy_manifest and stored_key not in hash_manifest:
+                    hash_manifest[stored_key] = value
         actual_hash = hashlib.sha256(
-            json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(hash_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         if actual_hash != expected_hash:
             raise AgentModelRouteError("agent_route_snapshot_hash_mismatch")
@@ -1118,7 +972,13 @@ def _run_route_snapshot(
     roles = safe_route_snapshot(snapshot.get("roles", snapshot))
     if not roles:
         raise AgentModelRouteError("agent_route_snapshot_invalid")
-    return roles, manifest.get("execution_selection"), manifest.get("execution_profile_id")
+    legacy = manifest.get("legacy")
+    legacy = legacy if isinstance(legacy, Mapping) else {}
+    return (
+        roles,
+        manifest.get("execution_selection") or legacy.get("execution_selection"),
+        manifest.get("execution_profile_id") or legacy.get("execution_profile_id"),
+    )
 
 
 async def load_pinned_agent_pins(
@@ -1226,18 +1086,13 @@ __all__ = [
     "registered_route_backend",
     "resolve_agent_execution_selection",
     "safe_execution_selection",
-    "SYSTEM_EXECUTION_PROFILE_IDS",
     "verify_execution_selection",
     "ROUTABLE_PROVIDERS",
     "ROUTE_SOURCE_LABELS",
-    "known_agent_teams",
-    "known_agent_subagents",
     "load_pinned_agent_pins",
-    "preview_execution_profile_routes",
     "resolve_agent_role_route",
     "resolve_agent_subagent_route",
     "safe_route_projection",
     "safe_route_projections",
     "safe_route_snapshot",
-    "select_role_subagent",
 ]

@@ -55,7 +55,7 @@ _current_character_lookup_request_id: contextvars.ContextVar[str | None] = (
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|dsn)\b\s*[=:]\s*)([^\s,;]+)"
+    r"(?i)(\b[A-Z0-9_]*(?:password|passwd|secret|token|api[_-]?key|admin[_-]?key|authorization|cookie|dsn)\b\s*[=:]\s*)([^\s,;]+)"
 )
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([^\s,;]+)")
 _URL_CREDENTIAL_RE = re.compile(

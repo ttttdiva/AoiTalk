@@ -196,10 +196,52 @@ class AntigravityCLIBackend(CLIBackendBase):
                 tool_error = tool_info.get("error") or tool_info.get("result")
                 if isinstance(tool_error, str) and cls._is_permission_denial(tool_error):
                     return tool_error.strip()
+                structured_error = tool_info.get("error")
+                if isinstance(structured_error, dict):
+                    # Headless tool_info.error has typed type/message fields.
+                    # A later SUCCESS result must not hide a denied operation.
+                    error_type = str(structured_error.get("type") or "").strip().lower()
+                    message = structured_error.get("message")
+                    if error_type in {
+                        "denied", "permission_denied", "rejected", "approval_required",
+                    } or (isinstance(message, str) and cls._is_permission_denial(message)):
+                        return "Antigravity CLI tool error reports an explicit permission denial"
             if str(event.get("event") or "").lower() in {
                 "permission_denied", "tool_denied", "approval_required",
             }:
                 return "Antigravity CLI emitted an explicit permission-denial event"
+        return ""
+
+    @staticmethod
+    def _failed_tool_action_detail(raw_output: str) -> str:
+        """Detect failed tool steps that a terminal SUCCESS can otherwise hide."""
+
+        failed_states = {"error", "failed", "failure", "cancelled", "canceled"}
+        for line in str(raw_output or "").splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+
+            event_name = str(event.get("event") or event.get("type") or "").strip().lower()
+            if event_name in {"tool_error", "tool_failed"}:
+                return "Antigravity CLI reports a failed tool action"
+
+            step = event.get("step_update")
+            if not isinstance(step, dict):
+                continue
+            tool_info = step.get("tool_info")
+            tool_info = tool_info if isinstance(tool_info, dict) else {}
+            step_type = str(step.get("step_type") or "").strip().lower()
+            step_state = str(step.get("state") or "").strip().lower()
+            tool_status = str(tool_info.get("status") or "").strip().lower()
+
+            if step_type == "tool" and step_state in failed_states:
+                return "Antigravity CLI reports a failed tool action"
+            if tool_status in failed_states:
+                return "Antigravity CLI reports a failed tool action"
         return ""
 
     def _permission_denial_description(self) -> str:
@@ -288,6 +330,14 @@ class AntigravityCLIBackend(CLIBackendBase):
         saw_terminal_result = False
         if self._permission_denial_detail(raw_output, stderr):
             return self._permission_denial_description()
+        if self._failed_tool_action_detail(raw_output):
+            self._set_cli_diagnostic(
+                status="failed", state="failed", error_code="agy_tool_action_failed",
+            )
+            return (
+                "Antigravity CLI のツール操作が失敗しました。"
+                "最終 result が SUCCESS でも操作成功とは扱いません。"
+            )
         for line in str(raw_output or "").splitlines():
             try:
                 event = _json.loads(line)

@@ -21,7 +21,6 @@ import contextlib
 import copy
 import hashlib
 import http.server
-import io
 import inspect
 import json
 import logging
@@ -34,7 +33,6 @@ import socket
 import subprocess
 import threading
 import time
-import zipfile
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
@@ -59,6 +57,10 @@ from ..agent_model_routing import (
     resolve_agent_role_route,
 )
 from ..operations_service import OperationsService
+from ..native_code_bundle_io import (
+    MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, ArtifactArchiveTooLarge, ArtifactArchiveUnsafe,
+    _BUILD_DIRS, _is_excluded_dir_name, _iter_files, _path_has_excluded_component, zip_tree as _zip_tree,
+)
 from .crowdworks_specialist_assessment import specialist_agent_binding
 from .crowdworks_specialists import (
     DEVELOPMENT_CAPABILITIES,
@@ -75,8 +77,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CLIENT_WORKFLOW_FILE = REPO_ROOT / "config" / "agent_harness" / "CLIENT_DEVELOPMENT.md"
 CLIENT_WORKSPACE_NAMESPACE = "_client_engagements"
 SOURCE_DIRNAME = "source"
-MAX_ARTIFACT_BYTES = 25 * 1024 * 1024
-MAX_ARTIFACT_FILES = 10_000
 TERMINAL_DEVELOPMENT_STATES = {"running", "uncertain"}
 _DEVELOPMENT_RESULT_TERMINAL_STATES = frozenset({
     "blocked",
@@ -85,19 +85,6 @@ _DEVELOPMENT_RESULT_TERMINAL_STATES = frozenset({
     "verification_failed",
     "ready_for_review",
 })
-_EXCLUDED_DIRS = {
-    ".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".aoitalk", ".next", ".nuxt", ".turbo", ".cache", ".parcel-cache", ".verify",
-}
-
-
-def _is_excluded_dir_name(name: str) -> bool:
-    return name in _EXCLUDED_DIRS or name.startswith(".aoitalk-harness-scratch-")
-
-
-def _path_has_excluded_component(path: Path) -> bool:
-    return any(_is_excluded_dir_name(part) for part in path.parts)
-_BUILD_DIRS = ("dist", "build", "out")
 _SENSITIVE_NAME = re.compile(
     r"(^\.env$|^\.env\.(?!example$|sample$|template$)|^\.npmrc$|^\.pypirc$|^\.netrc$|^\.git-credentials$|^credentials(?:\.json)?$|^secrets\.json$|\.pem$|\.key$|\.p12$|\.pfx$|^id_(?:rsa|ed25519|ecdsa)|\.secret$)",
     re.IGNORECASE,
@@ -224,14 +211,6 @@ class ClientWorkspaceError(RuntimeError):
     """The customer workspace cannot be used safely."""
 
 
-class ArtifactArchiveTooLarge(ValueError):
-    """The bounded artifact archive cannot be materialized safely."""
-
-
-class ArtifactArchiveUnsafe(ValueError):
-    """The archive contains a file that cannot cross the publication boundary."""
-
-
 def _is_sensitive_name(value: Any) -> bool:
     return is_sensitive_file_name(str(value or ""))
 
@@ -324,7 +303,9 @@ class ClientWorkspace:
         return {"name": self.key, "namespace": CLIENT_WORKSPACE_NAMESPACE, "source_dir": SOURCE_DIRNAME, "isolated_git": True}
 
 
-def prepare_client_workspace(root: Path, opportunity_id: Any) -> tuple[ClientWorkspace, Any]:
+def prepare_client_workspace(
+    root: Path, opportunity_id: Any, *, owner_id: str | None = None, run_id: str | None = None,
+) -> tuple[ClientWorkspace, Any]:
     """Create the per-engagement workspace through the harness WorkspaceManager.
 
     ``repo_root=None`` makes the manager create a plain directory rather than a
@@ -339,7 +320,11 @@ def prepare_client_workspace(root: Path, opportunity_id: Any) -> tuple[ClientWor
     engagement_root = assert_path_within_root(root / key, root)
     engagement_root.mkdir(parents=True, exist_ok=True)
     manager = WorkspaceManager(engagement_root, HarnessHookSettings(), repo_root=None)
-    source, _created = manager.create_for(SOURCE_DIRNAME)
+    source, _created = manager.create_for(SOURCE_DIRNAME, owner_id=owner_id, run_id=run_id)
+    # Preparation owns only this short-lived claim.  The adapter obtains and
+    # releases its own attempt claim, while the manager retains ownership.
+    if owner_id is not None and run_id is not None:
+        manager.release_for(SOURCE_DIRNAME, owner_id=owner_id, run_id=run_id)
     reports = engagement_root / "reports"
     home = engagement_root / ".home"
     reports.mkdir(exist_ok=True)
@@ -362,23 +347,6 @@ def prepare_client_workspace(root: Path, opportunity_id: Any) -> tuple[ClientWor
     if _is_relative_to(REPO_ROOT.resolve(), source.resolve()) or source.resolve() == REPO_ROOT.resolve():
         raise ClientWorkspaceError("client workspace resolves to the AoiTalk repository")
     return ClientWorkspace(key=key, root=engagement_root, source=source, reports=reports, home=home), manager
-
-
-def _iter_files(base: Path, *, exclude_build: bool = False):
-    for current, dirs, files in os.walk(base):
-        rel_dir = Path(current).relative_to(base)
-        dirs[:] = sorted(
-            d for d in dirs
-            if not _is_excluded_dir_name(d)
-            and not (exclude_build and rel_dir == Path(".") and d in _BUILD_DIRS)
-            and not Path(current, d).is_symlink()
-            and not os.path.isjunction(Path(current, d))
-        )
-        for name in sorted(files):
-            path = Path(current, name)
-            if path.is_symlink():
-                continue
-            yield path, path.relative_to(base)
 
 
 def workspace_fingerprint(source: Path) -> dict[str, Any]:
@@ -433,7 +401,7 @@ def workspace_fingerprint(source: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def ensure_engagement_project(session, opportunity: EngagementOpportunity, *, owner_user_id: Any) -> str | None:
+async def ensure_engagement_project(session, opportunity: EngagementOpportunity, *, owner_user_id: Any, commit: bool = True) -> str | None:
     """Create one Project per development engagement and grant the specialist.
 
     Uses the existing Project/ProjectMember repository and AgentProjectGrant
@@ -513,7 +481,8 @@ async def ensure_engagement_project(session, opportunity: EngagementOpportunity,
             )
     metadata["engagement_project_id"] = str(project_id)
     opportunity.metadata_json = metadata
-    await session.commit()
+    if commit:
+        await session.commit()
     return str(project_id)
 
 
@@ -1312,6 +1281,21 @@ def detect_project(source: Path) -> dict[str, Any]:
     if (source / "composer.json").exists() or any(source.glob("*.php")):
         info["type"] = "php"
         return info
+    # A dependency-free Node project need not have a package.json.  Only
+    # recognize explicit built-in node:test imports in conventional test
+    # filenames; ordinary browser JavaScript is not evidence of a Node suite.
+    for pattern in ("*.test.js", "*.test.cjs", "*.test.mjs"):
+        for path in source.glob(pattern):
+            try:
+                if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+                    continue
+                with path.open(encoding="utf-8", errors="replace") as handle:
+                    test_source = handle.read(50_000)
+            except OSError:
+                continue
+            if re.search(r"[\"']node:test[\"']", test_source):
+                info["type"] = "node_builtin_test"
+                return info
     if (source / "index.html").exists() or (source / "public" / "index.html").exists():
         info.update(type="static", web_capable=True)
     return info
@@ -1343,6 +1327,10 @@ async def _run_project_checks(
     async def run_check_async(key: str, label: str, argv: list[str], *, required: bool = True, timeout: float | None = None) -> CheckResult:
         project.setdefault("validation_ids", []).append(key)
         return await runner.run(key, label, argv, timeout=timeout or step_timeout, required=required)
+
+    if kind == "node_builtin_test":
+        results.append(await run_check_async("test", "Node テスト", ["node", "--test"]))
+        return results
 
     if kind == "node":
         scripts = project.get("scripts") or {}
@@ -1813,63 +1801,6 @@ async def run_web_verification(
 # ---------------------------------------------------------------------------
 # Packaging
 # ---------------------------------------------------------------------------
-
-
-def _zip_tree(base: Path, *, exclude_build: bool) -> tuple[bytes, list[str], list[str]]:
-    buffer = io.BytesIO()
-    included: list[str] = []
-    excluded_sensitive: list[str] = []
-    source_bytes = 0
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path, rel in _iter_files(base, exclude_build=exclude_build):
-            if _is_sensitive_path(rel):
-                excluded_sensitive.append(rel.as_posix())
-                continue
-            try:
-                stat = path.stat()
-                file_size = stat.st_size
-            except OSError:
-                continue
-            if file_size < 0 or stat.st_nlink > 1:
-                raise ArtifactArchiveUnsafe(
-                    f"unsafe hardlink in artifact source: {rel.as_posix()}"
-                )
-            if source_bytes + file_size > MAX_ARTIFACT_BYTES:
-                raise ArtifactArchiveTooLarge(
-                    f"artifact source exceeds {MAX_ARTIFACT_BYTES} bytes"
-                )
-            if len(included) >= MAX_ARTIFACT_FILES:
-                raise ArtifactArchiveTooLarge(
-                    f"artifact archive exceeds {MAX_ARTIFACT_FILES} files"
-                )
-            info = zipfile.ZipInfo(rel.as_posix(), date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            try:
-                with path.open("rb") as handle:
-                    content = handle.read(MAX_ARTIFACT_BYTES - source_bytes + 1)
-            except OSError:
-                continue
-            if len(content) > MAX_ARTIFACT_BYTES - source_bytes:
-                raise ArtifactArchiveTooLarge(
-                    f"artifact source exceeds {MAX_ARTIFACT_BYTES} bytes"
-                )
-            if len(content) != file_size:
-                # A concurrent truncation is bounded, but the archive must
-                # never silently claim a stale stat as evidence.
-                raise ArtifactArchiveUnsafe(
-                    f"artifact file changed while reading: {rel.as_posix()}"
-                )
-            archive.writestr(info, content)
-            source_bytes += len(content)
-            included.append(rel.as_posix())
-            if buffer.tell() > MAX_ARTIFACT_BYTES:
-                raise ArtifactArchiveTooLarge(
-                    f"artifact archive exceeds {MAX_ARTIFACT_BYTES} bytes"
-                )
-    archive_bytes = buffer.getvalue()
-    if len(archive_bytes) > MAX_ARTIFACT_BYTES:
-        raise ArtifactArchiveTooLarge(f"artifact archive exceeds {MAX_ARTIFACT_BYTES} bytes")
-    return archive_bytes, included, excluded_sensitive
 
 
 def scan_for_secrets(base: Path) -> list[str]:
@@ -2901,8 +2832,6 @@ class ClientDevelopmentService:
                         if mode == "mutate"
                         else ["workspace_read", "command_execute"]
                     ),
-                    team_id=route_data.get("agent_team_id"),
-                    execution_profile_id=route_data.get("execution_profile_id"),
                     subagent_id=route_data.get("acting_subagent_id"),
                     agent_id=route_data.get("agent_id"),
                     agent_revision_id=route_data.get("agent_revision_id"),
@@ -3126,8 +3055,6 @@ class ClientDevelopmentService:
                 "agent_id": routing_pins.agent_id,
                 "agent_revision_id": routing_pins.agent_revision_id,
                 "agent_revision_hash": revision_hash,
-                "agent_team_id": routing_pins.agent_team_id,
-                "execution_profile_id": routing_pins.execution_profile_id,
             },
             "source_snapshot_hash": source_hash,
             "source_revision": source_revision,
@@ -3152,8 +3079,6 @@ class ClientDevelopmentService:
                         "agent_revision_id": binding["agent_revision_id"],
                         "agent_revision_hash": revision_hash,
                         "display_name": binding["display_name"],
-                        "agent_team_id": binding["agent_team_id"],
-                        "execution_profile_id": binding["execution_profile_id"],
                     },
                     "source_snapshot_hash": source_hash,
                     "source_revision": source_revision,
@@ -3193,7 +3118,11 @@ class ClientDevelopmentService:
 
         try:
             root = client_workspace_root(self.config)
-            workspace, _manager = await asyncio.to_thread(prepare_client_workspace, root, opportunity.id)
+            workspace, _manager = await asyncio.to_thread(
+                prepare_client_workspace, root, opportunity.id,
+                owner_id=str(work_item_id or opportunity.id),
+                run_id=str(run_id or work_item_id or opportunity.id),
+            )
         except (ClientWorkspaceError, OSError, subprocess.SubprocessError, ValueError) as exc:
             development = {
                 "status": "blocked",
@@ -3235,8 +3164,6 @@ class ClientDevelopmentService:
                 "agent_revision_id": binding["agent_revision_id"],
                 "agent_revision_hash": revision_hash,
                 "display_name": binding["display_name"],
-                "agent_team_id": binding["agent_team_id"],
-                "execution_profile_id": binding["execution_profile_id"],
             },
             "source_snapshot_hash": source_hash,
             "source_revision": source_revision,
@@ -3395,7 +3322,7 @@ class ClientDevelopmentService:
                     workspace_root=workspace.root,
                 )
                 verification_project = detect_project(workspace.source)
-                require_toolchain = verification_project.get("type") == "node"
+                require_toolchain = verification_project.get("type") in {"node", "node_builtin_test"}
                 if _client_scoped_backend_ready(verification_settings, require_toolchain=require_toolchain):
                     verification_scope = await _issue_client_harness_scope(
                         verification_settings,
@@ -3804,7 +3731,11 @@ class ClientDevelopmentService:
             return DevelopmentResult("blocked", "blocked", "agent_route_model_unavailable", development=development)
         try:
             root = client_workspace_root(self.config)
-            workspace, manager = await asyncio.to_thread(prepare_client_workspace, root, opportunity.id)
+            workspace, manager = await asyncio.to_thread(
+                prepare_client_workspace, root, opportunity.id,
+                owner_id=str(work_item_id or opportunity.id),
+                run_id=str(run_id or work_item_id or opportunity.id),
+            )
         except (ClientWorkspaceError, OSError, subprocess.SubprocessError, ValueError) as exc:
             development = {
                 "status": "blocked",
@@ -3912,8 +3843,6 @@ class ClientDevelopmentService:
                 "agent_revision_id": binding["agent_revision_id"],
                 "agent_revision_hash": revision_hash,
                 "display_name": binding["display_name"],
-                "agent_team_id": binding["agent_team_id"],
-                "execution_profile_id": binding["execution_profile_id"],
             },
             "source_snapshot_hash": source_hash,
             "source_revision": source_revision,
@@ -4155,8 +4084,6 @@ class ClientDevelopmentService:
                     agent_revision_id=binding["agent_revision_id"],
                     execution_adapter="code_agent",
                     required_capabilities=list(DEVELOPMENT_CAPABILITIES),
-                    team_id=binding["agent_team_id"],
-                    execution_profile_id=binding["execution_profile_id"],
                 )
                 with _client_harness_scope_context(execution_scope):
                     result = await asyncio.wait_for(adapter.execute(item, attempt=1, run_id=run_id), timeout=timeout)
@@ -4216,7 +4143,7 @@ class ClientDevelopmentService:
         checks: list[CheckResult] = []
         browser_result: dict[str, Any] | None = None
         verification_scope = None
-        require_toolchain = project.get("type") == "node"
+        require_toolchain = project.get("type") in {"node", "node_builtin_test"}
         if self.execution_scope_factory is not None and _client_scoped_backend_ready(settings, require_toolchain=require_toolchain):
             try:
                 verification_scope = await _issue_client_harness_scope(
@@ -4780,6 +4707,12 @@ def development_source_revision(
             f"requirements-r{requirements_revision}",
         ]
     )
+    # Preserve the pre-recovery digest until an explicit retry is requested.
+    recovery_revision = metadata.get("development_recovery_revision", 0)
+    if type(recovery_revision) is not int or recovery_revision < 0:
+        raise ValueError("invalid development recovery revision")
+    if recovery_revision > 0:
+        revision_material += f":recovery-r{recovery_revision}"
     return "crowdworks-development-v2:" + hashlib.sha256(
         revision_material.encode("utf-8")
     ).hexdigest()
@@ -4788,6 +4721,9 @@ def development_source_revision(
 async def development_candidate(session, opportunity: EngagementOpportunity, kind: str, *, source_type: str) -> WorkCandidate | None:
     metadata = dict(opportunity.metadata_json or {})
     development = metadata.get("development") if isinstance(metadata.get("development"), dict) else {}
+    recovery_revision = metadata.get("development_recovery_revision", 0)
+    if type(recovery_revision) is not int or recovery_revision < 0:
+        return None
     if development.get("status") in TERMINAL_DEVELOPMENT_STATES:
         return None
     binding = await specialist_agent_binding(session, kind)

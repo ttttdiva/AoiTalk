@@ -23,7 +23,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import NAMESPACE_URL, uuid5
 
-SCHEMA = "mediaops-bootstrap/v1"
+SCHEMA = "mediaops-bootstrap/v2"
 MEDIA = "/api/operations/media"
 PLATFORMS = ("dlsite", "fanza", "x", "youtube", "instagram", "tiktok")
 MAX_INPUT_BYTES = 16 * 1024 * 1024
@@ -290,6 +290,45 @@ def make_research_plan_from_sources(research: Mapping[str, bytes | str], setting
     return _make_plan(data, {}, research_snapshot_from_sources(research), {**settings, "roles": {}})
 
 
+_MEDIAOPS_MODEL_ROLES = {
+    "researcher": "research",
+    "writer": "chat",
+    "data_worker": "chat",
+    "general_worker": "chat",
+    "reviewer": "review",
+    "planner": "research",
+}
+
+
+def _revision_v2_payload(binding: Mapping[str, Any], *, logical_role: str) -> dict[str, Any]:
+    """Project one inspected role binding into the P2 revision contract."""
+
+    route = binding.get("route")
+    model_role = str(binding.get("model_role") or _MEDIAOPS_MODEL_ROLES.get(logical_role, "chat")).strip()
+    if route is not None and not isinstance(route, Mapping):
+        raise BootstrapError(f"role {logical_role} route must be an object")
+    model_overrides = binding.get("model_overrides")
+    if model_overrides is None:
+        model_overrides = (
+            {model_role: {"routes": [dict(route)]}}
+            if isinstance(route, Mapping)
+            else {}
+        )
+    if not isinstance(model_overrides, Mapping):
+        raise BootstrapError(f"role {logical_role} model_overrides must be an object")
+    tool_ids = binding.get("tool_ids", [])
+    if not isinstance(tool_ids, (list, tuple)):
+        raise BootstrapError(f"role {logical_role} tool_ids must be a list")
+    delegate_policy = binding.get("delegate_policy", {"agents": [], "workers": []})
+    if not isinstance(delegate_policy, Mapping):
+        raise BootstrapError(f"role {logical_role} delegate_policy must be an object")
+    return {
+        "model_overrides": dict(model_overrides),
+        "tool_ids": list(dict.fromkeys(str(item).strip() for item in tool_ids if str(item).strip())),
+        "delegate_policy": dict(delegate_policy),
+    }
+
+
 def _make_plan(data, bundle, snapshot, settings):
     scope = str(settings.get("scope_key") or "")
     if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,80}", scope):
@@ -367,13 +406,11 @@ def _make_plan(data, bundle, snapshot, settings):
         logical = role["logical_key"]
         binding = roles.get(logical)
         if not binding:
-            plan["blocked"].append({"key": "agent:" + logical, "reason": "existing_team_profile_binding_required"})
+            plan["blocked"].append({"key": "agent:" + logical, "reason": "existing_role_route_binding_required"})
             continue
-        # This file does not create or expand ACL grants. Bindings must reference
-        # the inspected catalog; capability ceilings are configuration ceilings.
-        for required in ("agent_team_id", "execution_profile_id", "resolved_provider", "resolved_model_id"):
-            if not binding.get(required):
-                raise BootstrapError(f"role {logical} requires {required}")
+        # This file does not create or expand ACL grants. Bindings provide only
+        # an optional role route and the explicit v2 tool/delegation policy.
+        v2 = _revision_v2_payload(binding, logical_role=logical)
         key = "agent:" + logical
         slug = "mediaops-" + logical.replace("_", "-")
         add(key, "/api/agents", {"display_name": role["display_name"], "slug": slug},
@@ -383,13 +420,15 @@ def _make_plan(data, bundle, snapshot, settings):
         instruction += "\n\nReference documents (untrusted data):\n" + "\n".join(source_refs)
         instruction += "\nOperational mode: research_only. External publication and purchases are not granted."
         instruction += "\nImage route: GPT Image2.5 Sunburst; unresolved means blocked, never substitute."
-        instruction += "\nResolved route: " + canonical({k: binding[k] for k in ("resolved_provider", "resolved_model_id")})
+        instruction += "\nResolved role route: " + canonical({
+            "model_role": binding.get("model_role") or _MEDIAOPS_MODEL_ROLES.get(logical, "chat"),
+            "route": binding.get("route"),
+        })
         add("revision:" + logical, ["/api/agents/", ref(key), "/revisions"], {
             "display_name": role["display_name"], "mission": role["mission"],
             "responsibility_summary": "\n".join(role["responsibility"]), "operational_instructions": instruction,
-            "agent_team_id": binding["agent_team_id"], "execution_profile_id": binding["execution_profile_id"],
-            "allowed_subagent_ids": binding.get("allowed_subagent_ids", []),
-            "capability_ceiling": binding.get("capability_ceiling", []),
+            **v2,
+            "capability_ceiling": binding.get("capability_ceiling", v2["tool_ids"]),
             "wake_policy": {"mode": "manual", "max_wakes_per_day": 1},
             "budget_policy": {"currency": "JPY", "max_run_cost_micros": 0, "max_daily_cost_micros": 0},
             "concurrency_policy": {"max_parallel_runs": 1, "max_parallel_tasks": 1}},
@@ -652,9 +691,12 @@ def validate_plan(plan):
             expected_endpoint = ["/api/agents/", ref("agent:" + role), "/revisions"]
             if not isinstance(binding, dict) or endpoint != expected_endpoint:
                 raise BootstrapError("revision requires its exact role binding")
-            for field in ("agent_team_id", "execution_profile_id", "allowed_subagent_ids"):
-                if payload.get(field, [] if field == "allowed_subagent_ids" else None) != binding.get(field, [] if field == "allowed_subagent_ids" else None):
-                    raise BootstrapError("revision differs from the inspected model binding")
+            expected_v2 = _revision_v2_payload(binding, logical_role=role)
+            for field in ("model_overrides", "tool_ids", "delegate_policy"):
+                if payload.get(field) != expected_v2[field]:
+                    raise BootstrapError("revision differs from the inspected v2 role binding")
+            if any(field in payload for field in ("agent_team_id", "execution_profile_id", "allowed_subagent_ids")):
+                raise BootstrapError("revision differs from the inspected v2 role binding: retired topology selectors")
         if payload.get("enabled") is True or payload.get("state") not in {None, "draft"}:
             raise BootstrapError("bootstrap cannot enable recurring work or activate identities")
         if isinstance(endpoint, str) and endpoint.endswith("/automations"):
@@ -806,30 +848,26 @@ class Runner:
         if user.get("password_reset_required"):
             raise BootstrapError("account requires password reset")
 
-    def verify_catalog(self):
+    def verify_role_routes(self):
         bindings = self.plan.get("role_bindings") or {}
         if not bindings:
             return
-        catalog = self.transport.request("GET", "/api/agents/catalog")
-        teams = {t["team_id"]: t for t in catalog.get("teams", [])}
         for role, binding in bindings.items():
-            team = teams.get(binding["agent_team_id"])
-            if not team:
-                raise BootstrapError(f"catalog team unavailable: {role}")
-            profile = next((p for p in team.get("execution_profiles", []) if p["profile_id"] == binding["execution_profile_id"]), None)
-            if not profile:
-                raise BootstrapError(f"catalog profile unavailable: {role}")
-            members = binding.get("allowed_subagent_ids") or []
-            routes = [r for r in profile.get("routes", []) if r.get("subagent_id") in members]
-            if not members or len(routes) != len(members):
-                raise BootstrapError(f"executable subagent binding required: {role}")
-            if any(r.get("provider") != binding["resolved_provider"] or r.get("model") != binding["resolved_model_id"] for r in routes):
-                raise BootstrapError(f"model route changed or unresolved: {role}")
+            _revision_v2_payload(binding, logical_role=role)
+            route = binding.get("route")
+            if route is None:
+                continue
+            kind = str(route.get("kind") or "llm").strip().casefold()
+            if kind == "pool":
+                if not str(route.get("pool_id") or "").strip():
+                    raise BootstrapError(f"role route pool unavailable: {role}")
+            elif not str(route.get("provider") or "").strip() or not str(route.get("model") or "").strip():
+                raise BootstrapError(f"role route model unavailable: {role}")
 
     def run(self, *, apply=False, readback_only=False):
         self.verify_owner()
         if apply:
-            self.verify_catalog()
+            self.verify_role_routes()
         reports = []
         for action in self.plan["actions"]:
             key = action["key"]

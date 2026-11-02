@@ -21,6 +21,31 @@ from ..services.agent_task_invocation import (
 _TASK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+class AgentTaskMediaInputPin(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_revision_id: UUID
+    output_id: UUID
+    bytes_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    work_id: UUID
+    agent_run_id: UUID
+    plan_id: UUID
+    plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generation_run_id: UUID
+    generation_run_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_provenance_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AgentTaskImageReviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    persona_id: UUID
+    expected_agent_revision_id: UUID
+    pin: AgentTaskMediaInputPin
+
+
 class AgentTaskCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -62,15 +87,10 @@ class AgentTaskCreateRequest(BaseModel):
         description="Omitted/null keeps the existing command limits. Explicit narrowing only: an additional ceiling on each foreground command and tracked background job lifetime, further bounded at dispatch by the remaining absolute task deadline and all existing config/harness limits. Never grants command permission.",
     )
     agent_id: UUID
+    image_review: AgentTaskImageReviewInput | None = None
     provider: str | None = Field(None, min_length=1, max_length=200)
     model: str | None = Field(None, min_length=1, max_length=200)
     effort: str | None = Field(None, min_length=1, max_length=40)
-    execution_profile_id: str | None = Field(
-        None,
-        min_length=1,
-        max_length=64,
-        description="Optional runtime ExecutionProfile for this task. Omitted/null keeps the pinned AgentRevision default. An explicit id must be a formal system Profile or an enabled Profile of the Agent's own Team; it never changes the Agent role and never falls back. provider/model/effort remain assertions against the selected route.",
-    )
     required_capabilities: list[str] = Field(default_factory=list, max_length=20)
 
 
@@ -88,6 +108,10 @@ AgentTaskStatus = Literal[
 
 class AgentTaskFinalResult(BaseModel):
     response: str = Field(..., description="Secret-redacted final assistant answer; no internal execution trace")
+
+
+class AgentTaskImageReviewResult(AgentTaskFinalResult):
+    image_review: dict[str, Any]
 
 
 class AgentTaskFailedTool(BaseModel):
@@ -132,6 +156,78 @@ class AgentTaskInterruptedOperation(BaseModel):
     path: str | None = Field(None, description="Workspace-relative target, when the tool named one")
 
 
+class AgentTaskFreeTeamActualUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: StrictInt | None = Field(None, ge=0)
+    output_tokens: StrictInt | None = Field(None, ge=0)
+    total_tokens: StrictInt | None = Field(None, ge=0)
+    requests: StrictInt | None = Field(None, ge=0)
+    quota_actual: dict[str, StrictInt] | None = Field(None, max_length=8)
+
+
+class AgentTaskFreeTeamSettlement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["committed", "uncertain", "released"]
+    actual_usage: AgentTaskFreeTeamActualUsage
+
+
+class AgentTaskFreeTeamStatusCounts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    committed: StrictInt = Field(0, ge=0, le=64)
+    uncertain: StrictInt = Field(0, ge=0, le=64)
+    released: StrictInt = Field(0, ge=0, le=64)
+    reserved: StrictInt = Field(0, ge=0, le=64)
+
+
+class AgentTaskFreeTeamUsageTotals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: StrictInt = Field(0, ge=0)
+    output_tokens: StrictInt = Field(0, ge=0)
+    total_tokens: StrictInt = Field(0, ge=0)
+    requests: StrictInt = Field(0, ge=0)
+    quota_actual: dict[str, StrictInt] = Field(default_factory=dict, max_length=32)
+
+
+class AgentTaskFreeTeamReservationsTotal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    count: StrictInt = Field(0, ge=0, le=64)
+    by_status: AgentTaskFreeTeamStatusCounts
+    actual_usage: AgentTaskFreeTeamUsageTotals
+    uncertain_estimated_hold: dict[str, StrictInt] = Field(default_factory=dict, max_length=32)
+    truncated: StrictBool = False
+
+
+class AgentTaskFreeTeamWait(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    quota_reset_at: str | None = Field(None, max_length=64)
+    quota_reset_kind: Literal["daily", "minute", "cooldown"] | None = None
+    quota_ids: list[str] = Field(default_factory=list, max_length=8)
+    deferred_reason: str | None = Field(None, max_length=96)
+
+
+class AgentTaskFreeTeamProjection(BaseModel):
+    """Latest lease fields plus a bounded sum across all reservations for this task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    billing_mode: str | None = Field(None, max_length=40)
+    candidate: str | None = Field(None, max_length=140)
+    provider: str | None = Field(None, max_length=80)
+    model: str | None = Field(None, max_length=240)
+    quota_pool_ids: list[str] = Field(default_factory=list, max_length=8)
+    reservation_id: UUID | None = None
+    settlement: AgentTaskFreeTeamSettlement | None = None
+    wait: AgentTaskFreeTeamWait | None = None
+    reservations_total: AgentTaskFreeTeamReservationsTotal
+    non_free_reservation_detected: StrictBool = False
+
+
 class AgentTaskProjection(BaseModel):
     task_id: str = Field(..., pattern=r"^[0-9a-f]{32}$")
     status: AgentTaskStatus
@@ -144,10 +240,14 @@ class AgentTaskProjection(BaseModel):
         None,
         description="Operations whose outcome a restart left unknown; inspect the workspace, then resume with their operation ids",
     )
-    result: AgentTaskFinalResult | None = None
+    result: AgentTaskImageReviewResult | AgentTaskFinalResult | None = None
     failure: AgentTaskFailure | None = None
     tool_failures: AgentTaskToolFailures | None = Field(
         None, description="Recovered and unresolved tool failures for a completed or failed task"
+    )
+    free_team: AgentTaskFreeTeamProjection | None = Field(
+        None,
+        description="Latest complimentary lease and settlement, bounded wait data, and aggregate reservations_total for tasks whose bound AgentRevision operator route resolves to a Free Team pool",
     )
 
 
@@ -214,8 +314,13 @@ class AgentTaskCancelResponse(BaseModel):
     cancellation_requested: bool
 
 
+class AgentTaskAdmissionErrorDetail(BaseModel):
+    code: Literal["admin_restart_pending"]
+    message: str
+
+
 class AgentTaskErrorResponse(BaseModel):
-    detail: str | list[dict[str, Any]]
+    detail: str | list[dict[str, Any]] | AgentTaskAdmissionErrorDetail
     error: str | None = None
     required_ingress: Literal["cli_session", "remote_agent"] | None = Field(
         None,
@@ -237,7 +342,13 @@ def _maybe(value: Any) -> Any:
     return value
 
 
-def bind_agent_task_service(manager: Any, config: Any, coordinator: Any) -> AgentTaskInvocationService:
+def bind_agent_task_service(
+    manager: Any,
+    config: Any,
+    coordinator: Any,
+    *,
+    openrouter_quota_refresher: Any = None,
+) -> AgentTaskInvocationService:
     """Return the single canonical invocation service for this coordinator.
 
     Startup calls this before ``recover_stale`` so the evidence-based restart
@@ -246,8 +357,15 @@ def bind_agent_task_service(manager: Any, config: Any, coordinator: Any) -> Agen
 
     service = getattr(coordinator, "_agent_task_service", None)
     if service is None:
-        service = AgentTaskInvocationService(manager, config, coordinator)
+        service = AgentTaskInvocationService(
+            manager,
+            config,
+            coordinator,
+            openrouter_quota_refresher=openrouter_quota_refresher,
+        )
         coordinator._agent_task_service = service
+    elif openrouter_quota_refresher is not None:
+        service.source.openrouter_quota_refresher = openrouter_quota_refresher
     service.attach()
     return service
 
@@ -258,13 +376,20 @@ def create_agent_task_router(
     get_coordinator: Callable[[], Any],
     get_user_from_request: Callable[[Request], Any],
     require_auth_dependency: Callable[..., Any],
+    restart_work_dependency: Callable[..., Any] | None = None,
     config: Any,
+    get_openrouter_quota_refresher: Callable[[], Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(
         prefix="/api/agent-tasks",
         tags=["agent-tasks"],
         dependencies=[Depends(require_auth_dependency)],
     )
+
+    async def _no_restart_admission_for_standalone_router() -> None:
+        return None
+
+    require_restart_work = restart_work_dependency or _no_restart_admission_for_standalone_router
     async def _service() -> AgentTaskInvocationService:
         manager = get_db_manager()
         if inspect.isawaitable(manager):
@@ -274,10 +399,24 @@ def create_agent_task_router(
             coordinator = await coordinator
         if manager is None or coordinator is None:
             raise HTTPException(status_code=503, detail="Agent task runtime is unavailable")
+        openrouter_quota_refresher = (
+            get_openrouter_quota_refresher()
+            if get_openrouter_quota_refresher is not None
+            else None
+        )
         existing = getattr(coordinator, "_agent_task_service", None)
         if existing is not None:
+            if openrouter_quota_refresher is not None:
+                existing.source.openrouter_quota_refresher = (
+                    openrouter_quota_refresher
+                )
             return existing
-        service = AgentTaskInvocationService(manager, config, coordinator)
+        service = AgentTaskInvocationService(
+            manager,
+            config,
+            coordinator,
+            openrouter_quota_refresher=openrouter_quota_refresher,
+        )
         coordinator._agent_task_service = service
         return service
 
@@ -305,6 +444,15 @@ def create_agent_task_router(
         role = str(actor.get("role") or "user")
         return owner_id, role
 
+    async def _require_owner_before_restart_admission(request: Request) -> None:
+        await _owner(request)
+
+    async def _require_agent_task_admission(
+        _owner: None = Depends(_require_owner_before_restart_admission),
+        _admission: None = Depends(require_restart_work),
+    ):
+        yield None
+
     def _task_id(value: str) -> str:
         if not _TASK_ID_RE.fullmatch(value):
             raise HTTPException(status_code=404, detail="task not found")
@@ -326,6 +474,7 @@ def create_agent_task_router(
 
     @router.post(
         "",
+        dependencies=[Depends(_require_agent_task_admission)],
         status_code=202,
         operation_id="agent_task_create",
         response_model=AgentTaskCreateResponse,
@@ -409,6 +558,7 @@ def create_agent_task_router(
 
     @router.post(
         "/{task_id}/resume",
+        dependencies=[Depends(_require_agent_task_admission)],
         operation_id="agent_task_resume",
         response_model=AgentTaskResponse,
         responses=_error_responses(403, 404, 409, 422, 503),

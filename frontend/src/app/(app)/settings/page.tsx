@@ -68,6 +68,7 @@ import { SpotifySection } from "@/components/settings/spotify-section";
 import { EditorSettingsSection } from "@/components/settings/editor-settings-section";
 import { ChatBackgroundAnimationSettings } from "@/components/settings/chat-background-animation-settings";
 import { FileTransferSettings } from "@/components/settings/file-transfer-settings";
+import { PersonalDeadlineChatDraftSetting } from "@/components/settings/personal-deadline-chat-draft-setting";
 import { YomiLinterSection } from "@/components/settings/yomi-linter-section";
 import { SettingsDisclosure } from "@/components/settings/settings-disclosure";
 import {
@@ -1219,6 +1220,7 @@ export default function SettingsPage() {
         title="会話・AI応答"
         icon={<MessageSquareText className="size-4" />}
       >
+        <PersonalDeadlineChatDraftSetting isAdmin={isAdmin} />
         <SettingsDisclosure
           title="会話カスタム指示"
           icon={<MessageSquareText className="size-4" />}
@@ -1488,7 +1490,7 @@ export default function SettingsPage() {
         icon={<Search className="size-4" />}
       >
         <SettingsTargetFrame targetId="search-provider"><SearchSettingsSection /></SettingsTargetFrame>
-        <SettingsTargetFrame targetId="pc-bridge"><PcBridgeSettingsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="pc-bridge" width="wide"><PcBridgeSettingsSection isAdmin={isAdmin} /></SettingsTargetFrame>
         {isAdmin && <SettingsTargetFrame targetId="browser-agent"><BrowserAgentSettingsSection /></SettingsTargetFrame>}
         <SettingsTargetFrame targetId="clip-ingest"><ClipIngestTargetsSection /></SettingsTargetFrame>
         <SettingsTargetFrame targetId="knowledge-sources"><KnowledgeSourcesSection /></SettingsTargetFrame>

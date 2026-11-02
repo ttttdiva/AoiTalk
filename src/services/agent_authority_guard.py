@@ -12,13 +12,13 @@ import asyncio
 import concurrent.futures
 import contextvars
 import inspect
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping
 from uuid import UUID
 
 from .agent_authority import AgentAuthorityResolver
-from .agent_model_routing import known_agent_subagents, known_agent_teams
 from .turn_context import get_turn_context, is_explicit_reference_in_turn
 
 
@@ -28,6 +28,9 @@ class AgentToolAuthorityDecision:
     reason: str = ""
     capability: str | None = None
     required_capabilities: tuple[str, ...] = ()
+    reason_code: str = ""
+    tool_name: str = ""
+    decision_layer: str = ""
 
 
 def _canonical_id(value: Any) -> str:
@@ -57,6 +60,7 @@ _AGENT_MEMORY_SCOPES = frozenset({"project", "task", "session"})
 _AGENT_DIALOGUE_TOOLS = frozenset(
     {
         "list_agent_workers",
+        "delegate",
         "delegate_agent_work",
         "get_agent_work_status",
         "send_agent_work_message",
@@ -73,6 +77,112 @@ _AGENT_DIALOGUE_QUESTION_TOOLS = frozenset({"ask_user_question"})
 _ROOT_SCOPE_KINDS = frozenset({"aoidots", "agent_dialogue"})
 _ACTIVE_AGENT_RUN_STATES = frozenset({"queued", "running", "awaiting_approval"})
 _ACTIVE_AGENT_WORK_STATES = frozenset({"claimed", "running"})
+_AUTHORITY_TOOL_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+
+
+def _authority_reason_code(reason: str, *, fallback: str = "authority_scope_denied") -> str:
+    """Map guard diagnostics to fixed audit codes without persisting free text."""
+
+    lowered = str(reason or "").casefold()
+    if "unknown agent capability" in lowered or "unknown agent capability/resource" in lowered:
+        return "capability_unresolved"
+    if "tool pack" in lowered and "unknown" in lowered:
+        return "pack_unknown"
+    if "tool pack" in lowered or "tool pack" in lowered.replace("agent ", ""):
+        return "pack_not_allowed"
+    if "work lease" in lowered:
+        return "work_lease_invalid"
+    if "human" in lowered and ("anchor" in lowered or "authority" in lowered):
+        return "human_anchor_mismatch"
+    if "scope marker" in lowered or "canonical agentdialogue scope" in lowered:
+        return "run_scope_missing"
+    if "marker mismatch" in lowered or "marker is not canonical" in lowered:
+        return "run_scope_mismatch"
+    if "agentrun" in lowered and ("required" in lowered or "is required" in lowered):
+        return "run_missing"
+    if "agentrun" in lowered or "binding" in lowered:
+        return "run_scope_invalid"
+    if "capability" in lowered and any(
+        marker in lowered for marker in ("ceiling", "intersection", "outside")
+    ):
+        return "capability_not_in_ceiling"
+    if "grant" in lowered or "permission" in lowered:
+        return "capability_grant_invalid"
+    if "could not be revalidated" in lowered or "could not be loaded" in lowered:
+        return "authority_revalidation_failed"
+    if "subagent" in lowered or "worker" in lowered:
+        return "subagent_scope_denied"
+    if "memory" in lowered:
+        return "memory_scope_denied"
+    if "project" in lowered or "task" in lowered or "session" in lowered:
+        return "project_scope_denied"
+    if "resource" in lowered or "docs" in lowered:
+        return "resource_scope_denied"
+    return fallback
+
+
+def _delegate_worker_required_capabilities(args: Mapping[str, Any]) -> frozenset[str]:
+    """Resolve the shared kind and workspace capability ceiling."""
+
+    from .agent_delegate_policy import worker_delegate_required_capabilities
+
+    kind = str(args.get("kind") or "").strip().casefold()
+    scope = args.get("workspace_scope")
+    mode = str(scope.get("mode") or "").strip().casefold() if isinstance(scope, Mapping) else ""
+    return worker_delegate_required_capabilities(kind, mode)
+
+
+def _authority_decision_layer(reason_code: str, fallback: str) -> str:
+    if reason_code.startswith("run_"):
+        return "run_scope"
+    if reason_code == "work_lease_invalid":
+        return "work_lease"
+    if reason_code == "human_anchor_mismatch":
+        return "human_anchor"
+    if reason_code.startswith("capability_") or reason_code == "tool_owner_unknown":
+        return "capability_resolver"
+    if reason_code.startswith("pack_"):
+        return "tool_pack"
+    if reason_code == "memory_scope_denied":
+        return "memory_scope"
+    if reason_code == "project_scope_denied":
+        return "project_scope"
+    if reason_code == "resource_scope_denied":
+        return "resource_scope"
+    if reason_code == "subagent_scope_denied":
+        return "subagent_scope"
+    if reason_code == "authority_revalidation_failed":
+        return fallback
+    return fallback
+
+
+def _annotate_authority_denial(
+    decision: AgentToolAuthorityDecision,
+    *,
+    tool_name: str,
+    tool_definition: Any,
+    layer: str,
+    required_capabilities: tuple[str, ...] = (),
+    reason_code: str = "",
+) -> AgentToolAuthorityDecision:
+    if decision.allowed:
+        return decision
+    canonical_tool = str(getattr(tool_definition, "name", "") or "").strip().casefold()
+    if not _AUTHORITY_TOOL_NAME_RE.fullmatch(canonical_tool):
+        canonical_tool = "unknown_tool"
+    selected_code = reason_code or decision.reason_code or _authority_reason_code(
+        decision.reason
+    )
+    return replace(
+        decision,
+        reason_code=selected_code,
+        tool_name=canonical_tool,
+        decision_layer=_authority_decision_layer(selected_code, layer),
+        required_capabilities=(
+            decision.required_capabilities
+            or required_capabilities
+        ),
+    )
 
 
 def _is_projectless_agent_dialogue_turn(context: Any) -> bool:
@@ -259,7 +369,6 @@ async def _projectless_root_dialogue_decision(
                 or _canonical_id(dialogue.root_session_id) != session_id
                 or _canonical_id(dialogue.root_agent_id) != agent_id
                 or _canonical_id(dialogue.root_agent_revision_id) != revision_id
-                or str(dialogue.state or "").casefold() not in {"queued", "running", "waiting"}
             ):
                 return AgentToolAuthorityDecision(False, "AoiDots Root dialogue marker is not canonical")
 
@@ -351,6 +460,175 @@ async def _projectless_root_dialogue_decision(
         await db.close()
 
 
+async def _generic_agent_dialogue_controller_decision(
+    context: Any,
+    *,
+    tool_name: str,
+    config: Any,
+) -> AgentToolAuthorityDecision | None:
+    """Prove a current ordinary Agent run before generic Dialogue controls.
+
+    The dialogue service remains responsible for the requested Dialogue's
+    owner/root match. This boundary proves only that the caller is the exact
+    active Agent revision and session allowed to request that check.
+    """
+
+    user_id = _canonical_id(getattr(context, "user_id", None))
+    session_id = _canonical_id(getattr(context, "session_id", None))
+    agent_id = _canonical_id(getattr(context, "agent_id", None))
+    revision_id = _canonical_id(getattr(context, "agent_revision_id", None))
+    if not user_id or not session_id or not agent_id or not revision_id:
+        return AgentToolAuthorityDecision(
+            False,
+            "generic Agent Dialogue controller identity is incomplete",
+        )
+    try:
+        from .agent_run_service import get_current_agent_run_id
+
+        run_id = _canonical_id(get_current_agent_run_id())
+    except Exception:
+        run_id = ""
+    if not run_id:
+        return AgentToolAuthorityDecision(
+            False,
+            "current generic AgentRun is required for Dialogue controls",
+            reason_code="run_scope_missing",
+        )
+    try:
+        from sqlalchemy import select
+
+        from ..memory.database import get_database_manager
+        from ..memory.models import (
+            Agent,
+            AgentExecutionBinding,
+            AgentRevision,
+            AgentRun,
+            AgentWorkItem,
+            ConversationSession,
+        )
+        from .agent_delegate_policy import (
+            revision_has_new_delegate_policy,
+        )
+        from .agent_revision_v2 import revision_tool_ids
+
+        manager = get_database_manager()
+        raw_session = manager.get_session()
+        db = await raw_session if inspect.isawaitable(raw_session) else raw_session
+    except Exception:
+        return AgentToolAuthorityDecision(
+            False,
+            "generic Agent Dialogue controller could not load its authority rows",
+        )
+    try:
+        run = await db.get(AgentRun, UUID(run_id))
+        session = await db.get(ConversationSession, UUID(session_id))
+        agent = await db.get(Agent, UUID(agent_id))
+        revision = await db.get(AgentRevision, UUID(revision_id))
+        current_run_binding = bool(
+            run is not None
+            and str(getattr(run, "status", "")).casefold()
+            in _ACTIVE_AGENT_RUN_STATES
+            and _canonical_id(run.id) == run_id
+            and _canonical_id(run.session_id) == session_id
+            and _canonical_id(run.user_id) == user_id
+            and _canonical_id(run.agent_id) == agent_id
+            and _canonical_id(run.agent_revision_id) == revision_id
+            and run.work_item_id is not None
+            and session is not None
+            and getattr(session, "deleted_at", None) is None
+            and _canonical_id(session.user_id) == user_id
+            and _canonical_id(session.agent_id) == agent_id
+            and _canonical_id(session.project_id) == _canonical_id(run.project_id)
+            and agent is not None
+            and str(getattr(agent, "state", "")).casefold() == "active"
+            and revision is not None
+            and _canonical_id(revision.agent_id) == agent_id
+        )
+        if current_run_binding and not revision_has_new_delegate_policy(revision):
+            return AgentToolAuthorityDecision(
+                False,
+                "AoiDots Root dialogue scope marker is required",
+                reason_code="run_scope_missing",
+            )
+        if not current_run_binding or not revision_has_new_delegate_policy(revision):
+            return AgentToolAuthorityDecision(
+                False,
+                "generic Agent Dialogue controller is not bound to the current run",
+            )
+        binding = (
+            await db.execute(
+                select(AgentExecutionBinding)
+                .where(
+                    AgentExecutionBinding.session_id == UUID(session_id),
+                    AgentExecutionBinding.agent_id == UUID(agent_id),
+                    AgentExecutionBinding.agent_revision_id == UUID(revision_id),
+                )
+                .order_by(AgentExecutionBinding.created_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if binding is None:
+            return AgentToolAuthorityDecision(
+                False,
+                "generic Agent execution binding is unavailable",
+            )
+        work = await db.get(AgentWorkItem, run.work_item_id)
+        if (
+            work is None
+            or str(getattr(work, "state", "")).casefold()
+            not in _ACTIVE_AGENT_WORK_STATES
+            or _canonical_id(work.active_agent_run_id) != run_id
+            or _canonical_id(work.conversation_session_id) != session_id
+            or _canonical_id(work.assigned_agent_id) != agent_id
+            or _canonical_id(work.agent_revision_id) != revision_id
+            or not str(getattr(work, "lease_owner", "") or "").strip()
+            or not str(getattr(work, "lease_token", "") or "").strip()
+            or getattr(work, "lease_expires_at", None) is None
+            or work.lease_expires_at <= datetime.utcnow()
+        ):
+            return AgentToolAuthorityDecision(
+                False,
+                "generic Agent Dialogue controller Work lease is not active",
+            )
+        if getattr(session, "project_id", None) is not None:
+            from ..memory.project_repository import ProjectRepository
+
+            if not await ProjectRepository.has_permission(
+                db,
+                session.project_id,
+                UUID(user_id),
+                "read",
+            ):
+                return AgentToolAuthorityDecision(
+                    False,
+                    "generic Agent Dialogue controller Project access was revoked",
+                )
+        if tool_name == "delegate_agent_work":
+            tool_ids = revision_tool_ids(revision)
+            if tool_ids is None or not {
+                "delegate",
+                "delegate_agent_work",
+            }.intersection({
+                item.strip().casefold()
+                for item in tool_ids
+                if isinstance(item, str) and item.strip()
+            }):
+                return AgentToolAuthorityDecision(
+                    False,
+                    "AgentRevision does not expose the compatibility alias",
+                )
+        return None
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return AgentToolAuthorityDecision(
+            False,
+            "generic Agent Dialogue controller authority could not be revalidated",
+        )
+    finally:
+        await db.close()
+
+
 async def _projectless_worker_dialogue_decision(
     context: Any,
     *,
@@ -371,11 +649,7 @@ async def _projectless_worker_dialogue_decision(
             False,
             "Worker Agent cannot control the Root AgentDialogue",
         )
-    if _canonical_id(getattr(context, "project_id", None)):
-        return AgentToolAuthorityDecision(
-            False,
-            "projectless worker Dialogue scope is required",
-        )
+    projectless_turn = not _canonical_id(getattr(context, "project_id", None))
     marker = _execution_scope_marker(context, config)
     kind = str(
         marker.get("scope_kind")
@@ -411,10 +685,6 @@ async def _projectless_worker_dialogue_decision(
         or (context_dialogue_id and context_dialogue_id != marker_id)
     ):
         return AgentToolAuthorityDecision(False, "worker Dialogue execution identity is incomplete")
-    for key in ("dialogue_id", "agent_dialogue_id"):
-        requested_dialogue_id = _canonical_id(tool_args.get(key))
-        if requested_dialogue_id and requested_dialogue_id != marker_id:
-            return AgentToolAuthorityDecision(False, "worker Dialogue target is outside the current job")
     context_control_revision = getattr(context, "agent_dialogue_control_revision", None)
     marker_control_revision = marker.get("control_revision")
 
@@ -457,7 +727,8 @@ async def _projectless_worker_dialogue_decision(
         dialogue = await db.get(AgentDialogue, UUID(marker_id))
         if (
             dialogue is None
-            or str(dialogue.state or "").casefold() not in {"queued", "running", "waiting"}
+            or str(dialogue.state or "").casefold()
+            not in {"queued", "running", "waiting", "blocked"}
             or _canonical_id(dialogue.id) != marker_id
             or _canonical_id(dialogue.owner_user_id) != user_id
             or _canonical_id(dialogue.worker_session_id) != session_id
@@ -494,17 +765,15 @@ async def _projectless_worker_dialogue_decision(
             return AgentToolAuthorityDecision(False, "worker Agent binding is invalid")
 
         # A worker may use this lane only when its pinned capability ceiling
-        # intersects the configured Team catalog for the existing aoi_tools
-        # family.  This is a ceiling check, never a new grant.
-        resolver = AgentAuthorityResolver(config=config)
-        worker_team_capabilities = resolver._team_capabilities(worker_revision)
+        # contains the neutral aoi_tools capability. This is a ceiling check,
+        # never a new grant.
         worker_ceiling = {
             str(item).strip()
             for item in (getattr(worker_revision, "capability_ceiling_json", None) or [])
             if str(item).strip()
         }
-        if "aoi_tools" not in worker_ceiling.intersection(worker_team_capabilities):
-            return AgentToolAuthorityDecision(False, "worker Team has no aoi_tools capability intersection")
+        if "aoi_tools" not in worker_ceiling:
+            return AgentToolAuthorityDecision(False, "worker revision has no aoi_tools capability")
 
         root_session_id = _canonical_id(dialogue.root_session_id)
         root_agent_id = _canonical_id(dialogue.root_agent_id)
@@ -516,21 +785,51 @@ async def _projectless_worker_dialogue_decision(
             root_session is None
             or getattr(root_session, "deleted_at", None) is not None
             or _canonical_id(root_session.user_id) != user_id
-            or getattr(root_session, "project_id", None) is not None
+            or _canonical_id(root_session.agent_id) != root_agent_id
             or root_agent is None
             or str(getattr(root_agent, "state", "")).casefold() != "active"
+            or getattr(root_agent, "created_by", None) not in (None, UUID(user_id))
             or root_revision is None
             or _canonical_id(root_revision.agent_id) != root_agent_id
         ):
             return AgentToolAuthorityDecision(False, "worker Dialogue Root binding is invalid")
-        root_team_capabilities = resolver._team_capabilities(root_revision)
+        from .agent_delegate_policy import revision_has_new_delegate_policy
+
+        generic_dialogue = revision_has_new_delegate_policy(root_revision)
+        if not projectless_turn and not generic_dialogue:
+            return AgentToolAuthorityDecision(
+                False,
+                "projectless worker Dialogue scope is required",
+            )
+        if generic_dialogue:
+            root_project_id = _canonical_id(getattr(root_session, "project_id", None))
+            context_project_id = _canonical_id(getattr(context, "project_id", None))
+            dialogue_project_id = _canonical_id(getattr(dialogue, "project_id", None))
+            if root_project_id != context_project_id or dialogue_project_id != context_project_id:
+                return AgentToolAuthorityDecision(
+                    False,
+                    "worker Dialogue Project binding is invalid",
+                )
+            if root_project_id:
+                from ..memory.project_repository import ProjectRepository
+
+                if not await ProjectRepository.has_permission(
+                    db,
+                    UUID(root_project_id),
+                    UUID(user_id),
+                    "read",
+                ):
+                    return AgentToolAuthorityDecision(
+                        False,
+                        "worker Dialogue Project access was revoked",
+                    )
         root_ceiling = {
             str(item).strip()
             for item in (getattr(root_revision, "capability_ceiling_json", None) or [])
             if str(item).strip()
         }
-        if "aoi_tools" not in root_ceiling.intersection(root_team_capabilities):
-            return AgentToolAuthorityDecision(False, "source Root Team has no aoi_tools capability intersection")
+        if "aoi_tools" not in root_ceiling:
+            return AgentToolAuthorityDecision(False, "source Root revision has no aoi_tools capability")
 
         worker_run = await db.get(AgentRun, UUID(ambient_run_id))
         if (
@@ -961,70 +1260,7 @@ def _subagent_decision(
 ) -> AgentToolAuthorityDecision | None:
     if tool_name != "agent_team_delegate":
         return None
-    binding = getattr(context, "agent_execution_binding", None)
-    requested = str(args.get("subagent") or "").strip()
-    allowed = {
-        str(item).strip()
-        for item in (getattr(binding, "allowed_subagent_ids", ()) or ())
-        if str(item).strip()
-    }
-    if not requested or requested not in allowed:
-        return AgentToolAuthorityDecision(False, "Subagent is outside the pinned AgentRevision")
-    teams = known_agent_teams(config)
-    team = teams.get(str(getattr(binding, "agent_team_id", "") or "").strip())
-    if not isinstance(team, Mapping) or team.get("enabled", True) is False:
-        return AgentToolAuthorityDecision(False, "pinned Agent Team is unavailable")
-    members = {str(item).strip() for item in (team.get("subagent_ids") or [])}
-    if requested not in members:
-        return AgentToolAuthorityDecision(False, "Subagent is not a member of the pinned Agent Team")
-    subagents = known_agent_subagents(config)
-    subagent = subagents.get(requested)
-    if not isinstance(subagent, Mapping) or subagent.get("enabled", True) is False:
-        return AgentToolAuthorityDecision(False, "Subagent is unavailable")
-    declared = {
-        str(item).strip()
-        for item in (subagent.get("capability_ids") or [])
-        if str(item).strip()
-    }
-    ceiling = {
-        str(item).strip()
-        for item in (getattr(binding, "capability_ceiling", ()) or ())
-        if str(item).strip()
-    }
-    from .agent_team_v3 import (
-        AGENT_TEAM_CAPABILITY_CATALOG,
-        agent_team_subagent_allows_write,
-    )
-
-    effective = declared & ceiling & set(AGENT_TEAM_CAPABILITY_CATALOG)
-    requested_work_mode = str(args.get("work_mode") or "read").strip().lower()
-    if requested_work_mode not in {"read", "write"}:
-        return AgentToolAuthorityDecision(False, "Unsupported Subagent work mode")
-    if requested_work_mode == "read":
-        effective = {
-            capability
-            for capability in effective
-            if AGENT_TEAM_CAPABILITY_CATALOG[capability].get("access") == "read"
-        }
-    else:
-        if not agent_team_subagent_allows_write(dict(subagent)):
-            return AgentToolAuthorityDecision(False, "Subagent does not allow write mode")
-        if not any(
-            AGENT_TEAM_CAPABILITY_CATALOG[capability].get("access") == "write"
-            for capability in effective
-        ):
-            return AgentToolAuthorityDecision(
-                False,
-                "Subagent has no writable capability intersection with the AgentRevision",
-            )
-    if not effective:
-        return AgentToolAuthorityDecision(False, "Subagent has no capability intersection with the AgentRevision")
-    return AgentToolAuthorityDecision(
-        True,
-        "Subagent capability intersection is valid",
-        capability=sorted(effective)[0],
-        required_capabilities=tuple(sorted(effective)),
-    )
+    return AgentToolAuthorityDecision(False, "Agent Team delegation is retired; use delegate")
 
 
 async def guard_agent_tool_call_async(
@@ -1042,15 +1278,56 @@ async def guard_agent_tool_call_async(
         return AgentToolAuthorityDecision(True)
     user_id = str(getattr(context, "user_id", None) or "").strip()
     agent_id = str(getattr(context, "agent_id", None) or getattr(binding, "agent_id", "") or "").strip()
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    from ..llm.tool_policy import agent_capability_ids_for_tool
+
+    tool_capabilities = agent_capability_ids_for_tool(
+        normalized_tool,
+        tool_definition,
+    )
     revision_id = str(
         getattr(context, "agent_revision_id", None)
         or getattr(binding, "agent_revision_id", "")
         or ""
     ).strip()
     if not user_id or not agent_id or not revision_id:
-        return AgentToolAuthorityDecision(False, "Agent execution identity is incomplete")
+        return _annotate_authority_denial(
+            AgentToolAuthorityDecision(False, "Agent execution identity is incomplete"),
+            tool_name=tool_name,
+            tool_definition=tool_definition,
+            layer="execution_identity",
+            required_capabilities=tuple(sorted(tool_capabilities)),
+            reason_code="execution_identity_missing",
+        )
     args = dict(tool_args or {})
-    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    if normalized_tool == "delegate_worker":
+        tool_capabilities = _delegate_worker_required_capabilities(args)
+    if normalized_tool == "load_tool_pack":
+        from ..llm.tool_packs import agent_tool_pack_denial_code
+
+        denial_code = agent_tool_pack_denial_code(
+            args.get("pack"),
+            tool_definition,
+        )
+        if denial_code == "pack_unknown":
+            return _annotate_authority_denial(
+                AgentToolAuthorityDecision(False, "Unknown Agent tool pack"),
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="tool_pack",
+                reason_code="pack_unknown",
+            )
+        if denial_code == "pack_not_allowed":
+            return _annotate_authority_denial(
+                AgentToolAuthorityDecision(False, "Agent tool pack is not available for this turn"),
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="tool_pack",
+                reason_code="pack_not_allowed",
+            )
+        # Loading a pack changes only the session's presented schema. Every
+        # concrete tool from that pack still passes this guard independently.
+        return AgentToolAuthorityDecision(True)
     projectless_turn = not _canonical_id(getattr(context, "project_id", None))
     worker_dialogue_lane = False
     scope_marker = _execution_scope_marker(context, config)
@@ -1075,15 +1352,34 @@ async def guard_agent_tool_call_async(
                 tool_args=args,
             )
             if worker_decision is not None:
-                return worker_decision
+                return _annotate_authority_denial(
+                    worker_decision,
+                    tool_name=tool_name,
+                    tool_definition=tool_definition,
+                    layer="worker_scope",
+                    required_capabilities=tuple(sorted(tool_capabilities)),
+                )
             worker_dialogue_lane = True
         else:
-            root_decision = await _projectless_root_dialogue_decision(
-                context,
-                config=config,
-            )
+            if dialogue_role == "root" or scope_kind in _ROOT_SCOPE_KINDS:
+                root_decision = await _projectless_root_dialogue_decision(
+                    context,
+                    config=config,
+                )
+            else:
+                root_decision = await _generic_agent_dialogue_controller_decision(
+                    context,
+                    tool_name=normalized_tool,
+                    config=config,
+                )
             if root_decision is not None:
-                return root_decision
+                return _annotate_authority_denial(
+                    root_decision,
+                    tool_name=tool_name,
+                    tool_definition=tool_definition,
+                    layer="root_scope",
+                    required_capabilities=tuple(sorted(tool_capabilities)),
+                )
         # Child Project/Task targets are deliberately left to the dialogue
         # service, which owns human Project ACLs and worker grants.  The Root
         # or worker proof above is only the controller admission boundary.
@@ -1096,7 +1392,13 @@ async def guard_agent_tool_call_async(
                 tool_args=args,
             )
             if worker_decision is not None:
-                return worker_decision
+                return _annotate_authority_denial(
+                    worker_decision,
+                    tool_name=tool_name,
+                    tool_definition=tool_definition,
+                    layer="worker_scope",
+                    required_capabilities=tuple(sorted(tool_capabilities)),
+                )
             worker_dialogue_lane = True
         elif dialogue_role == "root" or scope_kind in _ROOT_SCOPE_KINDS:
             root_decision = await _projectless_root_dialogue_decision(
@@ -1104,11 +1406,24 @@ async def guard_agent_tool_call_async(
                 config=config,
             )
             if root_decision is not None:
-                return root_decision
+                return _annotate_authority_denial(
+                    root_decision,
+                    tool_name=tool_name,
+                    tool_definition=tool_definition,
+                    layer="root_scope",
+                    required_capabilities=tuple(sorted(tool_capabilities)),
+                )
         else:
-            return AgentToolAuthorityDecision(
-                False,
-                "projectless question requires a canonical AgentDialogue scope",
+            return _annotate_authority_denial(
+                AgentToolAuthorityDecision(
+                    False,
+                    "projectless question requires a canonical AgentDialogue scope",
+                ),
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="run_scope",
+                required_capabilities=tuple(sorted(tool_capabilities)),
+                reason_code="run_scope_missing",
             )
         # A non-Dialogue projectless Agent follows the ordinary capability and
         # planning gates below; this branch only admits a canonical Dialogue
@@ -1119,30 +1434,78 @@ async def guard_agent_tool_call_async(
     ):
         memory_scope_decision = await _memory_scope_decision(context, normalized_tool, args)
         if memory_scope_decision is not None and not memory_scope_decision.allowed:
-            return memory_scope_decision
+            return _annotate_authority_denial(
+                memory_scope_decision,
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="memory_scope",
+                required_capabilities=tuple(sorted(tool_capabilities)),
+            )
         scope_decision = _project_scope_decision(
             context,
-            args,
+            (
+                {}
+                if normalized_tool
+                in {"delegate", "delegate_agent_work", "delegate_plan", "delegate_worker"}
+                else args
+            ),
             memory_tool=normalized_tool in _AGENT_MEMORY_TOOLS,
         )
         if scope_decision is not None:
-            return scope_decision
-        resource_decision = await _resource_scope_decision(context, args)
+            return _annotate_authority_denial(
+                scope_decision,
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="project_scope",
+                required_capabilities=tuple(sorted(tool_capabilities)),
+            )
+        resource_decision = await _resource_scope_decision(
+            context,
+            (
+                {}
+                if normalized_tool
+                in {"delegate", "delegate_agent_work", "delegate_plan", "delegate_worker"}
+                else args
+            ),
+        )
         if resource_decision is not None:
-            return resource_decision
+            return _annotate_authority_denial(
+                resource_decision,
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="resource_scope",
+                required_capabilities=tuple(sorted(tool_capabilities)),
+            )
     subagent_decision = _subagent_decision(context, normalized_tool, args, config)
     if subagent_decision is not None and not subagent_decision.allowed:
-        return subagent_decision
+        return _annotate_authority_denial(
+            subagent_decision,
+            tool_name=tool_name,
+            tool_definition=tool_definition,
+            layer="subagent_scope",
+            required_capabilities=tuple(sorted(subagent_decision.required_capabilities)),
+        )
 
-    from ..llm.tool_policy import agent_capability_ids_for_tool
-
-    capabilities = (
-        frozenset(subagent_decision.required_capabilities)
-        if normalized_tool == "agent_team_delegate" and subagent_decision is not None
-        else agent_capability_ids_for_tool(normalized_tool, tool_definition)
-    )
+    if normalized_tool == "agent_team_delegate" and subagent_decision is not None:
+        capabilities = frozenset(subagent_decision.required_capabilities)
+    elif normalized_tool == "delegate_worker":
+        capabilities = _delegate_worker_required_capabilities(args)
+    else:
+        capabilities = agent_capability_ids_for_tool(normalized_tool, tool_definition)
     if not capabilities:
-        return AgentToolAuthorityDecision(False, "Unknown Agent capability/resource; execution is blocked")
+        owner = str(getattr(tool_definition, "owner", "") or "").strip().casefold()
+        reason_code = "tool_owner_unknown" if owner and owner not in {
+            "core",
+            "aoi_tools",
+            "tool_packs",
+        } else "capability_unresolved"
+        return _annotate_authority_denial(
+            AgentToolAuthorityDecision(False, "Unknown Agent capability/resource; execution is blocked"),
+            tool_name=tool_name,
+            tool_definition=tool_definition,
+            layer="capability_resolver",
+            reason_code=reason_code,
+        )
     resolver = AgentAuthorityResolver(config=config)
     reasons: list[str] = []
     allowed_capabilities: list[str] = []
@@ -1157,7 +1520,18 @@ async def guard_agent_tool_call_async(
         except asyncio.CancelledError:
             raise
         except Exception:
-            return AgentToolAuthorityDecision(False, "Agent authority could not be revalidated", capability)
+            return _annotate_authority_denial(
+                AgentToolAuthorityDecision(
+                    False,
+                    "Agent authority could not be revalidated",
+                    capability,
+                    tuple(sorted(capabilities)),
+                ),
+                tool_name=tool_name,
+                tool_definition=tool_definition,
+                layer="capability_resolver",
+                reason_code="capability_revalidation_failed",
+            )
         if decision.allowed:
             allowed_capabilities.append(capability)
             continue
@@ -1173,7 +1547,21 @@ async def guard_agent_tool_call_async(
             capability=allowed_capabilities[0] if allowed_capabilities else None,
         )
     reason = reasons[0] if reasons else "Agent authority intersection denied this tool"
-    return AgentToolAuthorityDecision(False, reason, sorted(capabilities)[0])
+    return _annotate_authority_denial(
+        AgentToolAuthorityDecision(
+            False,
+            reason,
+            sorted(capabilities)[0],
+            tuple(sorted(capabilities)),
+        ),
+        tool_name=tool_name,
+        tool_definition=tool_definition,
+        layer="capability_resolver",
+        reason_code=_authority_reason_code(
+            reason,
+            fallback="capability_not_in_ceiling",
+        ),
+    )
 
 
 async def guard_agent_native_capabilities_async(

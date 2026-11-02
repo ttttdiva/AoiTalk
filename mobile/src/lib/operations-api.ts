@@ -54,6 +54,24 @@ const text = (value: unknown, fallback = "未記録") => typeof value === "strin
 const id = (value: unknown) => typeof value === "string" && /^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(value) ? value : null;
 
 /**
+ * Give an execution row a stable history label without treating old routing
+ * metadata as a current selector.  The generated Operations type is refreshed
+ * with the backend contract; accepting unknown here keeps this adapter safe
+ * while that generated artifact is being regenerated.
+ */
+export function operationsRunLabel(run: unknown): string {
+  const row = record(run);
+  // Operations keeps recorded routing metadata under `legacy`.  It describes
+  // a completed/recorded run; it is not a selector for a new execution.
+  const legacy = record(row.legacy);
+  const historicalActor = legacy.acting_subagent_id;
+  if (typeof historicalActor === "string" && historicalActor.trim()) {
+    return `旧実行 · ${historicalActor.trim().slice(0, 160)}`;
+  }
+  return row.parent_run_id ? "子実行" : "Agent run";
+}
+
+/**
  * Parse only the bounded typed reference emitted by the Operations contract.
  * Scalar IDs, URLs, paths, and arbitrary metadata are intentionally ignored.
  */

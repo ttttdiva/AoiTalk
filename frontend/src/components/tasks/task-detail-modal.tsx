@@ -212,6 +212,7 @@ export function TaskDetailModal({
     useState<RecurringOccurrenceContext | null>(null);
   const [tags, setTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState(true);
+  const [taskLoadFailed, setTaskLoadFailed] = useState(false);
 
   // 見積工数
   const [editEstHours, setEditEstHours] = useState("");
@@ -834,10 +835,20 @@ export function TaskDetailModal({
       const shouldShowLoading = options.showLoading ?? true;
       if (shouldShowLoading) setLoading(true);
       try {
-        const t = browseQuery
-          ? await taskApi.getTask(requestedTaskId, browseQuery)
-          : await taskApi.getTask(requestedTaskId);
+        let t: Task;
+        try {
+          t = browseQuery
+            ? await taskApi.getTask(requestedTaskId, browseQuery)
+            : await taskApi.getTask(requestedTaskId);
+        } catch (err) {
+          if (isCurrentRequest()) {
+            console.error("タスク取得失敗:", err);
+            setTaskLoadFailed(!(err instanceof TaskApiError && (err.status === 404 || err.status === 401)));
+          }
+          return;
+        }
         if (!isCurrentRequest()) return;
+        setTaskLoadFailed(false);
         let occurrenceForView = activeOccurrenceContext;
         if (!occurrenceForView && t.has_recurrence) {
           occurrenceForView = browseQuery
@@ -993,6 +1004,7 @@ export function TaskDetailModal({
     }
     if (!materializingDraft) {
       taskFetchGenerationRef.current += 1;
+      setTaskLoadFailed(false);
       attachmentUploadGenerationRef.current += 1;
       attachmentUploadInFlightRef.current = false;
       setUploadingAttachments(false);
@@ -1442,12 +1454,23 @@ export function TaskDetailModal({
               <Skeleton className="h-8 w-48" />
               <Skeleton className="h-64 w-full" />
             </div>
+          ) : !task && taskLoadFailed ? (
+            <div className="flex flex-col items-center justify-center gap-4 p-16 text-muted-foreground">
+              <p>読み込みに失敗しました</p>
+              <Button onClick={() => void fetchTask()}>再試行</Button>
+            </div>
           ) : !task ? (
             <div className="flex items-center justify-center p-16 text-muted-foreground">
               タスクが見つかりません
             </div>
           ) : (
             <div className="flex min-h-0 min-w-0 flex-col space-y-6 overflow-y-auto p-4">
+              {taskLoadFailed && (
+                <div role="alert" className="flex items-center gap-4">
+                  <span>読み込みに失敗しました</span>
+                  <Button onClick={() => void fetchTask({ showLoading: false })}>再試行</Button>
+                </div>
+              )}
               {/* タイトル */}
               <TaskDetailHeader
                 task={task}

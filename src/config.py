@@ -207,7 +207,21 @@ class Config:
         Args:
             config_path: Path to config.yaml file. If None, uses default location.
         """
-        self.root_dir = Path(__file__).parent.parent
+        source_root = Path(__file__).parent.parent
+        from src.runtime_release_contract import is_runtime_release_active
+
+        runtime_config_root = (
+            os.getenv("AOITALK_RUNTIME_CONFIG_ROOT", "").strip()
+            if is_runtime_release_active(source_root)
+            else ""
+        )
+        self.root_dir = Path(runtime_config_root).expanduser() if runtime_config_root else source_root
+        if runtime_config_root and not self.root_dir.is_absolute():
+            raise ValueError("AOITALK_RUNTIME_CONFIG_ROOT must be absolute")
+        if runtime_config_root:
+            self.root_dir = self.root_dir.resolve(strict=True)
+            if not self.root_dir.is_dir():
+                raise NotADirectoryError("AOITALK_RUNTIME_CONFIG_ROOT is not a directory")
         if config_path:
             self.config_path = Path(config_path)
         else:
@@ -237,7 +251,37 @@ class Config:
         preexisting_profile = str(os.getenv("AOITALK_PROFILE") or "").strip().lower()
         preexisting_environment = str(os.getenv("AIVTUBER_ENV") or "").strip().lower()
         launch_enterprise = "enterprise" in {preexisting_profile, preexisting_environment}
+        protected_release_environment = {}
+        if is_runtime_release_active(source_root):
+            protected_names = (
+                "AOITALK_RUNTIME_RELEASE_ACTIVE",
+                "AOITALK_RUNTIME_RELEASE_ROOT",
+                "AOITALK_RUNTIME_CONFIG_ROOT",
+                "AOITALK_RUNTIME_CACHE_ROOT",
+                "AOITALK_RUNTIME_TRANSFER_LOCK_ROOT",
+                "AOITALK_RUNTIME_LOG_ROOT",
+                "GATEWAY_ROOT",
+                "GATEWAY_AOITALK_ROOT",
+                "GATEWAY_AOITALK_WORKING_DIRECTORY",
+                "AOITALK_DATA_DIR",
+                "AOITALK_WORKSPACES_DIR",
+                "AOITALK_STORAGE_ROOTS_FILE",
+                "AOITALK_GENERATED_MEDIA_DIR",
+                "AOITALK_OPERATIONS_ARTIFACT_ROOT",
+                "AOITALK_PROJECT_ROOT",
+                "AOITALK_MIOTTS_REFS_DIR",
+                "AOITALK_MIOTTS_PRESETS_DIR",
+                "AOITALK_IRODORI_REFS_DIR",
+                "AOITALK_GPU_TRIAL_STATE_PATH",
+                "AOITALK_PET_DATA_DIR",
+                "AOITALK_LOCAL_LLM_RUNTIME_ROOT",
+                "LLAMA_CPP_MODEL_ROOT",
+            )
+            protected_release_environment = {
+                name: os.environ[name] for name in protected_names if name in os.environ
+            }
         load_dotenv(self.root_dir / ".env", override=True)
+        os.environ.update(protected_release_environment)
         for key, value in preexisting_hf_cache_env.items():
             os.environ[key] = value
         # dotenv must not override a deployment secret file.  Re-read after

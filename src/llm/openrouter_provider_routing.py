@@ -18,6 +18,7 @@ _PROVIDER_OPTION_KEYS = {
     "allow_fallbacks",
     "require_parameters",
     "zdr",
+    "data_collection",
 }
 
 
@@ -97,6 +98,13 @@ def normalize_provider_options(
                 raise ValueError(f"{field} は boolean で指定してください")
             continue
         result[field] = boolean_value
+    if "data_collection" in value:
+        data_collection = value.get("data_collection")
+        if not isinstance(data_collection, str) or data_collection not in {"allow", "deny"}:
+            if strict:
+                raise ValueError("data_collection は allow または deny です")
+        else:
+            result["data_collection"] = data_collection
     return result
 
 

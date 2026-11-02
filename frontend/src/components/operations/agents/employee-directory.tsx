@@ -4,6 +4,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import type { Employee } from "@/lib/agent-employees-api";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { HelpPopover } from "@/components/ui/help-popover";
 import { EmployeeStatus, employeeInputClass } from "./employee-fields";
 import type { EmployeeProjection } from "./employee-observability";
@@ -24,6 +25,7 @@ export function EmployeeDirectory({ agents, projections, selected, loading, fail
   onThumbnailChanged?: (id: string, artifactId: string | null) => Promise<void>;
 }) {
   const [search, setSearch] = useState("");
+  const [showRetired, setShowRetired] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const browseScroll = useRef(0);
   const currentScroll = useRef(0);
@@ -31,9 +33,10 @@ export function EmployeeDirectory({ agents, projections, selected, loading, fail
   const wasVisible = useRef(visible);
   const needle = searchable(search.trim());
   const byId = new Map(projections.map(projection => [projection.id, projection]));
-  const filtered = agents.filter(agent => !needle || searchable([
+  const retiredCount = agents.filter(agent => agent.state === "retired").length;
+  const filtered = agents.filter(agent => (showRetired || agent.state !== "retired") && (!needle || searchable([
     agent.display_name, agent.slug, agent.id, byId.get(agent.id)?.job_title ?? "",
-  ].join(" ")).includes(needle));
+  ].join(" ")).includes(needle)));
 
   // Restore the gallery if it was temporarily hidden by the creation form.
   useLayoutEffect(() => {
@@ -63,7 +66,8 @@ export function EmployeeDirectory({ agents, projections, selected, loading, fail
         {search && <Button type="button" size="icon-sm" variant="ghost" aria-label="検索をクリア" className="absolute right-1 top-1" onClick={() => setSearch("")}><X aria-hidden="true" className="size-4" /></Button>}
       </div>
       <HelpPopover label="Agent一覧">名前・役職・slug・IDで検索できます。カードを選ぶと詳細を開きます。「一覧に戻る」で検索と一覧の位置を引き継ぎます。</HelpPopover>
-      <span role="status" className="shrink-0 text-xs text-muted-foreground">{needle ? `${filtered.length} / ${agents.length}件` : `${agents.length}件`}</span>
+      <label className="flex shrink-0 items-center gap-1.5 text-xs"><Checkbox checked={showRetired} onCheckedChange={setShowRetired} />退役済みも表示</label>
+      <span role="status" className="shrink-0 text-xs text-muted-foreground">表示 {filtered.length} / 全 {agents.length}件（退役済み {retiredCount}件）</span>
       {selected && onShowDetail && <Button type="button" size="sm" variant="ghost" className="ml-auto" onClick={onShowDetail}>選択中の詳細へ</Button>}
     </div>
     <div ref={listRef} role="region" aria-label="Agentの検索結果" tabIndex={0} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-1 [scrollbar-gutter:stable]" onScroll={event => {

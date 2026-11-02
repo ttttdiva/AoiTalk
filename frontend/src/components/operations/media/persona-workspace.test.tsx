@@ -4,10 +4,10 @@ import { SWRConfig } from "swr";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PersonaWorkspace } from "./persona-workspace";
 
-const mocks = vi.hoisted(() => ({ query: "tab=studio", replace: vi.fn(), list: vi.fn(), detail: vi.fn(), accounts: vi.fn(), portfolio: vi.fn() }));
+const mocks = vi.hoisted(() => ({ query: "tab=studio", replace: vi.fn(), list: vi.fn(), detail: vi.fn(), accounts: vi.fn(), portfolio: vi.fn(), stock: vi.fn() }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ replace: mocks.replace }), useSearchParams: () => new URLSearchParams(mocks.query) }));
 vi.mock("next/link", () => ({ default: ({ href, children, ...props }: React.ComponentProps<"a">) => <a href={href} {...props}>{children}</a> }));
-vi.mock("@/lib/media-operations-api", () => ({ mediaOperationsApi: { listPersonas: mocks.list, getPersona: mocks.detail } }));
+vi.mock("@/lib/media-operations-api", () => ({ mediaOperationsApi: { listPersonas: mocks.list, getPersona: mocks.detail, listStockItems: mocks.stock } }));
 vi.mock("@/lib/media-brand-portfolio-api", async importOriginal => ({ ...await importOriginal<typeof import("@/lib/media-brand-portfolio-api")>(), mediaBrandPortfolioApi: { get: mocks.portfolio } }));
 vi.mock("@/lib/media-operations-setup-api", () => ({ mediaOperationsSetupApi: { listPlatformAccounts: mocks.accounts } }));
 vi.mock("./persona-portfolio-panel", () => ({ PersonaPortfolioPanel: ({ setupBlockedReason }: { setupBlockedReason?: string }) => <div data-testid="portfolio-fixture" data-setup-blocked={Boolean(setupBlockedReason)}>構成fixture</div> }));
@@ -21,7 +21,7 @@ const a = persona("a", "刺されても死なない大きなクチバシ");
 const b = persona("b", "UN//REAL");
 function mount() { return render(<SWRConfig value={{ provider: () => new Map(), shouldRetryOnError: false, dedupingInterval: 0 }}><PersonaWorkspace /></SWRConfig>); }
 const source = { sha256: "8f3cade315b6866743748e0ff8e2567759793685b89a2cf7b5e1300e0ca30edd" };
-beforeEach(() => { vi.clearAllMocks(); mocks.query = "tab=studio"; mocks.portfolio.mockResolvedValue({ owner_user_id: "owner", status: "ready", source, headquarters_project_id: "hq", brands: [a,b].map(p => ({ project_id: p.project_id, persona: p, definition: { brand_key: p.id, display_name: p.current_revision.display_name }, channels: [] })) }); mocks.list.mockResolvedValue([a,b]); mocks.detail.mockImplementation(async id => id === "a" ? a : b); mocks.accounts.mockResolvedValue([]); });
+beforeEach(() => { vi.clearAllMocks(); mocks.query = "tab=studio"; mocks.portfolio.mockResolvedValue({ owner_user_id: "owner", status: "ready", source, headquarters_project_id: "hq", brands: [a,b].map(p => ({ project_id: p.project_id, persona: p, definition: { brand_key: p.id, display_name: p.current_revision.display_name }, channels: [] })) }); mocks.list.mockResolvedValue([a,b]); mocks.detail.mockImplementation(async id => id === "a" ? a : b); mocks.accounts.mockResolvedValue([]); mocks.stock.mockResolvedValue([]); });
 describe("persona workspace selection", () => {
   it("explains an existing portfolio under another owner without selecting it or offering duplicate setup", async () => {
     const saved = Array.from({ length: 8 }, (_, index) => {
@@ -75,7 +75,8 @@ describe("persona workspace selection", () => {
     mount(); await screen.findByRole("link", { name: /刺されても死なない大きなクチバシ/ });
     expect(screen.getByRole("link", { name: /^UN\/\/REAL/ })).toHaveAttribute("href", "/operations?tab=studio&persona=b");
     expect(screen.getByText(/公開人格を選択すると/)).toBeInTheDocument();
-    expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.accounts).not.toHaveBeenCalled();
+    // Persona cards read the owner's slots once for their connection chips, never a persona detail.
+    expect(mocks.detail).not.toHaveBeenCalled(); expect(mocks.accounts).toHaveBeenCalledWith();
   });
   it("uses the selected persona for account reads and stage navigation", async () => {
     mocks.query = "tab=studio&persona=b"; mount(); await screen.findByText("制作brief: UN//REAL");
@@ -99,5 +100,11 @@ describe("persona workspace selection", () => {
     result.rerender(<SWRConfig value={{ provider: () => new Map(), shouldRetryOnError: false }}><PersonaWorkspace /></SWRConfig>);
     await screen.findByText("選択した人格を確認中…");
     expect(screen.queryByText(`制作brief: ${a.current_revision.display_name}`)).not.toBeInTheDocument();
+  });
+  it("opens the owning persona for a content link without a persona (old pipeline links)", async () => {
+    mocks.stock.mockResolvedValue([{ id: "item-b", project_id: "project-b", title: "UN//REAL 初期制作設計", brand_name: "UN//REAL", stock_status: "awaiting_adoption", blockers: [] }]);
+    mocks.query = "tab=pipeline&content_item_id=item-b"; mount();
+    await waitFor(() => expect(mocks.replace).toHaveBeenCalledWith("/operations?tab=studio&persona=b&stage=qa&content=item-b", { scroll: false }));
+    expect(mocks.detail).not.toHaveBeenCalled();
   });
 });

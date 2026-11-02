@@ -202,6 +202,8 @@ class KnowledgeIndexService:
         )
 
     async def _initialize(self) -> bool:
+        from ..utils import qdrant_readiness
+
         if not _knowledge_search_enabled():
             self._initialization_failure = KnowledgeIndexSyncResult(status="disabled")
             logger.info(
@@ -228,6 +230,7 @@ class KnowledgeIndexService:
                 self.client = SharedQdrantClient.get_client(self.config.qdrant.local_path)
                 self._is_local_mode = True
             else:
+                await qdrant_readiness.await_ready()
                 self.client = QdrantClient(
                     host=self.config.qdrant.host,
                     port=self.config.qdrant.port,
@@ -238,6 +241,9 @@ class KnowledgeIndexService:
             self._initialized = True
             self._initialization_failure = None
             return True
+        except qdrant_readiness.QdrantNotReady as exc:
+            self._initialization_failure = KnowledgeIndexSyncResult(status="unavailable", error=str(exc))
+            return False
         except Exception as exc:
             self._initialization_failure = KnowledgeIndexSyncResult(
                 status="error",

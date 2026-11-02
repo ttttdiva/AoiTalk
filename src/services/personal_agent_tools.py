@@ -1,13 +1,16 @@
 """Static personal profiles and bounded, unregistered private adapters.
 
 The production registry is ``src.llm.runtime_tool_registry``, not the legacy
-global registry. These profiles remain ``disabled_design_only`` and never
-autostart or register as model tools. The signed-cookie owner route invokes the
-adapters directly with an exact selected Agent binding, current-authority
-callback, and a session-bound local-only OutboundPrivacyGateway. The invocation
-is adapter-only: it calls no LLM, creates no AgentRun/WorkItem, and emits no
-generative response. Reads and staged-draft writes await the current authority
-and privacy guard after every database await before decode, return, or commit.
+global registry. These profile definitions remain ``disabled_design_only``
+and never autostart or install a profile-wide tool set. A separately gated
+current-turn deadline candidate is injected by the Chat execution adapter
+only after its canonical user message is bound. The signed-cookie owner route
+continues to invoke adapters directly with an exact selected Agent binding,
+current-authority callback, and a session-bound local-only
+OutboundPrivacyGateway. That path is adapter-only: it calls no LLM, creates no
+AgentRun/WorkItem, and emits no generative response. Reads and staged-draft
+writes await the current authority and privacy guard after every database
+await before decode, return, or commit.
 """
 
 from __future__ import annotations

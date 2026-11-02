@@ -11,7 +11,7 @@ import inspect
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from typing import Any
 from uuid import UUID
@@ -73,6 +73,7 @@ class MediaExecutionOutcome(Mapping[str, Any]):
     retryable: bool = False
     awaiting_approval: bool = False
     retry_after_seconds: float | None = None
+    result: Mapping[str, Any] | None = None
     # Internal handoff only.  This sealed object is intentionally omitted from
     # ``to_dict`` so it cannot cross an HTTP/JSON boundary.
     receipt_evidence: Any | None = field(default=None, repr=False, compare=False)
@@ -120,7 +121,7 @@ class MediaExecutionOutcome(Mapping[str, Any]):
         return self.status == "succeeded"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "status": self.status,
             "outcome": self.status,
             "classification": self.status,
@@ -138,6 +139,9 @@ class MediaExecutionOutcome(Mapping[str, Any]):
                 "domain_status": self.domain_status,
             },
         }
+        if self.result is not None:
+            result["result"] = dict(self.result)
+        return result
 
     def with_receipt_evidence(self, evidence: Any) -> "MediaExecutionOutcome":
         """Carry sealed generation evidence to the coordinator privately."""
@@ -154,6 +158,7 @@ class MediaExecutionOutcome(Mapping[str, Any]):
             retryable=self.retryable,
             awaiting_approval=self.awaiting_approval,
             retry_after_seconds=self.retry_after_seconds,
+            result=self.result,
             receipt_evidence=evidence,
         )
 
@@ -229,6 +234,29 @@ def _safe_error_code(exc: BaseException, default: str) -> str:
     if "validation" in name or "invalid" in name:
         return "domain_validation_failed"
     return default
+
+
+_GENERATION_VALIDATION_REASONS = {
+    "Generation Studio response must be an object": "response_type",
+    "Generation Studio response contains unsupported fields": "response_fields",
+    "Generation Studio response has an unsupported status": "status",
+    "Generation Studio response must include run_id": "run_id_missing",
+    "Generation Studio returned a different run_id": "run_id_mismatch",
+    "Generation Studio response workspace scope mismatch": "workspace_scope",
+    "Generation Studio response project scope mismatch": "project_scope",
+    "Generation Studio outputs must be a list": "outputs_type",
+    "Generation Studio output contains unsupported fields": "output_fields",
+}
+
+
+def _generation_validation_summary(exc: BaseException, stage: str) -> str:
+    from .media_operations_service import MediaOperationsValidationError
+
+    known = type(exc) is MediaOperationsValidationError
+    reason = "other"
+    if known and len(exc.args) == 1 and isinstance(exc.args[0], str):
+        reason = _GENERATION_VALIDATION_REASONS.get(exc.args[0], "other")
+    return f"generation_validation stage={stage} class={'media_validation' if known else 'other'} reason={reason}"
 
 
 def _work_payload(work_item: Any, context: Any = None) -> dict[str, Any]:
@@ -1028,6 +1056,55 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                 service = None
         super().__init__(service, **kwargs)
 
+    def recovery_condition(self):
+        from sqlalchemy import and_, exists, select
+        from ..memory.models import AgentWorkEvent, AgentWorkItem
+        return and_(AgentWorkItem.source_type == "media.generation.plan",
+            AgentWorkItem.state == "blocked", AgentWorkItem.safe_error_code == "domain_validation_failed",
+            ~exists(select(AgentWorkEvent.id).where(AgentWorkEvent.work_item_id == AgentWorkItem.id,
+                AgentWorkEvent.event_type == "media.completed_receipt_recovery")))
+
+    async def recover_stale(self, session: Any, row: Any, *, coordinator: Any, now: datetime) -> bool:
+        from sqlalchemy import select
+        from ..memory.models import AgentWorkEvent
+        if (row.state != "blocked" or row.safe_error_code != "domain_validation_failed" or
+                row.source_type != "media.generation.plan" or row.cancelled_at or row.active_agent_run_id or
+                row.lease_owner or row.lease_token or row.lease_expires_at or
+                tuple(row.required_capabilities_json or ()) != ("media",)):
+            return False
+        prior = await session.execute(select(AgentWorkEvent.id).where(AgentWorkEvent.work_item_id == row.id,
+            AgentWorkEvent.event_type == "media.completed_receipt_recovery").limit(1))
+        if prior.scalar_one_or_none() is not None:
+            return False
+        source = coordinator.sources.get(row.source_type)
+        if source is None or not source.enabled or source.default_actor is None:
+            return False
+        claim = coordinator._claim_from_row(row, "")
+        try:
+            detail = await _call_compatible(source.service.get_generation_plan, kwargs={"session": session,
+                "actor": source.default_actor, "plan_id": row.source_id})
+            pins = await source.completed_recovery_pins(session, claim, detail)
+            allowed, _ = await coordinator._authority_allows(claim)
+        except Exception:
+            return False
+        if not pins or not allowed:
+            return False
+        metadata = dict(row.metadata_json or {})
+        payload = dict(metadata.get("payload") or {})
+        payload.update(pins, mode="reconcile", completed_receipt_recovery=True)
+        metadata["payload"] = payload
+        row.metadata_json = metadata
+        row.state = "pending"
+        row.max_attempts = int(row.attempt_count or 0) + 1
+        row.deadline = now + timedelta(minutes=30)
+        row.not_before = row.next_attempt_at = row.completed_at = None
+        row.safe_error_code = row.blocker_code = row.escalation_reason = row.outcome_classification = None
+        row.updated_at = now
+        await coordinator._append_event_in_session(session, row, event_type="media.completed_receipt_recovery",
+            actor_kind="service", actor_id=coordinator.worker_id, from_state="blocked", to_state="pending",
+            payload={"mode": "reconcile", "max_new_attempts": 1})
+        return True
+
     async def execute(
         self,
         work_item: Any = None,
@@ -1062,6 +1139,17 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
         if not plan_id or not plan_hash:
             return MediaExecutionOutcome(status="blocked", reason_code="generation_plan_pin_missing")
         mode = str(payload.get("mode") or "submit").strip().lower()
+        if coordinator is not None and mode != "reconcile":
+            from sqlalchemy import select
+            from ..memory.models import AgentWorkEvent
+            try:
+                prior = await session.execute(select(AgentWorkEvent.id).where(
+                    AgentWorkEvent.work_item_id == UUID(str(item.get("work_item_id") or item.get("id"))),
+                    AgentWorkEvent.event_type == "media.completed_receipt_recovery").limit(1))
+                if prior.scalar_one_or_none() is not None:
+                    return MediaExecutionOutcome(status="blocked", reason_code="generation_recovery_mode_changed")
+            except Exception:
+                return MediaExecutionOutcome(status="blocked", reason_code="generation_recovery_check_failed")
         if mode not in {"submit", "reconcile", "recover"}:
             return MediaExecutionOutcome(
                 status="blocked",
@@ -1126,6 +1214,7 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
             if not intent_hash:
                 return MediaExecutionOutcome(status="blocked", reason_code="generation_intent_pin_missing")
             call_kwargs["expected_intent_request_hash"] = intent_hash
+        stage = mode
         try:
             result = await _call_compatible(method, kwargs=call_kwargs)
             # A successful 73 submit commonly returns a durable run in
@@ -1144,7 +1233,8 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                     self.service, "reconcile_generation_plan_for_agent"
                 )
                 if (
-                    submitted_status in {"draft", "claimed", "queued", "running", "output_pending"}
+                    (submitted_status in {"draft", "claimed", "queued", "running", "output_pending"}
+                     or (submitted_status == "succeeded" and result.get("_generation_receipt_evidence") is None))
                     and intent_hash
                     and reconcile is not None
                 ):
@@ -1157,6 +1247,7 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                             )[:255],
                         }
                     )
+                    stage = "reconcile_after_submit"
                     result = await _call_compatible(
                         reconcile, kwargs=reconcile_kwargs
                     )
@@ -1179,6 +1270,7 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                 return MediaExecutionOutcome(
                     status="blocked",
                     reason_code=_safe_error_code(exc, "generation_authority_denied"),
+                    result_summary=_generation_validation_summary(exc, stage) if "validation" in name else None,
                     domain_ref=plan_id,
                 )
             return MediaExecutionOutcome(
@@ -1354,6 +1446,22 @@ class MediaGenerationExecutionAdapter(MediaExecutionAdapter):
                 domain_status=outcome.domain_status,
                 evidence=outcome.evidence,
             )
+        if outcome.is_success and latest_run_status == "succeeded" and isinstance(latest_run, Mapping):
+            # The domain service's run detail contains local row IDs, distinct
+            # from the provider's external run and asset identifiers.
+            outputs = latest_run.get("outputs")
+            try:
+                local_run_id = str(UUID(str(latest_run["id"])))
+                if not isinstance(outputs, list) or not outputs:
+                    raise ValueError("missing generation outputs")
+                local_output_ids = [str(UUID(str(item["id"]))) for item in outputs
+                                    if isinstance(item, Mapping) and str(item.get("generation_run_id")) == local_run_id]
+                if len(local_output_ids) != len(outputs):
+                    raise ValueError("generation output run mismatch")
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                outcome = replace(outcome, result={"generation_run_id": local_run_id, "output_ids": local_output_ids})
         return outcome.with_receipt_evidence(receipt_evidence)
 
 

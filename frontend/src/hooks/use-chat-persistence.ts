@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type Dispatch,
   type RefObject,
   type SetStateAction,
@@ -12,6 +13,9 @@ import type { useRouter } from "next/navigation";
 import { chatApi } from "@/lib/chat-api";
 import type {
   ConversationMessage,
+  ConversationMessageHistoryIndexEntry,
+  ConversationMessagePageOptions,
+  ConversationMessagesResponse,
   ConversationGenerationStatus,
   ConversationSession,
 } from "@/lib/chat-api";
@@ -44,6 +48,24 @@ const GENERATION_STATUS_TERMINAL_STATUSES = new Set([
   "cancelled",
   "failed",
 ]);
+
+export const CHAT_MESSAGE_PAGE_SIZE = 10;
+
+type MessagePageState = {
+  generation: number;
+  /** Invalidate older-page responses when a latest-page reset starts. */
+  epoch: number;
+  nextCursor: string | null;
+  hasMore: boolean;
+  loading: Promise<boolean> | null;
+};
+
+type GetMessagesPage = (
+  sessionId: string,
+  since?: string,
+  signal?: AbortSignal,
+  options?: ConversationMessagePageOptions,
+) => Promise<ConversationMessagesResponse>;
 
 const TRANSIENT_HISTORY_ERROR_STATUSES = new Set([
   408,
@@ -88,6 +110,7 @@ type RefreshIntent = {
   announcedMessageIds: string[];
   unscopedWebSocket: boolean;
   deferApply?: boolean;
+  existingMessageIds: Set<string>;
 };
 
 type QueuedRefresh = RefreshIntent & {
@@ -186,6 +209,36 @@ function fallbackTitleFromFirstUserMessage(content: string): string {
   return title.length > 40 ? `${title.slice(0, 37)}...` : title;
 }
 
+function latestPersistedMessages(
+  messages: ConversationMessage[],
+): ConversationMessage[] {
+  const persisted = messages.filter(
+    (message) =>
+      !isTransientChatMessage(message) && message.is_active_branch !== false,
+  );
+  return persisted.slice(Math.max(0, persisted.length - CHAT_MESSAGE_PAGE_SIZE));
+}
+
+function historyIndexEntryFromMessage(
+  message: ConversationMessage,
+  position: number,
+): ConversationMessageHistoryIndexEntry {
+  const normalized = (message.content || "").replace(/\s+/gu, " ").trim();
+  const attachments = Array.isArray(message.metadata?.attachments)
+    ? message.metadata.attachments
+        .map((attachment) => attachment?.name)
+        .filter((name): name is string => typeof name === "string" && name.length > 0)
+    : [];
+  return {
+    id: message.id,
+    role: message.role,
+    position,
+    preview: normalized.slice(0, 120) ||
+      (attachments.length > 0 ? `添付: ${attachments.join("、")}` : "（内容のないメッセージ）"),
+    created_at: message.created_at ?? null,
+  };
+}
+
 function shouldRequestSessionTitleGeneration(
   session: ConversationSession,
   messages: ConversationMessage[],
@@ -257,6 +310,17 @@ export function useChatPersistence({
   const refreshStatesRef = useRef(new Map<string, RefreshState>());
   const refreshErrorsRef = useRef(new Map<string, unknown>());
   const refreshServerTimesRef = useRef(new Map<string, string | null>());
+  const messagePageStatesRef = useRef(new Map<string, MessagePageState>());
+  const cacheWriteQueuesRef = useRef(new Map<string, Promise<void>>());
+  const [messagePageState, setMessagePageState] = useState<
+    MessagePageState | undefined
+  >(undefined);
+  const [messageHistoryIndexState, setMessageHistoryIndexState] = useState<{
+    sessionId: string;
+    generation: number;
+    epoch: number;
+    entries: ConversationMessageHistoryIndexEntry[];
+  } | null>(null);
   const initialLoadStateRef = useRef<{
     sessionId: string | null;
     generation: number;
@@ -293,7 +357,14 @@ export function useChatPersistence({
     ready: boolean;
   }>({ sessionId: null, generation: 0, ready: true });
   const deferredRefreshResultsRef = useRef(
-    new Map<string, { messages: ConversationMessage[]; serverTime: string | null }>(),
+    new Map<
+      string,
+      {
+        messages: ConversationMessage[];
+        serverTime: string | null;
+        preserveMessageIds: string[];
+      }
+    >(),
   );
   const connectionStateRef = useRef<{
     sessionId: string | null;
@@ -301,6 +372,47 @@ export function useChatPersistence({
   } | null>(null);
   const connectedSessionIdsRef = useRef(new Set<string>());
   const skipNextConnectionRecoveryRef = useRef<string | null>(null);
+  const touchMessagePageState = useCallback(() => {
+    const sessionId = activeSessionIdRef.current;
+    setMessagePageState(
+      sessionId ? messagePageStatesRef.current.get(sessionId) : undefined,
+    );
+  }, [activeSessionIdRef]);
+
+  const writeMessagesToCachePreservingHistory = useCallback(
+    async (
+      sessionId: string,
+      messages: ConversationMessage[],
+      serverTime: string | null,
+    ) => {
+      const previous =
+        cacheWriteQueuesRef.current.get(sessionId) ?? Promise.resolve();
+      const next = previous
+        .catch(() => undefined)
+        .then(async () => {
+          try {
+            const cached = await readCachedMessages(sessionId);
+            const cachedMessages = cached?.messages ?? [];
+            const mergedMessages = mergePersistedById(cachedMessages, messages);
+            await writeCachedMessages(
+              sessionId,
+              mergedMessages,
+              serverTime ?? cached?.serverTime ?? null,
+            );
+          } catch (error) {
+            // Cache persistence is an optimization. A quota/private-mode
+            // failure must never make a fetched page look like a failed chat.
+            console.warn("メッセージキャッシュの保存に失敗:", error);
+          }
+        });
+      cacheWriteQueuesRef.current.set(sessionId, next);
+      await next;
+      if (cacheWriteQueuesRef.current.get(sessionId) === next) {
+        cacheWriteQueuesRef.current.delete(sessionId);
+      }
+    },
+    [],
+  );
   const cancelRecoveryTimers = useCallback(() => {
     const pendingRecoveryTimers = pendingRecoveryTimersRef.current;
     for (const [timerId, cancel] of pendingRecoveryTimers) {
@@ -420,11 +532,76 @@ export function useChatPersistence({
         // 通常は前回の server_time を since に渡し、差分のみ取得する。
         // ブランチ切替後は inactive になった旧 active path を確実に除去し、
         // 新しい active path 全体を表示するため、full GET を行う。
-        const data = await chatApi.getMessages(
+        const getMessagesPage = chatApi.getMessages as unknown as GetMessagesPage;
+        const data = await getMessagesPage(
           intent.sessionId,
           intent.since ?? undefined,
+          undefined,
+          intent.forceFull
+            ? {
+                limit: CHAT_MESSAGE_PAGE_SIZE,
+                includeHistoryIndex: true,
+              }
+            : undefined,
         );
         if (!isCurrentRefresh(intent)) return null;
+
+        const pageState = messagePageStatesRef.current.get(intent.sessionId);
+        if (intent.forceFull || intent.since === null) {
+          setMessageHistoryIndexState(
+            data.history_index
+              ? {
+                  sessionId: intent.sessionId,
+                  generation: intent.generation,
+                  epoch: pageState?.epoch ?? 0,
+                  entries: data.history_index,
+                }
+              : null,
+          );
+        } else if (data.messages.length > 0) {
+          setMessageHistoryIndexState((current) => {
+            if (
+              !current ||
+              current.sessionId !== intent.sessionId ||
+              current.generation !== intent.generation ||
+              current.epoch !== (pageState?.epoch ?? 0)
+            ) {
+              return current;
+            }
+            const entriesById = new Map(current.entries.map((entry) => [entry.id, entry]));
+            for (const message of data.messages) {
+              if (message.is_active_branch === false) {
+                entriesById.delete(message.id);
+                continue;
+              }
+              const existing = entriesById.get(message.id);
+              entriesById.set(
+                message.id,
+                historyIndexEntryFromMessage(message, existing?.position ?? 0),
+              );
+            }
+            return {
+              ...current,
+              entries: [...entriesById.values()]
+                .sort((left, right) => {
+                  const leftTime = left.created_at ? Date.parse(left.created_at) : Number.POSITIVE_INFINITY;
+                  const rightTime = right.created_at ? Date.parse(right.created_at) : Number.POSITIVE_INFINITY;
+                  return leftTime - rightTime || left.id.localeCompare(right.id);
+                })
+                .map((entry, index) => ({ ...entry, position: index + 1 })),
+            };
+          });
+        }
+        if (intent.forceFull || intent.since === null) {
+          messagePageStatesRef.current.set(intent.sessionId, {
+            generation: intent.generation,
+            epoch: pageState?.epoch ?? 0,
+            nextCursor: data.next_cursor ?? null,
+            hasMore: data.has_more === true && Boolean(data.next_cursor),
+            loading: pageState?.loading ?? null,
+          });
+          touchMessagePageState();
+        }
 
         // since 指定時は既存の永続メッセージへ差分をマージ（id で重複排除）。
         // since なし（初回）は取得結果をそのまま採用する。
@@ -439,6 +616,19 @@ export function useChatPersistence({
           ? mergePersistedById(prevPersisted, data.messages)
           : data.messages;
 
+        const concurrentMessageIds =
+          intent.forceFull || intent.since === null
+            ? messagesRef.current
+                .filter(
+                  (message) =>
+                    message.session_id === intent.sessionId &&
+                    !isTransientChatMessage(message) &&
+                    !intent.existingMessageIds.has(message.id) &&
+                    !data.messages.some((incoming) => incoming.id === message.id),
+                )
+                .map((message) => message.id)
+            : [];
+
         const nextServerTime =
           data.server_time ?? deriveServerTime(mergedPersisted);
         refreshErrorsRef.current.delete(key);
@@ -452,15 +642,19 @@ export function useChatPersistence({
           deferredRefreshResultsRef.current.set(key, {
             messages: mergedPersisted,
             serverTime: nextServerTime,
+            preserveMessageIds: concurrentMessageIds,
           });
         } else {
           dispatchChatTimeline({
             type: "hydrate_persisted",
             sessionId: intent.sessionId,
             messages: mergedPersisted,
+            ...(concurrentMessageIds.length > 0
+              ? { preserveMessageIds: concurrentMessageIds }
+              : {}),
           });
           setLastServerTime(intent.sessionId, nextServerTime);
-          void writeCachedMessages(
+          void writeMessagesToCachePreservingHistory(
             intent.sessionId,
             mergedPersisted,
             nextServerTime,
@@ -476,7 +670,14 @@ export function useChatPersistence({
         return null;
       }
     },
-    [clearPermanentHistoryState, dispatchChatTimeline, isCurrentRefresh, messagesRef],
+    [
+      clearPermanentHistoryState,
+      dispatchChatTimeline,
+      isCurrentRefresh,
+      messagesRef,
+      touchMessagePageState,
+      writeMessagesToCachePreservingHistory,
+    ],
   );
 
   const startRefresh = useCallback(
@@ -562,7 +763,27 @@ export function useChatPersistence({
           !options?.announcedMessageId &&
           !(options?.announcedMessageIds?.length),
         deferApply: options?.deferApply,
+        existingMessageIds: new Set(
+          messagesRef.current
+            .filter(
+              (message) =>
+                message.session_id === sessionId &&
+                !isTransientChatMessage(message),
+            )
+            .map((message) => message.id),
+        ),
       };
+      if (forceFull) {
+        const previousPageState = messagePageStatesRef.current.get(sessionId);
+        messagePageStatesRef.current.set(sessionId, {
+          generation,
+          epoch: (previousPageState?.epoch ?? 0) + 1,
+          nextCursor: null,
+          hasMore: false,
+          loading: previousPageState?.loading ?? null,
+        });
+        touchMessagePageState();
+      }
       const stateKey = refreshStateKey(sessionId, generation);
       let state = refreshStatesRef.current.get(stateKey);
       if (!state) {
@@ -602,7 +823,107 @@ export function useChatPersistence({
 
       return startRefresh(stateKey, state, intent);
     },
-    [startRefresh],
+    [messagesRef, startRefresh, touchMessagePageState],
+  );
+
+  const loadOlderMessages = useCallback(
+    async (requestedSessionId?: string | null): Promise<boolean> => {
+      const sessionId = requestedSessionId ?? activeSessionIdRef.current;
+      if (!sessionId || activeSessionIdRef.current !== sessionId) return false;
+
+      const generation = loadGenerationRef.current;
+      const pageState = messagePageStatesRef.current.get(sessionId);
+      if (!pageState || pageState.generation !== generation) return false;
+      if (pageState.loading) return pageState.loading;
+
+      const cursor = pageState.nextCursor;
+      const pageEpoch = pageState.epoch;
+      if (!pageState.hasMore || !cursor) return false;
+
+      const request = (async () => {
+        try {
+          const getMessagesPage =
+            chatApi.getMessages as unknown as GetMessagesPage;
+          const data = await getMessagesPage(
+            sessionId,
+            undefined,
+            undefined,
+            { limit: CHAT_MESSAGE_PAGE_SIZE, before: cursor },
+          );
+          const currentState = messagePageStatesRef.current.get(sessionId);
+          if (
+            !mountedRef.current ||
+            activeSessionIdRef.current !== sessionId ||
+            loadGenerationRef.current !== generation ||
+            !currentState ||
+            currentState.generation !== generation ||
+            currentState.epoch !== pageEpoch ||
+            currentState.nextCursor !== cursor
+          ) {
+            return false;
+          }
+
+          messagePageStatesRef.current.set(sessionId, {
+            ...currentState,
+            nextCursor: data.next_cursor ?? null,
+            hasMore: data.has_more === true && Boolean(data.next_cursor),
+            loading: null,
+          });
+          dispatchChatTimeline({
+            type: "prepend_persisted",
+            sessionId,
+            messages: data.messages,
+          });
+          void writeMessagesToCachePreservingHistory(
+            sessionId,
+            data.messages,
+            null,
+          );
+          touchMessagePageState();
+          return data.messages.length > 0;
+        } catch (error) {
+          if (
+            mountedRef.current &&
+            activeSessionIdRef.current === sessionId &&
+            loadGenerationRef.current === generation &&
+            getErrorStatus(error) === 409
+          ) {
+            // A branch switch invalidates the cursor. Reset to a fresh latest
+            // page, and let the generation fence reject any old page result.
+            const refreshed = await refreshPersistedMessages(sessionId, {
+              forceFull: true,
+              trigger: "force_full",
+            });
+            return refreshed !== null;
+          }
+          console.warn("過去メッセージの追加取得に失敗:", error);
+          return false;
+        } finally {
+          const latest = messagePageStatesRef.current.get(sessionId);
+          if (latest?.loading) {
+            messagePageStatesRef.current.set(sessionId, {
+              ...latest,
+              loading: null,
+            });
+            touchMessagePageState();
+          }
+        }
+      })();
+
+      messagePageStatesRef.current.set(sessionId, {
+        ...pageState,
+        loading: request,
+      });
+      touchMessagePageState();
+      return request;
+    },
+    [
+      activeSessionIdRef,
+      dispatchChatTimeline,
+      refreshPersistedMessages,
+      touchMessagePageState,
+      writeMessagesToCachePreservingHistory,
+    ],
   );
 
   const getRefreshError = useCallback(
@@ -623,7 +944,6 @@ export function useChatPersistence({
       generation: number,
       cachedMessages: Awaited<ReturnType<typeof readCachedMessages>>,
     ) => {
-      const since = cachedMessages?.serverTime ?? null;
       if (
         !mountedRef.current ||
         loadGenerationRef.current !== generation ||
@@ -632,7 +952,9 @@ export function useChatPersistence({
         return null;
       }
       return refreshPersistedMessages(sessionId, {
-        since,
+        // The first visible page is always the latest bounded page.  The
+        // cache remains available as a complete persistence snapshot below.
+        forceFull: true,
         baseMessages: cachedMessages?.messages,
         trigger: "initial",
         deferApply: true,
@@ -1038,7 +1360,7 @@ export function useChatPersistence({
           );
           if (!waited || !ownsRecovery()) return;
           const messages = await refreshPersistedMessages(sessionId, {
-            since: cachedMessages?.serverTime ?? null,
+            forceFull: true,
             trigger: "poll",
             baseMessages: cachedMessages?.messages,
           });
@@ -1055,7 +1377,7 @@ export function useChatPersistence({
 
         // Keep one final body fetch after the bounded recovery window.
         const messages = await refreshPersistedMessages(sessionId, {
-          since: cachedMessages?.serverTime ?? null,
+          forceFull: true,
           trigger: "poll",
           baseMessages: cachedMessages?.messages,
         });
@@ -1125,7 +1447,7 @@ export function useChatPersistence({
               ready: true,
             };
             const messages = await refreshPersistedMessages(sessionId, {
-              since: cachedMessages?.serverTime ?? null,
+              forceFull: true,
               trigger: "poll",
               baseMessages: cachedMessages?.messages,
             });
@@ -1175,7 +1497,7 @@ export function useChatPersistence({
             ready: true,
           };
           const messages = await refreshPersistedMessages(sessionId, {
-            since: cachedMessages?.serverTime ?? null,
+            forceFull: true,
             trigger: "poll",
             baseMessages: cachedMessages?.messages,
           });
@@ -1354,6 +1676,14 @@ export function useChatPersistence({
       deferredRefreshResultsRef.current.delete(
         refreshStateKey(activeSessionId, loadGeneration),
       );
+      messagePageStatesRef.current.set(activeSessionId, {
+        generation: loadGeneration,
+        epoch: 0,
+        nextCursor: null,
+        hasMore: false,
+        loading: null,
+      });
+      touchMessagePageState();
     }
 
     // A→B→Aのような再選択でも、最初のA向け遅延responseを失効させる。
@@ -1361,6 +1691,8 @@ export function useChatPersistence({
     const previousActiveSessionId = previousActiveSessionIdRef.current;
     previousActiveSessionIdRef.current = activeSessionId;
     if (!activeSessionId) {
+      messagePageStatesRef.current.clear();
+      touchMessagePageState();
       initialLoadStateRef.current = {
         sessionId: null,
         generation: loadGeneration,
@@ -1412,7 +1744,7 @@ export function useChatPersistence({
           dispatchChatTimeline({
             type: "hydrate_persisted",
             sessionId: activeSessionId,
-            messages: cachedMessages.messages,
+            messages: latestPersistedMessages(cachedMessages.messages),
           });
           setLastServerTime(activeSessionId, cachedMessages.serverTime);
           setIsLoadingMessages(false);
@@ -1462,7 +1794,9 @@ export function useChatPersistence({
             throw bodyError;
           }
           bodyRecoveryNeeded = true;
-          messagesForDisplay = cachedMessages?.messages ?? [];
+          messagesForDisplay = cachedMessages
+            ? latestPersistedMessages(cachedMessages.messages)
+            : [];
           if (cachedMessages) {
             console.warn(
               "メッセージ差分の取得に失敗したためキャッシュを表示します:",
@@ -1500,9 +1834,12 @@ export function useChatPersistence({
           type: "hydrate_persisted",
           sessionId: activeSessionId,
           messages: messagesForDisplay,
+          ...(deferredResult?.preserveMessageIds?.length
+            ? { preserveMessageIds: deferredResult.preserveMessageIds }
+            : {}),
         });
         setLastServerTime(activeSessionId, nextServerTime);
-        void writeCachedMessages(
+        void writeMessagesToCachePreservingHistory(
           activeSessionId,
           messagesForDisplay,
           nextServerTime,
@@ -1670,6 +2007,17 @@ export function useChatPersistence({
   return {
     maybeGenerateLoadedSessionTitle,
     refreshPersistedMessages,
+    loadOlderMessages,
+    hasMoreMessages: messagePageState?.hasMore === true,
+    isLoadingOlderMessages: Boolean(messagePageState?.loading),
+    messageHistoryGeneration: messagePageState?.generation ?? 0,
+    messageHistoryEpoch: messagePageState?.epoch ?? 0,
+    messageHistoryIndex:
+      messageHistoryIndexState?.sessionId === activeSessionId &&
+      messageHistoryIndexState.generation === messagePageState?.generation &&
+      messageHistoryIndexState.epoch === messagePageState?.epoch
+        ? messageHistoryIndexState.entries
+        : [],
     waitForPersistedAssistantResponse,
     bumpSessionForAssistant,
   };

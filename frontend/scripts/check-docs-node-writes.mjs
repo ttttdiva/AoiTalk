@@ -21,6 +21,15 @@ function isAllowedFile(filePath) {
   return normalized === "src/lib/server/docs-node-writer.ts" || normalized === "src/db/schema.ts";
 }
 
+function isTestFile(filePath) {
+  const normalized = normalize(path.relative(FRONTEND_ROOT, filePath));
+  const segments = normalized.split("/");
+  return (
+    segments.includes("__tests__") ||
+    /\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)$/u.test(normalized)
+  );
+}
+
 function collectFiles(rootDir) {
   if (!fs.existsSync(rootDir)) return [];
   const files = [];
@@ -39,7 +48,9 @@ function collectFiles(rootDir) {
 export function findViolations(rootDir = DEFAULT_ROOT) {
   const violations = [];
   for (const filePath of collectFiles(rootDir)) {
-    if (isAllowedFile(filePath)) continue;
+    // Fixtures model writes behind mocked storage boundaries; the guard
+    // applies to production code paths, while production source stays scanned.
+    if (isAllowedFile(filePath) || isTestFile(filePath)) continue;
     const text = fs.readFileSync(filePath, "utf8");
     const lines = text.split(/\r?\n/);
     for (const [index, line] of lines.entries()) {

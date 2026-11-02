@@ -66,6 +66,7 @@ def create_group_chat_router(
     get_current_user,
     config=None,
     masking_handler=None,
+    chat_admission_dependency=None,
 ) -> APIRouter:
     """グループチャットルーターを作成する。
 
@@ -78,11 +79,14 @@ def create_group_chat_router(
             this legacy group endpoint cannot route a masking turn through a
             GroupChatManager/provider.  Keeping it optional preserves import
             compatibility for small test/embedding routers.
+        chat_admission_dependency: Optional authenticated conversation
+            admission dependency shared with admin restart.
 
     Returns:
         APIRouter
     """
     router = APIRouter(prefix="/api/conversations", tags=["group-chat"])
+    require_group_chat_admission = chat_admission_dependency or require_auth
 
     # リポジトリの利用可否
     try:
@@ -403,11 +407,14 @@ def create_group_chat_router(
 
     # ─── POST /api/conversations/{session_id}/group-respond ─── グループ応答生成 ───
 
-    @router.post("/{session_id}/group-respond")
+    @router.post(
+        "/{session_id}/group-respond",
+        responses={409: {"description": "Conversation restart admission is closed"}},
+    )
     async def group_respond(
         session_id: str,
         payload: GroupRespondRequest,
-        _: None = Depends(require_auth),
+        _: None = Depends(require_group_chat_admission),
         request: Request = None,
     ):
         """グループチャットの応答を生成する"""

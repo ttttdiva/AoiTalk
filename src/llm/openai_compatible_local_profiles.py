@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .strata_manifest import STRATA_MANIFEST
+from .strata_manifest import STRATA_DEEPSEEK_MANIFEST, STRATA_MANIFEST
 
 DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
 EXO_BASE_URL = "http://127.0.0.1:52415/v1"
@@ -25,6 +25,56 @@ FREETOKEN_QWEN3_06B_MODEL_ID = "Qwen/Qwen3-0.6B"
 STRATA_SOURCE_REPOSITORY = STRATA_MANIFEST.repository
 STRATA_SOURCE_REVISION = STRATA_MANIFEST.revision
 STRATA_DEFAULT_MODEL = "qwen3.8-flash-next-iq2_xs"
+STRATA_DEEPSEEK_SOURCE_REPOSITORY = STRATA_DEEPSEEK_MANIFEST.repository
+STRATA_DEEPSEEK_SOURCE_REVISION = STRATA_DEEPSEEK_MANIFEST.revision
+STRATA_DEEPSEEK_ENGINE_VERSION = STRATA_DEEPSEEK_MANIFEST.engine_version
+STRATA_DEEPSEEK_ENGINE_ARCHIVE_SHA256 = (
+    "57bfba85e1f5998c2e198a18ab125af2b5da32167370cdf5802af87ba8dc3480"
+)
+STRATA_DEEPSEEK_COMPONENT_MANIFEST_SHA256 = (
+    "84e9ba10a67871f5d2777dc6573b3a604ce8cec01a987b6deefffd932d2d8b55"
+)
+STRATA_DEEPSEEK_BUILD_ID = "d2d198a49+dsv41+cuda13.0"
+STRATA_DEEPSEEK_CONTROL_ARCHIVE_SHA256 = (
+    "992405e03630ec41e318d90dc91cda21b232d3a3f409d27b48d82d1274afeaab"
+)
+STRATA_DEEPSEEK_FEED_KEY_ID = "5d1bc23abbeffd0d"
+STRATA_DEEPSEEK_MODEL_ID = "deepseek-v4.1-flash-1017-local-iq2_xs"
+STRATA_DEEPSEEK_MODEL_LABEL = "DeepSeek V4.1 Flash 1017 (Local IQ2_XS)"
+STRATA_DEEPSEEK_SHARDS = [
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf",
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf",
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf",
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf",
+]
+STRATA_DEEPSEEK_PACK_RECIPE = {
+    # These names are intentionally explicit.  The pack command passes shard
+    # basenames to the upstream tool so it never copies or relocates the
+    # user's large GGUF files.
+    "shards": list(STRATA_DEEPSEEK_SHARDS),
+    "engram": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+    "engram_meta": (
+        "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf"
+    ),
+    "dspark": "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf",
+    "noise_token": 128799,
+    "markov_rank": 256,
+    "output_dir": "strata-pack-iq2-xs",
+    "expert_profile": "data/dsv41/profile-2.25.bin",
+    "required_files": (
+        "ds4.txt",
+        "tensors.txt",
+        "engram.bin",
+        "expert-profile.bin",
+    ),
+    "tokenizer_files": (
+        "vocab.json",
+        "merges.txt",
+        "token_type.json",
+        "tokenizer.json",
+        "chat_template.jinja",
+    ),
+}
 STRATA_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
     f"qwen3.8-flash-next-{quant.lower()}": {
         "id": f"qwen3.8-flash-next-{quant.lower()}",
@@ -48,6 +98,63 @@ STRATA_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "chat_agentic_completion_review_enabled": False,
     }
     for quant, size in (("Q2_0", 66.4), ("IQ2_XS", 68.0), ("IQ3_XXS", 75.8), ("IQ3_S", 83.6))
+}
+
+# DeepSeek V4.1 uses a separate upstream engine and pack layout.  Keep it in
+# the same registry so the existing OpenAI-compatible client, catalog and
+# runtime ownership paths continue to apply without a second backend.
+STRATA_MODEL_PROFILES[STRATA_DEEPSEEK_MODEL_ID] = {
+    "id": STRATA_DEEPSEEK_MODEL_ID,
+    "label": STRATA_DEEPSEEK_MODEL_LABEL,
+    "display_name": STRATA_DEEPSEEK_MODEL_LABEL,
+    "description": (
+        "既存のDeepSeek V4.1 Flash 1017 IQ2_XS GGUFを公式Strata v0.2.4の"
+        "DeepSeek engineで提供するローカルruntime。"
+    ),
+    "runtime": "strata",
+    "served_alias": STRATA_DEEPSEEK_MODEL_ID,
+    "source_repository": STRATA_DEEPSEEK_SOURCE_REPOSITORY,
+    "source_revision": STRATA_DEEPSEEK_SOURCE_REVISION,
+    "source_release_tag": STRATA_DEEPSEEK_MANIFEST.release_tag,
+    "source_url": (
+        f"https://github.com/{STRATA_DEEPSEEK_SOURCE_REPOSITORY}/tree/"
+        f"{STRATA_DEEPSEEK_SOURCE_REVISION}"
+    ),
+    "model_format": "GGUF",
+    "setup_family": "deepseek41",
+    "setup_model": "IST-DAS-2.25bpw",
+    "config_filename": f"strata-{STRATA_DEEPSEEK_MODEL_ID}.json",
+    "default_context_size": 8192,
+    "native_context_size": 8192,
+    # The model weights are user-owned local inputs.  No download contract is
+    # exposed for this profile; the prepare path consumes only the dedicated
+    # deepseek_model_dir setting.
+    "local_only": True,
+    "download_gb": 0.0,
+    "mtp_download_gb": 0.0,
+    "pack_download_gb": 0.0,
+    "tokenizer_download_gb": 0.0,
+    "runtime_download_gb": 0.0,
+    "setup_extra_gb_by_platform": {"windows": 0.0, "linux": 0.0},
+    "setup_model_arch": "deepseek41",
+    "engine_version": STRATA_DEEPSEEK_ENGINE_VERSION,
+    "engine_probe_name": "strata-dsv41",
+    "engine_probe_build": "d2d198a49",
+    "engine_archive_sha256": STRATA_DEEPSEEK_ENGINE_ARCHIVE_SHA256,
+    "component_manifest_sha256": STRATA_DEEPSEEK_COMPONENT_MANIFEST_SHA256,
+    "engine_build_id": STRATA_DEEPSEEK_BUILD_ID,
+    "control_archive_sha256": STRATA_DEEPSEEK_CONTROL_ARCHIVE_SHA256,
+    "feed_key_id": STRATA_DEEPSEEK_FEED_KEY_ID,
+    "engine_ready_s": 3600,
+    "engine_package": "strata-dsv41-0.1.49.2-windows-x86_64-cuda-cuda13.tar.gz",
+    "control_package": "strata-control-0.1.49.2-windows-x86_64.zip",
+    "pack_recipe": copy.deepcopy(STRATA_DEEPSEEK_PACK_RECIPE),
+    "capabilities": {
+        "reasoning": True,
+        "tools": True,
+        "media": {"image": False, "audio": False},
+    },
+    "chat_agentic_completion_review_enabled": False,
 }
 
 
@@ -184,6 +291,36 @@ LLAMA_CPP_LFM25_24B_A2B_Q6K_SOURCE_REVISION = (
 LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_SIZE_BYTES = 19_689_405_728
 LLAMA_CPP_LFM25_24B_A2B_Q6K_MODEL_SHA256 = (
     "4c5f34cb94d4a29f0360d04eaa274bb1361ceae163f40f6361cb75d1bee139c2"
+)
+LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_ALIAS = "omega-arsenal-31b-final"
+LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_FILENAME = (
+    "Omega-Arsenal-31B-Final-Q4_K_M.gguf"
+)
+LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REPOSITORY = (
+    "ReadyArt/Omega-Arsenal-31B-Final-GGUF"
+)
+LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REVISION = (
+    "b1decda3e339b3abc527df8910a64a6b642b63c0"
+)
+LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_SIZE_BYTES = 18_687_064_640
+LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_SHA256 = (
+    "c981b6020da8598b81aa819f5f9c1d355768f2824d66907213f5774ae94d92f5"
+)
+LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_ALIAS = (
+    "omega-arsenal-26b-a4b-final"
+)
+LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_FILENAME = (
+    "Omega-Arsenal-26B-A4B-Final.i1-Q4_K_M_hb16.gguf"
+)
+LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REPOSITORY = (
+    "ReadyArt/Omega-Arsenal-26B-A4B-Final-GGUF"
+)
+LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REVISION = (
+    "15337f996a9a5b729da068fcd50f2b2f3677f04d"
+)
+LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_SIZE_BYTES = 17_666_860_576
+LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_SHA256 = (
+    "b7ac800aa1cc690535f700028974b37d8eb61dca270682d8a59544797b4bdec8"
 )
 # Short spelling aliases keep imports consistent with other model-family
 # constants while the versioned names above remain canonical.
@@ -767,6 +904,94 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "ui_notice": (
             "公式推奨samplingは temperature=0.1 / top_k=50 / "
             "repeat_penalty=1.05。常時thinkingのためnon-thinkingへ切り替えません。"
+        ),
+    },
+    LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_ALIAS: {
+        "id": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_ALIAS,
+        "label": "Omega Arsenal Final 31B Q4_K_M",
+        "description": (
+            "ReadyArt/Omega-Arsenal-31B-Final-GGUF の Gemma 4 GGUF。"
+            "18歳以上向けで、個人の非商用利用に限定されます。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REPOSITORY,
+        "source_revision": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REVISION,
+        "source_url": (
+            "https://huggingface.co/"
+            f"{LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REPOSITORY}"
+        ),
+        "license": "restricted; personal-use-only; noncommercial; 18+",
+        "license_url": (
+            "https://huggingface.co/"
+            f"{LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REPOSITORY}/blob/"
+            f"{LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_SOURCE_REVISION}/LICENSE.txt"
+        ),
+        "gguf_filename": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_OMEGA_ARSENAL_31B_FINAL_MODEL_SHA256,
+        "architecture": "gemma4",
+        "quantization": "Q4_K_M",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja", "--temp", "1.0", "--top-p", "0.92"],
+        "jinja_required": True,
+        "apply_sampling_defaults": True,
+        "sampling_defaults": {"temperature": 1.0, "top_p": 0.92},
+        "capabilities": {
+            "reasoning": False,
+            "tools": False,
+            "media": {"image": False, "audio": False},
+        },
+        "ui_notice": (
+            "配布元metadataはApache-2.0ですが、同revisionのLICENSE.txtは"
+            "18歳以上・個人利用・非商用利用に限定しています。利用前に原文を確認してください。"
+        ),
+    },
+    LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_ALIAS: {
+        "id": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_ALIAS,
+        "label": "Omega Arsenal Final 26B A4B Q4_K_M hb16",
+        "description": (
+            "ReadyArt/Omega-Arsenal-26B-A4B-Final-GGUF の Gemma 4 GGUF。"
+            "18歳以上向けで、個人の非商用利用に限定されます。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REPOSITORY,
+        "source_revision": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REVISION,
+        "source_url": (
+            "https://huggingface.co/"
+            f"{LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REPOSITORY}"
+        ),
+        "license": "restricted; personal-use-only; noncommercial; 18+",
+        "license_url": (
+            "https://huggingface.co/"
+            f"{LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REPOSITORY}/blob/"
+            f"{LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_SOURCE_REVISION}/LICENSE.txt"
+        ),
+        "gguf_filename": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_OMEGA_ARSENAL_26B_A4B_FINAL_MODEL_SHA256,
+        "architecture": "gemma4",
+        "quantization": "Q4_K_M hb16",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja", "--temp", "1.0", "--top-p", "0.92"],
+        "jinja_required": True,
+        "apply_sampling_defaults": True,
+        "sampling_defaults": {"temperature": 1.0, "top_p": 0.92},
+        "capabilities": {
+            "reasoning": False,
+            "tools": False,
+            "media": {"image": False, "audio": False},
+        },
+        "ui_notice": (
+            "配布元metadataはApache-2.0ですが、同revisionのLICENSE.txtは"
+            "18歳以上・個人利用・非商用利用に限定しています。利用前に原文を確認してください。"
         ),
     },
 }

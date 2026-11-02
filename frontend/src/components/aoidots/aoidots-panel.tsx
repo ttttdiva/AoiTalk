@@ -1,7 +1,14 @@
 "use client";
 
+import { ConversationDelegationMap } from "@/components/chat/conversation-delegation-map";
+
 import Link from "next/link";
 import { useAoiDotsShortcut } from "./use-aoidots-shortcut";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Bot,
   ChevronDown,
@@ -52,13 +59,20 @@ import {
 } from "@/lib/chat-local-messages";
 import {
   answerAgentDialogueInput,
+  aoiDotsErrorCode,
+  aoiDotsHistoryFenceDeliveryBlockers,
+  aoiDotsHistoryFenceErrorMessage,
+  applyAoiDotsHistoryFence,
   bootstrapAoiDots,
   controlAgentDialogue,
   dispatchAoiDotsMessage,
   getAgentDialogue,
+  listAoiDotsUncertainInteractiveWork,
   listAoiDotsWork,
+  previewAoiDotsHistoryFence,
   type AoiDotsDialogueControlPayload,
   type AoiDotsDialogue,
+  type AoiDotsHistoryFenceReview,
   type AoiDotsPendingInput,
   type AoiDotsProfile,
   type AoiDotsWorkItem,
@@ -66,6 +80,12 @@ import {
 import { chatApi } from "@/lib/chat-api";
 import { conversationAgentApi, unwrapAgentRuns } from "@/lib/conversation-agent-api";
 import { useShellChrome } from "@/components/layout/shell-context";
+import { useCurrentUserId } from "@/components/providers/swr-global-provider";
+import {
+  EMPTY_CHAT_COMPOSER_DRAFT,
+  flushChatComposerDraftStore,
+  updateChatComposerDraft,
+} from "@/lib/chat-composer-draft-store";
 import type { MentionItem } from "@/components/chat/mention-menu";
 import type { ChatCommandCapability } from "@/lib/chat-commands";
 import {
@@ -141,6 +161,39 @@ function statusClass(status: string): string {
     return "text-primary";
   }
   return "text-muted-foreground";
+}
+
+function historyFenceStatusLabel(status: string | null): string {
+  switch (status) {
+    case "failed": return "失敗";
+    case "succeeded":
+    case "completed": return "完了";
+    case "running":
+    case "claimed": return "実行中";
+    case "waiting":
+    case "pending": return "待機中";
+    case "blocked": return "停止中";
+    case "cancelled": return "キャンセル";
+    default: return "確認できません";
+  }
+}
+
+function childWorkSummary(states: string[]): string {
+  if (states.length === 0) return "子Work 0件";
+  const counts = new Map<string, number>();
+  for (const state of states) counts.set(state, (counts.get(state) ?? 0) + 1);
+  const items = [...counts.entries()].map(
+    ([state, count]) => `${historyFenceStatusLabel(state)} ${count}件`,
+  );
+  return `子Work ${states.length}件（${items.join("・")}）`;
+}
+
+type AoiDotsHistoryFenceDisplay = AoiDotsHistoryFenceReview & {
+  errorMessage?: string;
+};
+
+function shortHistoryFenceDeliveryId(id: string): string {
+  return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 }
 
 export function canStopAoiDotsWork(status: string): boolean {
@@ -273,19 +326,33 @@ function workInput(item: AoiDotsWorkItem): AoiDotsPendingInput | null {
 export function AoiDotsToggleButton() {
   const { aoiDotsOpen, toggleAoiDots } = useShellChrome();
   return (
-    <button
-      type="button"
-      data-testid="aoi-dots-toggle"
-      data-aoi-dots-open={aoiDotsOpen ? "true" : "false"}
-      aria-label={aoiDotsOpen ? "AoiDotsを閉じる" : "AoiDotsを開く"}
-      aria-pressed={aoiDotsOpen}
-      aria-keyshortcuts="Alt+Shift+D"
-      title="AoiDots"
-      onClick={toggleAoiDots}
-      className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      <Bot className="size-4" />
-    </button>
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            data-testid="aoi-dots-toggle"
+            data-aoi-dots-open={aoiDotsOpen ? "true" : "false"}
+            aria-label={aoiDotsOpen ? "AoiDotsを閉じる" : "AoiDotsを開く"}
+            aria-pressed={aoiDotsOpen}
+            aria-keyshortcuts="Alt+Shift+D"
+            onClick={toggleAoiDots}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        }
+      >
+        <Bot className="size-4" />
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={8} positionerClassName="z-[80]">
+        <span>{aoiDotsOpen ? "AoiDotsを閉じる" : "AoiDotsを開く"}</span>
+        <kbd
+          data-slot="kbd"
+          className="rounded border border-current/30 px-1 py-0.5 font-mono text-[10px]"
+        >
+          Alt+Shift+D
+        </kbd>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -547,8 +614,11 @@ function AoiDotsWorkCard({
 
 export function AoiDotsPanel() {
   const { aoiDotsOpen, setAoiDotsOpen, toggleAoiDots } = useShellChrome();
+  const draftUserId = useCurrentUserId();
+  const [delegationMapOpen, setDelegationMapOpen] = useState(false);
   const projectContext = useOptionalProject();
   const selectedProjectId = projectContext?.selectedProjectId ?? null;
+  const includeProjectContext = Boolean(selectedProjectId);
   const projects = useMemo(
     () => projectContext?.projects ?? [],
     [projectContext?.projects],
@@ -572,6 +642,10 @@ export function AoiDotsPanel() {
   const [generationStartedAt, setGenerationStartedAt] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [rootBusy, setRootBusy] = useState(false);
+  const [historyFenceState, setHistoryFenceStateValue] = useState<"checking" | "clear" | "blocked" | "unavailable">("checking");
+  const [historyFenceReviews, setHistoryFenceReviews] = useState<AoiDotsHistoryFenceDisplay[]>([]);
+  const [historyFenceError, setHistoryFenceError] = useState<string | null>(null);
+  const [historyFenceApplying, setHistoryFenceApplying] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const panelRef = useAoiDotsShortcut(
@@ -601,6 +675,12 @@ export function AoiDotsPanel() {
   const responsePollGenerationRef = useRef(0);
   const liveToolResultsRef = useRef<ChatToolResultMetadata[]>([]);
   const activeClientMessageIdRef = useRef<string | null>(null);
+  const activeSubmittedDraftRef = useRef<{
+    clientMessageId: string;
+    content: string;
+    mentions: MentionItem[];
+    files: File[];
+  } | null>(null);
   const activeAgentRunIdRef = useRef<string | null>(null);
   const generationEpochRef = useRef(0);
   const dispatchingRootRef = useRef(false);
@@ -615,6 +695,13 @@ export function AoiDotsPanel() {
   const statusInflightRef = useRef<{ sessionId: string; requestId: number; promise: Promise<void> } | null>(null);
   const workRefreshGenerationRef = useRef(0);
   const dialogueLoadGenerationRef = useRef(new Map<string, number>());
+  const historyFenceGenerationRef = useRef(0);
+  const historyFenceStateRef = useRef<"checking" | "clear" | "blocked" | "unavailable">("checking");
+  const unresolvedInteractiveBusyRef = useRef(false);
+  const setHistoryFenceState = useCallback((value: "checking" | "clear" | "blocked" | "unavailable") => {
+    historyFenceStateRef.current = value;
+    setHistoryFenceStateValue(value);
+  }, []);
 
   const activeSessionId = profile?.session_id ?? null;
   const activeSessionIdRef = useRef<string | null>(null);
@@ -755,6 +842,7 @@ export function AoiDotsPanel() {
         setIsStreaming(false);
         setStopPending(false);
         activeClientMessageIdRef.current = null;
+        activeSubmittedDraftRef.current = null;
         activeAgentRunIdRef.current = null;
         setActiveAgentRunId(null);
         // 初回hydrationで本文は取得済み。実行中だった/再接続時のみ最終本文を再取得する。
@@ -877,6 +965,172 @@ export function AoiDotsPanel() {
       }
     }
   }, []);
+
+  const refreshHistoryFence = useCallback(async (busyWasConfirmed = false): Promise<boolean> => {
+    if (!profile?.session_id) {
+      setHistoryFenceState("unavailable");
+      setHistoryFenceError("AoiDots rootを確認できません。再読み込みしてください。");
+      return false;
+    }
+    if (busyWasConfirmed) unresolvedInteractiveBusyRef.current = true;
+    const requestGeneration = ++historyFenceGenerationRef.current;
+    const sessionId = profile.session_id;
+    historyFenceStateRef.current = "checking";
+    await Promise.resolve();
+    setHistoryFenceState("checking");
+    setHistoryFenceError(null);
+    try {
+      const candidates = await listAoiDotsUncertainInteractiveWork(
+        sessionId,
+        profile.agent_id,
+      );
+      const boundedCandidates = candidates.slice(0, 50);
+      const reviews = await Promise.all(boundedCandidates.map(async (candidate) => {
+        try {
+          return await previewAoiDotsHistoryFence(candidate, sessionId);
+        } catch (reviewError) {
+          const code = aoiDotsErrorCode(reviewError);
+          const status =
+            reviewError && typeof reviewError === "object" && "status" in reviewError
+              ? Number((reviewError as { status?: unknown }).status)
+              : null;
+          const base: AoiDotsHistoryFenceDisplay = {
+            workItemId: candidate.workItemId,
+            safeErrorCode: candidate.safeErrorCode,
+            status: code === "history_fence_already_releasable" ? "already_releasable" : "unavailable",
+            stateDigest: null,
+            runStatus: null,
+            childWorkStates: [],
+            deliveryBlockers: aoiDotsHistoryFenceDeliveryBlockers(reviewError),
+            errorCode: code,
+            errorStatus: status,
+            errorMessage: aoiDotsHistoryFenceErrorMessage(reviewError),
+          };
+          return base;
+        }
+      }));
+      if (
+        requestGeneration !== historyFenceGenerationRef.current ||
+        activeSessionIdRef.current !== sessionId
+      ) return false;
+      const actionable = reviews.filter(
+        (review) => review.status !== "already_fenced" && review.status !== "already_releasable",
+      );
+      setHistoryFenceReviews(actionable);
+      if (actionable.length > 0) {
+        setHistoryFenceState("blocked");
+        return false;
+      }
+      if (candidates.length > boundedCandidates.length) {
+        setHistoryFenceReviews(reviews);
+        setHistoryFenceState("blocked");
+        setHistoryFenceError("対象Workが多いため一覧を分割して確認できません。Work一覧を整理して再確認してください。");
+        return false;
+      }
+      if (candidates.length > 0) unresolvedInteractiveBusyRef.current = false;
+      if (unresolvedInteractiveBusyRef.current) {
+        setHistoryFenceState("blocked");
+        setHistoryFenceError("サーバーはこの相談の継続を拒否しましたが、安全に確認できるWorkを特定できません。再確認しても解決しない場合は運用担当へ連絡してください。");
+        return false;
+      }
+      setHistoryFenceReviews([]);
+      setHistoryFenceState("clear");
+      return true;
+    } catch (reviewError) {
+      if (requestGeneration !== historyFenceGenerationRef.current) return false;
+      setHistoryFenceReviews([]);
+      setHistoryFenceState(unresolvedInteractiveBusyRef.current ? "blocked" : "unavailable");
+      setHistoryFenceError(aoiDotsHistoryFenceErrorMessage(
+        reviewError,
+        "不明状態のWorkを取得できません。送信を保留し、時間をおいて再確認してください。",
+      ));
+      return false;
+    }
+  }, [profile, setHistoryFenceState]);
+
+  const applyHistoryFence = useCallback(async (review: AoiDotsHistoryFenceReview) => {
+    if (!profile?.session_id || historyFenceApplying) return;
+    setHistoryFenceApplying(review.workItemId);
+    setHistoryFenceError(null);
+    try {
+      const result = await applyAoiDotsHistoryFence(review, profile.session_id);
+      if (!new Set(["fenced", "already_fenced", "already_fenced_same_request"]).has(result.status)) {
+        throw new Error("履歴区切りの結果を確認できませんでした。最新状態を再確認してください。");
+      }
+      unresolvedInteractiveBusyRef.current = false;
+      toast.success("結果不明の履歴を再送せずに区切りました。相談の状態を確認しています。");
+      await refreshHistoryFence();
+    } catch (applyError) {
+      const code = aoiDotsErrorCode(applyError);
+      if (["history_fence_already_applied", "history_fence_already_releasable"].includes(code ?? "")) {
+        unresolvedInteractiveBusyRef.current = false;
+      }
+      setHistoryFenceError(aoiDotsHistoryFenceErrorMessage(applyError));
+      if (applyError && typeof applyError === "object" && "status" in applyError && Number((applyError as { status?: unknown }).status) === 409) {
+        await refreshHistoryFence();
+      }
+    } finally {
+      setHistoryFenceApplying(null);
+    }
+  }, [historyFenceApplying, profile, refreshHistoryFence]);
+
+  useEffect(() => {
+    if (!activeSessionId) return;
+    unresolvedInteractiveBusyRef.current = false;
+    const timerId = window.setTimeout(() => void refreshHistoryFence(), 0);
+    return () => window.clearTimeout(timerId);
+  }, [activeSessionId, refreshHistoryFence]);
+
+  useEffect(() => {
+    const event = socket.lastMessage;
+    if (!event || !activeSessionId) return;
+    if (event.__connection_session_id && event.__connection_session_id !== activeSessionId) return;
+    if (
+      event.__connection_generation !== undefined &&
+      event.__connection_generation !== socket.connectionGeneration
+    ) return;
+    if (aoiDotsErrorCode(event) !== "interactive_session_busy") return;
+    const eventClientId =
+      typeof event.client_message_id === "string"
+        ? event.client_message_id
+        : typeof (event.data as { client_message_id?: unknown } | undefined)?.client_message_id === "string"
+          ? (event.data as { client_message_id: string }).client_message_id
+          : null;
+    if (
+      eventClientId &&
+      activeClientMessageIdRef.current &&
+      eventClientId !== activeClientMessageIdRef.current
+    ) return;
+
+    unresolvedInteractiveBusyRef.current = true;
+    const rejectedDraft = activeSubmittedDraftRef.current;
+    const rejectedClientId = eventClientId ?? rejectedDraft?.clientMessageId ?? activeClientMessageIdRef.current;
+    if (rejectedDraft && rejectedClientId === rejectedDraft.clientMessageId) {
+      updateChatComposerDraft(activeSessionId, (current) => {
+        if (current.content.trim()) return current;
+        return {
+          ...EMPTY_CHAT_COMPOSER_DRAFT,
+          content: rejectedDraft.content,
+          mentions: rejectedDraft.mentions,
+        };
+      }, draftUserId);
+      flushChatComposerDraftStore();
+      setAttachedFiles((current) => current.length > 0 ? current : rejectedDraft.files);
+    }
+    if (rejectedClientId) {
+      setMessages((current) => current.filter((message) => messageClientId(message) !== rejectedClientId));
+    }
+    activeSubmittedDraftRef.current = null;
+    activeClientMessageIdRef.current = null;
+    activeAgentRunIdRef.current = null;
+    setActiveAgentRunId(null);
+    setStreamingContent("");
+    setIsStreaming(false);
+    setRootBusy(false);
+    generationStatusRequestRef.current += 1;
+    toast.error("前回の実行結果を確認できないため、この相談は停止中です。入力を保持し、前回の実行は再送していません。");
+    void refreshHistoryFence(true);
+  }, [activeSessionId, draftUserId, refreshHistoryFence, socket.connectionGeneration, socket.lastMessage]);
 
   const bootstrap = useCallback(async () => {
     workRefreshGenerationRef.current += 1;
@@ -1047,6 +1301,7 @@ export function AoiDotsPanel() {
       setRootBusy(false);
       setStopPending(false);
       activeClientMessageIdRef.current = null;
+      activeSubmittedDraftRef.current = null;
       activeAgentRunIdRef.current = null;
       setActiveAgentRunId(null);
       void loadMessages(activeSessionId);
@@ -1071,6 +1326,7 @@ export function AoiDotsPanel() {
       setRootBusy(false);
       setStopPending(false);
       activeClientMessageIdRef.current = null;
+      activeSubmittedDraftRef.current = null;
       activeAgentRunIdRef.current = null;
       setActiveAgentRunId(null);
       void loadMessages(activeSessionId);
@@ -1085,6 +1341,7 @@ export function AoiDotsPanel() {
         setRootBusy(false);
         setStopPending(false);
         activeClientMessageIdRef.current = null;
+        activeSubmittedDraftRef.current = null;
         activeAgentRunIdRef.current = null;
         setActiveAgentRunId(null);
       }
@@ -1120,6 +1377,19 @@ export function AoiDotsPanel() {
       ) {
         return "failed" as const;
       }
+      if (historyFenceStateRef.current !== "clear") {
+        toast.error(
+          historyFenceError ??
+            "前回の実行結果を確認できないため、この相談は停止中です。送信前に状態を確認してください。",
+        );
+        return "failed" as const;
+      }
+      if (!(await refreshHistoryFence())) {
+        toast.error(
+          "前回の実行結果を確認できないため、この相談は停止中です。入力は保持し、前回の実行は再送していません。",
+        );
+        return "failed" as const;
+      }
       dispatchingRootRef.current = true;
       generationStatusRequestRef.current += 1;
       const clientMessageId = newClientMessageId();
@@ -1140,6 +1410,12 @@ export function AoiDotsPanel() {
         commandCapabilities,
       );
       setMessages((current) => mergeMessages(current, [localMessage]));
+      activeSubmittedDraftRef.current = {
+        clientMessageId,
+        content,
+        mentions: mentions ?? [],
+        files: files ?? [],
+      };
 
       try {
         let accepted = false;
@@ -1151,7 +1427,7 @@ export function AoiDotsPanel() {
             mentions,
             undefined,
             undefined,
-            true,
+            includeProjectContext,
             undefined,
             undefined,
             activeSessionId,
@@ -1174,7 +1450,7 @@ export function AoiDotsPanel() {
             expected_agent_id: profile?.agent_id ?? null,
             project_id: null,
             context_project_hint_id: selectedProjectId ?? null,
-            include_project_context: true,
+            include_project_context: includeProjectContext,
             command_capabilities: commandCapabilities,
             mentions,
             ...(preparedAttachments
@@ -1211,13 +1487,21 @@ export function AoiDotsPanel() {
         setIsStreaming(false);
         setRootBusy(false);
         activeClientMessageIdRef.current = null;
+        activeSubmittedDraftRef.current = null;
         activeAgentRunIdRef.current = null;
         setActiveAgentRunId(null);
-        toast.error(
-          sendError instanceof Error
-            ? sendError.message
-            : "AoiDotsへの送信に失敗しました",
-        );
+        if (aoiDotsErrorCode(sendError) === "interactive_session_busy") {
+          unresolvedInteractiveBusyRef.current = true;
+          setHistoryFenceState("blocked");
+          await refreshHistoryFence(true);
+          toast.error("前回の実行結果を確認できないため、この相談は停止中です。入力を保持し、前回の実行は再送していません。");
+        } else {
+          toast.error(
+            sendError instanceof Error
+              ? sendError.message
+              : "AoiDotsへの送信に失敗しました",
+          );
+        }
         return "failed" as const;
       } finally {
         dispatchingRootRef.current = false;
@@ -1227,9 +1511,13 @@ export function AoiDotsPanel() {
       activeSessionId,
       loadMessages,
       profile,
+      historyFenceError,
+      refreshHistoryFence,
       refreshWork,
       rootBusy,
+      setHistoryFenceState,
       selectedProjectId,
+      includeProjectContext,
       socket,
     ],
   );
@@ -1554,6 +1842,7 @@ export function AoiDotsPanel() {
       inert={!aoiDotsOpen}
       data-testid="aoi-dots-panel"
       data-aoi-dots-open={aoiDotsOpen ? "true" : "false"}
+      data-aoi-dots-fence-state={historyFenceState}
     >
       <div className="flex min-h-12 shrink-0 items-center gap-2 border-b border-border px-3 py-2">
         <Bot className="size-4 text-primary" />
@@ -1576,6 +1865,7 @@ export function AoiDotsPanel() {
             {stopPending ? <Loader2 className="size-3.5 animate-spin" /> : <Square className="size-3.5" />}
           </button>
         )}
+        <button type="button" aria-expanded={delegationMapOpen && aoiDotsOpen} onClick={() => setDelegationMapOpen((value) => !value)} className="rounded px-1.5 py-1 text-xs">委任の流れ</button>
         <Link
           href="/operations"
           className="inline-flex size-7 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -1620,20 +1910,23 @@ export function AoiDotsPanel() {
       ) : (
         <>
           <div className="flex min-h-0 flex-1 flex-col">
-            <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-              <MessageList
-                messages={messages}
-                emptyMessage="AoiDotsへの相談を入力してください。"
-                isStreaming={isStreaming}
-                isWaitingResponse={isStreaming && !streamingContent}
-                streamingContent={streamingContent}
-                liveToolResults={liveToolResults}
-                activeTool={activeTool}
-                activeAgentRunId={activeAgentRunId}
-                generationKey={activeGenerationKey}
-                generationStartedAt={generationStartedAt}
-                showGenerationActivity={isStreaming}
-              />
+            <div className="relative min-h-0 flex-1">
+              <ConversationDelegationMap presentation="message-overlay" sessionId={loading || error ? null : activeSessionId} ownerId={draftUserId} serverIdentity={typeof window === "undefined" ? "" : window.location.origin + window.location.pathname} open={aoiDotsOpen && delegationMapOpen} onClose={() => setDelegationMapOpen(false)} />
+              <div className="h-full overflow-y-auto px-3 py-2">
+                <MessageList
+                  messages={messages}
+                  emptyMessage="AoiDotsへの相談を入力してください。"
+                  isStreaming={isStreaming}
+                  isWaitingResponse={isStreaming && !streamingContent}
+                  streamingContent={streamingContent}
+                  liveToolResults={liveToolResults}
+                  activeTool={activeTool}
+                  activeAgentRunId={activeAgentRunId}
+                  generationKey={activeGenerationKey}
+                  generationStartedAt={generationStartedAt}
+                  showGenerationActivity={isStreaming}
+                />
+              </div>
             </div>
 
             <div className="max-h-[36vh] shrink-0 overflow-y-auto border-t border-border-subtle px-3 py-2">
@@ -1716,6 +2009,86 @@ export function AoiDotsPanel() {
                 <div className="mt-1 text-[11px] text-muted-foreground">Dialogueを読み込み中…</div>
               )}
             </div>
+
+            {historyFenceState !== "clear" && (
+              <section
+                aria-live="polite"
+                aria-busy={historyFenceState === "checking"}
+                className="mb-2 max-h-56 shrink-0 space-y-2 overflow-y-auto rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs"
+                data-testid="aoi-dots-history-fence"
+                data-aoi-dots-fence-state={historyFenceState}
+                role="alert"
+              >
+                <div className="font-semibold text-foreground">
+                  {historyFenceState === "checking"
+                    ? "相談の継続可否を確認しています…"
+                    : "前回の実行結果を確認できないため、この相談は停止中"}
+                </div>
+                {historyFenceState !== "checking" && (
+                  <p className="text-muted-foreground">
+                    結果は不明のまま記録されます。前回の依頼は再送しません。確認内容を読んで明示操作した後に続行できます。
+                  </p>
+                )}
+                {historyFenceError && (
+                  <p className="text-destructive" data-testid="aoi-dots-history-fence-error">
+                    {historyFenceError}
+                  </p>
+                )}
+                {historyFenceReviews.map((review) => (
+                  <div key={review.workItemId} className="space-y-1 rounded border border-border bg-background/70 p-2">
+                    <div className="font-medium">Work {review.workItemId}</div>
+                    {review.errorCode === "history_fence_child_pending" ? (
+                      <div data-testid="aoi-dots-history-fence-blockers" className="space-y-1">
+                        {(review.deliveryBlockers ?? []).length > 0 ? (
+                          <>
+                            <div className="font-medium">未完了の内部deliveryがあります</div>
+                            {review.deliveryBlockers?.map((blocker) => (
+                              <div key={blocker.id}>
+                                {shortHistoryFenceDeliveryId(blocker.id)} · {blocker.kind} · {blocker.state}
+                              </div>
+                            ))}
+                            {review.childWorkStates.length > 0 && (
+                              <div>{childWorkSummary(review.childWorkStates)}</div>
+                            )}
+                          </>
+                        ) : (
+                          <div>未完了の内部処理があります。詳細は取得できませんでした。</div>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <div>Run状態: {historyFenceStatusLabel(review.runStatus)}</div>
+                        <div>{childWorkSummary(review.childWorkStates)}</div>
+                      </>
+                    )}
+                    <div className="text-muted-foreground">結果不明 · providerへの再送なし · 利用量も不明のままです。</div>
+                    {review.status === "dry_run_ok" && review.stateDigest ? (
+                      <button
+                        type="button"
+                        className="mt-1 rounded border border-amber-500/50 px-2 py-1 font-medium hover:bg-amber-500/10 disabled:opacity-50"
+                        disabled={historyFenceApplying !== null}
+                        onClick={() => void applyHistoryFence(review)}
+                      >
+                        {historyFenceApplying === review.workItemId
+                          ? "確認を適用中…"
+                          : "結果不明のまま履歴を区切り、相談を続ける"}
+                      </button>
+                    ) : (
+                      <p className="text-destructive">{review.errorMessage ?? "このWorkは自動で解除できません。追加確認が必要です。"}</p>
+                    )}
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 hover:bg-accent disabled:opacity-50"
+                  disabled={historyFenceState === "checking"}
+                  onClick={() => void refreshHistoryFence(unresolvedInteractiveBusyRef.current)}
+                >
+                  <RefreshCcw className="size-3" />
+                  状態を再確認
+                </button>
+              </section>
+            )}
 
             <ChatComposer
               presentation="aoidots"

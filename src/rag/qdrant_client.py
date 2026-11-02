@@ -151,6 +151,9 @@ class SharedQdrantClient:
             if config.local_path:
                 client = cls.get_client(config.local_path)
             else:
+                from ..utils import qdrant_readiness
+
+                qdrant_readiness.wait_ready(0)
                 client = QdrantClient(
                     host=config.host, port=config.port, api_key=config.api_key
                 )
@@ -258,6 +261,9 @@ class QdrantManager:
                 self._is_local_mode = True
             else:
                 # Server mode
+                from ..utils import qdrant_readiness
+
+                qdrant_readiness.wait_ready()
                 logger.info(f"Connecting to Qdrant server: {self.config.host}:{self.config.port}")
                 self.client = QdrantClient(
                     host=self.config.host,

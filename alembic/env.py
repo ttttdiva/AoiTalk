@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import logging
 from logging.config import fileConfig
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from alembic import context
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
 from src.memory.config import postgres_search_path, validate_isolated_schema_heads
+from src.memory.migration_guard import refuse_shared_database_from_worktree
 from src.memory.models import Base
 
 # .env から POSTGRES_* を読み込み、alembic.ini の sqlalchemy.url を上書きする。
@@ -137,6 +139,13 @@ def run_migrations_online() -> None:
         with context.begin_transaction():
             context.run_migrations()
 
+
+# CLI and application startup both reach the database through this file.
+refuse_shared_database_from_worktree(
+    Path(__file__).resolve().parents[1],
+    config.get_main_option("sqlalchemy.url"),
+    _configured_postgres_schema(),
+)
 
 if context.is_offline_mode():
     run_migrations_offline()

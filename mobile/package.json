@@ -4,6 +4,7 @@
   "private": true,
   "main": "index.js",
   "scripts": {
+    "postinstall": "node scripts/apply-calendar-patch.cjs",
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",

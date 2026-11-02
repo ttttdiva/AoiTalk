@@ -108,6 +108,15 @@ def _category(exc: BaseException) -> str | None:
                 lowered = value.strip().lower()
                 if _CATEGORY_PATTERN.fullmatch(lowered) and lowered in _CATEGORY_ALLOWLIST:
                     return lowered
+    # SDK status errors mirror the body's code/type as attributes.  A quota
+    # failure that only carries them must still be recognized as quota, so it
+    # is never retried as a temporary 429.
+    for key in ("code", "type"):
+        value = getattr(exc, key, None)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if _CATEGORY_PATTERN.fullmatch(lowered) and lowered in _CATEGORY_ALLOWLIST:
+                return lowered
     return None
 
 
@@ -140,6 +149,22 @@ def terminal_failure_event_fields(metadata: Any) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
         return {}
     fields: dict[str, Any] = {}
+    if (metadata.get("provider_failure_code") == "complimentary_media_unbounded"
+            and metadata.get("provider_failure_stage") == "request_budget_estimate"):
+        fields["provider_failure_code"] = "complimentary_media_unbounded"
+        fields["provider_failure_stage"] = "request_budget_estimate"
+    if (metadata.get("provider_failure_code") == "complimentary_image_budget_insufficient"
+            and metadata.get("provider_failure_stage") == "quota_reservation"):
+        fields["provider_failure_code"] = "complimentary_image_budget_insufficient"
+        fields["provider_failure_stage"] = "quota_reservation"
+    if (metadata.get("provider_failure_code") == "complimentary_image_usage_unknown"
+            and metadata.get("provider_failure_stage") == "provider_usage_settlement"):
+        fields["provider_failure_code"] = "complimentary_image_usage_unknown"
+        fields["provider_failure_stage"] = "provider_usage_settlement"
+    if (metadata.get("provider_failure_code") == "complimentary_image_cost_budget_exceeded"
+            and metadata.get("provider_failure_stage") == "request_budget_estimate"):
+        fields["provider_failure_code"] = "complimentary_image_cost_budget_exceeded"
+        fields["provider_failure_stage"] = "request_budget_estimate"
     failure = metadata.get("provider_failure")
     if isinstance(failure, Mapping):
         status = failure.get("http_status")

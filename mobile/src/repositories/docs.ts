@@ -11,7 +11,7 @@
  */
 
 import * as drizzleOrm from "drizzle-orm";
-import { and, asc, eq, gt, inArray, isNull, like, or, sql } from "drizzle-orm";
+import { and, asc, count, eq, gt, inArray, isNull, like, or, sql } from "drizzle-orm";
 import type { SQLiteBindParams } from "expo-sqlite";
 import { getDb, getSqlite, schema } from "../db/client";
 import {
@@ -78,12 +78,15 @@ import {
 import {
   buildDocsAuthoritativeSets,
   forEachDocsPromotionChunk,
+  loadDocsDirtyRowsForKeysTx,
   loadDocsDirtyRowsPagedTx,
+  loadDocsMembershipSnapshotForKeysTx,
   loadDocsMembershipSnapshotTx,
   loadDocsPendingNodeCreatesTx,
   loadDocsQuarantineMembershipSnapshotTx,
   loadDocsQuarantineOutboxSnapshotTx,
   loadDocsScopedOutboxProtectionTx,
+  type DocsPromotionKeysByTable,
 } from "./docs-promotion-snapshot";
 import {
   blankParagraphBodyJson,
@@ -255,10 +258,15 @@ export type DocsPagesReadSummary = {
   generationStatus: DocsReadGenerationStatus;
 };
 
-async function getSavedDocsWorkspaceIds(): Promise<string[]> {
-  const token = await getToken();
-  if (!token) return [];
-  const authScope = getTokenAuthScope(token);
+async function getSavedDocsWorkspaceIds(
+  authScopeOverride?: string | null,
+): Promise<string[]> {
+  let authScope = authScopeOverride;
+  if (authScopeOverride === undefined) {
+    const token = await getToken();
+    authScope = token ? getTokenAuthScope(token) : null;
+  }
+  if (!authScope) return [];
   const userId = authScope.slice("auth:".length);
   if (!userId) return [];
   const db = getDb();
@@ -330,10 +338,11 @@ async function getDocsVisibility(
   allowedScopeKeys?: ReadonlySet<string>,
   allowedEntityKeys?: ReadonlySet<string>,
   diagnostics?: DocsReadDiagnostics,
+  context?: { workspaceIds: string[]; authScope: string | null },
 ): Promise<DocsVisibility> {
-  let workspaceIds: string[] = [];
+  let workspaceIds: string[] = context?.workspaceIds ?? [];
   try {
-    workspaceIds = await getSavedDocsWorkspaceIds();
+    if (!context) workspaceIds = await getSavedDocsWorkspaceIds();
   } catch {
     markDocsReadDegraded(diagnostics, "workspace_projection_unavailable");
     workspaceIds = [];
@@ -349,10 +358,14 @@ async function getDocsVisibility(
   }
   let authScope: string | null = null;
   try {
-    const token = await getToken();
-    authScope = token && typeof getTokenAuthScope === "function"
-      ? getTokenAuthScope(token)
-      : null;
+    if (context) {
+      authScope = context.authScope;
+    } else {
+      const token = await getToken();
+      authScope = token && typeof getTokenAuthScope === "function"
+        ? getTokenAuthScope(token)
+        : null;
+    }
     if (!authScope) {
       return {
         membershipAvailable: true,
@@ -409,11 +422,37 @@ async function getDocsVisibility(
           .where(scopedCondition);
       }
     } catch {
-      // Older SQLite/ORM adapters must retain the exact original visibility
-      // calculation, never fall into the broader missing-membership fallback
-      // merely because they cannot execute the optimized query.
       markDocsReadDegraded(diagnostics, "visibility_query_fallback");
-      rows = await legacyQuery();
+      // A root-list read is deliberately bounded to the candidate entity IDs.
+      // Falling back to an unbounded membership scan would put the original
+      // 100k+ row JS-thread stall back on the first-paint path. Fail closed;
+      // the cached title snapshot remains displayable while the next read or
+      // sync retries the projection.
+      if (allowedEntityKeys === undefined) {
+        rows = await legacyQuery();
+      } else if (allowedEntityKeys.size === 0) {
+        rows = [];
+      } else {
+        // ORM fallback remains SQL-filtered by the bounded root candidate
+        // list. Chunk below SQLite's bind parameter ceiling.
+        rows = [];
+        const candidateIds = [...allowedEntityKeys];
+        for (let offset = 0; offset < candidateIds.length; offset += 400) {
+          const chunk = candidateIds.slice(offset, offset + 400);
+          const candidateRows = await db
+            .select({ entityKey: membership.entityKey, scopeKey: membership.scopeKey })
+            .from(membership)
+            .where(and(baseCondition, inArray(membership.entityKey, chunk)));
+          rows.push(...candidateRows);
+        }
+        if (allowedScopeKeys?.size) {
+          rows.push(...[...allowedScopeKeys].map((scopeKey) => ({
+            entityKey: "",
+            scopeKey,
+            isScopeWitness: 1,
+          })));
+        }
+      }
     }
     const activeScopeKeys = new Set(
       rows
@@ -433,19 +472,36 @@ async function getDocsVisibility(
       : activeScopeKeys;
     let dirtyEntityKeys = new Set<string>();
     try {
-      const dirtyRows = await db
-        .select({
-          entityId: schema.outbox.entityId,
-          docsScopeKey: schema.outbox.docsScopeKey,
-          blockedReason: schema.outbox.blockedReason,
-        })
-        .from(schema.outbox)
-        .where(
-          and(
-            eq(schema.outbox.authScope, authScope),
-            eq(schema.outbox.tableName, tableName),
-          ),
-        );
+      let dirtyRows = allowedEntityKeys !== undefined
+        ? allowedEntityKeys.size === 0
+          ? []
+          : await db.all<{
+              entityId: string;
+              docsScopeKey: string | null;
+              blockedReason: string | null;
+            }>(sql`
+              SELECT outbox.entity_id AS entityId,
+                     outbox.docs_scope_key AS docsScopeKey,
+                     outbox.blocked_reason AS blockedReason
+                FROM outbox
+                JOIN json_each(${JSON.stringify([...allowedEntityKeys])}) AS candidate_ids
+                  ON outbox.entity_id = candidate_ids.value
+               WHERE outbox.auth_scope = ${authScope}
+                 AND outbox.table_name = ${tableName}
+            `)
+        : await db
+          .select({
+            entityId: schema.outbox.entityId,
+            docsScopeKey: schema.outbox.docsScopeKey,
+            blockedReason: schema.outbox.blockedReason,
+          })
+          .from(schema.outbox)
+          .where(
+            and(
+              eq(schema.outbox.authScope, authScope),
+              eq(schema.outbox.tableName, tableName),
+            ),
+          );
       // A pending edit protects a relation only when its composite scope is
       // one of the account's active/readonly projections.  Legacy NULL scope
       // rows are intentionally fail-closed here; migration/backfill can
@@ -467,6 +523,36 @@ async function getDocsVisibility(
           .map((row) => row.entityId),
       );
     } catch {
+      if (allowedEntityKeys !== undefined && allowedEntityKeys.size > 0) {
+        // Candidate fallback is bounded and never scans the whole outbox.
+        const candidateIds = [...allowedEntityKeys];
+        const boundedRows: Array<{
+          entityId: string;
+          docsScopeKey: string | null;
+          blockedReason: string | null;
+        }> = [];
+        for (let offset = 0; offset < candidateIds.length; offset += 400) {
+          const chunk = candidateIds.slice(offset, offset + 400);
+          boundedRows.push(...await db
+            .select({
+              entityId: schema.outbox.entityId,
+              docsScopeKey: schema.outbox.docsScopeKey,
+              blockedReason: schema.outbox.blockedReason,
+            })
+            .from(schema.outbox)
+            .where(and(
+              eq(schema.outbox.authScope, authScope),
+              eq(schema.outbox.tableName, tableName),
+              inArray(schema.outbox.entityId, chunk),
+            )));
+        }
+        dirtyEntityKeys = new Set(boundedRows
+          .filter((row) => row.blockedReason == null && (
+            (typeof row.docsScopeKey === "string" && visibleScopeKeys.has(row.docsScopeKey))
+            || (row.docsScopeKey == null && visibleScopeKeys.size === 0)
+          ))
+          .map((row) => row.entityId));
+      }
       // Older schemas may have auth_scope/outbox projection absent; retain
       // only null-workspace dirty rows in docsRowVisible below.
       markDocsReadDegraded(diagnostics, "outbox_projection_unavailable");
@@ -832,6 +918,51 @@ function toNode(row: DbNode): DocsNode {
   };
 }
 
+type DocsRootListRow = Pick<
+  DbNode,
+  | "id" | "workspaceId" | "parentId" | "rootPageId" | "projectId"
+  | "source" | "access" | "readOnly" | "systemKey" | "title"
+  | "description" | "nodeType" | "sortOrder" | "dirty"
+  | "createdBy" | "updatedBy" | "createdAt" | "updatedAt" | "archivedAt"
+>;
+
+/**
+ * The Docs root list needs identity, title and ordering metadata only. Never
+ * select body_json/body_text while building the first-paint list projection.
+ */
+function toDocsRootListNode(row: DocsRootListRow): DocsNode {
+  return {
+    id: row.id,
+    workspace_id: row.workspaceId ?? null,
+    parent_id: row.parentId ?? null,
+    root_page_id: row.rootPageId ?? null,
+    project_id: row.projectId ?? null,
+    source: row.source ?? null,
+    access: row.access ?? null,
+    read_only: Boolean(row.readOnly),
+    system_key: row.systemKey ?? null,
+    is_explicit_blank: false,
+    canonical_title: null,
+    lifecycle: null,
+    title: row.title,
+    aliases: [],
+    description: row.description ?? null,
+    body_json: null,
+    body_text: null,
+    node_type: (row.nodeType as DocsNode["node_type"]) ?? "node",
+    display_props: null,
+    query_json: null,
+    view_json: null,
+    day_date: null,
+    sort_order: row.sortOrder ?? null,
+    created_by: row.createdBy ?? null,
+    updated_by: row.updatedBy ?? null,
+    created_at: row.createdAt ?? null,
+    updated_at: row.updatedAt ?? null,
+    archived_at: row.archivedAt ?? null,
+  };
+}
+
 function toSupertag(row: DbSupertag): DocsSupertag {
   return {
     id: row.id,
@@ -1043,6 +1174,117 @@ export async function applyRemoteDocsNodes(
     options.force ? runBackgroundSqliteWrite : runForegroundSqliteWrite,
     (w, tx, chunk) => applyRemoteDocsNodesInWriter(w, tx, chunk, authScope, options),
   );
+}
+
+export type DocsRootBootstrapScope = {
+  workspace_id: string;
+  project_id?: string | null;
+  source?: string;
+  access?: string;
+  read_only?: boolean;
+};
+
+/**
+ * Make authorized root rows from a validated first Docs page locally visible
+ * before the rest of a staged snapshot completes. This only upserts root
+ * candidates and their scope membership; it never reconciles IDs, removes
+ * live rows, touches outbox, or advances a digest/last-pulled watermark.
+ */
+export async function applyRemoteDocsRootBootstrapRows(
+  rows: readonly DocsNode[],
+  authScope: string,
+  scopes: readonly DocsRootBootstrapScope[],
+  options: { applyNodes: boolean; workspaceStateKey: string; assertActive?: () => void },
+): Promise<{ workspaceId: string; projectId: string | null; rowCount: number } | null> {
+  if (!schema.docsScopeMembership || !options.workspaceStateKey) return null;
+  const rootRows = rows.filter((row) =>
+    row.node_type === "node"
+    && row.parent_id == null
+    && row.archived_at == null
+    && typeof row.workspace_id === "string"
+    && row.workspace_id.length > 0,
+  );
+  if (!rootRows.length) return null;
+  const scopeMeta = scopes.find((scope) =>
+    ["owner", "write", "read"].includes(scope.access ?? "")
+    && rootRows.some((row) =>
+      row.workspace_id === scope.workspace_id
+      && (row.project_id ?? null) === (scope.project_id ?? null),
+    ),
+  );
+  if (!scopeMeta) return null;
+  const workspaceId = scopeMeta.workspace_id;
+  const projectId = scopeMeta.project_id ?? null;
+  const scopedRoots = rootRows.filter((row) =>
+    row.workspace_id === workspaceId && (row.project_id ?? null) === projectId,
+  );
+  if (!scopedRoots.length) return null;
+  const scopeKey = docsScopeKeyFromEntry(scopeMeta);
+  const now = new Date().toISOString();
+
+  await runBackgroundSqliteWrite((writer) => {
+    options.assertActive?.();
+    getDb().transaction((tx) => {
+      options.assertActive?.();
+      if (options.applyNodes) {
+        applyRemoteDocsNodesInWriter(writer, tx, scopedRoots, authScope);
+      }
+      for (const row of scopedRoots) {
+        const readOnly = row.read_only === true
+          || row.access === "read"
+          || scopeMeta.read_only === true
+          || scopeMeta.access === "read";
+        const state = readOnly ? "readonly" : "active";
+        tx.insert(schema.docsScopeMembership)
+          .values({
+            authScope,
+            scopeKey,
+            scopeId: workspaceId,
+            projectId,
+            tableName: "knowledge_nodes",
+            entityKey: row.id,
+            state,
+            access: readOnly ? "read" : row.access ?? scopeMeta.access ?? null,
+            readOnly,
+            updatedAt: now,
+          })
+          .onConflictDoUpdate({
+            target: [
+              schema.docsScopeMembership.authScope,
+              schema.docsScopeMembership.scopeKey,
+              schema.docsScopeMembership.tableName,
+              schema.docsScopeMembership.entityKey,
+            ],
+            set: {
+              scopeId: workspaceId,
+              projectId,
+              state,
+              access: readOnly ? "read" : row.access ?? scopeMeta.access ?? null,
+              readOnly,
+              updatedAt: now,
+            },
+          })
+          .run();
+      }
+      // Make just this authorized root projection readable while the rest of
+      // the staged snapshot continues. The final promotion still owns all
+      // digests, cursors, tombstones and authoritative-ID reconciliation.
+      tx.insert(schema.syncState)
+        .values({
+          tableName: options.workspaceStateKey,
+          lastPulledAt: null,
+          lastPushedAt: null,
+          cursor: workspaceId,
+        })
+        .onConflictDoUpdate({
+          target: schema.syncState.tableName,
+          set: { cursor: workspaceId },
+        })
+        .run();
+    });
+    options.assertActive?.();
+  });
+  return { workspaceId, projectId, rowCount: scopedRoots.length };
 }
 
 /**
@@ -1668,6 +1910,8 @@ export type DocsSyncStagedRow = {
 
 /** Maximum number of staged rows retained by one promotion read. */
 export const DOCS_STAGED_PROMOTION_BATCH_SIZE = 256;
+/** Use one SQLite set operation instead of row-sized JS membership snapshots. */
+const DOCS_AUTHORITATIVE_MEMBERSHIP_SET_THRESHOLD = 1_024;
 
 export type DocsSyncPromotionTelemetry = {
   /** Whether the compatibility in-memory input or SQLite staging was used. */
@@ -1707,6 +1951,23 @@ export type DocsPromotionPhase =
   | "building_sets" | "unchanged_receipt" | "membership_snapshot"
   | "protection" | "staging" | "reconcile" | "finalizing";
 
+/** Finite, data-free outcome for the repository's persisted-receipt recheck. */
+export type DocsPromotionRevalidation = {
+  path: "validated_incremental" | "full_fallback" | "unchanged_receipt";
+  reason:
+    | "accepted"
+    | "unchanged_receipt"
+    | "engine_not_eligible"
+    | "empty_cache_initial_snapshot"
+    | "resuming_promotion"
+    | "forced_full_fallback"
+    | "missing_receipt_metadata"
+    | "scope_set_changed"
+    | "missing_receipt_rows"
+    | "receipt_value_mismatch"
+    | "saved_scope_mismatch";
+};
+
 export type DocsStagingProgress = {
   rowsRead: number;
   batchesRead: number;
@@ -1724,6 +1985,8 @@ export type DocsSyncPromotionOptions = {
   /** Bounded diagnostics only; no SQL text, bindings or live payloads. */
   onPromotionPhase?: (phase: DocsPromotionPhase) => void;
   onSqliteProgress?: (progress: DocsSqliteProgress) => void;
+  /** Optional safe checkpoint for the repository's persisted-receipt recheck. */
+  onPromotionRevalidation?: (result: DocsPromotionRevalidation) => void;
   /** Called before native SQL and commit; a cancelled run must roll back. */
   assertActive?: () => void;
   runId: string;
@@ -1749,6 +2012,14 @@ export type DocsSyncPromotionOptions = {
   }>;
   /** Reconcile the complete ACL scope set in this same promotion tx. */
   scopeSet?: DocsScopeSetReconcile;
+  /**
+   * The sync engine sets this only when a valid since watermark and unchanged
+   * ACL/scope receipt prove the staged response is an incremental delta.
+   * The promoter rechecks the persisted receipt before using the narrow path.
+   */
+  validatedIncremental?: boolean;
+  /** True only when the engine selected an existing docs_sync_runs promoting row. */
+  resumePromotion?: boolean;
   /** Commit metadata atomically with live promotion. */
   finalize?: {
     scopeDigest: string;
@@ -1770,6 +2041,137 @@ export type DocsSyncPromotionOptions = {
 function writableDocsPromotionScope(options: DocsSyncPromotionOptions, scopeKey: string) {
   return options.scopes?.find((scope) => docsScopeKeyFromEntry(scope) === scopeKey
     && scope.read_only === false && ["owner", "write"].includes(scope.access ?? ""));
+}
+
+function promotionScopeSignature(scopes: NonNullable<DocsSyncPromotionOptions["scopes"]>): string {
+  return JSON.stringify(scopes.map((scope) => [
+    scope.workspace_id, scope.project_id ?? null, scope.source ?? null,
+    scope.access ?? null, scope.read_only ?? null,
+  ]).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))));
+}
+
+type DocsPromotionRevalidationDecision = {
+  accepted: boolean;
+  reason: Exclude<DocsPromotionRevalidation["reason"], "unchanged_receipt">;
+};
+
+async function canPromoteValidatedIncrementalTx(
+  tx: DocsSqliteAsyncTransaction,
+  options: DocsSyncPromotionOptions,
+  tableNames: readonly string[],
+): Promise<DocsPromotionRevalidationDecision> {
+  const finalize = options.finalize;
+  if (!options.validatedIncremental) return { accepted: false, reason: "engine_not_eligible" };
+  if (options.force || options.staged) return { accepted: false, reason: "forced_full_fallback" };
+  if (!finalize || !finalize.scopeDigest || !finalize.scopeRevision || !finalize.scopeRevisionKey
+    || !finalize.scopesKey || !finalize.workspaceKey || !finalize.workspaceId
+    || !finalize.scopeDigestKey || !finalize.lastPulledKey
+    || tableNames.some((table) => !finalize.digestKeys[table] || !finalize.digestByTable[table])) {
+    return { accepted: false, reason: "missing_receipt_metadata" };
+  }
+  if (options.scopeSet && promotionScopeSignature(options.scopeSet.previousScopes)
+    !== promotionScopeSignature(options.scopeSet.newScopes)) {
+    return { accepted: false, reason: "scope_set_changed" };
+  }
+  const expectedKeys = [
+    finalize.scopeDigestKey,
+    finalize.scopeRevisionKey,
+    finalize.lastPulledKey,
+    finalize.scopesKey,
+    finalize.workspaceKey,
+    ...tableNames.map((table) => finalize.digestKeys[table]),
+  ];
+  const rows = await tx.getAllAsync<{
+    table_name: string;
+    cursor: string | null;
+    last_pulled_at: string | null;
+  }>(
+    `SELECT table_name, cursor, last_pulled_at FROM sync_state
+      WHERE table_name IN (${expectedKeys.map(() => "?").join(", ")})`,
+    ...expectedKeys,
+  );
+  const saved = new Map(rows.map((row) => [row.table_name, row]));
+  if (expectedKeys.some((key) => !saved.has(key))) {
+    return { accepted: false, reason: "missing_receipt_rows" };
+  }
+  if (saved.get(finalize.scopeDigestKey)?.cursor !== finalize.scopeDigest
+    || saved.get(finalize.scopeRevisionKey)?.cursor !== finalize.scopeRevision
+    || saved.get(finalize.workspaceKey)?.cursor !== finalize.workspaceId
+    || !saved.get(finalize.lastPulledKey)?.last_pulled_at
+    || tableNames.some((table) => !saved.get(finalize.digestKeys[table])?.cursor)) {
+    return { accepted: false, reason: "receipt_value_mismatch" };
+  }
+  try {
+    const priorScopes = JSON.parse(saved.get(finalize.scopesKey)?.cursor ?? "null");
+    if (!Array.isArray(priorScopes) || !options.scopes
+      || promotionScopeSignature(priorScopes) !== promotionScopeSignature(options.scopes)) {
+      return { accepted: false, reason: "saved_scope_mismatch" };
+    }
+  } catch { return { accepted: false, reason: "saved_scope_mismatch" }; }
+  return { accepted: true, reason: "accepted" };
+}
+
+async function findStaleDocsMembershipKeysTx(
+  tx: DocsSqliteAsyncTransaction,
+  options: DocsSyncPromotionOptions,
+  tableNames: readonly string[],
+): Promise<Map<string, Set<string>>> {
+  const stale = new Map<string, Set<string>>();
+  for (const table of tableNames) {
+    const ids = options.authoritative[table]?.ids;
+    if (ids == null) continue;
+    const rows = await tx.getAllAsync<{ entity_key: string }>(
+      `WITH authority(entity_key) AS MATERIALIZED (
+         SELECT CAST(value AS TEXT) FROM json_each(?)
+       )
+       SELECT membership.entity_key
+         FROM docs_scope_membership AS membership
+         LEFT JOIN authority ON authority.entity_key = membership.entity_key
+        WHERE membership.auth_scope = ? AND membership.scope_key = ?
+          AND membership.table_name = ? AND membership.state <> 'deleted'
+          AND authority.entity_key IS NULL
+        ORDER BY membership.entity_key ASC`,
+      JSON.stringify(ids),
+      options.authScope,
+      options.scopeKey ?? `${options.scopeId ?? "personal"}|project:${options.projectId ?? ""}`,
+      table,
+    );
+    if (rows.length) stale.set(table, new Set(rows.map((row) => row.entity_key)));
+  }
+  return stale;
+}
+
+function collectDocsPromotionKeys(
+  rows: readonly { table_name: string; entity_key: string }[],
+  stale: Map<string, Set<string>>,
+): DocsPromotionKeysByTable {
+  const keys: DocsPromotionKeysByTable = new Map();
+  const add = (table: string, key: string): void => {
+    const bucket = keys.get(table) ?? new Set<string>();
+    bucket.add(key);
+    keys.set(table, bucket);
+  };
+  for (const row of rows) add(row.table_name, row.entity_key);
+  for (const [table, values] of stale) for (const key of values) add(table, key);
+  // Relation cleanup needs the endpoint memberships to preserve the existing
+  // in-scope guard, but dirty/outbox protection remains limited to actual
+  // staged or stale relation keys.
+  for (const [table, values] of [...keys]) {
+    const leftTable = table === "knowledge_node_supertags" || table === "knowledge_field_values"
+      ? "knowledge_nodes"
+      : table === "knowledge_supertag_fields" ? "knowledge_supertags" : null;
+    const rightTable = table === "knowledge_node_supertags" ? "knowledge_supertags"
+      : table === "knowledge_field_values" ? "knowledge_fields"
+        : table === "knowledge_supertag_fields" ? "knowledge_fields" : null;
+    if (!leftTable || !rightTable) continue;
+    for (const key of values) {
+      const separator = key.indexOf(":");
+      if (separator < 0) continue;
+      add(leftTable, key.slice(0, separator));
+      add(rightTable, key.slice(separator + 1));
+    }
+  }
+  return keys;
 }
 
 function preservedDocsNodeWritable(
@@ -5059,6 +5461,82 @@ async function upsertDocsMembershipBatchAsync(
   }
 }
 
+/**
+ * Reconcile a large complete authority set without copying existing
+ * membership rows into JS. The conflict predicate avoids rewriting healthy
+ * rows, while a previously readonly/blocked target membership remains
+ * readonly exactly as the paged snapshot path requires. Sibling scopes are
+ * only read for the affected staged/stale keys by the caller and are never
+ * changed here.
+ */
+async function upsertDocsMembershipAuthoritySetAsync(
+  tx: DocsSqliteAsyncTransaction,
+  options: DocsSyncPromotionOptions,
+  scopeKey: string,
+  workspaceId: string | undefined,
+  table: string,
+  ids: readonly string[],
+  now: string,
+): Promise<void> {
+  if (!workspaceId || !ids.length) return;
+  const scopeMeta = options.scopes?.find(
+    (scope) => scope.workspace_id === workspaceId
+      && (scope.project_id ?? null) === (options.projectId ?? null),
+  );
+  await tx.runAsync(
+    `WITH authority(entity_key) AS (
+       SELECT DISTINCT CAST(value AS TEXT) FROM json_each(?)
+     ), desired AS (
+       SELECT authority.entity_key,
+              CASE WHEN previous.entity_key IS NOT NULL
+                     AND previous.state <> 'deleted'
+                     AND (previous.state <> 'active'
+                       OR previous.read_only = 1
+                       OR previous.access = 'read')
+                   THEN 'readonly' ELSE 'active' END AS state
+         FROM authority
+         LEFT JOIN docs_scope_membership AS previous
+           ON previous.auth_scope = ? AND previous.scope_key = ?
+          AND previous.table_name = ?
+          AND previous.entity_key = authority.entity_key
+     )
+     INSERT INTO docs_scope_membership(
+       auth_scope, scope_key, scope_id, project_id, table_name, entity_key,
+       state, access, read_only, updated_at
+     )
+     SELECT ?, ?, ?, ?, ?, desired.entity_key, desired.state,
+            CASE WHEN desired.state = 'readonly' THEN 'read' ELSE ? END,
+            CASE WHEN desired.state = 'readonly' THEN 1 ELSE ? END,
+            ?
+       FROM desired
+      WHERE 1
+     ON CONFLICT(auth_scope, scope_key, table_name, entity_key) DO UPDATE SET
+       scope_id = excluded.scope_id,
+       project_id = excluded.project_id,
+       state = excluded.state,
+       access = excluded.access,
+       read_only = excluded.read_only,
+       updated_at = excluded.updated_at
+     WHERE docs_scope_membership.scope_id IS NOT excluded.scope_id
+        OR docs_scope_membership.project_id IS NOT excluded.project_id
+        OR docs_scope_membership.state IS NOT excluded.state
+        OR docs_scope_membership.access IS NOT excluded.access
+        OR docs_scope_membership.read_only IS NOT excluded.read_only`,
+    JSON.stringify(ids),
+    options.authScope,
+    scopeKey,
+    table,
+    options.authScope,
+    scopeKey,
+    workspaceId,
+    options.projectId ?? null,
+    table,
+    scopeMeta?.access ?? null,
+    sqlBoolean(scopeMeta?.read_only),
+    now,
+  );
+}
+
 async function removeDocsMembershipAsync(
   tx: DocsSqliteAsyncTransaction,
   authScope: string,
@@ -5534,6 +6012,427 @@ async function upsertDocsEdgeAsync(
   );
 }
 
+type DocsInitialSnapshotChunkStart = {
+  mode: "start" | "resume";
+};
+
+/**
+ * Chunk commits are restricted to a complete first snapshot and a local Docs
+ * database that is empty apart from the validated page-one root bootstrap.
+ * In that case there are no prior scoped rows to evict, quarantine, or
+ * reconcile. The persisted ready run already owns the immutable authority,
+ * scopes, and finalize metadata needed by a later resume.
+ */
+async function inspectDocsInitialSnapshotChunkStart(
+  tx: DocsSqliteAsyncTransaction,
+  options: DocsSyncPromotionOptions,
+  tableNames: readonly string[],
+  scopeKey: string,
+): Promise<DocsInitialSnapshotChunkStart | null> {
+  const run = await tx.getFirstAsync<{
+    state: string;
+    scope_key: string;
+    pending_json: unknown;
+    force: unknown;
+  }>(
+    `SELECT state, scope_key, pending_json, force
+       FROM docs_sync_runs WHERE run_id = ? AND auth_scope = ?`,
+    options.runId,
+    options.authScope,
+  );
+  if (!run || run.scope_key !== scopeKey) return null;
+  const runState = run.state;
+  if (runState === "promoting") {
+    if (!options.resumePromotion || options.force || sqliteBoolean(run.force)) {
+      throw new Error("Docs promotion requires persisted run resume selection");
+    }
+    if (!options.finalize || !options.scopes?.length || !options.finalize.serverTime) {
+      throw new Error("Docs promotion resume metadata is incomplete");
+    }
+    let pending: unknown;
+    try {
+      pending = typeof run.pending_json === "string" ? JSON.parse(run.pending_json) : run.pending_json;
+    } catch { throw new Error("Docs promotion resume state is invalid"); }
+    if (!Array.isArray(pending) || pending.length > 0) {
+      throw new Error("Docs promotion resume state is not ready");
+    }
+    return { mode: "resume" };
+  }
+  if (options.resumePromotion || runState !== "ready" || options.force || sqliteBoolean(run.force)) return null;
+  let pending: unknown;
+  try {
+    pending = typeof run.pending_json === "string" ? JSON.parse(run.pending_json) : run.pending_json;
+  } catch { return null; }
+  if (!Array.isArray(pending) || pending.length > 0) return null;
+
+  const finalize = options.finalize;
+  if (!finalize || !finalize.scopeDigest || !finalize.scopeRevision || !finalize.scopeRevisionKey
+    || !finalize.scopeDigestKey || !finalize.lastPulledKey || !finalize.scopesKey
+    || !finalize.workspaceKey || !finalize.workspaceId || !options.scopes?.length
+    || tableNames.some((table) => !finalize.digestKeys[table]
+      || !finalize.digestByTable[table] || options.authoritative[table]?.ids == null)) return null;
+  const workspaceId = finalize.workspaceId;
+  if (options.scopeSet && (options.scopeSet.previousScopes.length > 0
+    || promotionScopeSignature(options.scopeSet.newScopes) !== promotionScopeSignature(options.scopes))) return null;
+  if (tableNames.some((table) => {
+    const ids = options.authoritative[table]?.ids;
+    return ids == null || new Set(ids).size !== ids.length;
+  })) return null;
+  const largeAuthority = tableNames.some((table) =>
+    (options.authoritative[table]?.ids?.length ?? 0) >= DOCS_AUTHORITATIVE_MEMBERSHIP_SET_THRESHOLD);
+  if (!largeAuthority) return null;
+
+  // Root-first sync may have committed the exact page-one root prefix before
+  // promotion so the workspace can render immediately. Accept only those
+  // staged root IDs in the requested target scope; any other membership keeps
+  // this run on the atomic path.
+  const stagedRootRows = await tx.getAllAsync<{ entity_key: string }>(
+    `SELECT entity_key FROM docs_sync_staging
+      WHERE run_id = ? AND auth_scope = ? AND table_name = 'knowledge_nodes'
+        AND is_tombstone = 0
+        AND json_extract(payload_json, '$.node_type') = 'node'
+        AND json_extract(payload_json, '$.parent_id') IS NULL
+        AND json_extract(payload_json, '$.archived_at') IS NULL
+      ORDER BY entity_key ASC`,
+    options.runId,
+    options.authScope,
+  );
+  const stagedRootIds = stagedRootRows.map((row) => row.entity_key);
+  const stagedRootJson = JSON.stringify(stagedRootIds);
+  const otherMembership = await tx.getFirstAsync<{ present: number }>(
+    `SELECT 1 AS present FROM docs_scope_membership
+      WHERE NOT (auth_scope = ? AND scope_key = ? AND table_name = 'knowledge_nodes'
+        AND entity_key IN (SELECT CAST(value AS TEXT) FROM json_each(?))) LIMIT 1`,
+    options.authScope,
+    scopeKey,
+    stagedRootJson,
+  );
+  if (otherMembership) return null;
+  const rootMembershipRows = stagedRootIds.length
+    ? await tx.getAllAsync<{
+      entity_key: string;
+      scope_id: string | null;
+      project_id: string | null;
+      state: string;
+      access: string | null;
+      read_only: unknown;
+    }>(
+      `SELECT entity_key, scope_id, project_id, state, access, read_only
+         FROM docs_scope_membership
+        WHERE auth_scope = ? AND scope_key = ? AND table_name = 'knowledge_nodes'
+          AND entity_key IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+      options.authScope,
+      scopeKey,
+      stagedRootJson,
+    )
+    : [];
+  if (rootMembershipRows.some((row) =>
+    row.scope_id !== workspaceId
+      || (row.project_id ?? null) !== (options.projectId ?? null)
+      || !["active", "readonly"].includes(row.state))) return null;
+  const priorOutbox = await tx.getFirstAsync<{ present: number }>(
+    `SELECT 1 AS present FROM outbox
+      WHERE table_name IN (${tableNames.map(() => "?").join(", ")}) LIMIT 1`,
+    ...tableNames,
+  );
+  if (priorOutbox) return null;
+
+  // A missing membership projection can coexist with orphaned or legacy live
+  // rows. Only the exact root rows above may already be live; every other Docs
+  // live table and every unrelated node must be empty.
+  const liveTables = [
+    "knowledge_supertags", "knowledge_node_supertags",
+    "knowledge_supertag_fields", "knowledge_fields", "knowledge_field_values",
+    "knowledge_node_placements", "knowledge_edges",
+  ];
+  for (const table of liveTables) {
+    if (await tx.getFirstAsync<{ present: number }>(`SELECT 1 AS present FROM ${table} LIMIT 1`)) return null;
+  }
+  if (rootMembershipRows.length) {
+    const rootLiveRows = await tx.getAllAsync<{ id: string }>(
+      `SELECT id FROM knowledge_nodes
+        WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+          AND workspace_id = ? AND project_id IS ? AND parent_id IS NULL
+          AND archived_at IS NULL AND dirty = 0`,
+      JSON.stringify(rootMembershipRows.map((row) => row.entity_key)),
+      workspaceId,
+      options.projectId ?? null,
+    );
+    const liveNodeCount = await tx.getFirstAsync<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM knowledge_nodes",
+    );
+    if (rootLiveRows.length !== rootMembershipRows.length
+      || Number(liveNodeCount?.count ?? 0) !== rootMembershipRows.length) return null;
+  } else if (await tx.getFirstAsync<{ present: number }>("SELECT 1 AS present FROM knowledge_nodes LIMIT 1")) {
+    return null;
+  }
+
+  const receiptKeys = [
+    finalize.scopeDigestKey,
+    finalize.scopeRevisionKey,
+    finalize.lastPulledKey,
+    finalize.scopesKey,
+    finalize.workspaceKey,
+    ...tableNames.map((table) => finalize.digestKeys[table]),
+  ];
+  // applyRemoteDocsRootBootstrapRows uses the unsuffixed workspace marker.
+  // It is the only pre-finalization sync_state row permitted, and only when
+  // the matching staged roots and their live memberships are present.
+  const rootWorkspaceKey = `docs_workspace:v2:${options.authScope.slice("auth:".length)}`;
+  const bootstrapReceiptKeys = [...new Set([...receiptKeys, rootWorkspaceKey])];
+  const priorReceiptRows = await tx.getAllAsync<{ table_name: string; cursor: string | null }>(
+    `SELECT table_name, cursor FROM sync_state
+      WHERE table_name IN (${bootstrapReceiptKeys.map(() => "?").join(", ")})`,
+    ...bootstrapReceiptKeys,
+  );
+  if (priorReceiptRows.some((row) =>
+    row.table_name !== rootWorkspaceKey || row.cursor !== workspaceId)) return null;
+  if ((rootMembershipRows.length > 0) !== (priorReceiptRows.length > 0)) return null;
+
+  let totalStaged = 0;
+  for (const table of tableNames) {
+    options.assertActive?.();
+    const ids = options.authoritative[table]?.ids;
+    if (!ids) return null;
+    const count = await tx.getFirstAsync<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM docs_sync_staging
+        WHERE run_id = ? AND auth_scope = ? AND table_name = ? AND is_tombstone = 0`,
+      options.runId,
+      options.authScope,
+      table,
+    );
+    if (Number(count?.count ?? 0) !== ids.length) return null;
+    const missingAuthorityRow = ids.length
+      ? await tx.getFirstAsync<{ present: number }>(
+        `SELECT 1 AS present FROM json_each(?) AS authority
+          WHERE NOT EXISTS (
+            SELECT 1 FROM docs_sync_staging AS staged
+             WHERE staged.run_id = ? AND staged.auth_scope = ? AND staged.table_name = ?
+               AND staged.entity_key = CAST(authority.value AS TEXT)
+          ) LIMIT 1`,
+        JSON.stringify(ids),
+        options.runId,
+        options.authScope,
+        table,
+      )
+      : null;
+    if (missingAuthorityRow) return null;
+    totalStaged += ids.length;
+  }
+  const allStaged = await tx.getFirstAsync<{ count: number }>(
+    "SELECT COUNT(*) AS count FROM docs_sync_staging WHERE run_id = ? AND auth_scope = ?",
+    options.runId,
+    options.authScope,
+  );
+  if (Number(allStaged?.count ?? 0) !== totalStaged
+    || totalStaged < DOCS_AUTHORITATIVE_MEMBERSHIP_SET_THRESHOLD) return null;
+
+  await tx.runAsync(
+    `UPDATE docs_sync_runs SET state = 'promoting', updated_at = ?
+      WHERE run_id = ? AND auth_scope = ? AND scope_key = ? AND state = 'ready'`,
+    finalize.serverTime,
+    options.runId,
+    options.authScope,
+    scopeKey,
+  );
+  return { mode: "start" };
+}
+
+async function applyDocsInitialSnapshotChunkTx(
+  tx: DocsSqliteAsyncTransaction,
+  options: DocsSyncPromotionOptions,
+  rows: readonly RawDocsStaging[],
+  now: string,
+  workspaceId: string | undefined,
+  scopeKey: string,
+  scopeMeta: NonNullable<DocsSyncPromotionOptions["scopes"]>[number] | undefined,
+  progress: DocsStagingProgress,
+): Promise<void> {
+  const keyRows = rows.map((row) => ({ table_name: row.table_name, entity_key: row.entity_key }));
+  const keysByTable = collectDocsPromotionKeys(keyRows, new Map());
+  const membership = await loadDocsMembershipSnapshotForKeysTx(
+    tx, options.authScope, scopeKey, scopeMeta, keysByTable, options.assertActive,
+  );
+  const outbox = await loadDocsScopedOutboxProtectionTx(
+    tx, options.authScope, scopeKey, DOCS_SCOPE_TABLE_NAMES, keysByTable,
+  );
+  const dirty = await loadDocsDirtyRowsForKeysTx(tx, keysByTable);
+  const isProtected = (table: string, key: string): boolean =>
+    outbox.get(table)?.has(key) === true
+    || (table === "knowledge_nodes" && dirty.nodes.has(key))
+    || (table === "knowledge_supertags" && dirty.supertags.has(key))
+    || (table === "knowledge_node_supertags" && dirty.nodeSupertags.has(key))
+    || (table === "knowledge_field_values" && dirty.fieldValues.has(key));
+  const writes = new Map<string, Map<string, string[]>>();
+  const nodeRows: Record<string, unknown>[] = [];
+  const simpleRows: DocsSyncStagedRow[] = [];
+
+  for (const row of rows) {
+    options.assertActive?.();
+    const payload = decodeDocsSqlJson<Record<string, unknown> | null>(row.payload_json, null) ?? {};
+    const staged: DocsSyncStagedRow = {
+      tableName: row.table_name,
+      entityKey: row.entity_key,
+      payload,
+      isTombstone: sqliteBoolean(row.is_tombstone),
+    };
+    const key = staged.entityKey || docsCompositeKey(payload);
+    if (!key) continue;
+    if (isProtected(staged.tableName, key)) {
+      const cached = staged.tableName === "knowledge_nodes"
+        ? await tx.getFirstAsync<{ access: string | null; read_only: number | null }>(
+          "SELECT access, read_only FROM knowledge_nodes WHERE id = ?", key,
+        ) : null;
+      const state = !staged.isTombstone && staged.tableName === "knowledge_nodes"
+        && preservedDocsNodeWritable(options, scopeKey, payload,
+          cached ? { access: cached.access, readOnly: cached.read_only !== 0 } : null)
+        ? "active" : "blocked";
+      await upsertDocsMembershipAsync(tx, options, scopeKey, workspaceId, staged.tableName, key, state, now);
+      await setDocsConflictAsync(tx, options, scopeKey, staged.tableName, key, payload);
+      continue;
+    }
+    if (staged.isTombstone || payload.deleted === true) {
+      await removeDocsMembershipAsync(tx, options.authScope, scopeKey, staged.tableName, key);
+      if ((membership.refs.get(`${staged.tableName}:${key}`) ?? 0) <= 1) {
+        await deleteDocsLiveRowAsync(tx, staged.tableName, key);
+      }
+      continue;
+    }
+
+    const state = staged.tableName === "knowledge_nodes" && membership.readonlyNodes.has(key)
+      ? "readonly" : "active";
+    const byState = writes.get(staged.tableName) ?? new Map<string, string[]>();
+    const stateKeys = byState.get(state) ?? [];
+    stateKeys.push(key);
+    byState.set(state, stateKeys);
+    writes.set(staged.tableName, byState);
+    if (staged.tableName === "knowledge_nodes") {
+      nodeRows.push(state === "readonly" ? { ...payload, access: "read", read_only: true } : payload);
+    } else {
+      simpleRows.push(staged);
+    }
+  }
+
+  for (const [table, byState] of writes) {
+    for (const [state, ids] of byState) {
+      await upsertDocsMembershipBatchAsync(tx, options, scopeKey, workspaceId, table, ids, state, now);
+    }
+  }
+  if (nodeRows.length) await upsertDocsNodeBatchAsync(tx, nodeRows, now, progress);
+  for (const row of simpleRows) {
+    const payload = row.payload ?? {};
+    const key = row.entityKey || docsCompositeKey(payload);
+    if (!key) continue;
+    if (row.tableName === "knowledge_supertags") await upsertDocsSupertagAsync(tx, payload, now);
+    else if (row.tableName === "knowledge_fields") await upsertDocsFieldAsync(tx, payload, now);
+    else if (row.tableName === "knowledge_supertag_fields") await upsertDocsSupertagFieldAsync(tx, payload);
+    else if (row.tableName === "knowledge_node_supertags") await upsertDocsNodeSupertagAsync(tx, payload);
+    else if (row.tableName === "knowledge_field_values") await upsertDocsFieldValueAsync(tx, payload, now);
+    else if (row.tableName === "knowledge_node_placements") await upsertDocsPlacementAsync(tx, payload);
+    else if (row.tableName === "knowledge_edges") await upsertDocsEdgeAsync(tx, payload);
+  }
+
+  for (const table of DOCS_SCOPE_TABLE_NAMES) {
+    const ids = rows.filter((row) => row.table_name === table).map((row) => row.entity_key);
+    if (!ids.length) continue;
+    await tx.runAsync(
+      `DELETE FROM docs_sync_staging WHERE run_id = ? AND auth_scope = ? AND table_name = ?
+        AND entity_key IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+      options.runId,
+      options.authScope,
+      table,
+      JSON.stringify(ids),
+    );
+  }
+  progress.rowsRead += rows.length;
+  progress.batchesRead += 1;
+  progress.rowsApplied += rows.length;
+}
+
+async function promoteDocsEmptyInitialSnapshotInChunks(
+  options: DocsSyncPromotionOptions,
+  tableNames: readonly string[],
+  scopeKey: string,
+  workspaceId: string | undefined,
+): Promise<DocsSyncPromotionTelemetry | null> {
+  const now = new Date().toISOString();
+  const start = await withForegroundYieldingDocsExclusiveTransaction((rawTx) =>
+    withDocsPreparedWrites(rawTx, (tx) =>
+      inspectDocsInitialSnapshotChunkStart(tx, options, tableNames, scopeKey)),
+    options.assertActive,
+    options.onSqliteProgress,
+  );
+  if (!start) {
+    if (options.resumePromotion) throw new Error("Docs promotion resume state is unavailable");
+    return null;
+  }
+  if (start.mode === "resume" && !options.resumePromotion) {
+    throw new Error("Docs promotion requires persisted run resume selection");
+  }
+  options.onPromotionRevalidation?.({
+    path: "full_fallback",
+    reason: start.mode === "resume" ? "resuming_promotion" : "empty_cache_initial_snapshot",
+  });
+
+  const scopeMeta = options.scopes?.find((scope) => scope.workspace_id === workspaceId
+    && (scope.project_id ?? null) === (options.projectId ?? null));
+  const progress: DocsStagingProgress = {
+    rowsRead: 0, batchesRead: 0, rowsApplied: 0,
+    nodeUpsertRows: 0, nodeUpsertBatches: 0, unchangedNodes: 0,
+  };
+  let maxBatchSize = 0;
+  while (true) {
+    options.assertActive?.();
+    const chunkResult = await withForegroundYieldingDocsExclusiveTransaction((rawTx) =>
+      withDocsPreparedWrites(rawTx, async (tx) => {
+        const run = await tx.getFirstAsync<{ state: string; scope_key: string }>(
+          "SELECT state, scope_key FROM docs_sync_runs WHERE run_id = ? AND auth_scope = ?",
+          options.runId,
+          options.authScope,
+        );
+        if (!run || run.state !== "promoting" || run.scope_key !== scopeKey) {
+          throw new Error("Docs promotion persisted chunk state changed");
+        }
+        const order = tableNames.map((table, index) => `WHEN '${table}' THEN ${index}`).join(" ");
+        const rows = await tx.getAllAsync<RawDocsStaging>(
+          `SELECT table_name, entity_key, payload_json, is_tombstone
+             FROM docs_sync_staging WHERE run_id = ? AND auth_scope = ?
+            ORDER BY CASE table_name ${order} ELSE ${tableNames.length} END, entity_key ASC
+            LIMIT ${DOCS_STAGED_PROMOTION_BATCH_SIZE}`,
+          options.runId,
+          options.authScope,
+        );
+        if (!rows.length) {
+          options.onPromotionPhase?.("finalizing");
+          await finalizeDocsSyncRunTx(tx, options);
+          return { done: true as const, rows: 0 };
+        }
+        options.onPromotionPhase?.("membership_snapshot");
+        docsPermissionEpoch += 1;
+        options.onPromotionPhase?.("protection");
+        options.onPromotionPhase?.("staging");
+        await applyDocsInitialSnapshotChunkTx(
+          tx, options, rows, now, workspaceId, scopeKey, scopeMeta, progress,
+        );
+        return { done: false as const, rows: rows.length };
+      }),
+      options.assertActive,
+      options.onSqliteProgress,
+    );
+    docsPermissionEpoch += 1;
+    if (chunkResult.done) break;
+    maxBatchSize = Math.max(maxBatchSize, chunkResult.rows);
+    options.onStagingProgress?.({ ...progress });
+    options.assertActive?.();
+  }
+  return {
+    source: "staging",
+    rowsRead: progress.rowsRead,
+    batches: progress.batchesRead,
+    maxBatchSize,
+  };
+}
+
 async function promoteDocsSyncRunAsync(
   options: DocsSyncPromotionOptions,
 ): Promise<DocsSyncPromotionTelemetry> {
@@ -5545,16 +6444,26 @@ async function promoteDocsSyncRunAsync(
     ?? options.authoritative.knowledge_nodes?.scopeId
     ?? options.authoritative.knowledge_supertags?.scopeId
     ?? options.authoritative.knowledge_fields?.scopeId;
+  const hasLargeAuthority = tableNames.some((table) =>
+    (options.authoritative[table]?.ids?.length ?? 0) >= DOCS_AUTHORITATIVE_MEMBERSHIP_SET_THRESHOLD);
+  if (options.resumePromotion || (!options.validatedIncremental && hasLargeAuthority)) {
+    const chunkedInitialSnapshot = await promoteDocsEmptyInitialSnapshotInChunks(
+      options, tableNames, scopeKey, workspaceId,
+    );
+    if (chunkedInitialSnapshot) return chunkedInitialSnapshot;
+  }
   const membershipScopeMeta = options.scopes?.find(
     (scope) => scope.workspace_id === workspaceId
       && (scope.project_id ?? null) === (options.projectId ?? null),
   );
   options.onPromotionPhase?.("building_sets");
-  const authoritativeByTable = await buildDocsAuthoritativeSets(
-    options.authoritative,
-    tableNames,
-    options.assertActive,
-  );
+  let authoritativeByTable = options.validatedIncremental
+    ? new Map<string, Set<string>>()
+    : await buildDocsAuthoritativeSets(
+        options.authoritative,
+        tableNames,
+        options.assertActive,
+      );
 
   const stagingProgress: DocsStagingProgress = {
     rowsRead: 0, batchesRead: 0, rowsApplied: 0,
@@ -5565,7 +6474,28 @@ async function promoteDocsSyncRunAsync(
     withDocsPreparedWrites(rawTx, async (tx) => {
     options.onPromotionPhase?.("unchanged_receipt");
     if (await tryFinalizeUnchangedDocsRunTx(tx, options, tableNames)) {
+      options.onPromotionRevalidation?.({ path: "unchanged_receipt", reason: "unchanged_receipt" });
       return { source: "staging" as const, rowsRead: 0, batches: 0, maxBatchSize: 0 };
+    }
+    const revalidation = await canPromoteValidatedIncrementalTx(tx, options, tableNames);
+    const incrementalPromotion = revalidation.accepted;
+    options.onPromotionRevalidation?.({
+      path: incrementalPromotion ? "validated_incremental" : "full_fallback",
+      reason: revalidation.reason,
+    });
+    // Missing authority for one table means retain that table's prior
+    // membership; it does not require reading every account membership row.
+    // Reconcile only tables with an explicit authority array and use targeted
+    // snapshots for staged/stale keys so partial fallback remains safe.
+    const optimizedAuthorityFallback = !incrementalPromotion && hasLargeAuthority;
+    if (options.validatedIncremental && !incrementalPromotion) {
+      // A receipt changed while this run was staged. Fall back to the exact
+      // authoritative reconciliation path instead of trusting the delta.
+      authoritativeByTable = await buildDocsAuthoritativeSets(
+        options.authoritative,
+        tableNames,
+        options.assertActive,
+      );
     }
     docsPermissionEpoch += 1;
     // Everything below, including the protection snapshot, runs on the same
@@ -5573,22 +6503,72 @@ async function promoteDocsSyncRunAsync(
     // native transaction object.  No Drizzle query is allowed to observe or
     // mutate the promotion while it is in flight.
     options.onPromotionPhase?.("membership_snapshot");
-    const membershipSnapshot = await loadDocsMembershipSnapshotTx(
-      tx,
-      options.authScope,
-      scopeKey,
-      membershipScopeMeta,
-      options.assertActive,
-      { workspace_id: workspaceId, project_id: options.projectId ?? null },
-    );
+    let staleByTable = new Map<string, Set<string>>();
+    let stagedKeyRows: Array<{ table_name: string; entity_key: string }> = [];
+    let affectedKeysByTable: DocsPromotionKeysByTable | undefined;
+    let stagedKeysByTable = new Map<string, Set<string>>();
+    let membershipSnapshot: Awaited<ReturnType<typeof loadDocsMembershipSnapshotTx>>;
+    if (incrementalPromotion || optimizedAuthorityFallback) {
+      staleByTable = await findStaleDocsMembershipKeysTx(tx, options, tableNames);
+      stagedKeyRows = await tx.getAllAsync<{ table_name: string; entity_key: string }>(
+        `SELECT table_name, entity_key FROM docs_sync_staging
+          WHERE run_id = ? AND auth_scope = ? ORDER BY table_name, entity_key`,
+        options.runId,
+        options.authScope,
+      );
+      stagedKeysByTable = new Map();
+      for (const row of stagedKeyRows) {
+        const bucket = stagedKeysByTable.get(row.table_name) ?? new Set<string>();
+        bucket.add(row.entity_key);
+        stagedKeysByTable.set(row.table_name, bucket);
+      }
+      affectedKeysByTable = new Map();
+      for (const [table, keys] of stagedKeysByTable) {
+        affectedKeysByTable.set(table, new Set(keys));
+      }
+      for (const [table, keys] of staleByTable) {
+        const bucket = affectedKeysByTable.get(table) ?? new Set<string>();
+        for (const key of keys) bucket.add(key);
+        affectedKeysByTable.set(table, bucket);
+      }
+      const membershipKeysByTable = collectDocsPromotionKeys(stagedKeyRows, staleByTable);
+      membershipSnapshot = await loadDocsMembershipSnapshotForKeysTx(
+        tx,
+        options.authScope,
+        scopeKey,
+        membershipScopeMeta,
+        membershipKeysByTable,
+        options.assertActive,
+      );
+    } else {
+      membershipSnapshot = await loadDocsMembershipSnapshotTx(
+        tx,
+        options.authScope,
+        scopeKey,
+        membershipScopeMeta,
+        options.assertActive,
+        { workspace_id: workspaceId, project_id: options.projectId ?? null },
+      );
+      for (const table of tableNames) {
+        const ids = authoritativeByTable.get(table);
+        if (!ids) continue;
+        const stale = new Set(
+          [...(membershipSnapshot.scoped.get(table) ?? [])].filter((key) => !ids.has(key)),
+        );
+        if (stale.size) staleByTable.set(table, stale);
+      }
+    }
     options.onPromotionPhase?.("protection");
     const outboxProtection = await loadDocsScopedOutboxProtectionTx(
       tx,
       options.authScope,
       scopeKey,
       tableNames,
+      affectedKeysByTable,
     );
-    const dirty = await loadDocsDirtyRowsPagedTx(tx);
+    const dirty = (incrementalPromotion || optimizedAuthorityFallback) && affectedKeysByTable
+      ? await loadDocsDirtyRowsForKeysTx(tx, affectedKeysByTable)
+      : await loadDocsDirtyRowsPagedTx(tx);
     const isProtected = (table: string, key: string): boolean => {
       if (outboxProtection.get(table)?.has(key)) return true;
       if (table === "knowledge_nodes" && dirty.nodes.has(key)) return true;
@@ -5614,6 +6594,7 @@ async function promoteDocsSyncRunAsync(
       const scopeBucket = scopedMembership.get(table);
       if (!scopeBucket?.has(key)) return;
       scopeBucket.delete(key);
+      staleByTable.get(table)?.delete(key);
       const refKey = `${table}:${key}`;
       const count = (membershipRefs.get(refKey) ?? 1) - 1;
       if (count > 0) membershipRefs.set(refKey, count);
@@ -5677,11 +6658,20 @@ async function promoteDocsSyncRunAsync(
       payload: unknown,
     ): Promise<void> => setDocsConflictAsync(tx, options, scopeKey, table, key, payload);
 
-    for (const table of tableNames) {
-      const ids = authoritativeIds(table);
-      if (!ids) continue;
-      const keys = [...ids];
-      await upsertMembershipBatch(table, keys);
+    if (optimizedAuthorityFallback) {
+      for (const table of tableNames) {
+        const ids = options.authoritative[table]?.ids;
+        if (!ids?.length) continue;
+        await upsertDocsMembershipAuthoritySetAsync(
+          tx, options, scopeKey, workspaceId, table, ids, now,
+        );
+      }
+    } else {
+      for (const table of tableNames) {
+        const ids = authoritativeIds(table);
+        if (!ids) continue;
+        await upsertMembershipBatch(table, [...ids]);
+      }
     }
 
     const stagedTelemetry: DocsSyncPromotionTelemetry = {
@@ -5833,11 +6823,23 @@ async function promoteDocsSyncRunAsync(
     ) : new Set<string>();
 
     const nodeAuthoritative = authoritativeIds("knowledge_nodes");
-    if (nodeAuthoritative) {
+    const incrementalStaleKeys = (table: string): string[] => {
+      const staged = stagedKeysByTable.get(table) ?? new Set<string>();
+      const current = scopedMembership.get(table) ?? new Set<string>();
+      return [...(staleByTable.get(table) ?? new Set<string>())]
+        .filter((key) => current.has(key) && !staged.has(key));
+    };
+    const fullFallbackStaleKeys = (table: string): string[] =>
+      [...(staleByTable.get(table) ?? new Set<string>())]
+        .filter((key) => scopedMembership.get(table)?.has(key));
+    const nodeStale = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_nodes")
+      : nodeAuthoritative ? fullFallbackStaleKeys("knowledge_nodes") : [];
+    if (nodeStale.length) {
       await forEachDocsPromotionChunk(
-        scopedMembership.get("knowledge_nodes") ?? [],
+        nodeStale,
         async (id) => {
-          if (nodeAuthoritative.has(id) || pendingCreates.has(id)) return;
+          if (pendingCreates.has(id)) return;
           if (isProtected("knowledge_nodes", id)) {
             await blockMembershipTx("knowledge_nodes", id);
             await setConflict("knowledge_nodes", id, {
@@ -5861,11 +6863,13 @@ async function promoteDocsSyncRunAsync(
     }
 
     const supertagAuthoritative = authoritativeIds("knowledge_supertags");
-    if (supertagAuthoritative) {
+    const supertagStale = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_supertags")
+      : supertagAuthoritative ? fullFallbackStaleKeys("knowledge_supertags") : [];
+    if (supertagStale.length) {
       await forEachDocsPromotionChunk(
-        scopedMembership.get("knowledge_supertags") ?? [],
+        supertagStale,
         async (id) => {
-          if (supertagAuthoritative.has(id)) return;
           if (isProtected("knowledge_supertags", id)) {
             await blockMembershipTx("knowledge_supertags", id);
             await setConflict("knowledge_supertags", id, {
@@ -5885,11 +6889,13 @@ async function promoteDocsSyncRunAsync(
     }
 
     const fieldAuthoritative = authoritativeIds("knowledge_fields");
-    if (fieldAuthoritative) {
+    const fieldStale = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_fields")
+      : fieldAuthoritative ? fullFallbackStaleKeys("knowledge_fields") : [];
+    if (fieldStale.length) {
       await forEachDocsPromotionChunk(
-        scopedMembership.get("knowledge_fields") ?? [],
+        fieldStale,
         async (id) => {
-          if (fieldAuthoritative.has(id)) return;
           if (isProtected("knowledge_fields", id)) {
             await blockMembershipTx("knowledge_fields", id);
             await setConflict("knowledge_fields", id, {
@@ -5908,9 +6914,13 @@ async function promoteDocsSyncRunAsync(
       );
     }
 
-    const nodeScope = scopedMembership.get("knowledge_nodes") ?? new Set<string>();
-    const supertagScope = scopedMembership.get("knowledge_supertags") ?? new Set<string>();
-    const fieldScope = scopedMembership.get("knowledge_fields") ?? new Set<string>();
+    const isInScope = (table: string, key: string): boolean => {
+      const current = scopedMembership.get(table);
+      if (incrementalPromotion) return current?.has(key) ?? false;
+      return authoritativeIds(table)?.has(key) === true
+        || staleByTable.get(table)?.has(key) === true
+        || current?.has(key) === true;
+    };
     const reconcileRelation = async (
       table: string,
       key: string,
@@ -5918,7 +6928,10 @@ async function promoteDocsSyncRunAsync(
       authoritative: Set<string> | null,
       remove: () => Promise<void>,
     ): Promise<void> => {
-      if (!inScope || !authoritative || authoritative.has(key)) return;
+      const shouldRemove = incrementalPromotion
+        ? staleByTable.get(table)?.has(key) === true
+        : Boolean(authoritative && !authoritative.has(key));
+      if (!inScope || !shouldRemove) return;
       if (isProtected(table, key)) {
         await blockMembershipTx(table, key);
         const [first, second] = key.split(":", 2);
@@ -5938,14 +6951,17 @@ async function promoteDocsSyncRunAsync(
       if (!membershipRefs.has(`${table}:${key}`)) await remove();
     };
     const nodeSupertagAuth = authoritativeIds("knowledge_node_supertags");
+    const staleNodeSupertags = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_node_supertags")
+      : nodeSupertagAuth ? fullFallbackStaleKeys("knowledge_node_supertags") : [];
     await forEachDocsPromotionChunk(
-      scopedMembership.get("knowledge_node_supertags") ?? [],
+      staleNodeSupertags,
       async (key) => {
         const [nodeId, supertagId] = key.split(":", 2);
         await reconcileRelation(
           "knowledge_node_supertags",
           key,
-          nodeScope.has(nodeId) || supertagScope.has(supertagId),
+          isInScope("knowledge_nodes", nodeId) || isInScope("knowledge_supertags", supertagId),
           nodeSupertagAuth,
           () => deleteDocsLiveRowAsync(tx, "knowledge_node_supertags", key),
         );
@@ -5953,14 +6969,17 @@ async function promoteDocsSyncRunAsync(
       options.assertActive,
     );
     const fieldValueAuth = authoritativeIds("knowledge_field_values");
+    const staleFieldValues = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_field_values")
+      : fieldValueAuth ? fullFallbackStaleKeys("knowledge_field_values") : [];
     await forEachDocsPromotionChunk(
-      scopedMembership.get("knowledge_field_values") ?? [],
+      staleFieldValues,
       async (key) => {
         const [nodeId, fieldId] = key.split(":", 2);
         await reconcileRelation(
           "knowledge_field_values",
           key,
-          nodeScope.has(nodeId) || fieldScope.has(fieldId),
+          isInScope("knowledge_nodes", nodeId) || isInScope("knowledge_fields", fieldId),
           fieldValueAuth,
           () => deleteDocsLiveRowAsync(tx, "knowledge_field_values", key),
         );
@@ -5968,14 +6987,17 @@ async function promoteDocsSyncRunAsync(
       options.assertActive,
     );
     const supertagFieldAuth = authoritativeIds("knowledge_supertag_fields");
+    const staleSupertagFields = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_supertag_fields")
+      : supertagFieldAuth ? fullFallbackStaleKeys("knowledge_supertag_fields") : [];
     await forEachDocsPromotionChunk(
-      scopedMembership.get("knowledge_supertag_fields") ?? [],
+      staleSupertagFields,
       async (key) => {
         const [supertagId, fieldId] = key.split(":", 2);
         await reconcileRelation(
           "knowledge_supertag_fields",
           key,
-          supertagScope.has(supertagId) || fieldScope.has(fieldId),
+          isInScope("knowledge_supertags", supertagId) || isInScope("knowledge_fields", fieldId),
           supertagFieldAuth,
           () => deleteDocsLiveRowAsync(tx, "knowledge_supertag_fields", key),
         );
@@ -5983,10 +7005,12 @@ async function promoteDocsSyncRunAsync(
       options.assertActive,
     );
     const placementAuth = authoritativeIds("knowledge_node_placements");
+    const stalePlacements = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_node_placements")
+      : placementAuth ? fullFallbackStaleKeys("knowledge_node_placements") : [];
     await forEachDocsPromotionChunk(
-      scopedMembership.get("knowledge_node_placements") ?? [],
+      stalePlacements,
       async (key) => {
-        if (!placementAuth || placementAuth.has(key)) return;
         if (isProtected("knowledge_node_placements", key)) {
           await blockMembershipTx("knowledge_node_placements", key);
           await setConflict("knowledge_node_placements", key, { id: key, deleted: true });
@@ -6001,10 +7025,12 @@ async function promoteDocsSyncRunAsync(
       options.assertActive,
     );
     const edgeAuth = authoritativeIds("knowledge_edges");
+    const staleEdges = incrementalPromotion
+      ? incrementalStaleKeys("knowledge_edges")
+      : edgeAuth ? fullFallbackStaleKeys("knowledge_edges") : [];
     await forEachDocsPromotionChunk(
-      scopedMembership.get("knowledge_edges") ?? [],
+      staleEdges,
       async (key) => {
-        if (!edgeAuth || edgeAuth.has(key)) return;
         if (isProtected("knowledge_edges", key)) {
           await blockMembershipTx("knowledge_edges", key);
           await setConflict("knowledge_edges", key, { id: key, deleted: true });
@@ -6374,17 +7400,25 @@ export const docsRepo = {
   async listPages(options?: {
     diagnostics?: DocsReadDiagnostics;
     signal?: AbortSignal;
+    authScope?: string | null;
   }): Promise<DocsNode[]> {
     assertDocsReadActive(options?.signal);
     const db = getDb();
-    const rowVisibility = await getDocsVisibility(
-      "knowledge_nodes",
-      undefined,
-      undefined,
-      options?.diagnostics,
-    );
+    let authScope: string | null = null;
+    let workspaceIds: string[] = [];
+    try {
+      const hasAuthScopeOverride = options != null && "authScope" in options;
+      if (hasAuthScopeOverride) {
+        authScope = options.authScope ?? null;
+      } else {
+        const token = await getToken();
+        authScope = token ? getTokenAuthScope(token) : null;
+      }
+      workspaceIds = await getSavedDocsWorkspaceIds(authScope);
+    } catch {
+      markDocsReadDegraded(options?.diagnostics, "workspace_projection_unavailable");
+    }
     assertDocsReadActive(options?.signal);
-    const workspaceIds = rowVisibility.workspaceIds;
     const conditions = [
       isNull(schema.knowledgeNodes.parentId),
       isNull(schema.knowledgeNodes.archivedAt),
@@ -6407,19 +7441,57 @@ export const docsRepo = {
       // the first validated Docs promotion records the current workspace.
       conditions.push(eq(schema.knowledgeNodes.dirty, true) as never);
     }
+    // Read root candidates first, projecting no body/content columns. The
+    // membership lookup below is then bounded to these IDs instead of
+    // materializing the entire Docs membership and outbox tables on JS.
     const rows = await db
-      .select()
+      .select({
+        id: schema.knowledgeNodes.id,
+        workspaceId: schema.knowledgeNodes.workspaceId,
+        parentId: schema.knowledgeNodes.parentId,
+        rootPageId: schema.knowledgeNodes.rootPageId,
+        projectId: schema.knowledgeNodes.projectId,
+        source: schema.knowledgeNodes.source,
+        access: schema.knowledgeNodes.access,
+        readOnly: schema.knowledgeNodes.readOnly,
+        systemKey: schema.knowledgeNodes.systemKey,
+        title: schema.knowledgeNodes.title,
+        description: schema.knowledgeNodes.description,
+        nodeType: schema.knowledgeNodes.nodeType,
+        sortOrder: schema.knowledgeNodes.sortOrder,
+        dirty: schema.knowledgeNodes.dirty,
+        createdBy: schema.knowledgeNodes.createdBy,
+        updatedBy: schema.knowledgeNodes.updatedBy,
+        createdAt: schema.knowledgeNodes.createdAt,
+        updatedAt: schema.knowledgeNodes.updatedAt,
+        archivedAt: schema.knowledgeNodes.archivedAt,
+      })
       .from(schema.knowledgeNodes)
       .where(and(...conditions));
     assertDocsReadActive(options?.signal);
+    const rowVisibility = await getDocsVisibility(
+      "knowledge_nodes",
+      undefined,
+      new Set(rows.map((row) => row.id)),
+      options?.diagnostics,
+      { workspaceIds, authScope },
+    );
+    assertDocsReadActive(options?.signal);
     return rows
       .filter((row) => docsRowVisible(row, rowVisibility))
-      .map(toNode)
+      .map(toDocsRootListNode)
       .sort(sortBySortThenTitle);
   },
 
   /** Read the same visibility-filtered page list with a non-secret diagnostic count. */
-  async listPagesWithDiagnostics(options?: { signal?: AbortSignal }): Promise<DocsPagesReadSummary> {
+  async listPagesWithDiagnostics(options?: {
+    signal?: AbortSignal;
+    onPages?: (
+      pages: DocsNode[],
+      readStatus: "success" | "degraded",
+      reasons: DocsReadDegradedReason[],
+    ) => void;
+  }): Promise<DocsPagesReadSummary> {
     const signal = options?.signal;
     assertDocsReadActive(signal);
     let generationStart: DocsReadGeneration;
@@ -6431,18 +7503,56 @@ export const docsRepo = {
       return blockedDocsReadSummary("auth_generation_unknown");
     }
     const readDiagnostics: DocsReadDiagnostics = { reasons: new Set() };
-    let pages = await docsRepo.listPages({ diagnostics: readDiagnostics, signal });
+    const token = generationStart.auth.token;
+    const pagesFromSqlite = await docsRepo.listPages({
+      diagnostics: readDiagnostics,
+      signal,
+      authScope: token ? getTokenAuthScope(token) : null,
+    });
+    assertDocsReadActive(signal);
+    let generationStatus: DocsReadGenerationStatus;
+    try {
+      generationStatus = compareDocsReadGeneration(
+        generationStart,
+        await captureDocsReadGeneration(),
+      );
+      assertDocsReadActive(signal);
+    } catch (error) {
+      if (isDocsReadCancelled(error)) throw error;
+      return blockedDocsReadSummary("auth_generation_unknown");
+    }
+    if (generationStatus === "changed" || generationStatus === "unknown") {
+      const reason = generationStatus === "changed"
+        ? "auth_generation_mismatch"
+        : "auth_generation_unknown";
+      return {
+        ...blockedDocsReadSummary(reason),
+        generationStatus,
+      };
+    }
+    const pages = pagesFromSqlite;
+    if (generationStatus === "degraded") {
+      markDocsReadDegraded(readDiagnostics, "auth_generation_mismatch");
+    }
+    const fastReadReasons = [...readDiagnostics.reasons];
+    options?.onPages?.(
+      pages,
+      fastReadReasons.length ? "degraded" : "success",
+      fastReadReasons,
+    );
+    // Let React paint the bounded root projection before SecureStore actor
+    // checks and non-visible diagnostics run on the same JS/SQLite lane.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     assertDocsReadActive(signal);
     const db = getDb();
     let workspaceIds: string[] | null = null;
     let actorScopeStatus: DocsPagesReadSummary["actorScopeStatus"] = "unknown";
     let aggregateStatus: DocsPagesReadSummary["aggregateStatus"] = "success";
     try {
-      const token = await getToken();
-      assertDocsReadActive(signal);
+      const token = generationStart.auth.token;
       if (token) {
         actorScopeStatus = "resolved";
-        workspaceIds = await getSavedDocsWorkspaceIds();
+        workspaceIds = await getSavedDocsWorkspaceIds(getTokenAuthScope(token));
         assertDocsReadActive(signal);
       }
     } catch (error) {
@@ -6457,10 +7567,12 @@ export const docsRepo = {
     let localDirtyNodeCount: number | null = null;
     let localDirtyRootCount: number | null = null;
     try {
-      const activeRows = await db
+      const counts = await db
         .select({
-          parentId: schema.knowledgeNodes.parentId,
-          dirty: schema.knowledgeNodes.dirty,
+          activeNodeCount: count(schema.knowledgeNodes.id),
+          activeRootCount: count(sql`CASE WHEN ${schema.knowledgeNodes.parentId} IS NULL THEN 1 END`),
+          localDirtyNodeCount: count(sql`CASE WHEN ${schema.knowledgeNodes.dirty} = 1 THEN 1 END`),
+          localDirtyRootCount: count(sql`CASE WHEN ${schema.knowledgeNodes.dirty} = 1 AND ${schema.knowledgeNodes.parentId} IS NULL THEN 1 END`),
         })
         .from(schema.knowledgeNodes)
         .where(and(
@@ -6468,11 +7580,10 @@ export const docsRepo = {
           isNull(schema.knowledgeNodes.archivedAt),
         ));
       assertDocsReadActive(signal);
-      activeNodeCount = activeRows.length;
-      activeRootCount = activeRows.filter((row) => row.parentId == null).length;
-      const dirtyRows = activeRows.filter((row) => row.dirty === true);
-      localDirtyNodeCount = dirtyRows.length;
-      localDirtyRootCount = dirtyRows.filter((row) => row.parentId == null).length;
+      activeNodeCount = counts[0]?.activeNodeCount ?? 0;
+      activeRootCount = counts[0]?.activeRootCount ?? 0;
+      localDirtyNodeCount = counts[0]?.localDirtyNodeCount ?? 0;
+      localDirtyRootCount = counts[0]?.localDirtyRootCount ?? 0;
     } catch (error) {
       if (isDocsReadCancelled(error)) throw error;
       aggregateStatus = "error";
@@ -6482,19 +7593,15 @@ export const docsRepo = {
     let outboxFailedCount: number | null = null;
     if (actorScopeStatus === "resolved") {
       try {
-        const token = await getToken();
-        assertDocsReadActive(signal);
+        const token = generationStart.auth.token;
         if (!token) {
           actorScopeStatus = "unknown";
         } else {
           const authScope = getTokenAuthScope(token);
-          const rows = await db
+          const counts = await db
             .select({
-              authScope: schema.outbox.authScope,
-              tableName: schema.outbox.tableName,
-              retryCount: schema.outbox.retryCount,
-              blockedReason: schema.outbox.blockedReason,
-              lastError: schema.outbox.lastError,
+              total: count(schema.outbox.opId),
+              failed: count(sql`CASE WHEN ${schema.outbox.blockedReason} IS NOT NULL OR ${schema.outbox.retryCount} >= 5 OR COALESCE(${schema.outbox.lastError}, '') LIKE 'conflict:%' THEN 1 END`),
             })
             .from(schema.outbox)
             .where(and(
@@ -6502,14 +7609,8 @@ export const docsRepo = {
               like(schema.outbox.tableName, "knowledge_%"),
             ));
           assertDocsReadActive(signal);
-          const docsRows = rows.filter((row) => row.authScope === authScope);
-          const failedRows = docsRows.filter((row) =>
-            row.blockedReason != null
-            || row.retryCount >= 5
-            || (row.lastError ?? "").startsWith("conflict:"),
-          );
-          outboxFailedCount = failedRows.length;
-          outboxPendingCount = docsRows.length - failedRows.length;
+          outboxPendingCount = Math.max(0, (counts[0]?.total ?? 0) - (counts[0]?.failed ?? 0));
+          outboxFailedCount = counts[0]?.failed ?? 0;
         }
       } catch (error) {
         if (isDocsReadCancelled(error)) throw error;
@@ -6517,36 +7618,6 @@ export const docsRepo = {
         aggregateStatus = "error";
         markDocsReadDegraded(readDiagnostics, "actor_scope_unavailable");
       }
-    }
-    let generationStatus: DocsReadGenerationStatus = "unknown";
-    try {
-      generationStatus = compareDocsReadGeneration(
-        generationStart,
-        await captureDocsReadGeneration(),
-      );
-      assertDocsReadActive(signal);
-    } catch (error) {
-      if (isDocsReadCancelled(error)) throw error;
-      markDocsReadDegraded(readDiagnostics, "auth_generation_unknown");
-    }
-    if (generationStatus === "degraded") {
-      markDocsReadDegraded(readDiagnostics, "auth_generation_mismatch");
-    } else if (generationStatus === "changed" || generationStatus === "unknown") {
-      markDocsReadDegraded(
-        readDiagnostics,
-        generationStatus === "changed" ? "auth_generation_mismatch" : "auth_generation_unknown",
-      );
-      // Do not hand a previous actor's array to the next actor. The SQLite
-      // cache remains intact for a later same-actor read/re-authentication.
-      pages = [];
-      activeNodeCount = null;
-      activeRootCount = null;
-      localDirtyNodeCount = null;
-      localDirtyRootCount = null;
-      workspaceIds = null;
-      outboxPendingCount = null;
-      outboxFailedCount = null;
-      actorScopeStatus = "error";
     }
     const readDegradedReasons = [...readDiagnostics.reasons];
     return {

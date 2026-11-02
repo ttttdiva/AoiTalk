@@ -300,7 +300,7 @@ internal static class Program
         profile = $script:ProfileName
         tunnel_id = $script:TunnelId
         profile_dir = $profileRoot
-        task_name = "AoiTalk Plugin 41"
+        task_name = "AoiTalk Plugin"
     }
     $identity | ConvertTo-Json | Set-Content -LiteralPath $identityPath -Encoding UTF8
     $env:AOITALK_NATIVE_FIXTURE_MODE = "status-json-warning"

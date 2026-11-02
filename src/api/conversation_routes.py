@@ -39,7 +39,7 @@ from ..services.agent_root_lifecycle import (
     project_private_root_metadata,
 )
 from ..services.conversation_status import project_conversation_statuses
-from ..services.session_llm_runtime import release_session_agent_team_registry
+from ..services.conversation_delegation_map import DelegationMapResponse
 from .http_cache import etag_json_response, make_weak_etag_from_payload
 from .memory_selection_models import MemorySelectionResponse
 
@@ -188,6 +188,8 @@ class CreateSessionRequest(BaseModel):
     agent_id: Optional[str] = None
     initial_message: Optional[InitialUserMessageRequest] = None
     main_route: Optional[CreateSessionMainRoute] = None
+    # Automation/worker conversation: its executed route never becomes the user's last-used route.
+    background_worker: bool = False
 
 
 class UpdateSessionRequest(BaseModel):
@@ -333,14 +335,21 @@ class ConversationHistoryStatusResponse(BaseModel):
     statuses: list[ConversationHistoryStatusItem]
 
 
+class ConversationAgentBindingLegacyProjection(BaseModel):
+    """Historical Team/Profile pins for a conversation binding."""
+
+    agent_team_id: str | None = None
+    execution_profile_id: str | None = None
+    allowed_subagent_ids: list[str] | None = None
+
+
 class ConversationAgentBindingProjection(BaseModel):
     id: str
     session_id: str
     agent_id: str
     agent_revision_id: str
     revision_version: int
-    agent_team_id: str
-    execution_profile_id: str
+    legacy: ConversationAgentBindingLegacyProjection | None = None
     snapshot_hash: Optional[str] = None
     created_at: Optional[str] = None
 
@@ -1025,6 +1034,8 @@ def create_conversation_router(
     get_current_user,
     get_llm_for_title_generation=None,
     get_title_config=None,
+    chat_admission_dependency=None,
+    remember_background_worker_session=None,
 ) -> APIRouter:
     """Create conversation history router
 
@@ -1037,6 +1048,7 @@ def create_conversation_router(
         APIRouter with conversation endpoints
     """
     router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+    require_conversation_write_admission = chat_admission_dependency or require_auth
 
     # Import repository
     try:
@@ -1130,6 +1142,9 @@ def create_conversation_router(
         payload = []
         for message in messages:
             message_dict = message.to_dict()
+            sync_fingerprint = getattr(message, "_sync_fingerprint", None)
+            if isinstance(sync_fingerprint, str):
+                message_dict["_sync_fingerprint"] = sync_fingerprint
             projection = branch_info.get(str(message.id), {})
             message_dict["branch_count"] = projection.get("branch_count", 1)
             message_dict["branch_index"] = projection.get("branch_index", 0)
@@ -1321,6 +1336,67 @@ def create_conversation_router(
             user_info,
             permission=permission,
         )
+
+    async def _recover_grok_bot_replies(session, user_info: dict, repo) -> None:
+        """Grok Bot Chatの遅延返信を、所有者本人の履歴取得時だけ照合・保存する。
+
+        送信・再送はしない。所有者以外（参加者を含む）や binding 未設定では
+        何もしない。失敗しても通常の履歴取得は継続する。
+        """
+        if not callable(get_title_config):
+            return
+        requester_id = str((user_info or {}).get("id") or "")
+        if not requester_id or str(getattr(session, "user_id", "")) != requester_id:
+            return
+        try:
+            await _require_session_project_permission(
+                session, user_info, permission="write"
+            )
+            from ..services.grok_bot_chat_recovery import (
+                recover_grok_bot_chat_history,
+            )
+
+            await recover_grok_bot_chat_history(
+                get_title_config(),
+                session=session,
+                requester_id=requester_id,
+                repository=repo,
+            )
+        except HTTPException:
+            return
+        except Exception as exc:
+            logger.warning(
+                "Grok Bot Chat history recovery skipped: %s", type(exc).__name__
+            )
+
+    async def _recover_muse_chat_replies(session, user_info: dict, repo) -> None:
+        """Muse Chatの遅延返信を、所有者本人の履歴取得時だけ読み取り専用で保存する。
+
+        送信・再送はしない。所有者以外や Muse Chat 未設定では何もしない。
+        """
+        if not callable(get_title_config):
+            return
+        requester_id = str((user_info or {}).get("id") or "")
+        if not requester_id or str(getattr(session, "user_id", "")) != requester_id:
+            return
+        try:
+            await _require_session_project_permission(
+                session, user_info, permission="write"
+            )
+            from ..services.muse_chat_service import recover_muse_chat_history
+
+            await recover_muse_chat_history(
+                get_title_config(),
+                session=session,
+                requester_id=requester_id,
+                repository=repo,
+            )
+        except HTTPException:
+            return
+        except Exception as exc:
+            logger.warning(
+                "Muse Chat history recovery skipped: %s", type(exc).__name__
+            )
 
     @router.get(
         "/search",
@@ -1866,6 +1942,8 @@ def create_conversation_router(
                     merge_session_llm_settings({}, {"main_route": route})
                     if has_explicit_last_used_route(route) else {}
                 )
+                if payload.background_worker:
+                    context = {**context, "background_worker": True}
 
                 async def authorize_created_session(db_session, created):
                     current_project_id = getattr(created, "project_id", None)
@@ -1949,6 +2027,8 @@ def create_conversation_router(
                     **client_create_kwargs
                 )
                 persisted_session_id = str(session.id)
+                if callable(remember_background_worker_session):
+                    remember_background_worker_session(session.id, session.context)
                 mark_phase("response")
                 response = {"success": True, "session": _session_to_api_dict(session)}
                 if first_msg_content:
@@ -1968,7 +2048,8 @@ def create_conversation_router(
                     detail="initial_message requires the idempotent client session endpoint",
                 )
             mark_phase("previous_active")
-            if not requested_agent_id:
+            # Worker conversations must not close the user's own active session.
+            if not requested_agent_id and not payload.background_worker:
                 active = await repo.get_active_session(
                     user_id,
                     character_name,
@@ -2058,6 +2139,22 @@ def create_conversation_router(
                     status_code=500,
                     detail="Failed to persist displayed LLM route on new session",
                 ) from stamp_exc
+
+            if payload.background_worker:
+                worker_context = {
+                    **(session.context if isinstance(session.context, dict) else {}),
+                    "background_worker": True,
+                }
+                if not await repo.update_session(
+                    str(session.id), touch_activity=False, context=worker_context
+                ):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to persist background_worker flag on new session",
+                    )
+                session.context = worker_context
+            if callable(remember_background_worker_session):
+                remember_background_worker_session(session.id, session.context)
 
             # first_message 挿入
             first_msg_content = _initial_character_greeting(char_data)
@@ -2167,14 +2264,27 @@ def create_conversation_router(
             )
             binding_payload = None
             if result.binding is not None:
+                legacy_team_id = getattr(result.binding, "agent_team_id", None)
+                legacy_profile_id = getattr(result.binding, "execution_profile_id", None)
+                legacy_subagents = list(
+                    getattr(result.binding, "allowed_subagent_ids", ()) or ()
+                )
+                legacy = (
+                    ConversationAgentBindingLegacyProjection(
+                        agent_team_id=legacy_team_id or None,
+                        execution_profile_id=legacy_profile_id or None,
+                        allowed_subagent_ids=legacy_subagents or None,
+                    )
+                    if legacy_team_id or legacy_profile_id or legacy_subagents
+                    else None
+                )
                 binding_payload = ConversationAgentBindingProjection(
                     id=str(result.binding.binding_id),
                     session_id=result.binding.session_id,
                     agent_id=result.binding.agent_id,
                     agent_revision_id=result.binding.agent_revision_id,
                     revision_version=result.binding.revision_version,
-                    agent_team_id=result.binding.agent_team_id,
-                    execution_profile_id=result.binding.execution_profile_id,
+                    legacy=legacy,
                     snapshot_hash=result.binding.snapshot_hash,
                     created_at=result.binding.created_at,
                 )
@@ -2416,6 +2526,38 @@ def create_conversation_router(
         except Exception as e:
             logger.error(f"Failed to get session: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get("/{session_id}/delegation-map", response_model=DelegationMapResponse)
+    async def get_conversation_delegation_map(
+        session_id: UUID, _: None = Depends(require_auth), request: Request = None,
+    ):
+        """Read the bounded delegation lineage for one visible conversation."""
+        from sqlalchemy import select
+        from ..memory.database import get_database_manager
+        from ..memory.models import ConversationParticipant, ConversationSession
+        from ..services.conversation_delegation_map import project_delegation_map
+
+        db = await get_database_manager().get_session()
+        try:
+            session = await db.scalar(select(ConversationSession).where(
+                ConversationSession.id == session_id, ConversationSession.deleted_at.is_(None)))
+            if session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            user_info = await _get_current_conversation_user(request)
+            visible_ids = await _get_visible_conversation_user_ids(request)
+            if str(session.user_id) not in visible_ids:
+                participant = await db.scalar(select(ConversationParticipant.id).where(
+                    ConversationParticipant.session_id == session.id,
+                    ConversationParticipant.participant_type == "user",
+                    ConversationParticipant.participant_id.in_(visible_ids),
+                    ConversationParticipant.status == "joined").limit(1))
+                if participant is None:
+                    raise HTTPException(status_code=403, detail="Access denied")
+            await _require_project_permission(session.project_id, user_info,
+                                              permission="read", db_session=db)
+            return await project_delegation_map(db, session, user_info.get("id"))
+        finally:
+            await db.close()
 
     @router.get("/{session_id}/memory-selection", response_model=MemorySelectionResponse, response_model_exclude_none=True)
     async def get_session_memory_selection(
@@ -2706,6 +2848,11 @@ def create_conversation_router(
 
         try:
             since_dt = _parse_since_param(since)
+            include_sync_fingerprint = bool(
+                request
+                and request.query_params.get("include_sync_fingerprint", "0").lower()
+                in ("1", "true")
+            )
             query_started_at = datetime.now(timezone.utc)
 
             repo = ConversationRepository()
@@ -2719,11 +2866,16 @@ def create_conversation_router(
                 raise HTTPException(status_code=403, detail="Access denied")
             user_info = await _get_current_conversation_user(request)
             await _require_session_project_permission(session, user_info)
+            await _recover_grok_bot_replies(session, user_info, repo)
+            await _recover_muse_chat_replies(session, user_info, repo)
 
             try:
                 messages, branch_info = (
                     await repo.get_session_messages_with_branch_info(
-                        session_id, limit=limit, since=since_dt
+                        session_id,
+                        limit=limit,
+                        since=since_dt,
+                        include_sync_fingerprint=include_sync_fingerprint,
                     )
                 )
             except Exception as branch_error:
@@ -2732,7 +2884,10 @@ def create_conversation_router(
                     branch_error,
                 )
                 messages = await repo.get_session_messages(
-                    session_id, limit=limit, since=since_dt
+                    session_id,
+                    limit=limit,
+                    since=since_dt,
+                    include_sync_fingerprint=include_sync_fingerprint,
                 )
                 branch_info = {}
 
@@ -2781,11 +2936,14 @@ def create_conversation_router(
             logger.error(f"Failed to get messages: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    @router.post("/{session_id}/messages")
+    @router.post(
+        "/{session_id}/messages",
+        responses={409: {"description": "Conversation restart admission is closed"}},
+    )
     async def add_message(
         session_id: str,
         payload: AddMessageRequest,
-        _: None = Depends(require_auth),
+        _: None = Depends(require_conversation_write_admission),
         request: Request = None,
     ):
         """Add a message to a session"""
@@ -2991,7 +3149,7 @@ def create_conversation_router(
     @router.post("/{session_id}/generate-title")
     async def generate_session_title(
         session_id: str,
-        _: None = Depends(require_auth),
+        _: None = Depends(require_conversation_write_admission),
         request: Request = None,
     ):
         """Generate a title once early conversation context is available."""
@@ -3347,15 +3505,6 @@ def create_conversation_router(
                 session_id,
                 actor_user_id=user_info.get("id"),
             )
-
-            # The process-local manual Team projection follows the durable
-            # session row.  Release it only after the repository confirms the
-            # delete; failures must leave the projection intact for retries.
-            if deleted:
-                release_session_agent_team_registry(
-                    str(session.user_id) if session.user_id is not None else None,
-                    session_id,
-                )
 
             return JSONResponse({"success": deleted})
         except HTTPException:
@@ -3741,6 +3890,8 @@ def create_conversation_router(
             if not _session_is_visible(session_obj, visible_user_ids):
                 raise HTTPException(status_code=403, detail="Access denied")
             await _require_session_project_permission(session_obj, user_info)
+            await _recover_grok_bot_replies(session_obj, user_info, repo)
+            await _recover_muse_chat_replies(session_obj, user_info, repo)
 
             try:
                 messages, branch_info = (

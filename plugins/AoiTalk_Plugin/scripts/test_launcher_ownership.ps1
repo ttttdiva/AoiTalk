@@ -191,7 +191,7 @@ exit /b %ERRORLEVEL%
         alias = $runtimeAlias
         profile = $profileName
         profile_dir = $profileRoot
-        task_name = "AoiTalk Plugin 41"
+        task_name = "AoiTalk Plugin"
     } | ConvertTo-Json | Set-Content -LiteralPath $identityPath -Encoding UTF8
     $ownStatus | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statusPath -Encoding UTF8
     Assert-LocalAliasOwnership

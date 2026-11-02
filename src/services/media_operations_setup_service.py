@@ -29,6 +29,8 @@ from ..memory.models import (
     PersonaBulkDraft,
     PersonaBulkDraftSlot,
     PersonaIntakeSlot,
+    MediaPlatformCredential,
+    OperationEvent,
     PlatformAccount,
     PlatformAccountRevision,
 )
@@ -94,6 +96,8 @@ _PLATFORM_ATTRIBUTES: tuple[tuple[str, str], ...] = (
     ("fanza", "platform_fanza"),
     ("tiktok", "platform_tiktok"),
 )
+
+_YOUTUBE_CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
 
 
 def _fact_state(value: Any) -> str:
@@ -1844,11 +1848,16 @@ class MediaOperationsSetupService(
         platform: str,
         account_ref: str,
     ) -> PlatformAccount | None:
+        account_ref_condition = (
+            func.lower(PlatformAccount.account_ref)
+            == account_ref.casefold()
+            if platform == "x"
+            else PlatformAccount.account_ref == account_ref
+        )
         conditions = [
             PlatformAccount.platform
             == platform,
-            PlatformAccount.account_ref
-            == account_ref,
+            account_ref_condition,
         ]
 
         if project_id is None:
@@ -1894,6 +1903,36 @@ class MediaOperationsSetupService(
             )
             .limit(1),
         )
+
+    async def _find_platform_account_ref_event(
+        self,
+        session: Any,
+        *,
+        account_id: UUID,
+        idempotency_key: str,
+    ) -> OperationEvent | None:
+        events = await self._scalars(
+            session,
+            select(OperationEvent)
+            .where(
+                OperationEvent.entity_type == "platform_account",
+                OperationEvent.entity_id == account_id,
+                OperationEvent.event_type
+                == "media.platform_account.account_ref_updated",
+            )
+            .order_by(
+                OperationEvent.created_at.desc(),
+                OperationEvent.id.desc(),
+            ),
+        )
+        for event in events:
+            payload = event.payload_json
+            if (
+                isinstance(payload, dict)
+                and payload.get("idempotency_key") == idempotency_key
+            ):
+                return event
+        return None
 
     def _build_platform_revision(
         self,
@@ -2150,6 +2189,540 @@ class MediaOperationsSetupService(
             session,
             account,
         )
+
+    async def update_youtube_channel_slot(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        account_id: UUID | str | None = None,
+        *,
+        expected_version: Any,
+        channel_id: Any,
+        activate: Any = False,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        """Register a YouTube channel id, then optionally activate its slot.
+
+        This changes only the account's local identity and lifecycle state.
+        It does not verify a Google identity, create OAuth credentials, or
+        authorize publication. The channel id must be registered in a prior
+        call before a paused slot can be activated.
+        """
+        session = self._resolve_session(session)
+        if actor is None or account_id is None:
+            raise MediaOperationsValidationError(
+                "actor and platform_account_id are required"
+            )
+        if type(activate) is not bool:
+            raise MediaOperationsValidationError("activate must be a boolean")
+
+        channel_id_value = _required_text(channel_id, "channel_id", 24)
+        if not _YOUTUBE_CHANNEL_ID.fullmatch(channel_id_value):
+            raise MediaOperationsValidationError(
+                "channel_id must be a 24-character YouTube channel id starting with UC"
+            )
+        key = _idempotency_key(idempotency_key)
+        if len(key) > 220:
+            raise MediaOperationsValidationError(
+                "idempotency_key exceeds maximum length"
+            )
+        revision_key = f"youtube-slot:{key}"
+
+        # This operation changes a canonical publishing identity and is
+        # reserved for a signed-in human, even if an agent has project access.
+        from .operations_service import OperationsService
+
+        operations = OperationsService()
+        actor_id = await operations._assert_human(actor)
+        account = await self._get_platform_account_row(
+            session,
+            account_id,
+            for_update=True,
+        )
+        await self._assert_entity_access(
+            session,
+            actor,
+            account,
+            permission="write",
+        )
+        if (
+            account.platform != "youtube"
+            or account.project_id is None
+            or account.persona_id is None
+            or account.account_type != "profile"
+        ):
+            raise MediaOperationsValidationError(
+                "YouTube channel setup requires a project-scoped Persona profile slot"
+            )
+        persona = await self._get_persona_row(session, account.persona_id)
+        await self._assert_entity_access(
+            session,
+            actor,
+            persona,
+            permission="write",
+        )
+        if (
+            persona.project_id != account.project_id
+            or persona.owner_user_id != account.owner_user_id
+        ):
+            raise MediaOperationsConflictError(
+                "YouTube slot Persona scope does not match its account"
+            )
+        placeholder_ref = (
+            f"{persona.parent_brand_ref}:youtube"
+            if isinstance(persona.parent_brand_ref, str)
+            and persona.parent_brand_ref.startswith("sns-v6:")
+            else None
+        )
+        if placeholder_ref is None:
+            raise MediaOperationsValidationError(
+                "YouTube channel setup requires a canonical SNS v6 Persona"
+            )
+
+        existing_revision = await self._find_platform_revision_by_idempotency(
+            session,
+            account_id=account.id,
+            idempotency_key=revision_key,
+        )
+        if existing_revision is not None:
+            if (
+                account.account_ref == channel_id_value
+                and (not activate or account.status == "active")
+            ):
+                return await self._platform_detail(session, account)
+            raise MediaOperationsConflictError(
+                "idempotency key was already used for a different YouTube slot update"
+            )
+
+        latest_revision = await self._scalar(
+            session,
+            select(PlatformAccountRevision)
+            .where(PlatformAccountRevision.platform_account_id == account.id)
+            .order_by(PlatformAccountRevision.version.desc())
+            .limit(1)
+            .with_for_update(),
+        )
+        if latest_revision is None:
+            raise MediaOperationsConflictError(
+                "PlatformAccount revision history is incomplete"
+            )
+        if isinstance(expected_version, bool) or not isinstance(expected_version, (int, str)):
+            raise MediaOperationsValidationError(
+                "expected_version must be an integer"
+            )
+        if isinstance(expected_version, str) and not re.fullmatch(
+            r"[0-9]+",
+            expected_version.strip(),
+        ):
+            raise MediaOperationsValidationError(
+                "expected_version must be an integer"
+            )
+        try:
+            expected = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise MediaOperationsValidationError(
+                "expected_version must be an integer"
+            ) from exc
+        if expected != latest_revision.version:
+            raise MediaOperationsConflictError("stale PlatformAccount version")
+
+        if activate and account.account_ref != channel_id_value:
+            raise MediaOperationsValidationError(
+                "register the matching YouTube channel id before activating the slot"
+            )
+        if account.connection_id is not None or await self._scalar(
+            session,
+            select(MediaPlatformCredential.id)
+            .where(MediaPlatformCredential.platform_account_id == account.id)
+            .limit(1),
+        ):
+            raise MediaOperationsConflictError(
+                "a bound YouTube slot cannot be changed by channel setup"
+            )
+        if account.account_ref not in {placeholder_ref, channel_id_value}:
+            raise MediaOperationsConflictError(
+                "an already registered YouTube channel id cannot be replaced here"
+            )
+
+        identity = await self._find_platform_account_identity(
+            session,
+            owner_user_id=account.owner_user_id,
+            project_id=account.project_id,
+            platform="youtube",
+            account_ref=channel_id_value,
+        )
+        if identity is not None and identity.id != account.id:
+            raise MediaOperationsConflictError(
+                "YouTube channel id is already registered to another slot in this Project"
+            )
+
+        old_account_ref = account.account_ref
+        old_status = account.status
+        next_status = "active" if activate else old_status
+        if old_account_ref == channel_id_value and old_status == next_status:
+            return await self._platform_detail(session, account)
+
+        account.account_ref = channel_id_value
+        account.status = next_status
+        revision_content = latest_revision.to_safe_dict()
+        content = {
+            "display_name": revision_content["display_name"],
+            "publish_capability": revision_content["publish_capability"],
+            "media_capability": revision_content["media_capability"],
+            "analytics_capability": revision_content["analytics_capability"],
+            "credential_status": revision_content["credential_status"],
+            "remote_url": revision_content["remote_url"],
+            "locale": revision_content["locale"],
+            "timezone": revision_content["timezone"],
+            "supported_content_modes": revision_content["supported_content_modes"],
+            "disclosure_defaults": revision_content["disclosure_defaults"],
+            "rating_defaults": revision_content["rating_defaults"],
+            "adapter_ref": revision_content["adapter_ref"],
+        }
+        revision = self._build_platform_revision(
+            account=account,
+            version=latest_revision.version + 1,
+            content=content,
+            created_by=actor_id,
+            idempotency_key=revision_key,
+        )
+        session.add(revision)
+        await operations._event(
+            session,
+            actor=actor,
+            entity_type="platform_account",
+            entity_id=account.id,
+            event_type="media.platform_account.youtube_channel_updated",
+            owner_user_id=account.owner_user_id,
+            project_id=account.project_id,
+            payload={
+                "action": "youtube_slot_activated" if activate else "youtube_channel_registered",
+                "platform": "youtube",
+                "persona_id": str(persona.id),
+                "account_ref_before": old_account_ref,
+                "account_ref_after": channel_id_value,
+                "status_before": old_status,
+                "status_after": next_status,
+                "account_revision_version": revision.version,
+            },
+        )
+        try:
+            await self._flush_commit(session)
+        except IntegrityError as exc:
+            await self._rollback(session)
+            raise MediaOperationsConflictError(
+                "YouTube channel setup conflicted with a concurrent slot update"
+            ) from exc
+        return await self._platform_detail(session, account)
+
+    async def update_platform_account_ref(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        account_id: UUID | str | None = None,
+        *,
+        account_ref: Any,
+        expected_version: Any,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        """Rebind an X account ref and any non-OAuth credential atomically."""
+        session = self._resolve_session(session)
+        if actor is None or account_id is None:
+            raise MediaOperationsValidationError(
+                "actor and platform_account_id are required"
+            )
+
+        raw_account_ref = _required_text(account_ref, "account_ref", 255)
+        handle = raw_account_ref[1:] if raw_account_ref.startswith("@") else raw_account_ref
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+            raise MediaOperationsValidationError(
+                "account_ref must be a valid X handle"
+            )
+        account_ref_value = f"@{handle}"
+        key = _idempotency_key(idempotency_key)
+        if len(key) > 220:
+            raise MediaOperationsValidationError(
+                "idempotency_key exceeds maximum length"
+            )
+        if isinstance(expected_version, bool) or not isinstance(
+            expected_version,
+            (int, str),
+        ):
+            raise MediaOperationsValidationError(
+                "expected_version must be an integer"
+            )
+        if isinstance(expected_version, str) and not re.fullmatch(
+            r"[0-9]+",
+            expected_version.strip(),
+        ):
+            raise MediaOperationsValidationError(
+                "expected_version must be an integer"
+            )
+        try:
+            expected = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise MediaOperationsValidationError(
+                "expected_version must be an integer"
+            ) from exc
+        if expected < 1:
+            raise MediaOperationsValidationError(
+                "expected_version must be at least 1"
+            )
+
+        from .operations_service import OperationsService
+
+        operations = OperationsService()
+        actor_id = await operations._assert_human(actor)
+        account = await self._get_platform_account_row(
+            session,
+            account_id,
+            for_update=True,
+        )
+        await self._assert_entity_access(
+            session,
+            actor,
+            account,
+            permission="write",
+        )
+        if account.platform != "x":
+            raise MediaOperationsValidationError(
+                "account-ref updates are available only for X accounts"
+            )
+
+        previous_event = await self._find_platform_account_ref_event(
+            session,
+            account_id=account.id,
+            idempotency_key=key,
+        )
+        if previous_event is not None:
+            payload = previous_event.payload_json or {}
+            if (
+                payload.get("expected_account_revision") != expected
+                or payload.get("account_ref_after") != account_ref_value
+            ):
+                raise MediaOperationsConflictError(
+                    "idempotency key was already used for a different X account-ref update"
+                )
+            if account.account_ref != account_ref_value:
+                raise MediaOperationsConflictError(
+                    "X account identity changed after the account-ref update"
+                )
+            return await self._platform_detail(session, account)
+
+        latest_revision = await self._scalar(
+            session,
+            select(PlatformAccountRevision)
+            .where(PlatformAccountRevision.platform_account_id == account.id)
+            .order_by(
+                PlatformAccountRevision.version.desc(),
+                PlatformAccountRevision.id.desc(),
+            )
+            .limit(1)
+            .with_for_update(),
+        )
+        if latest_revision is None:
+            raise MediaOperationsConflictError(
+                "PlatformAccount revision history is incomplete"
+            )
+        if expected != latest_revision.version:
+            raise MediaOperationsConflictError(
+                "stale PlatformAccount version"
+            )
+        if account.account_ref == account_ref_value:
+            return await self._platform_detail(session, account)
+
+        identity = await self._find_platform_account_identity(
+            session,
+            owner_user_id=account.owner_user_id,
+            project_id=account.project_id,
+            platform="x",
+            account_ref=account_ref_value,
+        )
+        if identity is not None and identity.id != account.id:
+            raise MediaOperationsConflictError(
+                "X account handle is already registered in this owner/project scope"
+            )
+
+        from .media_credential_vault_service import MediaCredentialVaultService
+
+        vault = MediaCredentialVaultService()
+        credential = await vault._credential(
+            session,
+            account.id,
+            lock=True,
+        )
+        if credential is not None:
+            await vault._assert_credential_binding(session, account, credential)
+            if (
+                credential.connection_type == "oauth"
+                and credential.verification_code == "identity_match"
+            ):
+                raise MediaOperationsConflictError(
+                    "a verified OAuth X identity cannot be changed"
+                )
+
+        old_account_ref = account.account_ref
+        connection = None
+        if account.connection_id is not None:
+            connection = await self._scalar(
+                session,
+                select(ExternalConnection)
+                .where(ExternalConnection.id == account.connection_id)
+                .limit(1)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            )
+            if connection is None:
+                raise MediaOperationsConflictError(
+                    "X account connection binding is missing"
+                )
+            await self._assert_entity_access(
+                session,
+                actor,
+                connection,
+                permission="write",
+            )
+            if (
+                connection.owner_user_id != account.owner_user_id
+                or connection.project_id != account.project_id
+                or str(connection.provider_key or "").strip().lower() != "x"
+                or str(connection.remote_account_ref or "") != old_account_ref
+            ):
+                raise MediaOperationsConflictError(
+                    "X account connection binding is invalid"
+                )
+            duplicate_connection = await self._scalar(
+                session,
+                select(ExternalConnection.id)
+                .where(
+                    ExternalConnection.owner_user_id == account.owner_user_id,
+                    ExternalConnection.project_id == account.project_id,
+                    ExternalConnection.provider_key == "x",
+                    ExternalConnection.remote_account_ref == account_ref_value,
+                    ExternalConnection.id != connection.id,
+                )
+                .limit(1),
+            )
+            if duplicate_connection is not None:
+                raise MediaOperationsConflictError(
+                    "X account handle is already registered to another connection"
+                )
+
+        credential_disabled = False
+        if (
+            credential is not None
+            and credential.connection_type != "oauth"
+            and credential.status != "disabled"
+        ):
+            await vault.disable_credential(
+                session,
+                actor,
+                account.id,
+                expected_revision=credential.revision,
+                idempotency_key=f"account-ref-disable:{key}",
+                commit=False,
+            )
+            credential_disabled = True
+
+        latest_revision = await self._scalar(
+            session,
+            select(PlatformAccountRevision)
+            .where(PlatformAccountRevision.platform_account_id == account.id)
+            .order_by(
+                PlatformAccountRevision.version.desc(),
+                PlatformAccountRevision.id.desc(),
+            )
+            .limit(1)
+            .with_for_update(),
+        )
+        if latest_revision is None:
+            raise MediaOperationsConflictError(
+                "PlatformAccount revision history is incomplete"
+            )
+        if connection is not None:
+            connection.remote_account_ref = account_ref_value
+            connection.version = int(connection.version or 1) + 1
+            connection.updated_at = datetime.utcnow()
+        account.account_ref = account_ref_value
+        revision_content = latest_revision.to_safe_dict()
+        revision = self._build_platform_revision(
+            account=account,
+            version=latest_revision.version + 1,
+            content={
+                "display_name": revision_content["display_name"],
+                "publish_capability": revision_content["publish_capability"],
+                "media_capability": revision_content["media_capability"],
+                "analytics_capability": revision_content["analytics_capability"],
+                "credential_status": revision_content["credential_status"],
+                "remote_url": revision_content["remote_url"],
+                "locale": revision_content["locale"],
+                "timezone": revision_content["timezone"],
+                "supported_content_modes": revision_content[
+                    "supported_content_modes"
+                ],
+                "disclosure_defaults": revision_content[
+                    "disclosure_defaults"
+                ],
+                "rating_defaults": revision_content["rating_defaults"],
+                "adapter_ref": revision_content["adapter_ref"],
+            },
+            created_by=actor_id,
+            idempotency_key=f"platform-account-ref:{key}",
+        )
+        session.add(revision)
+        await operations._event(
+            session,
+            actor=actor,
+            entity_type="platform_account",
+            entity_id=account.id,
+            event_type="media.platform_account.account_ref_updated",
+            owner_user_id=account.owner_user_id,
+            project_id=account.project_id,
+            payload={
+                "action": "platform_account_ref_updated",
+                "platform": "x",
+                "persona_id": str(account.persona_id) if account.persona_id else None,
+                "account_ref_before": old_account_ref,
+                "account_ref_after": account_ref_value,
+                "credential_disabled": credential_disabled,
+                "account_revision_version": revision.version,
+                "expected_account_revision": expected,
+                "idempotency_key": key,
+            },
+        )
+        try:
+            await self._flush_commit(session)
+        except IntegrityError as exc:
+            await self._rollback(session)
+            recovered = await self._get_platform_account_row(
+                session,
+                account_id,
+            )
+            await self._assert_entity_access(
+                session,
+                actor,
+                recovered,
+                permission="write",
+            )
+            recovered_event = await self._find_platform_account_ref_event(
+                session,
+                account_id=recovered.id,
+                idempotency_key=key,
+            )
+            if (
+                recovered.account_ref == account_ref_value
+                and recovered_event is not None
+                and (recovered_event.payload_json or {}).get(
+                    "expected_account_revision"
+                )
+                == expected
+            ):
+                return await self._platform_detail(session, recovered)
+            raise MediaOperationsConflictError(
+                "X account-ref update conflicted with an existing account or connection"
+            ) from exc
+
+        return await self._platform_detail(session, account)
 
     async def create_platform_account(
         self,

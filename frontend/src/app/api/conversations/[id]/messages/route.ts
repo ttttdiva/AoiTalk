@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { conversationMessages, conversationSessions } from "@/db/schema";
-import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import {
   canWriteLockedConversationSession,
@@ -12,6 +12,7 @@ import {
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import { toDbLocalTimestamp } from "@/lib/server/db-time";
 import { jsonWithConditional } from "@/lib/server/http-cache";
+import type { ConversationMessageHistoryIndexEntry } from "@/lib/chat-api";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -219,6 +220,7 @@ type RouteErrorCode =
   | "invalid_request"
   | "session_not_found"
   | "forbidden"
+  | "history_cursor_stale"
   | "idempotency_conflict"
   | "message_persistence_failed";
 
@@ -326,6 +328,94 @@ function messagePayload(row: typeof conversationMessages.$inferSelect) {
   };
 }
 
+const MESSAGE_PAGE_DEFAULT = 10;
+const MESSAGE_PAGE_MAX = 50;
+const MESSAGE_CURSOR_VERSION = 1;
+
+type OlderMessageCursor = {
+  v: typeof MESSAGE_CURSOR_VERSION;
+  s: string;
+  t: string | null;
+  i: string;
+};
+
+function encodeOlderMessageCursor(cursor: OlderMessageCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeOlderMessageCursor(raw: string, sessionId: string): OlderMessageCursor {
+  if (!/^[A-Za-z0-9_-]{1,2048}$/.test(raw)) {
+    throw new Error("before の形式が不正です");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("before の形式が不正です");
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error("before の形式が不正です");
+  }
+  const candidate = value as Partial<OlderMessageCursor>;
+  if (
+    candidate.v !== MESSAGE_CURSOR_VERSION ||
+    candidate.s !== sessionId ||
+    typeof candidate.i !== "string" ||
+    candidate.i.length === 0 ||
+    (candidate.t !== null && typeof candidate.t !== "string")
+  ) {
+    throw new Error("before の形式が不正です");
+  }
+  if (candidate.t !== null && Number.isNaN(new Date(candidate.t).getTime())) {
+    throw new Error("before の日時が不正です");
+  }
+  return {
+    v: MESSAGE_CURSOR_VERSION,
+    s: sessionId,
+    t: candidate.t ?? null,
+    i: candidate.i,
+  };
+}
+
+function messagePageLimit(request: NextRequest, hasBefore: boolean): number | null {
+  const raw = request.nextUrl.searchParams.get("limit");
+  if (raw === null && !hasBefore) return null;
+  const normalized = raw ?? String(MESSAGE_PAGE_DEFAULT);
+  if (!/^[0-9]+$/.test(normalized)) {
+    throw new Error("limit は整数で指定してください");
+  }
+  const value = Number(normalized);
+  if (!Number.isSafeInteger(value) || value < 1 || value > MESSAGE_PAGE_MAX) {
+    throw new Error(`limit は1から${MESSAGE_PAGE_MAX}の範囲で指定してください`);
+  }
+  return value;
+}
+
+function messageCursorCondition(cursor: OlderMessageCursor) {
+  const createdAt = conversationMessages.createdAt;
+  if (cursor.t === null) {
+    return sql`(${createdAt} is null and ${conversationMessages.id} < ${cursor.i})`;
+  }
+  const cursorDate = toDbLocalTimestamp(cursor.t);
+  return sql`(
+    ${createdAt} < ${cursorDate}
+    or ${createdAt} is null
+    or (${createdAt} = ${cursorDate} and ${conversationMessages.id} < ${cursor.i})
+  )`;
+}
+
+function messageCursorFromRow(
+  row: typeof conversationMessages.$inferSelect,
+  sessionId: string,
+): OlderMessageCursor {
+  return {
+    v: MESSAGE_CURSOR_VERSION,
+    s: sessionId,
+    t: row.createdAt?.toISOString() ?? null,
+    i: row.id,
+  };
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -345,6 +435,8 @@ export async function GET(
 
   // ?since=<ISO8601 UTC>: updated_at（無ければ created_at）が since より新しい差分のみ返す。
   const sinceParam = request.nextUrl.searchParams.get("since");
+  const beforeParam = request.nextUrl.searchParams.get("before");
+  const includeHistoryIndex = request.nextUrl.searchParams.get("history_index") === "1";
   let sinceDate: Date | null = null;
   if (sinceParam !== null) {
     const parsed = new Date(sinceParam);
@@ -357,6 +449,42 @@ export async function GET(
       );
     }
     sinceDate = parsed;
+  }
+
+  if (sinceDate && beforeParam !== null) {
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      "since と before は同時に指定できません",
+    );
+  }
+  if (includeHistoryIndex && (sinceDate || beforeParam !== null)) {
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      "history_index は最新ページの取得時のみ指定できます",
+    );
+  }
+
+  let limit: number | null;
+  let olderCursor: OlderMessageCursor | null = null;
+  try {
+    // Existing delta callers remain unbounded. The Chat page opts into the
+    // latest-page contract with `limit=10`; `before` implies the same bound.
+    limit = sinceDate ? null : messagePageLimit(request, beforeParam !== null);
+    if (beforeParam !== null) {
+      olderCursor = decodeOlderMessageCursor(beforeParam, id);
+      if (limit === null) limit = MESSAGE_PAGE_DEFAULT;
+    }
+  } catch (error) {
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      error instanceof Error ? error.message : "ページ指定が不正です",
+    );
   }
 
   const session = await getLiveConversationSession(id, user.id);
@@ -396,17 +524,70 @@ export async function GET(
     );
   }
 
-  const rows = await db
-    .select()
-    .from(conversationMessages)
-    .where(and(...conditions))
-    .orderBy(asc(conversationMessages.createdAt), asc(conversationMessages.id));
+  if (olderCursor) {
+    // The anchor must still belong to the active path. A branch switch makes
+    // an old cursor stale and lets the client reset to a fresh latest page;
+    // concurrent new messages leave the anchor active and remain safe.
+    const [anchor] = await db
+      .select({
+        id: conversationMessages.id,
+        createdAt: conversationMessages.createdAt,
+      })
+      .from(conversationMessages)
+      .where(
+        and(
+          eq(conversationMessages.sessionId, id),
+          eq(conversationMessages.id, olderCursor.i),
+          or(
+            eq(conversationMessages.isActiveBranch, true),
+            isNull(conversationMessages.isActiveBranch),
+          )!,
+        ),
+      )
+      .limit(1);
+    if (
+      !anchor ||
+      (anchor.createdAt?.toISOString() ?? null) !== olderCursor.t
+    ) {
+      return structuredErrorResponse(
+        requestId,
+        409,
+        "history_cursor_stale",
+        "会話のブランチが切り替わったため、履歴を読み直してください",
+      );
+    }
+    conditions.push(messageCursorCondition(olderCursor));
+  }
+
+  const orderedRows = await (limit === null
+    ? db
+        .select()
+        .from(conversationMessages)
+        .where(and(...conditions))
+        .orderBy(asc(conversationMessages.createdAt), asc(conversationMessages.id))
+    : db
+        .select()
+        .from(conversationMessages)
+        .where(and(...conditions))
+        // Read newest rows in the database, then reverse only the bounded
+        // page for the ascending UI contract. The extra row detects has_more.
+        .orderBy(
+          sql`${conversationMessages.createdAt} desc nulls last`,
+          desc(conversationMessages.id),
+        )
+        .limit(limit + 1));
+
+  const hasMore = limit !== null && orderedRows.length > limit;
+  const selectedRows =
+    limit === null
+      ? orderedRows
+      : orderedRows.slice(0, limit).reverse();
 
   // FastAPI repairs legacy flat rows before projecting branch metadata.  For
   // the BFF's cold GET, apply the same repair to the already-loaded active
   // path so the two transports agree without a write or a tree-wide preload.
-  const legacyParentLinks = sinceDate ? null : getLegacyParentLinks(rows);
-  const projectionRows: BranchMetadataRow[] = rows.map((row) => ({
+  const legacyParentLinks = sinceDate ? null : getLegacyParentLinks(orderedRows);
+  const projectionRows: BranchMetadataRow[] = selectedRows.map((row) => ({
     id: row.id,
     parentMessageId:
       legacyParentLinks?.get(row.id) ?? row.parentMessageId,
@@ -419,11 +600,11 @@ export async function GET(
     id,
     projectionRows,
     legacyParentLinks
-      ? { legacyParentLinks, repairRows: rows }
+      ? { legacyParentLinks, repairRows: orderedRows }
       : undefined,
   );
   const parentLinks = projection.parentLinks ?? legacyParentLinks;
-  const messages = rows.map((row) => ({
+  const messages = selectedRows.map((row) => ({
     ...messagePayload(row),
     ...(parentLinks?.has(row.id)
       ? { parent_message_id: parentLinks.get(row.id) }
@@ -437,7 +618,7 @@ export async function GET(
   let serverTime = sinceParam ?? new Date().toISOString();
   // overlap で since より古い行だけが返った場合も cursor を後退させない。
   let latestMs = sinceDate?.getTime() ?? Number.NEGATIVE_INFINITY;
-  for (const row of rows) {
+  for (const row of selectedRows) {
     const stamp = row.updatedAt ?? row.createdAt;
     if (stamp) {
       const ms = stamp.getTime();
@@ -448,11 +629,67 @@ export async function GET(
     }
   }
 
+  const nextCursor =
+    hasMore && limit !== null && orderedRows.length > 0
+      ? encodeOlderMessageCursor(
+          messageCursorFromRow(orderedRows[limit - 1], id),
+        )
+      : null;
+
+  let historyIndex: ConversationMessageHistoryIndexEntry[] | undefined;
+  if (includeHistoryIndex) {
+    const indexRows = await db
+      .select({
+        id: conversationMessages.id,
+        role: conversationMessages.role,
+        createdAt: conversationMessages.createdAt,
+      })
+      .from(conversationMessages)
+      .where(
+        and(
+          eq(conversationMessages.sessionId, id),
+          or(
+            eq(conversationMessages.isActiveBranch, true),
+            isNull(conversationMessages.isActiveBranch),
+          )!,
+        ),
+      )
+      .orderBy(asc(conversationMessages.createdAt), asc(conversationMessages.id));
+    historyIndex = indexRows.map((row, index) => ({
+      id: row.id,
+      role: row.role as ConversationMessageHistoryIndexEntry["role"],
+      position: index + 1,
+      preview: row.role === "user"
+        ? `メッセージ ${index + 1}`
+        : "",
+      created_at: row.createdAt?.toISOString() ?? null,
+    }));
+  }
+
   // ETag は server_time を除いた messages のみから算出（304 が壊れないようにする）。
+  // Bounded pages also include cursor metadata in the validator: a concurrent
+  // append can change has_more/next_cursor without changing an older page's
+  // message bodies.
   return jsonWithConditional(
     request,
-    { messages, server_time: serverTime },
-    { etagSource: { messages } },
+    {
+      messages,
+      server_time: serverTime,
+      has_more: hasMore,
+      next_cursor: nextCursor,
+      ...(historyIndex ? { history_index: historyIndex } : {}),
+    },
+    {
+      etagSource:
+        limit === null
+          ? { messages }
+          : {
+              messages,
+              has_more: hasMore,
+              next_cursor: nextCursor,
+              ...(historyIndex ? { history_index: historyIndex } : {}),
+            },
+    },
   );
 }
 

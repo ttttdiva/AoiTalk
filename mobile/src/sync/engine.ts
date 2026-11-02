@@ -1,5 +1,6 @@
 import { and, eq, like } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { GENERAL_SESSION_FINGERPRINT_REVISION_KEY } from "../db/general-session-fingerprint-revision";
 import { runBackgroundSqliteWrite, runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import type { SqliteHandle, SqliteWriter } from "../db/sqlite-writer";
 import { rescheduleLocalTaskNotificationsFromCache } from "../lib/local-notifications";
@@ -30,11 +31,12 @@ import {
 } from "../repositories/outbox";
 import { getSyncV3Mode, type SyncV3Mode } from "./v3/api";
 import { requestV3DocsRebootstrap, runV3Pull } from "./v3/pull";
-import { pushOutboxViaV3 } from "./v3/push";
+import { pushOutboxViaV3, settleV2FallbackHolds } from "./v3/push";
 import { SyncV3DisabledError } from "./v3/types";
 import { captureLegacy } from "../sync-v3/legacy-migration";
 import { markSyncV3RequestWriteFailed } from "../sync-v3/request-observer";
 import { checkSyncV3CacheSafety, isSyncV3ManuallyStopped } from "./v3/safety";
+import { autoResolveStuckOutbox } from "./outbox-auto-resolution";
 import { rebaseDocsWriteFollowups, rebaseLegacyBlankDocsUpdate, isDocsResultOlderThanRecordedConflict, matchesDocsCreateContent, compareDocsVersions } from "../repositories/docs-create-ack";
 import { isTaskCasStaleReason, matchesTaskUpdateReceipt } from "./task-update-receipt";
 import {
@@ -80,6 +82,7 @@ import {
 } from "../repositories/records";
 import {
   applyDocsNodeTombstones,
+  applyRemoteDocsRootBootstrapRows,
   applyRemoteDocsEdges,
   applyRemoteDocsFieldValues,
   applyRemoteDocsFields,
@@ -99,10 +102,13 @@ import {
   reconcileDocsNodesWithServer,
   reconcileDocsSupertagsWithServer,
   promoteDocsSyncRun,
+  type DocsPromotionRevalidation,
   type DocsPromotionPhase,
   type DocsStagingProgress,
   quarantineRevokedDocsScope,
 } from "../repositories/docs";
+import { getRootDocsProjectScopeCoverage } from "../repositories/docs-noop-scope-coverage";
+import { finalizeDocsFastNoopRun } from "../repositories/docs-fast-noop-finalize";
 import { flushPendingConversations } from "../repositories/conversations";
 import { flushPendingClipIngests } from "../repositories/pending-clip-ingest";
 import { refreshClipIngestTargetsIfStale } from "../lib/clip-ingest-targets";
@@ -155,15 +161,36 @@ import {
   type SyncPullLifecycle,
   type SyncPullRequestOutcome,
   type SyncPullResponse,
+  type SyncTablePayload,
   type SyncPushOperation,
   type SyncPushResult,
   type SyncTable,
 } from "./api";
 
 import {
-  GENERAL_DIGEST_VERSION, generalDigestsForRequest, generalTableNeedsApply, reusableGeneralDigests,
-  validGeneralDigests, validateGeneralDigestPage,
+  GENERAL_DIGEST_VERSION, GENERAL_FULL_REPLAY_INTERVAL_MS,
+  GENERAL_MESSAGE_SYNC_VERSION,
+  GENERAL_SOURCE_TOKEN_VERSION, generalDigestsForRequest,
+  generalTableNeedsApply, localConversationSessionFingerprint, reusableGeneralDigests,
+  reusableGeneralSourceDigests, validGeneralDigests, validGeneralSourceDigests, validateGeneralDigestPage,
+  validateGeneralSourcePage, validateGeneralMessageSyncPage,
 } from "./general-sync-digests";
+import {
+  getLocalGeneralMessageSyncDigestResult,
+  type GeneralMessageSyncReceiptProgress,
+  type GeneralMessageSyncReceiptTimings,
+} from "./general-message-sync-receipt";
+import { createDocsFastDigestBundle } from "./docs-fast-digest-bundle";
+import {
+  GENERAL_ROW_MANIFEST_TABLES,
+  deleteGeneralRowVersions,
+  isGeneralRowManifestTable,
+  readGeneralRowVersions,
+  readPendingGeneralRowIds,
+  type GeneralRowManifestTable,
+  type GeneralRowVersion,
+  upsertGeneralRowVersions,
+} from "./general-row-versions";
 
 const TABLES: SyncTable[] = [
   "projects",
@@ -232,6 +259,30 @@ export type SyncDiagnosticOutcome =
 
 export type SyncDiagnosticScope = "general" | "personal" | "shared" | "project";
 
+export type DocsPromotionFallbackReason =
+  | "force_requested"
+  | "run_forced"
+  | "saved_digest_baseline_missing"
+  | "since_missing"
+  | "since_invalid"
+  | "saved_scope_digest_missing"
+  | "scope_digest_mismatch"
+  | "saved_scope_revision_missing"
+  | "scope_revision_mismatch"
+  | "authoritative_scope_set_missing"
+  | "scope_projection_changed"
+  | "run_not_ready"
+  | "pending_tables_remain";
+
+export type DocsPromotionEligibilityDiagnostic = {
+  enginePath: "incremental" | "full_fallback" | "promotion_resume";
+  engineReasons: DocsPromotionFallbackReason[];
+  authoritativeIdTableCount: number;
+  maxAuthoritativeIdCount: number;
+  repositoryPath?: DocsPromotionRevalidation["path"];
+  repositoryReason?: DocsPromotionRevalidation["reason"];
+};
+
 export type SyncDiagnosticTable = {
   table: SyncTable;
   /** False means the response did not contain this table; zero is not inferred. */
@@ -250,7 +301,9 @@ export type DocsSyncDiagnosticStage =
   | "load_active_run"
   | "create_run"
   | "ready_resume"
+  | "promotion_resume"
   | "http_pull"
+  | "roots_visible"
   | "reload_ready_run"
   | "promoting";
 
@@ -273,6 +326,10 @@ function cloneDocsSqliteProgress(progress: DocsSqliteProgress): DocsSqliteProgre
 function cloneDocsCheckpoint(checkpoint: DocsSyncDiagnostic): DocsSyncDiagnostic {
   return {
     ...checkpoint,
+    ...(checkpoint.promotionEligibility ? { promotionEligibility: {
+      ...checkpoint.promotionEligibility,
+      engineReasons: [...checkpoint.promotionEligibility.engineReasons],
+    } } : {}),
     ...(checkpoint.promotion ? { promotion: {
       ...checkpoint.promotion,
       ...(checkpoint.promotion.sqlite ? { sqlite: cloneDocsSqliteProgress(checkpoint.promotion.sqlite) } : {}),
@@ -284,10 +341,15 @@ function cloneDocsCheckpoint(checkpoint: DocsSyncDiagnostic): DocsSyncDiagnostic
 export type DocsSyncDiagnostic = {
   runId?: string | null;
   stage: DocsSyncDiagnosticStage;
+  scopeCategory?: Exclude<SyncDiagnosticScope, "general">;
+  /** Ordinal/count only; never includes scope identifiers. */
+  scopeOrdinal?: number;
+  scopeCount?: number | null;
   /** Total elapsed time since this flight's Docs watchdog budget began. */
   elapsedMs: number;
-  runState: "downloading" | "ready" | null;
+  runState: "downloading" | "ready" | "promoting" | null;
   pendingTables: number | null;
+  promotionEligibility?: DocsPromotionEligibilityDiagnostic;
   promotion?: DocsPromotionDiagnostic;
 };
 
@@ -358,27 +420,63 @@ type DocsResyncProgressHandler = (progress: DocsResyncProgress) => void;
 
 type PendingOutbox = typeof schema.outbox.$inferSelect;
 type PendingOutboxSnapshot = Parameters<typeof removeOutboxOpIfSnapshot>[1];
+type DocsLiveWriteState = {
+  started: boolean;
+  /** Reset the Docs inactivity watchdog after a committed/native work unit. */
+  reportProgress?: () => void;
+};
+type SyncStageWatchdog = {
+  stage: SyncStage;
+  startedAt: number;
+  lastProgressAt: number;
+  page?: number;
+  pendingTables?: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  reported: boolean;
+};
+
 type SyncExecutionContext = {
   epoch: number;
   controller: AbortController;
   /** Present only for a normal product sync; force Docs resync has its own UI. */
   flightSequence?: number;
   lastDocsProgressKey?: string;
-  docsLiveWriteState?: { started: boolean };
+  docsLiveWriteState?: DocsLiveWriteState;
+  stageWatchdog?: SyncStageWatchdog;
   docsDiagnostic?: {
     startedAt: number;
     stage: DocsSyncDiagnosticStage | null;
     runId?: string | null;
+    scopeCategory?: Exclude<SyncDiagnosticScope, "general">;
+    scopeOrdinal?: number;
+    scopeCount?: number | null;
     runState: DocsSyncDiagnostic["runState"];
     pendingTables: number | null;
+    promotionEligibility?: DocsPromotionEligibilityDiagnostic;
     promotion?: DocsPromotionDiagnostic;
     frozen: boolean;
+  };
+  generalDiagnostic?: {
+    startedAt: number;
+    phase: string;
+    page?: number;
+    pendingTableCount?: number;
+    scannedRows?: number;
+    scopedRows?: number;
+    batchCount?: number;
   };
   diagnostic?: SyncDiagnosticReceipt;
   v3PushRequestIds: Set<string>;
   v3PullActive?: boolean;
 };
 type DocsSyncRunRow = typeof schema.docsSyncRuns.$inferSelect;
+type DocsScopePullResult = {
+  scopes: DocsSyncScope[];
+  rootProjectScopesValidated: boolean;
+  projectDigests: Record<string, Record<string, string>>;
+  projectFastDigests: Record<string, Record<string, string>>;
+  projectScopeRevisions: Record<string, string>;
+};
 type DocsSyncAuthoritative = Record<
   string,
   { ids?: string[]; scopeId?: string; digest?: string }
@@ -541,13 +639,183 @@ function logSyncFlightBoundary(
   sqlite?: DocsSqliteProgress,
 ): void {
   if (!receipt) return;
+  const docs = receipt.docsWatchdog ?? receipt.docsSubstage;
   console.info("[sync] flight checkpoint", JSON.stringify({
     event, at: Date.now(), requestId: receipt.requestId,
     canonicalRequestId: receipt.canonicalRequestId ?? receipt.requestId,
     authGeneration: receipt.authGeneration,
     runId: runId ?? receipt.docsWatchdog?.runId ?? receipt.docsSubstage?.runId ?? null,
+    ...(docs?.scopeCategory ? { docsScopeCategory: docs.scopeCategory } : {}),
+    ...(docs?.scopeOrdinal != null ? { docsScopeOrdinal: docs.scopeOrdinal } : {}),
+    ...(docs?.scopeCount != null ? { docsScopeCount: docs.scopeCount } : {}),
+    ...(docs?.promotionEligibility ? { docsPromotionEligibility: {
+      enginePath: docs.promotionEligibility.enginePath,
+      engineReasons: [...docs.promotionEligibility.engineReasons],
+      authoritativeIdTableCount: docs.promotionEligibility.authoritativeIdTableCount,
+      maxAuthoritativeIdCount: docs.promotionEligibility.maxAuthoritativeIdCount,
+      ...(docs.promotionEligibility.repositoryPath
+        ? { repositoryPath: docs.promotionEligibility.repositoryPath } : {}),
+      ...(docs.promotionEligibility.repositoryReason
+        ? { repositoryReason: docs.promotionEligibility.repositoryReason } : {}),
+    } } : {}),
     ...(sqlite ? { sqlite } : {}),
     ...(event === "terminal" ? { outcome: receipt.outcome } : {}),
+  }));
+}
+
+function logDocsNoopScopeCoverage(
+  receipt: SyncDiagnosticReceipt | undefined,
+  candidateScopes: number,
+  skippedScopes: number,
+  serverDigestScopes: number,
+  serverRevisionScopes: number,
+  rootReceiptValidated: boolean,
+  timings: {
+    coverageDurationMs: number;
+    fastReceiptScopes: number;
+    legacyReceiptScopes: number;
+    receiptSaveDurationMs: number;
+    receiptWriteRows: number;
+    receiptWriteStatements: number;
+  },
+): void {
+  if (!receipt || candidateScopes <= 0) return;
+  console.info("[sync] Docs project-scope coverage", JSON.stringify({
+    event: "docs_project_scope_coverage",
+    at: Date.now(),
+    requestId: receipt.requestId,
+    canonicalRequestId: receipt.canonicalRequestId ?? receipt.requestId,
+    candidateScopes,
+    skippedScopes,
+    serverDigestScopes,
+    serverRevisionScopes,
+    rootReceiptValidated,
+    localSqlReads: rootReceiptValidated ? 1 : 0,
+    ...timings,
+  }));
+}
+
+function logGeneralMessageReceipt(
+  context: SyncExecutionContext,
+  phase: "preflight" | "terminal",
+  result: {
+    eligible: boolean;
+    reason: string;
+    scannedRows: number;
+    scopedRows: number;
+    batchCount: number;
+    pendingOutboxCount: number;
+    reusedSavedDigest?: boolean;
+    digestMatches?: boolean;
+    timings?: GeneralMessageSyncReceiptTimings;
+  },
+): void {
+  console.info("[sync] general message receipt", JSON.stringify({
+    event: "general_message_receipt",
+    phase,
+    at: Date.now(),
+    requestId: context.diagnostic?.requestId ?? null,
+    eligible: result.eligible,
+    reason: result.reason,
+    scannedRows: result.scannedRows,
+    scopedRows: result.scopedRows,
+    batchCount: result.batchCount,
+    pendingOutboxCount: result.pendingOutboxCount,
+    revisionCacheHit: result.reusedSavedDigest === true,
+    ...(result.digestMatches == null ? {} : { digestMatches: result.digestMatches }),
+    ...(result.timings ?? {}),
+  }));
+}
+
+function setGeneralDiagnosticPhase(
+  context: SyncExecutionContext,
+  phase: string,
+  fields: {
+    page?: number;
+    pendingTableCount?: number;
+    scannedRows?: number;
+    scopedRows?: number;
+    batchCount?: number;
+  } = {},
+): void {
+  context.generalDiagnostic = {
+    startedAt: context.generalDiagnostic?.startedAt ?? Date.now(),
+    phase,
+    ...fields,
+  };
+}
+
+/** Start a refresh now and return the stage operation that awaits its result. */
+function startOverlappedRefresh(refresh: () => Promise<unknown>): () => Promise<unknown> {
+  let started: Promise<unknown>;
+  try {
+    started = refresh();
+  } catch (error) {
+    started = Promise.reject(error);
+  }
+  // The stage awaits it later; avoid an unhandled rejection before then.
+  started.catch(() => undefined);
+  return () => started;
+}
+
+function logGeneralPullFailure(context: SyncExecutionContext, error: unknown): void {
+  const diagnostic = context.generalDiagnostic;
+  const rawName = error instanceof Error
+    ? error.name
+    : error && typeof error === "object" && "name" in error
+      ? String((error as { name?: unknown }).name ?? "")
+      : "UnknownError";
+  const errorName = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(rawName)
+    ? rawName
+    : "UnknownError";
+  console.warn("[sync] general pull failure diagnostic", JSON.stringify({
+    event: "general_pull_failure",
+    phase: diagnostic?.phase ?? "unknown",
+    errorName,
+    elapsedMs: diagnostic
+      ? Math.max(0, Date.now() - diagnostic.startedAt)
+      : null,
+    page: diagnostic?.page ?? 0,
+    pendingTableCount: diagnostic?.pendingTableCount ?? 0,
+    scannedRows: diagnostic?.scannedRows ?? 0,
+    scopedRows: diagnostic?.scopedRows ?? 0,
+    batchCount: diagnostic?.batchCount ?? 0,
+    // Only the engine's own validation errors (plain Error) carry fixed
+    // messages; HTTP errors may embed server text, so they stay name-only.
+    errorMessage: error instanceof Error && error.name === "Error"
+      ? error.message.slice(0, 160)
+      : undefined,
+  }));
+}
+
+function logDocsRequestCheckpoint(
+  context: SyncExecutionContext,
+  event: "request_start" | "request_finish",
+  fields: {
+    durationMs?: number;
+    page: number;
+    outcome?: string;
+    httpStatus?: number | null;
+    attemptCount?: number;
+    errorKind?: string;
+  },
+): void {
+  const docs = context.docsDiagnostic;
+  if (!context.diagnostic) return;
+  console.info("[sync] Docs request checkpoint", JSON.stringify({
+    event,
+    at: Date.now(),
+    requestId: context.diagnostic.requestId,
+    canonicalRequestId: context.diagnostic.canonicalRequestId ?? context.diagnostic.requestId,
+    scope: docs?.scopeCategory ?? "personal",
+    scopeOrdinal: docs?.scopeOrdinal ?? null,
+    scopeCount: docs?.scopeCount ?? null,
+    page: fields.page,
+    ...(fields.durationMs != null ? { durationMs: fields.durationMs } : {}),
+    ...(fields.outcome ? { outcome: fields.outcome } : {}),
+    ...(fields.httpStatus != null ? { httpStatus: fields.httpStatus } : {}),
+    ...(fields.attemptCount != null ? { attemptCount: fields.attemptCount } : {}),
+    ...(fields.errorKind ? { errorKind: fields.errorKind } : {}),
   }));
 }
 
@@ -752,7 +1020,7 @@ function docsRunDiagnosticFields(run: DocsSyncRunRow | null): {
   if (!run) return { runState: null, pendingTables: null };
   const pending = parseJsonRecord<unknown>(run.pendingJson, null);
   return {
-    runState: run.state === "downloading" || run.state === "ready"
+    runState: run.state === "downloading" || run.state === "ready" || run.state === "promoting"
       ? run.state
       : null,
     pendingTables: Array.isArray(pending) ? pending.length : null,
@@ -764,10 +1032,16 @@ function publishDocsSubstage(context: SyncExecutionContext): void {
   if (!runtime || runtime.frozen || !runtime.stage || !context.diagnostic) return;
   context.diagnostic.docsSubstage = {
     stage: runtime.stage,
-    runId: runtime.runId ?? null,
+    ...(runtime.scopeCategory ? { scopeCategory: runtime.scopeCategory } : {}),
+    ...(runtime.scopeOrdinal != null ? { scopeOrdinal: runtime.scopeOrdinal } : {}),
+    ...(runtime.scopeCount != null ? { scopeCount: runtime.scopeCount } : {}),
     elapsedMs: Math.max(0, Date.now() - runtime.startedAt),
     runState: runtime.runState,
     pendingTables: runtime.pendingTables,
+    ...(runtime.promotionEligibility ? { promotionEligibility: {
+      ...runtime.promotionEligibility,
+      engineReasons: [...runtime.promotionEligibility.engineReasons],
+    } } : {}),
     ...(runtime.promotion ? { promotion: {
       ...runtime.promotion,
       phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
@@ -824,10 +1098,16 @@ function captureDocsWatchdog(context: SyncExecutionContext): void {
   if (!context.diagnostic || context.diagnostic.docsWatchdog) return;
   const snapshot: DocsSyncDiagnostic = {
     stage: runtime.stage,
-    runId: runtime.runId ?? null,
+    ...(runtime.scopeCategory ? { scopeCategory: runtime.scopeCategory } : {}),
+    ...(runtime.scopeOrdinal != null ? { scopeOrdinal: runtime.scopeOrdinal } : {}),
+    ...(runtime.scopeCount != null ? { scopeCount: runtime.scopeCount } : {}),
     elapsedMs: Math.max(0, Date.now() - runtime.startedAt),
     runState: runtime.runState,
     pendingTables: runtime.pendingTables,
+    ...(runtime.promotionEligibility ? { promotionEligibility: {
+      ...runtime.promotionEligibility,
+      engineReasons: [...runtime.promotionEligibility.engineReasons],
+    } } : {}),
     ...(runtime.promotion ? { promotion: {
       ...runtime.promotion,
       phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
@@ -837,9 +1117,11 @@ function captureDocsWatchdog(context: SyncExecutionContext): void {
   };
   context.diagnostic.docsSubstage = cloneDocsCheckpoint(snapshot);
   context.diagnostic.docsWatchdog = cloneDocsCheckpoint(snapshot);
-  // Fixed schema labels and numeric progress only; available in ordinary logcat.
+  // Opaque run ID and bounded progress only; never content, auth, bindings, or SQL.
   console.warn("[sync] Docs watchdog checkpoint", JSON.stringify({
-    ...snapshot, requestId: context.diagnostic.requestId,
+    ...snapshot,
+    runId: runtime.runId ?? null,
+    requestId: context.diagnostic.requestId,
     canonicalRequestId: context.diagnostic.canonicalRequestId ?? context.diagnostic.requestId,
     authGeneration: context.diagnostic.authGeneration,
   }));
@@ -998,11 +1280,71 @@ function getSyncStateKey(authScope: string): string {
 }
 
 const GENERAL_SYNC_PAGINATION_VERSION = 1;
+const GENERAL_ROW_MANIFEST_DIFF_LIMIT = 400;
 // A defensive upper bound for a corrupt/malicious server that keeps issuing
 // fresh cursors forever.  Normal full pulls (including the current 1k+ message
 // device dataset) complete in well under 100 pages; exceeding this bound is a
 // recoverable sync failure rather than an unbounded battery/network loop.
 const GENERAL_SYNC_MAX_PAGES = 2_048;
+
+function extractGeneralRowVersions(payload: SyncTablePayload): GeneralRowVersion[] {
+  const versions: GeneralRowVersion[] = [];
+  for (const item of [...payload.changes, ...payload.tombstones]) {
+    const row = item as Record<string, unknown>;
+    const version = row._row_version;
+    delete row._row_version;
+    if (version == null) continue;
+    if (typeof row.id !== "string" || typeof version !== "string"
+      || !/^[a-f0-9]{16}$/.test(version)) {
+      throw new Error("一般テーブルrow versionが不正です");
+    }
+    versions.push({ id: row.id, version });
+  }
+  return versions;
+}
+
+function protectPendingGeneralRows(
+  authScope: string,
+  table: GeneralRowManifestTable,
+  payload: SyncTablePayload,
+): GeneralRowVersion[] {
+  const entries = [...payload.changes, ...payload.tombstones];
+  const ids = entries.flatMap((item) =>
+    typeof item.id === "string" ? [item.id] : [],
+  );
+  const pending = readPendingGeneralRowIds(authScope, table, ids);
+  payload.changes = payload.changes.filter((item) =>
+    typeof item.id !== "string" || !pending.has(item.id),
+  );
+  payload.tombstones = payload.tombstones.filter((item) =>
+    !pending.has(item.id),
+  );
+  return extractGeneralRowVersions(payload)
+    .filter((item) => !pending.has(item.id));
+}
+
+function parseGeneralRowManifest(payload: SyncTablePayload): {
+  rows: Map<string, string>;
+  sourceDigest: string;
+} {
+  if (!Array.isArray(payload.row_manifest)
+    || typeof payload.row_manifest_source_digest !== "string"
+    || !/^[a-f0-9]{64}$/.test(payload.row_manifest_source_digest)) {
+    throw new Error("一般テーブルrow manifestが不正です");
+  }
+  const rows = new Map<string, string>();
+  for (const entry of payload.row_manifest) {
+    if (!Array.isArray(entry) || entry.length !== 2
+      || typeof entry[0] !== "string"
+      || typeof entry[1] !== "string"
+      || !/^[a-f0-9]{16}$/.test(entry[1])
+      || rows.has(entry[0])) {
+      throw new Error("一般テーブルrow manifest行が不正です");
+    }
+    rows.set(entry[0], entry[1]);
+  }
+  return { rows, sourceDigest: payload.row_manifest_source_digest };
+}
 
 type GeneralSyncCheckpoint = {
   version: number;
@@ -1019,12 +1361,39 @@ type GeneralSyncCheckpoint = {
   digests?: Record<string, string>;
   /** Frozen previous receipts used to validate this run, including restart. */
   requestDigests?: Record<string, string>;
+  /** Separate PostgreSQL MVCC source receipts; never a general timestamp. */
+  sourceDigests?: Record<string, string>;
+  /** Start receipts frozen before a paginated source replay. */
+  sourceTokenStarts?: Record<string, string>;
+  /** Local session state guards the server shortcut against unqueued edits. */
+  localSessionFingerprint?: string | null;
   fullReplayedAt?: number;
   contentApplied?: boolean;
+  /** Exact committed message receipt; inert while a full replay is pending/resuming. */
+  messageSyncDigest?: string | null;
+  messageSyncServerTime?: string | null;
+  /** Exact local message-set generation bound to the saved server receipt. */
+  messageSyncLocalRevision?: string | null;
+  messageSyncScopedRows?: number | null;
+  /** Saved overlap base for an interrupted message delta run. */
+  messageDeltaSince?: string | null;
+  messageDeltaMode?: "delta" | "full";
 };
 
 function getGeneralSyncStateKey(authScope: string): string {
   return `__general_v1__:${authScope.slice("auth:".length)}`;
+}
+
+// Fingerprint the trigger-maintained write generation, not the rows: hashing
+// every session row took about 4 seconds on device for each no-op sync.
+async function currentLocalConversationSessionFingerprint(): Promise<string> {
+  const rows = await getDb()
+    .select({ cursor: schema.syncState.cursor })
+    .from(schema.syncState)
+    .where(eq(schema.syncState.tableName, GENERAL_SESSION_FINGERPRINT_REVISION_KEY));
+  return localConversationSessionFingerprint([
+    { id: GENERAL_SESSION_FINGERPRINT_REVISION_KEY, revision: rows[0]?.cursor ?? null },
+  ]);
 }
 
 async function getGeneralSyncCheckpoint(
@@ -1086,9 +1455,40 @@ async function getGeneralSyncCheckpoint(
     cursors,
     digests: validGeneralDigests(parsed.digests, TABLES),
     requestDigests: validGeneralDigests(parsed.requestDigests, TABLES),
+    sourceDigests: validGeneralSourceDigests(parsed.sourceDigests, TABLES),
+    sourceTokenStarts: validGeneralSourceDigests(parsed.sourceTokenStarts, TABLES),
+    localSessionFingerprint:
+      typeof parsed.localSessionFingerprint === "string"
+        && /^[a-f0-9]{64}$/.test(parsed.localSessionFingerprint)
+        ? parsed.localSessionFingerprint
+        : null,
     fullReplayedAt: typeof parsed.fullReplayedAt === "number" && Number.isFinite(parsed.fullReplayedAt)
       ? parsed.fullReplayedAt : undefined,
     contentApplied: typeof parsed.contentApplied === "boolean" ? parsed.contentApplied : undefined,
+    messageSyncDigest: typeof parsed.messageSyncDigest === "string"
+      && /^[a-f0-9]{32}$/.test(parsed.messageSyncDigest)
+      ? parsed.messageSyncDigest
+      : null,
+    messageSyncServerTime: typeof parsed.messageSyncServerTime === "string"
+      && Number.isFinite(Date.parse(parsed.messageSyncServerTime))
+      ? parsed.messageSyncServerTime
+      : null,
+    messageSyncLocalRevision: typeof parsed.messageSyncLocalRevision === "string"
+      && /^\d+$/.test(parsed.messageSyncLocalRevision)
+      ? parsed.messageSyncLocalRevision
+      : null,
+    messageSyncScopedRows: typeof parsed.messageSyncScopedRows === "number"
+      && Number.isSafeInteger(parsed.messageSyncScopedRows)
+      && parsed.messageSyncScopedRows >= 0
+      ? parsed.messageSyncScopedRows
+      : null,
+    messageDeltaSince: typeof parsed.messageDeltaSince === "string"
+      && Number.isFinite(Date.parse(parsed.messageDeltaSince))
+      ? parsed.messageDeltaSince
+      : null,
+    messageDeltaMode: parsed.messageDeltaMode === "delta" || parsed.messageDeltaMode === "full"
+      ? parsed.messageDeltaMode
+      : undefined,
   };
 }
 
@@ -1116,7 +1516,17 @@ async function markGeneralSyncCheckpointComplete(
   authScope: string,
   serverTime: string,
   watermark: string | null,
-  receipt: Pick<GeneralSyncCheckpoint, "digests" | "fullReplayedAt"> = {},
+  receipt: Pick<
+    GeneralSyncCheckpoint,
+    | "digests"
+    | "sourceDigests"
+    | "localSessionFingerprint"
+    | "fullReplayedAt"
+    | "messageSyncDigest"
+    | "messageSyncServerTime"
+    | "messageSyncLocalRevision"
+    | "messageSyncScopedRows"
+  > = {},
 ): Promise<void> {
   const db = getDb();
   const tableName = getGeneralSyncStateKey(authScope);
@@ -1182,6 +1592,23 @@ function getDocsDigestPrefix(
   projectId?: string | null,
 ): string {
   return `docs_digest:v2:${authScope.slice("auth:".length)}${getDocsScopeSuffix(scopeId)}${getDocsScopeProjectSuffix(projectId)}:`;
+}
+
+function getDocsFastDigestPrefix(
+  authScope: string,
+  scopeId?: string,
+  projectId?: string | null,
+): string {
+  return `docs_fast_digest:v1:${authScope.slice("auth:".length)}${getDocsScopeSuffix(scopeId)}${getDocsScopeProjectSuffix(projectId)}:`;
+}
+
+function getDocsFastDigestKey(
+  authScope: string,
+  table: string,
+  scopeId?: string,
+  projectId?: string | null,
+): string {
+  return `${getDocsFastDigestPrefix(authScope, scopeId, projectId)}${table}`;
 }
 
 function getDocsDigestKey(
@@ -1307,10 +1734,10 @@ async function getActiveDocsSyncRun(
 ): Promise<DocsSyncRunRow | null> {
   if (!docsStagingAvailable()) return null;
   const rows = await withDocsExclusiveTransaction(async (tx) => {
-    const params: unknown[] = [authScope, "downloading", "ready"];
+    const params: unknown[] = [authScope, "downloading", "ready", "promoting"];
     let sql = `
       SELECT * FROM docs_sync_runs
-      WHERE auth_scope = ? AND state IN (?, ?)
+      WHERE auth_scope = ? AND state IN (?, ?, ?)
     `;
     if (scopeId != null) {
       sql += " AND scope_key = ?";
@@ -1485,6 +1912,7 @@ async function persistDocsPage(
   pendingTables: SyncTable[],
   nextCursors: Record<string, string>,
   assertActive?: () => void,
+  liveWriteState?: DocsLiveWriteState,
 ): Promise<number> {
   if (!docsStagingAvailable()) return 0;
   assertActive?.();
@@ -1571,21 +1999,27 @@ async function persistDocsPage(
         ] as const];
       });
       if (!rows.length) continue;
-      await withDocsExclusiveTransaction(async (tx: DocsSqliteAsyncTransaction) => {
-        assertActive?.();
-        await executeDocsPreparedBatch(
-          tx,
-          `INSERT INTO docs_sync_staging(
-             run_id, auth_scope, scope_key, scope_id, project_id,
-             table_name, entity_key, payload_json, is_tombstone
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(run_id, table_name, entity_key) DO UPDATE SET
-             payload_json = excluded.payload_json,
-             is_tombstone = excluded.is_tombstone`,
-          rows,
-        );
-        assertActive?.();
-      });
+      if (liveWriteState) liveWriteState.started = true;
+      try {
+        await withDocsExclusiveTransaction(async (tx: DocsSqliteAsyncTransaction) => {
+          assertActive?.();
+          await executeDocsPreparedBatch(
+            tx,
+            `INSERT INTO docs_sync_staging(
+               run_id, auth_scope, scope_key, scope_id, project_id,
+               table_name, entity_key, payload_json, is_tombstone
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(run_id, table_name, entity_key) DO UPDATE SET
+               payload_json = excluded.payload_json,
+               is_tombstone = excluded.is_tombstone`,
+            rows,
+          );
+          assertActive?.();
+        });
+      } finally {
+        if (liveWriteState) liveWriteState.started = false;
+      }
+      liveWriteState?.reportProgress?.();
       stagedRowsWritten += rows.length;
     }
   };
@@ -1607,10 +2041,12 @@ async function persistDocsPage(
 
   const updatedAt = new Date().toISOString();
   const nextPending = Object.keys(nextCursors);
-  await withDocsExclusiveTransaction(async (tx) => {
-    assertActive?.();
-    await tx.runAsync(
-      `UPDATE docs_sync_runs SET
+  if (liveWriteState) liveWriteState.started = true;
+  try {
+    await withDocsExclusiveTransaction(async (tx) => {
+      assertActive?.();
+      await tx.runAsync(
+        `UPDATE docs_sync_runs SET
          scope_key = ?, scope_id = ?, project_id = ?,
          snapshot_token = ?, scope_revision = ?, scope_digest = ?, server_time = ?,
          cursor_json = ?, pending_json = ?, state = ?,
@@ -1632,9 +2068,13 @@ async function persistDocsPage(
       updatedAt,
       run.runId,
       authScope,
-    );
-    assertActive?.();
-  });
+      );
+      assertActive?.();
+    });
+  } finally {
+    if (liveWriteState) liveWriteState.started = false;
+  }
+  liveWriteState?.reportProgress?.();
   // Keep the in-memory run used by the page loop in lockstep with the row we
   // just persisted.  A pull may span many pages; retaining the original
   // run object would make the next page overwrite accumulated digests and
@@ -1722,15 +2162,67 @@ async function getSavedDocsDigests(
     .where(like(schema.syncState.tableName, `${prefix}%`));
   const digests: Record<string, string> = {};
   for (const row of rows) {
-    // drizzle の like ヘルパは ESCAPE 句を持たず、prefix 内の `_`/`%`（将来 scope に
-    // 含まれ得る）が LIKE ワイルドカードとして過剰マッチしうる。JS 側で厳密な
-    // 前方一致に絞り、他 scope や別種 tableName の混入を防ぐ。
+    // LIKE の前方一致に加えて suffix を許可表と照合する。root prefix は project
+    // scope も prefix するため、startsWith だけでは他 scope が混ざる。
     if (!row.tableName.startsWith(prefix)) continue;
-    if (row.cursor) {
-      digests[row.tableName.slice(prefix.length)] = row.cursor;
+    const table = row.tableName.slice(prefix.length);
+    // The root prefix also prefixes every workspace/project scope. Only an
+    // exact table suffix belongs to this request's scope.
+    if (DOCS_TABLES.includes(table as (typeof DOCS_TABLES)[number]) && row.cursor) {
+      digests[table] = row.cursor;
     }
   }
   return digests;
+}
+
+async function getSavedDocsFastDigests(
+  authScope: string,
+  scopeId?: string,
+  projectId?: string | null,
+): Promise<Record<string, string>> {
+  const db = getDb();
+  const prefix = getDocsFastDigestPrefix(authScope, scopeId, projectId);
+  const rows = await db
+    .select()
+    .from(schema.syncState)
+    .where(like(schema.syncState.tableName, `${prefix}%`));
+  const digests: Record<string, string> = {};
+  for (const row of rows) {
+    if (!row.tableName.startsWith(prefix)) continue;
+    const table = row.tableName.slice(prefix.length);
+    if (
+      DOCS_TABLES.includes(table as (typeof DOCS_TABLES)[number])
+      && row.cursor
+      && /^[a-f0-9]{64}$/.test(row.cursor)
+    ) {
+      digests[table] = row.cursor;
+    }
+  }
+  return digests;
+}
+
+async function saveDocsFastDigests(
+  authScope: string,
+  digests: Record<string, string>,
+  scopeId?: string,
+  projectId?: string | null,
+): Promise<void> {
+  const entries = Object.entries(digests).filter(([table, digest]) =>
+    DOCS_TABLES.includes(table as (typeof DOCS_TABLES)[number])
+      && /^[a-f0-9]{64}$/.test(digest),
+  );
+  if (entries.length !== DOCS_TABLES.length) return;
+  const db = getDb();
+  for (const [table, digest] of entries) {
+    const tableName = getDocsFastDigestKey(authScope, table, scopeId, projectId);
+    await db
+      .insert(schema.syncState)
+      .values({ tableName, lastPulledAt: null, lastPushedAt: null, cursor: digest })
+      .onConflictDoUpdate({
+        target: schema.syncState.tableName,
+        set: { cursor: digest },
+      });
+  }
 }
 
 /** 応答の authoritative_digest を cursor 列へ保存する（適用完了後のみ呼ぶ）。 */
@@ -1930,8 +2422,20 @@ async function applyPullResponse(
       assertSyncExecutionActive(context);
       getDb().transaction((tx) => {
         applyRemoteConversationMessagesInWriter(
-          writer, tx, messages.changes as unknown as ConversationMessage[]);
-        applyConversationMessageTombstonesInWriter(writer, tx, messages.tombstones);
+          writer,
+          tx,
+          messages.changes as unknown as ConversationMessage[],
+          {
+            serverSyncScope: authScope,
+            authoritativeIds: messages.authoritative_ids,
+          },
+        );
+        applyConversationMessageTombstonesInWriter(
+          writer,
+          tx,
+          messages.tombstones,
+          { serverSyncScope: authScope },
+        );
       });
     }
 
@@ -2195,13 +2699,34 @@ async function applyDocsPullOnce(
   projectId?: string | null,
   options: {
     forceDocs?: boolean;
+    hasSavedDocsDigestBaseline?: boolean;
     onProgress?: DocsResyncProgressHandler;
     run?: DocsSyncRunRow | null;
     previousScopes?: DocsSyncScope[];
     diagnosticPromotionGeneration?: number;
   } = {},
-): Promise<DocsSyncScope[]> {
+): Promise<DocsScopePullResult> {
+  const requestPreparationStartedAt = Date.now();
+  let fastDigestLoadMs = 0;
+  let digestBundleMs = 0;
+  let projectBaselineReadMs = 0;
+  let projectBaselineReadCount = 0;
   const persistedRun = options.run ?? null;
+  let docsFastDigests: Record<string, string> = {};
+  if (!options.forceDocs) {
+    const startedAt = Date.now();
+    docsFastDigests = await getSavedDocsFastDigests(authScope, scopeId, projectId);
+    fastDigestLoadMs = Math.max(0, Date.now() - startedAt);
+  }
+  const hasCompleteDocsDigestBaseline = DOCS_TABLES.every((table) =>
+    Boolean(docsDigests[table]),
+  );
+  let docsFastDigestBundle: string | null = null;
+  if (hasCompleteDocsDigestBaseline) {
+    const startedAt = Date.now();
+    docsFastDigestBundle = await createDocsFastDigestBundle(docsFastDigests, DOCS_TABLES);
+    digestBundleMs = Math.max(0, Date.now() - startedAt);
+  }
   let pendingTables = persistedRun
     ? parseJsonRecord<SyncTable[]>(persistedRun.pendingJson, [...DOCS_TABLES])
     : [...DOCS_TABLES];
@@ -2217,12 +2742,48 @@ async function applyDocsPullOnce(
   const seenCursorStates = new Set<string>();
   const authoritativeCounts = new Map<SyncTable, number>();
   const appliedCounts = new Map<SyncTable, number>();
+  let rootProjectScopesValidated = false;
+  const projectDigests: Record<string, Record<string, string>> = {};
+  const projectFastDigests: Record<string, Record<string, string>> = {};
+  const projectScopeRevisions: Record<string, string> = {};
+  let currentFastDigests: Record<string, string> = {};
+  let fastDigestsStable = false;
+  let unchangedFastDigestReceipt = false;
+  let localFastDigestWriteStatements = 0;
+  let lastDocsResponseFinishedAt: number | null = null;
+  let hasCompleteProjectFastBaseline = false;
+  if (scopeId == null && projectId == null) {
+    const previousProjectScopes = (options.previousScopes ?? []).filter((scope) =>
+      scope.source === "project" && Boolean(scope.project_id),
+    );
+    hasCompleteProjectFastBaseline = previousProjectScopes.length > 0;
+    for (const previousScope of previousProjectScopes) {
+      if (!previousScope.project_id) continue;
+      const startedAt = Date.now();
+      const saved = await getSavedDocsFastDigests(
+        authScope,
+        previousScope.workspace_id,
+        previousScope.project_id,
+      );
+      projectBaselineReadMs += Math.max(0, Date.now() - startedAt);
+      projectBaselineReadCount += 1;
+      if (!DOCS_TABLES.every((table) => Boolean(saved[table]))) {
+        hasCompleteProjectFastBaseline = false;
+        break;
+      }
+    }
+  }
   let stagedRowsWritten = 0;
   let discoveredScopes: DocsSyncScope[] = [];
   let page = 0;
 
-  if (persistedRun?.state === "ready" && pendingTables.length === 0) {
-    markDocsSubstage(context, "ready_resume", persistedRun);
+  if ((persistedRun?.state === "ready" || persistedRun?.state === "promoting")
+    && pendingTables.length === 0) {
+    markDocsSubstage(
+      context,
+      persistedRun.state === "promoting" ? "promotion_resume" : "ready_resume",
+      persistedRun,
+    );
   }
 
   while (pendingTables.length) {
@@ -2259,47 +2820,113 @@ async function applyDocsPullOnce(
       useStaging ? "staged" : "applied",
       options.diagnosticPromotionGeneration ?? null,
     );
-    const docsResponse = await pullSync({
-      since: docsSince,
-      tables: pendingTables,
-      ...(scopeId ? { docs_scope_id: scopeId } : {}),
-      ...(projectId ? { project_id: projectId } : {}),
-      docs_pagination: true,
-      // Staging needs the authoritative ID set on the terminal page so clean
-      // rows can be reconciled during atomic promotion.  This is intentionally
-      // true even for force resync; force no longer means destructive delete.
-      docs_reconcile: true,
-      ...(snapshotToken ? { docs_snapshot_token: snapshotToken } : {}),
-      ...(scopeRevision ? { docs_scope_revision: scopeRevision } : {}),
-      ...(requestDocsScopeDigest
-        ? { docs_scope_digest: requestDocsScopeDigest }
-        : {}),
-      ...(Object.keys(docsDigests).length
-        ? { docs_digests: docsDigests }
-        : {}),
-      ...(Object.keys(docsCursors).length
-        ? { docs_cursors: docsCursors }
-        : {}),
-      signal: context.controller.signal,
-      ...(pullDiagnostic
-        ? {
-            requestId: pullDiagnostic.requestId,
-            lifecycle: pullDiagnosticLifecycle(pullDiagnostic),
-          }
-        : {}),
-    }).catch((error: unknown) => {
+    if (context.diagnostic) {
+      console.info("[sync] Docs request preparation checkpoint", JSON.stringify({
+        event: "docs_request_prepare",
+        at: Date.now(),
+        scope: diagnosticScopeFor(scopeId, projectId),
+        page: page + 1,
+        elapsedMs: Math.max(0, Date.now() - requestPreparationStartedAt),
+        fastDigestLoadMs,
+        digestBundleMs,
+        projectBaselineReadMs,
+        projectBaselineReadCount,
+        savedTableDigestCount: Object.keys(docsDigests).length,
+        fastDigestBundlePresent: docsFastDigestBundle != null,
+        projectFastBaselineComplete: hasCompleteProjectFastBaseline,
+      }));
+    }
+    const docsRequestStartedAt = Date.now();
+    logDocsRequestCheckpoint(context, "request_start", { page: page + 1 });
+    let docsResponse: SyncPullResponse;
+    try {
+      docsResponse = await pullSync({
+        since: docsSince,
+        tables: pendingTables,
+        ...(scopeId ? { docs_scope_id: scopeId } : {}),
+        ...(projectId ? { project_id: projectId } : {}),
+        docs_pagination: true,
+        // Staging needs the authoritative ID set on the terminal page so clean
+        // rows can be reconciled during atomic promotion. This remains true
+        // for force resync, which no longer means destructive delete.
+        docs_reconcile: true,
+        ...(snapshotToken ? { docs_snapshot_token: snapshotToken } : {}),
+        ...(scopeRevision ? { docs_scope_revision: scopeRevision } : {}),
+        ...(requestDocsScopeDigest
+          ? { docs_scope_digest: requestDocsScopeDigest }
+          : {}),
+        ...(Object.keys(docsDigests).length
+          ? { docs_digests: docsDigests }
+          : {}),
+        ...(Object.keys(docsCursors).length
+          ? { docs_cursors: docsCursors }
+          : {}),
+        ...(scopeId == null && projectId == null
+          && options.hasSavedDocsDigestBaseline
+          && !options.forceDocs
+          ? {
+              include_docs_project_digests: true,
+              docs_project_fast_baseline: hasCompleteProjectFastBaseline,
+            }
+          : {}),
+        docs_fast_digest_version: 1,
+        ...(docsFastDigestBundle
+          ? { docs_fast_digest_bundle: docsFastDigestBundle }
+          : {}),
+        signal: context.controller.signal,
+        ...(pullDiagnostic
+          ? {
+              requestId: pullDiagnostic.requestId,
+              lifecycle: pullDiagnosticLifecycle(pullDiagnostic),
+            }
+          : {}),
+      });
+    } catch (error) {
       finishPullDiagnosticFromError(pullDiagnostic, error);
+      logDocsRequestCheckpoint(context, "request_finish", {
+        page: page + 1,
+        durationMs: Math.max(0, Date.now() - docsRequestStartedAt),
+        outcome: "error",
+        httpStatus: pullDiagnostic?.status,
+        attemptCount: pullDiagnostic?.attemptCount,
+        errorKind: error instanceof Error ? error.name : "UnknownError",
+      });
       if (isApiConnectionError(error) || isApiTimeoutError(error)) {
         throw new DocsPullTransportError(error);
       }
       throw error;
+    }
+    logDocsRequestCheckpoint(context, "request_finish", {
+      page: page + 1,
+      durationMs: Math.max(0, Date.now() - docsRequestStartedAt),
+      outcome: "response",
+      httpStatus: pullDiagnostic?.status,
+      attemptCount: pullDiagnostic?.attemptCount,
     });
+    lastDocsResponseFinishedAt = Date.now();
     assertSyncExecutionActive(context);
     if (docsResponse.docs_pagination_version !== 2) {
       throw new Error("サーバーがDocs分割同期に対応していません");
     }
     if (!docsResponse.docs_scope_digest) {
       throw new Error("サーバーがDocs可視範囲を返しませんでした");
+    }
+    if (scopeId == null && projectId == null && docsResponse.docs_project_digests) {
+      Object.assign(projectDigests, docsResponse.docs_project_digests);
+    }
+    if (scopeId == null && projectId == null && docsResponse.docs_project_scope_revisions) {
+      Object.assign(projectScopeRevisions, docsResponse.docs_project_scope_revisions);
+    }
+    if (docsResponse.docs_fast_digest_stable === true) {
+      currentFastDigests = docsResponse.docs_fast_digests ?? {};
+      fastDigestsStable = true;
+      if (
+        scopeId == null
+        && projectId == null
+        && docsResponse.docs_project_fast_digests
+      ) {
+        Object.assign(projectFastDigests, docsResponse.docs_project_fast_digests);
+      }
     }
     if (
       snapshotToken &&
@@ -2384,6 +3011,39 @@ async function applyDocsPullOnce(
       );
       throw new Error("Docs同期のauthoritative metadataがありません");
     }
+    if (
+      page === 0
+      && options.hasSavedDocsDigestBaseline
+      && !options.forceDocs
+      && hasCompleteDocsDigestBaseline
+      && docsFastDigestBundle
+      && savedDocsScopeDigest
+      && savedDocsScopeRevision
+      && docsResponse.docs_scope_digest === savedDocsScopeDigest
+      && docsResponse.docs_scope_revision === savedDocsScopeRevision
+      && docsResponse.docs_fast_digest_stable === true
+      && pendingTables.length === DOCS_TABLES.length
+      && DOCS_TABLES.every((table) => pendingTables.includes(table))
+      && DOCS_TABLES.every((table) => {
+        const payload = docsResponse.tables[table];
+        return Boolean(
+          payload
+          && payload.changes.length === 0
+          && payload.tombstones.length === 0
+          && !payload.cursor
+          && payload.authoritative_ids == null
+          && payload.authoritative_scope_id == null
+          && payload.authoritative_digest === docsDigests[table]
+          && docsResponse.docs_fast_digests?.[table] === docsFastDigests[table],
+        );
+      })
+    ) {
+      // The compact server receipt exactly matches the saved eight-table row
+      // set and the ACL revision. The repository may finalize metadata without
+      // scanning membership; it still leaves live rows, dirty flags and outbox
+      // entries untouched.
+      unchangedFastDigestReceipt = true;
+    }
     recordPullResponse(
       pullDiagnostic,
       docsResponse,
@@ -2424,7 +3084,42 @@ async function applyDocsPullOnce(
         pendingTables,
         nextCursors,
         () => assertSyncExecutionActive(context),
+        context.docsLiveWriteState,
       );
+    }
+    // The server orders mobile roots before descendants. On a first-page
+    // bootstrap, expose only the explicitly authorized personal-owner root
+    // rows and their membership now; keep the remaining staged snapshot,
+    // digest/watermark and all authoritative-ID reconciliation atomic at the
+    // normal final promotion boundary.
+    if (
+      page === 1
+      && !scopeId
+      && docsResponse.docs_scope_revision
+      && (!savedDocsScopeRevision || savedDocsScopeRevision === docsResponse.docs_scope_revision)
+      && (!savedDocsScopeDigest || savedDocsScopeDigest === docsResponse.docs_scope_digest)
+      && docsResponse.docs_scopes?.length
+    ) {
+      const personalOwnerScope = docsResponse.docs_scopes.find((scope) =>
+        scope.source === "personal"
+        && scope.access === "owner"
+        && (scope.project_id ?? null) === null,
+      );
+      const nodeRows = docsResponse.tables.knowledge_nodes?.changes as DocsNode[] | undefined;
+      if (personalOwnerScope && nodeRows?.length) {
+        const rootBootstrap = await applyRemoteDocsRootBootstrapRows(
+          nodeRows,
+          authScope,
+          [personalOwnerScope],
+          {
+            applyNodes: useStaging,
+            workspaceStateKey: getDocsWorkspaceKey(authScope),
+            assertActive: () => assertSyncExecutionActive(context),
+          },
+        );
+        assertSyncExecutionActive(context);
+        if (rootBootstrap?.rowCount) markDocsSubstage(context, "roots_visible", persistedRun);
+      }
     }
     if (options.onProgress) {
       const hasAllCounts = DOCS_TABLES.every((table) =>
@@ -2550,91 +3245,184 @@ async function applyDocsPullOnce(
         finalizedWorkspaceId ?? promotionScopeId,
         promotionProjectId,
       );
+      const previousScopeSignature = options.previousScopes
+        ? JSON.stringify(options.previousScopes.map((scope) => [
+            scope.workspace_id, scope.project_id ?? null, scope.source ?? null,
+            scope.access ?? null, scope.read_only ?? null,
+          ]).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))))
+        : null;
+      const nextScopeSignature = JSON.stringify(runScopes.map((scope) => [
+        scope.workspace_id, scope.project_id ?? null, scope.source ?? null,
+        scope.access ?? null, scope.read_only ?? null,
+      ]).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))));
+      const engineFallbackReasons: DocsPromotionFallbackReason[] = [];
+      if (options.forceDocs) engineFallbackReasons.push("force_requested");
+      if (currentRun.force) engineFallbackReasons.push("run_forced");
+      if (!options.hasSavedDocsDigestBaseline) engineFallbackReasons.push("saved_digest_baseline_missing");
+      if (!docsSince) engineFallbackReasons.push("since_missing");
+      else if (!Number.isFinite(Date.parse(docsSince))) engineFallbackReasons.push("since_invalid");
+      if (!savedDocsScopeDigest) engineFallbackReasons.push("saved_scope_digest_missing");
+      else if (savedDocsScopeDigest !== responseDocsScopeDigest) engineFallbackReasons.push("scope_digest_mismatch");
+      if (!savedDocsScopeRevision) engineFallbackReasons.push("saved_scope_revision_missing");
+      else if (savedDocsScopeRevision !== scopeRevision) engineFallbackReasons.push("scope_revision_mismatch");
+      if (!hasAuthoritativeScopeSet) engineFallbackReasons.push("authoritative_scope_set_missing");
+      if (previousScopeSignature && previousScopeSignature !== nextScopeSignature) {
+        engineFallbackReasons.push("scope_projection_changed");
+      }
+      if (currentRun.state !== "ready" && currentRun.state !== "promoting") {
+        engineFallbackReasons.push("run_not_ready");
+      }
+      const pendingTableCount = parseJsonRecord<SyncTable[]>(currentRun.pendingJson, []).length;
+      if (pendingTableCount !== 0) engineFallbackReasons.push("pending_tables_remain");
+      const validatedIncremental = currentRun.state === "ready" && engineFallbackReasons.length === 0;
+      const authoritativeIdCounts = DOCS_TABLES
+        .map((table) => authoritative[table]?.ids?.length ?? 0)
+        .filter((count) => count > 0);
+      if (context.docsDiagnostic && !context.docsDiagnostic.frozen) {
+        context.docsDiagnostic.promotionEligibility = {
+          enginePath: currentRun.state === "promoting"
+            ? "promotion_resume"
+            : validatedIncremental ? "incremental" : "full_fallback",
+          engineReasons: [...engineFallbackReasons],
+          authoritativeIdTableCount: authoritativeIdCounts.length,
+          maxAuthoritativeIdCount: Math.max(0, ...authoritativeIdCounts),
+        };
+      }
       const stateScopeId = scopeId;
       const stateProjectId = projectId;
+      const repositoryRevalidation: { current: DocsPromotionRevalidation | null } = {
+        current: null,
+      };
       let promotionTelemetry: Awaited<ReturnType<typeof promoteDocsSyncRun>>;
+      let docsSqlCompletedCheckpoint = 0;
+      const promotionFinalize = {
+        scopeDigest: responseDocsScopeDigest,
+        serverTime: docsServerTime,
+        digestByTable: parseJsonRecord<Record<string, string>>(
+          currentRun.digestJson,
+          {},
+        ),
+        scopeDigestKey: getDocsScopeDigestKey(authScope, stateScopeId, stateProjectId),
+        scopeRevision,
+        scopeRevisionKey: getDocsScopeRevisionKey(authScope, stateScopeId, stateProjectId),
+        lastPulledKey: getDocsSyncStateKey(authScope, stateScopeId, stateProjectId),
+        digestKeys: Object.fromEntries(
+          Object.keys(
+            parseJsonRecord<Record<string, string>>(currentRun.digestJson, {}),
+          ).map((table) => [
+            table,
+            getDocsDigestKey(authScope, table, stateScopeId, stateProjectId),
+          ]),
+        ),
+        scopesKey: hasAuthoritativeScopeSet
+          ? getDocsScopesKey(authScope)
+          : undefined,
+        workspaceKey: finalizedWorkspaceId
+          ? getDocsWorkspaceKey(authScope, finalizedWorkspaceId, promotionProjectId)
+          : undefined,
+        workspaceId: finalizedWorkspaceId,
+      };
+      const promotionScopeSet = options.previousScopes && hasAuthoritativeScopeSet
+        ? { previousScopes: options.previousScopes, newScopes: runScopes }
+        : undefined;
+      const onPromotionRevalidation = (result: DocsPromotionRevalidation): void => {
+        repositoryRevalidation.current = result;
+        const runtime = context.docsDiagnostic;
+        if (!runtime || runtime.frozen || !runtime.promotionEligibility) return;
+        runtime.promotionEligibility = {
+          ...runtime.promotionEligibility,
+          repositoryPath: result.path,
+          repositoryReason: result.reason,
+        };
+        publishDocsSubstage(context);
+      };
+      const onPromotionPhase = (phase: DocsPromotionPhase): void => {
+        const runtime = context.docsDiagnostic;
+        if (!runtime || runtime.frozen) return;
+        runtime.promotion = {
+          phase, startedAt: Date.now(),
+          ...(phase !== "building_sets" && runtime.promotion?.sqlite
+            ? { sqlite: runtime.promotion.sqlite } : {}),
+          ...(phase !== "building_sets" && runtime.promotion?.work
+            ? { work: runtime.promotion.work } : {}),
+        };
+        publishDocsSubstage(context);
+      };
+      const onStagingProgress = (progress: DocsStagingProgress): void => {
+        context.docsLiveWriteState?.reportProgress?.();
+        const runtime = context.docsDiagnostic;
+        if (!runtime || runtime.frozen || !runtime.promotion) return;
+        runtime.promotion.work = { ...progress };
+      };
+      const onSqliteProgress = (progress: DocsSqliteProgress): void => {
+        if (context.docsLiveWriteState) {
+          context.docsLiveWriteState.started = progress.nativeActive;
+          if (progress.completedStatements > docsSqlCompletedCheckpoint) {
+            docsSqlCompletedCheckpoint = progress.completedStatements;
+            context.docsLiveWriteState.reportProgress?.();
+          }
+        }
+        if (progress.awaiting === "settled") {
+          logSyncFlightBoundary(context.diagnostic, "native_settled", persistedRun.runId, progress);
+        }
+        const runtime = context.docsDiagnostic;
+        if (!runtime || runtime.frozen || !runtime.promotion) return;
+        runtime.promotion = {
+          ...runtime.promotion,
+          sqlite: cloneDocsSqliteProgress(progress),
+          phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
+        };
+        if (context.diagnostic?.docsSubstage) {
+          context.diagnostic.docsSubstage.promotion = runtime.promotion;
+        }
+      };
       try {
         markDocsSubstage(context, "promoting", currentRun);
-        promotionTelemetry = await promoteDocsSyncRun({
-          assertActive: () => assertSyncExecutionActive(context),
-          onPromotionPhase: (phase) => {
-            const runtime = context.docsDiagnostic;
-            if (!runtime || runtime.frozen) return;
-            runtime.promotion = {
-              phase, startedAt: Date.now(),
-              ...(phase !== "building_sets" && runtime.promotion?.sqlite
-                ? { sqlite: runtime.promotion.sqlite } : {}),
-              ...(phase !== "building_sets" && runtime.promotion?.work ? { work: runtime.promotion.work } : {}),
-            };
-            publishDocsSubstage(context);
-          },
-          onStagingProgress: (progress) => {
-            const runtime = context.docsDiagnostic;
-            if (!runtime || runtime.frozen || !runtime.promotion) return;
-            runtime.promotion.work = { ...progress };
-          },
-          onSqliteProgress: (progress) => {
-            // Ownership must still update after diagnostics freeze at timeout.
-            if (context.docsLiveWriteState) {
-              context.docsLiveWriteState.started = progress.nativeActive;
-            }
-            if (progress.awaiting === "settled") {
-              logSyncFlightBoundary(context.diagnostic, "native_settled", persistedRun.runId, progress);
-            }
-            const runtime = context.docsDiagnostic;
-            if (!runtime || runtime.frozen || !runtime.promotion) return;
-            runtime.promotion = {
-              ...runtime.promotion, sqlite: cloneDocsSqliteProgress(progress),
-              phaseElapsedMs: Math.max(0, Date.now() - runtime.promotion.startedAt),
-            };
-            // Retain the latest await without per-statement React notifications.
-            if (context.diagnostic?.docsSubstage) {
-              context.diagnostic.docsSubstage.promotion = runtime.promotion;
-            }
-          },
-          runId: persistedRun.runId,
-          authScope,
-          scopeId: promotionScopeId,
-          projectId: promotionProjectId,
-          scopeKey: promotionScopeKey,
-          snapshotServerTime: docsServerTime,
-          force: options.forceDocs,
-          authoritative,
-          scopes: runScopes,
-          finalize: {
-            scopeDigest: responseDocsScopeDigest,
-            serverTime: docsServerTime,
-            digestByTable: parseJsonRecord<Record<string, string>>(
-              currentRun.digestJson,
-              {},
-            ),
-            scopeDigestKey: getDocsScopeDigestKey(authScope, stateScopeId, stateProjectId),
-            scopeRevision,
-            scopeRevisionKey: getDocsScopeRevisionKey(authScope, stateScopeId, stateProjectId),
-            lastPulledKey: getDocsSyncStateKey(authScope, stateScopeId, stateProjectId),
-            digestKeys: Object.fromEntries(
-              Object.keys(
-                parseJsonRecord<Record<string, string>>(currentRun.digestJson, {}),
-              ).map((table) => [
-                table,
-                getDocsDigestKey(authScope, table, stateScopeId, stateProjectId),
-              ]),
-            ),
-            scopesKey: hasAuthoritativeScopeSet
-              ? getDocsScopesKey(authScope)
-              : undefined,
-            workspaceKey: finalizedWorkspaceId
-              ? getDocsWorkspaceKey(authScope, finalizedWorkspaceId, promotionProjectId)
-              : undefined,
-            workspaceId: finalizedWorkspaceId,
-          },
-          scopeSet: options.previousScopes && hasAuthoritativeScopeSet
-            ? {
-                previousScopes: options.previousScopes,
-                newScopes: runScopes,
-              }
-            : undefined,
-        });
+        const finalizedByFastReceipt = unchangedFastDigestReceipt
+          ? await finalizeDocsFastNoopRun({
+              assertActive: () => assertSyncExecutionActive(context),
+              onSqliteProgress,
+              runId: persistedRun.runId,
+              authScope,
+              scopeId: promotionScopeId,
+              projectId: promotionProjectId,
+              scopeKey: promotionScopeKey,
+              snapshotServerTime: docsServerTime,
+              force: options.forceDocs,
+              validatedIncremental,
+              unchangedFastDigestReceipt: true,
+              authoritative,
+              scopes: runScopes,
+              scopeSet: promotionScopeSet,
+              finalize: promotionFinalize,
+            })
+          : false;
+        if (finalizedByFastReceipt) {
+          onPromotionPhase("unchanged_receipt");
+          onPromotionRevalidation({ path: "unchanged_receipt", reason: "unchanged_receipt" });
+          promotionTelemetry = { source: "staging", rowsRead: 0, batches: 0, maxBatchSize: 0 };
+        } else {
+          promotionTelemetry = await promoteDocsSyncRun({
+            assertActive: () => assertSyncExecutionActive(context),
+            onPromotionRevalidation,
+            onPromotionPhase,
+            onStagingProgress,
+            onSqliteProgress,
+            runId: persistedRun.runId,
+            authScope,
+            resumePromotion: currentRun.state === "promoting",
+            scopeId: promotionScopeId,
+            projectId: promotionProjectId,
+            scopeKey: promotionScopeKey,
+            snapshotServerTime: docsServerTime,
+            force: options.forceDocs,
+            validatedIncremental,
+            authoritative,
+            scopes: runScopes,
+            finalize: promotionFinalize,
+            scopeSet: promotionScopeSet,
+          });
+        }
       } catch (error) {
         markDocsPromotion(
           context.diagnostic,
@@ -2667,6 +3455,21 @@ async function applyDocsPullOnce(
           stagedPromotionMaxBatchSize: promotionTelemetry.maxBatchSize,
         });
       }
+      const repositoryReceiptAccepted = repositoryRevalidation.current?.path === "validated_incremental"
+        || repositoryRevalidation.current?.path === "unchanged_receipt";
+      rootProjectScopesValidated = !options.forceDocs
+        && scopeId == null
+        && projectId == null
+        && validatedIncremental
+        && engineFallbackReasons.length === 0
+        && hasAuthoritativeScopeSet
+        && previousScopeSignature === nextScopeSignature
+        && repositoryReceiptAccepted
+        && (
+          Object.keys(projectDigests).length > 0
+          || Object.keys(projectFastDigests).length > 0
+        )
+        && Object.keys(projectScopeRevisions).length > 0;
     } else {
       assertSyncExecutionActive(context);
       await saveDocsScopeDigest(
@@ -2696,11 +3499,70 @@ async function applyDocsPullOnce(
         () => assertSyncExecutionActive(context),
       );
     }
+    if (
+      fastDigestsStable
+      && !unchangedFastDigestReceipt
+      && DOCS_TABLES.every((table) => Boolean(currentFastDigests[table]))
+    ) {
+      await saveDocsFastDigests(
+        authScope,
+        currentFastDigests,
+        scopeId,
+        projectId,
+      );
+      localFastDigestWriteStatements = DOCS_TABLES.length;
+    }
   }
-  return discoveredScopes;
+  if (context.diagnostic && lastDocsResponseFinishedAt != null) {
+    console.info("[sync] Docs scope pull completion checkpoint", JSON.stringify({
+      event: "docs_scope_pull_complete",
+      at: Date.now(),
+      scope: diagnosticScopeFor(scopeId, projectId),
+      pageCount: page,
+      responseToCompletionMs: Math.max(0, Date.now() - lastDocsResponseFinishedAt),
+      unchangedFastDigestReceipt,
+      fastDigestsStable,
+      stagedRowsWritten,
+      localFastDigestWriteStatements,
+    }));
+  }
+  return {
+    scopes: discoveredScopes,
+    rootProjectScopesValidated,
+    projectDigests,
+    projectFastDigests,
+    projectScopeRevisions,
+  };
 }
 
 async function resetGeneralSyncCheckpoint(authScope: string): Promise<void> {
+  const previous = await getGeneralSyncCheckpoint(authScope);
+  if (previous?.messageSyncDigest && previous.messageSyncServerTime) {
+    await saveGeneralSyncCheckpoint(authScope, {
+      version: GENERAL_SYNC_PAGINATION_VERSION,
+      state: "in_progress",
+      since: null,
+      serverTime: null,
+      watermark: null,
+      snapshotToken: null,
+      pendingTables: [...TABLES],
+      cursors: {},
+      digests: {},
+      requestDigests: {},
+      sourceDigests: {},
+      sourceTokenStarts: {},
+      localSessionFingerprint: null,
+      fullReplayedAt: previous.fullReplayedAt,
+      contentApplied: false,
+      messageSyncDigest: previous.messageSyncDigest,
+      messageSyncServerTime: previous.messageSyncServerTime,
+      messageSyncLocalRevision: previous.messageSyncLocalRevision,
+      messageSyncScopedRows: previous.messageSyncScopedRows,
+      messageDeltaMode: "delta",
+      messageDeltaSince: previous.messageSyncServerTime,
+    });
+    return;
+  }
   const db = getDb();
   const tableName = getGeneralSyncStateKey(authScope);
   await db
@@ -2731,6 +3593,7 @@ async function applyGeneralPullOnce(
   authScope: string,
   context: SyncExecutionContext,
 ): Promise<boolean> {
+  setGeneralDiagnosticPhase(context, "checkpoint_load");
   assertSyncExecutionActive(context);
   const saved = await getGeneralSyncCheckpoint(authScope);
   // A terminal checkpoint means every page was committed but the final
@@ -2748,7 +3611,16 @@ async function applyGeneralPullOnce(
       authScope,
       saved.serverTime,
       saved.watermark,
-      { digests: saved.digests, fullReplayedAt: saved.fullReplayedAt },
+      {
+        digests: saved.digests,
+        sourceDigests: saved.sourceDigests,
+        localSessionFingerprint: saved.localSessionFingerprint,
+        fullReplayedAt: saved.fullReplayedAt,
+        messageSyncDigest: saved.messageSyncDigest,
+        messageSyncServerTime: saved.messageSyncServerTime,
+        messageSyncLocalRevision: saved.messageSyncLocalRevision,
+        messageSyncScopedRows: saved.messageSyncScopedRows,
+      },
     );
     return saved.contentApplied !== false;
   }
@@ -2780,12 +3652,175 @@ async function applyGeneralPullOnce(
     ? reusableGeneralDigests(saved?.digests, TABLES, saved?.fullReplayedAt, now)
     : generalDigestsForRequest(saved?.requestDigests, TABLES);
   const digests = !hasCompletedMarker ? { ...(saved?.digests ?? {}) } : {};
-  const fullReplayedAt = !hasCompletedMarker && saved
+  let sourceDigests: Record<string, string> = since != null ? {} : hasCompletedMarker
+    ? reusableGeneralSourceDigests(saved?.sourceDigests, TABLES, saved?.fullReplayedAt, now)
+    : validGeneralSourceDigests(saved?.sourceDigests, TABLES);
+  let sourceTokenStarts: Record<string, string> = !hasCompletedMarker
+    ? validGeneralSourceDigests(saved?.sourceTokenStarts, TABLES)
+    : {};
+  // Active message writes make the legacy whole-scope MVCC source token
+  // unstable. The dedicated overlap+exact-receipt protocol below owns this
+  // projection, so never use the old source shortcut for it.
+  delete sourceDigests.conversation_messages;
+  delete sourceTokenStarts.conversation_messages;
+  let localSessionFingerprint: string | null = !hasCompletedMarker
+    ? saved?.localSessionFingerprint ?? null
+    : null;
+  if (hasCompletedMarker && sourceDigests.conversation_sessions) {
+    setGeneralDiagnosticPhase(context, "local_session_preflight");
+    localSessionFingerprint = await currentLocalConversationSessionFingerprint();
+    if (localSessionFingerprint !== saved?.localSessionFingerprint) {
+      // Session read/title/context updates can be local-only.  Force that
+      // projection through the normal pull once before accepting a shortcut.
+      delete sourceDigests.conversation_sessions;
+    }
+  }
+  let requestSourceDigests = since != null ? {} : hasCompletedMarker
+    ? { ...sourceDigests }
+    : { ...sourceTokenStarts };
+  delete requestSourceDigests.conversation_messages;
+  let fullReplayedAt = !hasCompletedMarker && saved
     ? saved.fullReplayedAt
     : Object.keys(requestDigests).length ? saved?.fullReplayedAt : now;
   let contentApplied = !hasCompletedMarker && Boolean(saved) && saved?.contentApplied !== false;
+  let messageSyncDigest = saved?.messageSyncDigest ?? null;
+  let messageSyncServerTime = saved?.messageSyncServerTime ?? null;
+  let messageSyncLocalRevision = saved?.messageSyncLocalRevision ?? null;
+  let messageSyncScopedRows = saved?.messageSyncScopedRows ?? null;
+  let preflightMessageReceipt: Awaited<
+    ReturnType<typeof getLocalGeneralMessageSyncDigestResult>
+  > | null = null;
+  let messageReceiptPreflightReason = hasCompletedMarker
+    ? "preflight_not_run"
+    : saved?.messageSyncDigest
+      ? "checkpoint_in_progress"
+      : "saved_baseline_missing";
+  let messageDeltaMode: "delta" | "full" = saved?.messageDeltaMode ?? "full";
+  let messageDeltaSince = !hasCompletedMarker ? saved?.messageDeltaSince ?? null : null;
+  if (hasCompletedMarker) {
+    const reusableMessageBaseline = Boolean(
+      saved?.messageSyncDigest
+      && saved?.messageSyncServerTime
+      && saved?.fullReplayedAt
+      && now >= saved.fullReplayedAt
+      && now - saved.fullReplayedAt < GENERAL_FULL_REPLAY_INTERVAL_MS,
+    );
+    if (reusableMessageBaseline) {
+      setGeneralDiagnosticPhase(context, "message_receipt_preflight", {
+        page: 0,
+        pendingTableCount: pendingTables.length,
+        scannedRows: 0,
+        scopedRows: 0,
+        batchCount: 0,
+      });
+    }
+    const localMessageReceipt = reusableMessageBaseline
+      ? await getLocalGeneralMessageSyncDigestResult(
+        authScope,
+        saved?.messageSyncLocalRevision != null
+          && saved.messageSyncScopedRows != null
+          && saved.messageSyncDigest
+          ? {
+              digest: saved.messageSyncDigest,
+              localRevision: saved.messageSyncLocalRevision,
+              scopedRows: saved.messageSyncScopedRows,
+            }
+          : null,
+        (progress: GeneralMessageSyncReceiptProgress) => {
+          setGeneralDiagnosticPhase(context, "message_receipt_preflight", {
+            page: 0,
+            pendingTableCount: pendingTables.length,
+            scannedRows: progress.scannedRows,
+            scopedRows: progress.scopedRows,
+            batchCount: progress.batchCount,
+          });
+        },
+      )
+      : null;
+    if (reusableMessageBaseline && localMessageReceipt) {
+      setGeneralDiagnosticPhase(context, "message_receipt_preflight", {
+        scannedRows: localMessageReceipt.scannedRows,
+        scopedRows: localMessageReceipt.scopedRows,
+        batchCount: localMessageReceipt.batchCount,
+      });
+    }
+    preflightMessageReceipt = localMessageReceipt;
+    const localMessageDigest = localMessageReceipt?.digest ?? null;
+    const preflightReason = !reusableMessageBaseline
+      ? saved?.messageSyncDigest ? "baseline_expired_or_full_replay_required" : "saved_baseline_missing"
+      : localMessageReceipt?.refusalReason
+        ?? (localMessageDigest === saved?.messageSyncDigest
+          ? "digest_match"
+          : "saved_digest_mismatch");
+    messageReceiptPreflightReason = preflightReason;
+    logGeneralMessageReceipt(context, "preflight", {
+      eligible: Boolean(reusableMessageBaseline && localMessageReceipt?.digest),
+      reason: preflightReason,
+      scannedRows: localMessageReceipt?.scannedRows ?? 0,
+      scopedRows: localMessageReceipt?.scopedRows ?? 0,
+      batchCount: localMessageReceipt?.batchCount ?? 0,
+      pendingOutboxCount: localMessageReceipt?.pendingOutboxCount ?? 0,
+      reusedSavedDigest: localMessageReceipt?.reusedSavedDigest ?? false,
+      timings: localMessageReceipt?.timings,
+      digestMatches: reusableMessageBaseline
+        ? localMessageDigest === saved?.messageSyncDigest
+        : undefined,
+    });
+    const canDeferMessageReceipt = Boolean(
+      localMessageReceipt
+      && (localMessageReceipt.refusalReason === "pending_outbox"
+        || localMessageReceipt.refusalReason === "local_state_changed"),
+    );
+    if (reusableMessageBaseline && canDeferMessageReceipt) {
+      // A transient local write must not discard the previous exact receipt.
+      // Reuse it as the delta base and defer verification until the next run.
+      messageSyncDigest = saved!.messageSyncDigest!;
+      messageSyncServerTime = saved!.messageSyncServerTime!;
+      messageSyncLocalRevision = saved!.messageSyncLocalRevision ?? null;
+      messageSyncScopedRows = saved!.messageSyncScopedRows ?? null;
+      messageDeltaSince = saved!.messageSyncServerTime!;
+      messageDeltaMode = "delta";
+    } else if (reusableMessageBaseline && localMessageDigest === saved?.messageSyncDigest) {
+      messageSyncDigest = saved!.messageSyncDigest!;
+      messageSyncServerTime = saved!.messageSyncServerTime!;
+      messageSyncLocalRevision = localMessageReceipt!.localRevision;
+      messageSyncScopedRows = localMessageReceipt!.scopedRows;
+      messageDeltaSince = messageSyncServerTime;
+      messageDeltaMode = "delta";
+    } else {
+      // Keep the last committed receipt in the in-progress checkpoint. The
+      // full mode below prevents it from being used as a delta baseline; a
+      // later successful terminal page replaces it with a verified receipt.
+      messageDeltaSince = null;
+      messageDeltaMode = "full";
+    }
+  } else if (!saved?.messageDeltaMode) {
+    // A v313 checkpoint may contain a cursor created before message row
+    // fingerprints existed. Restart that table from page one while preserving
+    // other table cursors; the already-applied rows remain intact.
+    if (saved?.state === "in_progress" && saved.cursors.conversation_messages) {
+      cursors = { ...cursors };
+      delete cursors.conversation_messages;
+      if (!pendingTables.includes("conversation_messages")) {
+        pendingTables = [...pendingTables, "conversation_messages"];
+      }
+    }
+    messageDeltaMode = "full";
+    messageDeltaSince = null;
+    // As above, old fields stay inert while a full replay is pending/resuming.
+  } else if (messageDeltaMode === "delta") {
+    if (!messageSyncDigest || !messageSyncServerTime || !messageDeltaSince) {
+      messageDeltaMode = "full";
+      messageDeltaSince = null;
+    }
+  }
   const seenPageStates = new Set<string>();
   let pageCount = 0;
+  let manifestTableNames = GENERAL_ROW_MANIFEST_TABLES.join(",");
+  const manifestDiffCounts: Record<string, number> = {};
+  let rowIdFetchCount = 0;
+  let rowIdFetchCountAtRequestStart = 0;
+  let forceFullGeneralRowManifest = false;
 
   while (pendingTables.length) {
     assertSyncExecutionActive(context);
@@ -2809,25 +3844,84 @@ async function applyGeneralPullOnce(
       pendingTables,
       "not_applicable",
     );
-    const response = await pullSync({
-      since,
-      tables: pendingTables,
-      general_pagination: true,
-      general_digest_version: GENERAL_DIGEST_VERSION,
-      ...(Object.keys(requestDigests).length ? { general_digests: requestDigests } : {}),
-      ...(snapshotToken ? { general_snapshot_token: snapshotToken } : {}),
-      ...(Object.keys(cursors).length ? { general_cursors: cursors } : {}),
-      signal: context.controller.signal,
-      ...(pullDiagnostic
-        ? {
-            requestId: pullDiagnostic.requestId,
-            lifecycle: pullDiagnosticLifecycle(pullDiagnostic),
-          }
-        : {}),
-    }).catch((error: unknown) => {
-      finishPullDiagnosticFromError(pullDiagnostic, error);
-      throw error;
+    const requestStartedAt = Date.now();
+    rowIdFetchCountAtRequestStart = rowIdFetchCount;
+    setGeneralDiagnosticPhase(context, "pull_request", {
+      page: pageCount,
+      pendingTableCount: pendingTables.length,
     });
+    recordSyncStageProgress(context, { page: pageCount, pendingTables: pendingTables.length });
+    logSyncStageCheckpoint(context, "general_request_start", "general", {
+      page: pageCount,
+      pendingTableCount: pendingTables.length,
+      pendingTableNames: pendingTables.join(","),
+      sincePresent: since == null ? "false" : "true",
+      cursorTableNames: Object.keys(cursors).sort().join(","),
+      sourceReceiptTableNames: Object.keys(sourceDigests).sort().join(","),
+      sourceTokenStartTableNames: Object.keys(sourceTokenStarts).sort().join(","),
+      messageSyncMode: messageDeltaMode,
+      messageSyncSincePresent: messageDeltaMode === "delta" && messageDeltaSince
+        ? "true"
+        : "false",
+      messageReceiptPreflightReason,
+      messageReceiptPreflightCacheHit: preflightMessageReceipt?.reusedSavedDigest
+        ? "true"
+        : "false",
+      messageReceiptPreflightScannedRows: preflightMessageReceipt?.scannedRows ?? 0,
+      manifestTableNames,
+      manifestDiffCounts: JSON.stringify(manifestDiffCounts),
+      rowIdFetchCount,
+    });
+    let response: SyncPullResponse;
+    try {
+      response = await pullSync({
+        since,
+        tables: pendingTables,
+        general_pagination: true,
+        ...(!forceFullGeneralRowManifest
+          ? { general_digest_version: GENERAL_DIGEST_VERSION }
+          : {}),
+        general_source_token_version: GENERAL_SOURCE_TOKEN_VERSION,
+        general_source_terminal_receipts: true,
+        general_row_manifest_version: 1,
+        ...(!forceFullGeneralRowManifest && Object.keys(requestDigests).length
+          ? { general_digests: requestDigests }
+          : {}),
+        ...(Object.keys(requestSourceDigests).length
+          ? { general_source_digests: requestSourceDigests }
+          : {}),
+        general_message_sync_version: GENERAL_MESSAGE_SYNC_VERSION,
+        ...(messageDeltaMode === "delta"
+          && messageSyncDigest
+          && messageDeltaSince
+          ? {
+              general_message_sync_digest: messageSyncDigest,
+              general_message_sync_since: messageDeltaSince,
+            }
+          : { general_message_sync_full: true }),
+        ...(snapshotToken ? { general_snapshot_token: snapshotToken } : {}),
+        ...(Object.keys(cursors).length ? { general_cursors: cursors } : {}),
+        signal: context.controller.signal,
+        ...(pullDiagnostic
+          ? {
+              requestId: pullDiagnostic.requestId,
+              lifecycle: pullDiagnosticLifecycle(pullDiagnostic),
+            }
+          : {}),
+      });
+    } catch (error) {
+      finishPullDiagnosticFromError(pullDiagnostic, error);
+      logSyncStageCheckpoint(context, "general_request_finish", "general", {
+        page: pageCount,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        outcome: "error",
+        errorKind: error instanceof Error ? error.name : "UnknownError",
+        httpStatus: pullDiagnostic?.status,
+      });
+      throw error;
+    }
+    const httpRequestDurationMs = Math.max(0, Date.now() - requestStartedAt);
+    recordSyncStageProgress(context, { page: pageCount, pendingTables: pendingTables.length });
     assertSyncExecutionActive(context);
     recordPullResponse(
       pullDiagnostic,
@@ -2835,6 +3929,10 @@ async function applyGeneralPullOnce(
       pendingTables,
       "not_applicable",
     );
+    setGeneralDiagnosticPhase(context, "response_validation", {
+      page: pageCount,
+      pendingTableCount: pendingTables.length,
+    });
 
     const isBoundedResponse =
       response.general_pagination_version === GENERAL_SYNC_PAGINATION_VERSION
@@ -2884,10 +3982,468 @@ async function applyGeneralPullOnce(
       }
     }
     const pageDigests = validateGeneralDigestPage(response, pendingTables, requestDigests, since);
+    const sourcePage = validateGeneralSourcePage(
+      response,
+      pendingTables,
+      requestSourceDigests,
+      sourceTokenStarts,
+    );
+    const messageSyncPage = validateGeneralMessageSyncPage(
+      response,
+      pendingTables,
+      messageDeltaMode === "delta" ? messageSyncDigest : null,
+    );
+    const rowManifestPlans: Array<{
+      table: GeneralRowManifestTable;
+      serverRows: Map<string, string>;
+      sourceDigest: string;
+      fetchIds: string[];
+      staleIds: string[];
+      protectedStaleIds: Set<string>;
+      deferredPendingCount: number;
+      diffCount: number;
+      fullFallback: boolean;
+    }> = [];
+    const manifestFallbackTables: GeneralRowManifestTable[] = [];
+    const responseManifestTableNames = pendingTables.filter((table) =>
+      isGeneralRowManifestTable(table)
+      && response.tables[table]?.row_manifest != null,
+    );
+    manifestTableNames = [...new Set([
+      ...manifestTableNames.split(",").filter(Boolean),
+      ...responseManifestTableNames,
+    ])].join(",");
+    for (const table of pendingTables) {
+      if (!isGeneralRowManifestTable(table)) continue;
+      const payload = response.tables[table];
+      if (payload?.general_source_not_modified && payload.row_manifest == null) {
+        manifestDiffCounts[table] = 0;
+      }
+      if (!payload || payload.row_manifest == null) continue;
+      if (response.general_row_manifest_version !== 1) {
+        throw new Error("一般テーブルrow manifestの版がありません");
+      }
+      const manifest = parseGeneralRowManifest(payload);
+      const localRows = readGeneralRowVersions(authScope, table);
+      const changedIds = [...manifest.rows].flatMap(([id, version]) =>
+        localRows.get(id) === version ? [] : [id],
+      );
+      // Rows with a pending outbox are never overwritten by a pull, so do not
+      // spend a request fetching them on every sync. The table receipt is not
+      // saved while any are deferred, so they are fetched once they settle.
+      const pendingChangedIds = readPendingGeneralRowIds(authScope, table, changedIds);
+      const fetchIds = changedIds.filter((id) => !pendingChangedIds.has(id));
+      const staleIds = [...localRows.keys()].filter((id) => !manifest.rows.has(id));
+      const pendingStaleIds = readPendingGeneralRowIds(authScope, table, staleIds);
+      const diffCount = changedIds.length + staleIds.length;
+      manifestDiffCounts[table] = diffCount;
+      const fullFallback = diffCount > GENERAL_ROW_MANIFEST_DIFF_LIMIT;
+      const plan = {
+        table,
+        serverRows: manifest.rows,
+        sourceDigest: manifest.sourceDigest,
+        fetchIds,
+        staleIds,
+        protectedStaleIds: pendingStaleIds,
+        deferredPendingCount: pendingChangedIds.size,
+        diffCount,
+        fullFallback,
+      };
+      rowManifestPlans.push(plan);
+      if (fullFallback) manifestFallbackTables.push(table);
+      delete sourceDigests[table];
+      delete sourceTokenStarts[table];
+
+      // Reuse the existing session authoritative reconciliation path. Other
+      // general tables receive tombstones through their existing repository
+      // apply functions, while rows with pending outbox operations are kept.
+      if (staleIds.length) {
+        if (table === "conversation_sessions") {
+          payload.authoritative_ids = [
+            ...manifest.rows.keys(),
+            ...staleIds.filter((id) => pendingStaleIds.has(id)),
+          ];
+        } else {
+          payload.tombstones.push(...staleIds
+            .filter((id) => !pendingStaleIds.has(id))
+            .map((id) => ({ id, deleted_at: new Date().toISOString() })));
+        }
+      }
+    }
+    if (
+      pendingTables.includes("conversation_messages")
+      && !messageSyncPage.supported
+    ) {
+      // A rollback to a server without message receipts cannot validate this
+      // client's previous baseline. Do not preserve it as resumable history.
+      messageSyncDigest = null;
+      messageSyncServerTime = null;
+      messageSyncLocalRevision = null;
+      messageSyncScopedRows = null;
+      messageDeltaSince = null;
+      messageDeltaMode = "full";
+    }
+    // The message-specific receipt supersedes the volatile MVCC receipt for
+    // this table. Keep other tables' source receipts unchanged.
+    delete sourcePage.starts.conversation_messages;
+    delete sourcePage.receipts.conversation_messages;
+    if (response.general_source_token_version == null) {
+      // An older server ignored the additive query fields.  Its full pull is
+      // still valid, but receipts from a newer server cannot survive rollback.
+      sourceDigests = {};
+      sourceTokenStarts = {};
+      localSessionFingerprint = null;
+    } else {
+      for (const [table, source] of Object.entries(sourcePage.starts)) {
+        sourceTokenStarts[table] = source;
+        delete sourceDigests[table];
+      }
+      for (const [table, receipt] of Object.entries(sourcePage.receipts)) {
+        sourceDigests[table] = receipt;
+        delete sourceTokenStarts[table];
+      }
+      for (const table of pendingTables) {
+        if (
+          !response.tables[table]?.general_source_not_modified
+          && !sourcePage.starts[table]
+          && !sourcePage.receipts[table]
+          && !sourceTokenStarts[table]
+        ) {
+          delete sourceDigests[table];
+        }
+      }
+      if (Object.keys(sourcePage.starts).length) fullReplayedAt = now;
+      requestSourceDigests = { ...sourceTokenStarts };
+      delete requestSourceDigests.conversation_messages;
+    }
     // Retain the existing general-completion refresh for ordinary pages.
     // Only a complete set of proven not-modified receipts suppresses it.
-    const pageHasChanges = pendingTables.some((table) => !response.tables[table]?.general_not_modified);
-    await applyPullResponse(authScope, response, context);
+    const pageRowVersions = new Map<GeneralRowManifestTable, GeneralRowVersion[]>();
+    for (const table of pendingTables) {
+      if (!isGeneralRowManifestTable(table)) continue;
+      const payload = response.tables[table];
+      if (!payload || payload.row_manifest != null) continue;
+      if (![...payload.changes, ...payload.tombstones].some((row) =>
+        (row as Record<string, unknown>)._row_version != null,
+      )) continue;
+      const versions = protectPendingGeneralRows(authScope, table, payload);
+      if (versions.length) pageRowVersions.set(table, versions);
+    }
+    let pageHasChanges = pendingTables.some((table) => {
+      const payload = response.tables[table];
+      if (!payload) return false;
+      if (payload.row_manifest != null) {
+        return (manifestDiffCounts[table] ?? 0) > 0;
+      }
+      return !payload.general_not_modified
+        && !payload.general_source_not_modified
+        && !payload.general_message_sync_not_modified;
+    });
+    const applyStartedAt = Date.now();
+    setGeneralDiagnosticPhase(context, "apply", {
+      page: pageCount,
+      pendingTableCount: pendingTables.length,
+    });
+    logSyncStageCheckpoint(context, "general_apply_start", "general", {
+      page: pageCount,
+      pendingTableCount: pendingTables.length,
+    });
+    try {
+      const responseNeedsApply = pendingTables.some((table) => {
+        const payload = response.tables[table];
+        return Boolean(payload && !payload.general_source_not_modified
+          && !payload.general_not_modified
+          && !payload.general_message_sync_not_modified
+          && generalTableNeedsApply(payload));
+      });
+      if (responseNeedsApply) {
+        await applyPullResponse(authScope, response, context);
+      }
+      for (const [table, versions] of pageRowVersions) {
+        await upsertGeneralRowVersions(authScope, table, versions);
+      }
+      recordSyncStageProgress(context, { page: pageCount, pendingTables: pendingTables.length });
+      logSyncStageCheckpoint(context, "general_apply_finish", "general", {
+        page: pageCount,
+        durationMs: Math.max(0, Date.now() - applyStartedAt),
+        outcome: "success",
+      });
+    } catch (error) {
+      logSyncStageCheckpoint(context, "general_apply_finish", "general", {
+        page: pageCount,
+        durationMs: Math.max(0, Date.now() - applyStartedAt),
+        outcome: "error",
+        errorKind: error instanceof Error ? error.name : "UnknownError",
+      });
+      throw error;
+    }
+    const rowIdsReturned = new Map<GeneralRowManifestTable, Set<string>>();
+    for (const plan of rowManifestPlans) {
+      rowIdsReturned.set(plan.table, new Set());
+      const removableStale = plan.staleIds.filter(
+        (id) => !plan.protectedStaleIds.has(id),
+      );
+      await deleteGeneralRowVersions(authScope, plan.table, removableStale);
+    }
+    const remainingRowIds = new Map<GeneralRowManifestTable, string[]>();
+    for (const plan of rowManifestPlans) {
+      if (!plan.fullFallback && plan.fetchIds.length) {
+        remainingRowIds.set(plan.table, [...plan.fetchIds]);
+      }
+    }
+    while ([...remainingRowIds.values()].some((ids) => ids.length > 0)) {
+      const rowIdRequest: Record<string, string[]> = {};
+      let selectedCount = 0;
+      for (const plan of rowManifestPlans) {
+        if (selectedCount > 0) break;
+        const pending = remainingRowIds.get(plan.table);
+        // UUID row IDs plus one table stay below the existing request-target
+        // budget; three tables at their per-table maximum can exceed 2 KiB.
+        if (!pending?.length || selectedCount >= 40) continue;
+        const take = Math.min(40, pending.length, 40 - selectedCount);
+        rowIdRequest[plan.table] = pending.splice(0, take);
+        selectedCount += take;
+      }
+      if (!selectedCount) break;
+      const rowResponse = await pullSync({
+        tables: Object.keys(rowIdRequest) as SyncTable[],
+        general_row_ids: rowIdRequest,
+        signal: context.controller.signal,
+      });
+      rowIdFetchCount += 1;
+      const versionsByTable = new Map<GeneralRowManifestTable, GeneralRowVersion[]>();
+      let rowResponseNeedsApply = false;
+      for (const [tableName, ids] of Object.entries(rowIdRequest)) {
+        if (!isGeneralRowManifestTable(tableName)) continue;
+        const table = tableName;
+        const payload = rowResponse.tables[table];
+        if (!payload) throw new Error(`一般row id取得応答が欠落しています: ${table}`);
+        const returned = rowIdsReturned.get(table)!;
+        for (const row of [...payload.changes, ...payload.tombstones]) {
+          if (typeof row.id === "string") returned.add(row.id);
+        }
+        const versions = protectPendingGeneralRows(authScope, table, payload);
+        if (versions.length) versionsByTable.set(table, versions);
+        rowResponseNeedsApply ||= generalTableNeedsApply(payload);
+        if (ids.some((id) => !returned.has(id))) {
+          console.info("[sync] general row id response incomplete", JSON.stringify({
+            event: "general_row_id_response_incomplete",
+            table,
+            requestedCount: ids.length,
+            returnedCount: returned.size,
+          }));
+        }
+      }
+      if (rowResponseNeedsApply) {
+        await applyPullResponse(authScope, rowResponse, context);
+      }
+      for (const [table, versions] of versionsByTable) {
+        await upsertGeneralRowVersions(authScope, table, versions);
+      }
+    }
+    for (const plan of rowManifestPlans) {
+      const returned = rowIdsReturned.get(plan.table) ?? new Set<string>();
+      const fetchComplete = plan.fetchIds.every((id) => returned.has(id));
+      // A table settled by its manifest is no longer part of this replay. The
+      // server echoes every requested digest as a start token, and a start for
+      // a table the client stopped tracking fails page validation.
+      if (!plan.fullFallback) {
+        delete sourceTokenStarts[plan.table];
+        delete requestSourceDigests[plan.table];
+      }
+      if (!plan.fullFallback && fetchComplete && plan.deferredPendingCount === 0) {
+        sourceDigests[plan.table] = plan.sourceDigest;
+      } else {
+        delete sourceDigests[plan.table];
+      }
+    }
+    logSyncStageCheckpoint(context, "general_request_finish", "general", {
+      page: pageCount,
+      durationMs: httpRequestDurationMs,
+      outcome: "response",
+      httpStatus: pullDiagnostic?.status,
+      attemptCount: pullDiagnostic?.attemptCount,
+      manifestTableNames,
+      manifestDiffCounts: JSON.stringify(manifestDiffCounts),
+      rowIdFetchCount,
+      rowIdFetchCountThisRequest: rowIdFetchCount - rowIdFetchCountAtRequestStart,
+    });
+    let messageDigestMatches = true;
+    let messageReceiptDeferred = false;
+    if (messageSyncPage.supported && messageSyncPage.digest) {
+      setGeneralDiagnosticPhase(context, "message_receipt_terminal", {
+        page: pageCount,
+        pendingTableCount: pendingTables.length,
+        scannedRows: 0,
+        scopedRows: 0,
+        batchCount: 0,
+      });
+      // A delta response can repeat rows from the overlap window without
+      // changing their local values. Offer the preflight receipt in both
+      // cases; the persisted row revision check decides whether it is reusable.
+      // The final digest comparison below still fails closed on server drift.
+      const terminalReuse = preflightMessageReceipt;
+      const localMessageReceipt = await getLocalGeneralMessageSyncDigestResult(
+        authScope,
+        terminalReuse?.digest && terminalReuse.localRevision != null
+          ? {
+              digest: terminalReuse.digest,
+              localRevision: terminalReuse.localRevision,
+              scopedRows: terminalReuse.scopedRows,
+            }
+          : null,
+        (progress: GeneralMessageSyncReceiptProgress) => {
+          setGeneralDiagnosticPhase(context, "message_receipt_terminal", {
+            page: pageCount,
+            pendingTableCount: pendingTables.length,
+            scannedRows: progress.scannedRows,
+            scopedRows: progress.scopedRows,
+            batchCount: progress.batchCount,
+          });
+        },
+      );
+      setGeneralDiagnosticPhase(context, "message_receipt_terminal", {
+        page: pageCount,
+        pendingTableCount: pendingTables.length,
+        scannedRows: localMessageReceipt.scannedRows,
+        scopedRows: localMessageReceipt.scopedRows,
+        batchCount: localMessageReceipt.batchCount,
+      });
+      messageReceiptDeferred = localMessageReceipt.refusalReason === "pending_outbox"
+        || localMessageReceipt.refusalReason === "local_state_changed";
+      messageDigestMatches = !messageReceiptDeferred
+        && localMessageReceipt.digest === messageSyncPage.digest;
+      logGeneralMessageReceipt(context, "terminal", {
+        eligible: localMessageReceipt.digest != null,
+        reason: localMessageReceipt.refusalReason
+          ?? (messageDigestMatches ? "digest_match" : "server_digest_mismatch"),
+        scannedRows: localMessageReceipt.scannedRows,
+        scopedRows: localMessageReceipt.scopedRows,
+        batchCount: localMessageReceipt.batchCount,
+        pendingOutboxCount: localMessageReceipt.pendingOutboxCount,
+        reusedSavedDigest: localMessageReceipt.reusedSavedDigest,
+        timings: localMessageReceipt.timings,
+        digestMatches: messageDigestMatches,
+      });
+      if (messageReceiptDeferred) {
+        console.info("[sync] general message receipt deferred", JSON.stringify({
+          event: "general_message_receipt_deferred",
+          at: Date.now(),
+          reason: localMessageReceipt.refusalReason,
+          pendingOutboxCount: localMessageReceipt.pendingOutboxCount,
+          mode: messageDeltaMode,
+        }));
+      } else if (messageDigestMatches) {
+        messageSyncDigest = messageSyncPage.digest;
+        messageSyncServerTime = messageSyncPage.serverTime ?? null;
+        messageSyncLocalRevision = localMessageReceipt.localRevision;
+        messageSyncScopedRows = localMessageReceipt.scopedRows;
+        messageDeltaSince = messageSyncServerTime;
+      } else {
+        // During a delta mismatch, retain the last committed receipt only as
+        // inert history while the mandatory full replay is in progress.
+        if (messageDeltaMode !== "delta") {
+          messageSyncDigest = null;
+          messageSyncServerTime = null;
+          messageSyncLocalRevision = null;
+          messageSyncScopedRows = null;
+        }
+        messageDeltaSince = null;
+      }
+    }
+    if (
+      messageSyncPage.supported
+      && messageSyncPage.digest
+      && !messageDigestMatches
+      && messageDeltaMode === "delta"
+      && !messageReceiptDeferred
+    ) {
+      // The overlap returned data but did not reconstruct the exact server
+      // set (for example a late commit or newly visible session). Do one safe
+      // full replay of messages; never acknowledge the delta baseline.
+      console.info("[sync] general message delta fell back to full", JSON.stringify({
+        event: "general_message_delta_fallback",
+        at: Date.now(),
+        reason: "local_server_digest_mismatch",
+      }));
+      messageDeltaMode = "full";
+      messageDeltaSince = null;
+      sourceDigests = { ...sourceDigests };
+      sourceTokenStarts = { ...sourceTokenStarts };
+      delete sourceDigests.conversation_messages;
+      delete sourceTokenStarts.conversation_messages;
+      pendingTables = ["conversation_messages"];
+      cursors = {};
+      snapshotToken = null;
+      serverTime = null;
+      watermark = null;
+      watermarkInitialized = false;
+      await saveGeneralSyncCheckpoint(authScope, {
+        version: GENERAL_SYNC_PAGINATION_VERSION,
+        state: "in_progress",
+        since: null,
+        serverTime: null,
+        watermark: null,
+        snapshotToken: null,
+        pendingTables,
+        cursors,
+        sourceDigests,
+        sourceTokenStarts,
+        localSessionFingerprint,
+        digests,
+        requestDigests,
+        fullReplayedAt,
+        contentApplied,
+        messageSyncDigest,
+        messageSyncServerTime,
+        messageSyncLocalRevision,
+        messageSyncScopedRows,
+        messageDeltaSince: null,
+        messageDeltaMode,
+      });
+      continue;
+    }
+    if (manifestFallbackTables.length) {
+      forceFullGeneralRowManifest = true;
+      pendingTables = [...manifestFallbackTables];
+      cursors = {};
+      for (const table of manifestFallbackTables) {
+        const plan = rowManifestPlans.find((item) => item.table === table);
+        if (!plan) continue;
+        delete sourceDigests[table];
+        sourceTokenStarts[table] = plan.sourceDigest;
+        requestSourceDigests[table] = plan.sourceDigest;
+      }
+      await saveGeneralSyncCheckpoint(authScope, {
+        version: GENERAL_SYNC_PAGINATION_VERSION,
+        state: "in_progress",
+        since,
+        serverTime,
+        watermark,
+        snapshotToken,
+        pendingTables,
+        cursors,
+        sourceDigests,
+        sourceTokenStarts,
+        localSessionFingerprint,
+        digests,
+        requestDigests,
+        fullReplayedAt,
+        contentApplied: contentApplied || manifestFallbackTables.some(
+          (table) => (manifestDiffCounts[table] ?? 0) > 0,
+        ),
+        messageSyncDigest,
+        messageSyncServerTime,
+        messageSyncLocalRevision,
+        messageSyncScopedRows,
+        messageDeltaSince,
+        messageDeltaMode,
+      });
+      contentApplied ||= manifestFallbackTables.some(
+        (table) => (manifestDiffCounts[table] ?? 0) > 0,
+      );
+      continue;
+    }
     contentApplied ||= pageHasChanges;
     Object.assign(digests, pageDigests);
     assertSyncExecutionActive(context);
@@ -2898,6 +4454,30 @@ async function applyGeneralPullOnce(
       if (cursor) nextCursors[table] = cursor;
     }
     const nextPendingTables = Object.keys(nextCursors) as SyncTable[];
+    // Keep starts for tables whose own cursor ended. The server can certify
+    // those projections only after the final table page has finished; dropping
+    // an early table here prevents its next-flight receipt from ever forming.
+    const sessionTableWasApplied = pendingTables.includes("conversation_sessions")
+      && !response.tables.conversation_sessions?.general_source_not_modified;
+    if (sessionTableWasApplied && sourceDigests.conversation_sessions
+      && !sourceTokenStarts.conversation_sessions) {
+      // Capture the local row state immediately after server reconciliation.
+      // A later local-only edit during another table's pagination must remain
+      // detectable on the next flight, so never refresh this baseline on an
+      // unchanged skip response.
+      localSessionFingerprint = await currentLocalConversationSessionFingerprint();
+    } else if (!sourceDigests.conversation_sessions) {
+      localSessionFingerprint = null;
+    }
+    const checkpointStartedAt = Date.now();
+    setGeneralDiagnosticPhase(context, "checkpoint_save", {
+      page: pageCount,
+      pendingTableCount: nextPendingTables.length,
+    });
+    logSyncStageCheckpoint(context, "general_checkpoint_start", "general", {
+      page: pageCount,
+      nextPendingTableCount: nextPendingTables.length,
+    });
     await saveGeneralSyncCheckpoint(authScope, {
       version: GENERAL_SYNC_PAGINATION_VERSION,
       state: "in_progress",
@@ -2907,7 +4487,25 @@ async function applyGeneralPullOnce(
       snapshotToken,
       pendingTables: nextPendingTables,
       cursors: nextCursors,
-      digests, requestDigests, fullReplayedAt, contentApplied,
+      sourceDigests,
+      sourceTokenStarts,
+      localSessionFingerprint,
+      digests,
+      requestDigests,
+      fullReplayedAt,
+      contentApplied,
+      messageSyncDigest,
+      messageSyncServerTime,
+      messageSyncLocalRevision,
+      messageSyncScopedRows,
+      messageDeltaSince,
+      messageDeltaMode,
+    });
+    logSyncStageCheckpoint(context, "general_checkpoint_finish", "general", {
+      page: pageCount,
+      durationMs: Math.max(0, Date.now() - checkpointStartedAt),
+      nextPendingTableCount: nextPendingTables.length,
+      outcome: "success",
     });
     reportGeneralSyncProgress(
       authScope,
@@ -2922,8 +4520,21 @@ async function applyGeneralPullOnce(
   if (!serverTime) {
     throw new Error("一般テーブル同期server_timeがありません");
   }
+  setGeneralDiagnosticPhase(context, "complete_marker_save", {
+    page: pageCount,
+    pendingTableCount: 0,
+  });
   await setLastPulledAt(authScope, watermark);
-  await markGeneralSyncCheckpointComplete(authScope, serverTime, watermark, { digests, fullReplayedAt });
+  await markGeneralSyncCheckpointComplete(authScope, serverTime, watermark, {
+    digests,
+    sourceDigests,
+    localSessionFingerprint,
+    fullReplayedAt,
+    messageSyncDigest,
+    messageSyncServerTime,
+    messageSyncLocalRevision,
+    messageSyncScopedRows,
+  });
   return contentApplied;
 }
 
@@ -2935,13 +4546,37 @@ async function applyGeneralPull(
   // scope-bound snapshot; discard that checkpoint and restart once from a
   // fresh, bounded run rather than leaving the account permanently stuck on
   // the same 409 response.
+  context.generalDiagnostic = {
+    startedAt: Date.now(),
+    phase: "checkpoint_load",
+  };
   try {
     return await applyGeneralPullOnce(authScope, context);
   } catch (error) {
-    if (!isGeneralCheckpointRestartError(error)) throw error;
-    await resetGeneralSyncCheckpoint(authScope);
-    assertSyncExecutionActive(context);
-    return await applyGeneralPullOnce(authScope, context);
+    if (isGeneralCheckpointRestartError(error)) {
+      try {
+        setGeneralDiagnosticPhase(context, "checkpoint_reset");
+        await resetGeneralSyncCheckpoint(authScope);
+        assertSyncExecutionActive(context);
+        setGeneralDiagnosticPhase(context, "checkpoint_retry");
+        return await applyGeneralPullOnce(authScope, context);
+      } catch (retryError) {
+        if (
+          !(retryError instanceof SyncExecutionInterruptedError)
+          && !isSyncExecutionInterrupted(context)
+        ) {
+          logGeneralPullFailure(context, retryError);
+        }
+        throw retryError;
+      }
+    }
+    if (
+      !(error instanceof SyncExecutionInterruptedError)
+      && !isSyncExecutionInterrupted(context)
+    ) {
+      logGeneralPullFailure(context, error);
+    }
+    throw error;
   }
 }
 
@@ -3051,11 +4686,25 @@ async function applyDocsPull(
   markDocsSubstage(context, "load_saved_scopes");
   const previousScopes = await getSavedDocsScopes(authScope);
   assertSyncExecutionActive(context);
+  let scopeOrdinal = 0;
+  let scopeCount: number | null = 1 + previousScopes.filter((scope) =>
+    !(scope.source === "personal" && scope.access === "owner"),
+  ).length;
 
   const pullScope = async (
     scopeId?: string,
     projectId?: string | null,
-  ): Promise<DocsSyncScope[]> => {
+  ): Promise<DocsScopePullResult> => {
+    scopeOrdinal += 1;
+    const localScopeStateStartedAt = Date.now();
+    if (context.docsDiagnostic && !context.docsDiagnostic.frozen) {
+      const scopeCategory = diagnosticScopeFor(scopeId, projectId);
+      if (scopeCategory !== "general") context.docsDiagnostic.scopeCategory = scopeCategory;
+      context.docsDiagnostic.scopeOrdinal = scopeOrdinal;
+      context.docsDiagnostic.scopeCount = scopeCount;
+      context.docsDiagnostic.promotionEligibility = undefined;
+      publishDocsSubstage(context);
+    }
     // Run metadata belongs to this exact Docs scope. A completed root/shared
     // run must not decorate the next scope's pre-run local read diagnostics.
     resetDocsRunDiagnosticFields(context);
@@ -3074,6 +4723,7 @@ async function applyDocsPull(
       markDocsSubstage(context, "load_table_digests");
       docsDigests = await getSavedDocsDigests(authScope, scopeId, projectId);
     }
+    const hasSavedDocsDigestBaseline = DOCS_TABLES.every((table) => Boolean(docsDigests[table]));
     assertSyncExecutionActive(context);
     let savedDocsScopeDigest: string | null = null;
     if (!options.forceDocs) {
@@ -3125,6 +4775,20 @@ async function applyDocsPull(
         ...parseJsonRecord<Record<string, string>>(run.digestJson, {}),
       };
     }
+    console.info("[sync] Docs scope local-state checkpoint", JSON.stringify({
+      event: "scope_state_ready",
+      at: Date.now(),
+      requestId: context.diagnostic?.requestId ?? null,
+      scope: diagnosticScopeFor(scopeId, projectId),
+      scopeOrdinal,
+      scopeCount,
+      durationMs: Math.max(0, Date.now() - localScopeStateStartedAt),
+      hasSince: Boolean(docsSince),
+      digestTableCount: Object.keys(docsDigests).length,
+      hasScopeDigest: Boolean(savedDocsScopeDigest),
+      hasScopeRevision: Boolean(savedDocsScopeRevision),
+      runState: run?.state ?? null,
+    }));
     const reportProgress: DocsResyncProgressHandler = (progress) => {
       reportDocsSyncProgress(
         authScope,
@@ -3153,6 +4817,7 @@ async function applyDocsPull(
           projectId,
           {
             ...options,
+            hasSavedDocsDigestBaseline,
             onProgress: reportProgress,
             run,
             previousScopes: scopeId == null ? previousScopes : undefined,
@@ -3249,13 +4914,90 @@ async function applyDocsPull(
         throw error;
       }
     }
-    return [];
+    return {
+      scopes: [],
+      rootProjectScopesValidated: false,
+      projectDigests: {},
+      projectFastDigests: {},
+      projectScopeRevisions: {},
+    };
   };
 
-  const discoveredScopes = await pullScope();
+  const rootResult = await pullScope();
+  const discoveredScopes = rootResult.scopes;
   assertSyncExecutionActive(context);
   // Older servers omit docs_scopes and retain the v2 personal-only contract.
   if (!discoveredScopes.length) return;
+  scopeCount = 1 + discoveredScopes.filter((scope) =>
+    !(scope.source === "personal" && scope.access === "owner"),
+  ).length;
+  if (context.docsDiagnostic && !context.docsDiagnostic.frozen) {
+    context.docsDiagnostic.scopeCount = scopeCount;
+    publishDocsSubstage(context);
+  }
+  const candidateProjectScopes = discoveredScopes.filter((scope) =>
+    scope.source === "project" && Boolean(scope.project_id),
+  );
+  const rootProjectScopes = rootResult.rootProjectScopesValidated
+    ? candidateProjectScopes
+    : [];
+  const coverageStartedAt = Date.now();
+  const rootProjectCoverage = rootProjectScopes.length > 0
+    ? await getRootDocsProjectScopeCoverage(
+      authScope,
+      rootProjectScopes,
+      rootResult.projectDigests,
+      rootResult.projectScopeRevisions,
+      rootResult.projectFastDigests,
+    )
+    : { coveredScopeKeys: new Set<string>(), fastReceiptScopeKeys: new Set<string>() };
+  const coverageDurationMs = Math.max(0, Date.now() - coverageStartedAt);
+  const rootCoveredScopeKeys = rootProjectCoverage.coveredScopeKeys;
+  const receiptSaveStartedAt = Date.now();
+  let receiptWriteScopes = 0;
+  for (const scope of rootProjectScopes) {
+    const scopeKey = getDocsScopeKey(scope.workspace_id, scope.project_id);
+    const fastDigests = scope.project_id
+      ? rootResult.projectFastDigests[scope.project_id]
+      : undefined;
+    if (
+      rootCoveredScopeKeys.has(scopeKey)
+      && !rootProjectCoverage.fastReceiptScopeKeys.has(scopeKey)
+      && fastDigests
+    ) {
+      await saveDocsFastDigests(
+        authScope,
+        fastDigests,
+        scope.workspace_id,
+        scope.project_id,
+      );
+      receiptWriteScopes += 1;
+    }
+  }
+  const receiptSaveDurationMs = Math.max(0, Date.now() - receiptSaveStartedAt);
+  assertSyncExecutionActive(context);
+  logDocsNoopScopeCoverage(
+    context.diagnostic,
+    candidateProjectScopes.length,
+    rootCoveredScopeKeys.size,
+    new Set([
+      ...Object.keys(rootResult.projectDigests),
+      ...Object.keys(rootResult.projectFastDigests),
+    ]).size,
+    Object.keys(rootResult.projectScopeRevisions).length,
+    rootResult.rootProjectScopesValidated,
+    {
+      coverageDurationMs,
+      fastReceiptScopes: rootProjectCoverage.fastReceiptScopeKeys.size,
+      legacyReceiptScopes: Math.max(
+        0,
+        rootCoveredScopeKeys.size - rootProjectCoverage.fastReceiptScopeKeys.size,
+      ),
+      receiptSaveDurationMs,
+      receiptWriteRows: receiptWriteScopes * DOCS_TABLES.length,
+      receiptWriteStatements: receiptWriteScopes * DOCS_TABLES.length,
+    },
+  );
   const activeIds = new Set(
     discoveredScopes.map((scope) => getDocsScopeKey(scope.workspace_id, scope.project_id)),
   );
@@ -3314,6 +5056,7 @@ async function applyDocsPull(
   }
   for (const scope of discoveredScopes) {
     if (scope.source === "personal" && scope.access === "owner") continue;
+    if (rootCoveredScopeKeys.has(getDocsScopeKey(scope.workspace_id, scope.project_id))) continue;
     assertSyncExecutionActive(context);
     await pullScope(scope.workspace_id, scope.project_id);
   }
@@ -4148,7 +5891,7 @@ async function rollbackRejectedDocsDelete(
   return true;
 }
 
-async function pushOutbox(
+async function pushOutboxOnce(
   authScope: string,
   context: SyncExecutionContext,
   mode: SyncV3Mode = "v2",
@@ -4179,6 +5922,7 @@ async function pushOutbox(
   // v3 only changes the transport and the result conversion. The rows re-read
   // in the identity-allocation transaction are the snapshot for every receipt.
   let v3Quarantine = new Map<string, string>();
+  let v2FallbackResultIds = new Set<string>();
   let response: { results: SyncPushResult[] };
   if (mode === "v3") {
     const v3 = await pushOutboxViaV3(
@@ -4190,6 +5934,7 @@ async function pushOutbox(
     pending = v3.pending;
     operations = v3.operations;
     response = { results: v3.results };
+    v2FallbackResultIds = v3.fallbackResultIds;
     v3Quarantine = v3.quarantine;
   } else {
     response = await pushSync(operations, context.controller.signal);
@@ -4495,6 +6240,16 @@ async function pushOutbox(
     });
     assertSyncExecutionActive(context);
   }
+  if (v2FallbackResultIds.size > 0) {
+    // v2's response is durable in sync_state until this result loop has
+    // committed the matching outbox settlement. If the flight is interrupted
+    // above, the next run replays that result instead of sending it again.
+    await settleV2FallbackHolds(
+      authScope,
+      v2FallbackResultIds,
+      () => assertSyncExecutionActive(context),
+    );
+  }
   await flushReorderOutbox(
     reorderPending,
     context,
@@ -4502,6 +6257,21 @@ async function pushOutbox(
     pending,
     regularResultStatuses,
   );
+}
+
+async function pushOutbox(
+  authScope: string,
+  context: SyncExecutionContext,
+  mode: SyncV3Mode = "v2",
+): Promise<void> {
+  const assertActive = () => assertSyncExecutionActive(context);
+  assertActive();
+  await autoResolveStuckOutbox(authScope, assertActive);
+  assertActive();
+  await pushOutboxOnce(authScope, context, mode);
+  assertActive();
+  await autoResolveStuckOutbox(authScope, assertActive);
+  assertActive();
 }
 
 // Status listeners are UI observers. A throwing subscriber must not turn a
@@ -4514,6 +6284,100 @@ function updateSyncStatus(update: () => void): void {
       "[sync] status observer failed",
       error instanceof Error ? error.name : "UnknownError",
     );
+  }
+}
+
+const SYNC_STAGE_NO_PROGRESS_MS = 90_000;
+
+function logSyncStageCheckpoint(
+  context: SyncExecutionContext,
+  event: "stage_start" | "stage_finish" | "stage_stalled" | "general_request_start"
+    | "general_request_finish" | "general_apply_start" | "general_apply_finish"
+    | "general_checkpoint_start" | "general_checkpoint_finish" | "terminal_summary_start"
+    | "terminal_summary_finish",
+  stage: SyncStage,
+  fields: Record<string, number | string | null | undefined> = {},
+): void {
+  if (!context.diagnostic) return;
+  const now = Date.now();
+  const watch = context.stageWatchdog;
+  const payload = {
+    event,
+    at: now,
+    requestId: context.diagnostic.requestId,
+    canonicalRequestId: context.diagnostic.canonicalRequestId ?? context.diagnostic.requestId,
+    authGeneration: context.diagnostic.authGeneration,
+    stage,
+    ...(watch?.stage === stage ? {
+      stageElapsedMs: Math.max(0, now - watch.startedAt),
+      noProgressMs: Math.max(0, now - watch.lastProgressAt),
+      ...(watch.page != null ? { page: watch.page } : {}),
+      ...(watch.pendingTables != null ? { pendingTables: watch.pendingTables } : {}),
+    } : {}),
+    ...fields,
+  };
+  if (event === "stage_stalled") {
+    console.warn("[sync] stage watchdog checkpoint", JSON.stringify(payload));
+  } else {
+    console.info("[sync] stage checkpoint", JSON.stringify(payload));
+  }
+}
+
+function scheduleSyncStageWatchdog(context: SyncExecutionContext, watch: SyncStageWatchdog): void {
+  if (watch.timer !== null) clearTimeout(watch.timer);
+  watch.timer = setTimeout(() => {
+    if (context.stageWatchdog !== watch || watch.reported) return;
+    watch.reported = true;
+    logSyncStageCheckpoint(context, "stage_stalled", watch.stage);
+  }, SYNC_STAGE_NO_PROGRESS_MS);
+}
+
+function beginSyncStageWatchdog(context: SyncExecutionContext, stage: SyncStage): void {
+  if (context.stageWatchdog?.timer !== null && context.stageWatchdog?.timer !== undefined) {
+    clearTimeout(context.stageWatchdog.timer);
+  }
+  const now = Date.now();
+  const watch: SyncStageWatchdog = {
+    stage,
+    startedAt: now,
+    lastProgressAt: now,
+    timer: null,
+    reported: false,
+  };
+  context.stageWatchdog = watch;
+  logSyncStageCheckpoint(context, "stage_start", stage);
+  // Docs owns a separate inactivity watchdog which also tracks native SQLite
+  // settlements. Keep this stage checkpoint for timing, without duplicating
+  // its timeout warning.
+  if (stage !== "docs") scheduleSyncStageWatchdog(context, watch);
+}
+
+function recordSyncStageProgress(
+  context: SyncExecutionContext,
+  fields: { page?: number; pendingTables?: number } = {},
+): void {
+  const watch = context.stageWatchdog;
+  if (!watch) return;
+  watch.lastProgressAt = Date.now();
+  if (fields.page != null) watch.page = fields.page;
+  if (fields.pendingTables != null) watch.pendingTables = fields.pendingTables;
+  watch.reported = false;
+  if (watch.stage !== "docs") scheduleSyncStageWatchdog(context, watch);
+}
+
+function finishSyncStageWatchdog(
+  context: SyncExecutionContext,
+  stage: SyncStage,
+  outcome: "success" | "error" | "interrupted",
+): void {
+  const watch = context.stageWatchdog;
+  if (watch?.stage === stage) {
+    if (watch.timer !== null) clearTimeout(watch.timer);
+    logSyncStageCheckpoint(context, "stage_finish", stage, {
+      outcome,
+      elapsedMs: Math.max(0, Date.now() - watch.startedAt),
+    });
+    context.stageWatchdog = undefined;
   }
 }
 
@@ -4536,6 +6400,7 @@ function reportGeneralSyncProgress(
   page: number,
   pendingTables: number,
 ): void {
+  recordSyncStageProgress(context, { page, pendingTables });
   if (context.flightSequence == null) return;
   updateSyncStatus(() => useSyncStatusStore.getState().setGeneralProgress(
     authScope,
@@ -4580,7 +6445,7 @@ function reportDocsSyncProgress(
   ));
 }
 
-// Docs is first so a long general replay cannot starve it. A separate stage
+// Docs is first so a long general replay cannot starve it. An inactivity
 // budget keeps one stalled Docs stage from holding the whole auth queue forever;
 // the child signal prevents that stage from crossing another SQLite boundary
 // after the budget expires. The parent flight remains valid for general sync.
@@ -4605,8 +6470,25 @@ async function applyDocsPullWithinFlightBudget(
   let liveWriteAtTimeout = false;
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let parentAbort: (() => void) | null = null;
-  const docsLiveWriteState = { started: false };
-  const docsContext: SyncExecutionContext = {
+  let rejectDeadline!: (reason: DocsStageWatchdogError) => void;
+  let docsContext!: SyncExecutionContext;
+  const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
+  const resetInactivityTimer = (): void => {
+    if (timedOut) return;
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      liveWriteAtTimeout = docsLiveWriteState.started;
+      captureDocsWatchdog(docsContext);
+      controller.abort();
+      rejectDeadline(new DocsStageWatchdogError());
+    }, DOCS_STAGE_WATCHDOG_MS);
+  };
+  const docsLiveWriteState: DocsLiveWriteState = {
+    started: false,
+    reportProgress: resetInactivityTimer,
+  };
+  docsContext = {
     ...context,
     controller,
     docsLiveWriteState,
@@ -4618,20 +6500,12 @@ async function applyDocsPullWithinFlightBudget(
       frozen: false,
     },
   };
+  resetInactivityTimer();
   const docsFlight = applyDocsPull(authScope, docsContext);
   // A raced promise may settle after the stage has moved on. Consume its
   // rejection while child guards prevent any later local apply.
   void docsFlight.catch(() => undefined);
   try {
-    const deadline = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        liveWriteAtTimeout = docsLiveWriteState.started;
-        captureDocsWatchdog(docsContext);
-        controller.abort();
-        reject(new DocsStageWatchdogError());
-      }, DOCS_STAGE_WATCHDOG_MS);
-    });
     const interrupted = new Promise<never>((_, reject) => {
       parentAbort = () => {
         controller.abort();
@@ -4697,6 +6571,15 @@ async function performSync(
   }
   let v3PullDisabled = false;
   const v2PullActive = () => mode === "v2" || v3PullDisabled;
+  // The two trailing cache refreshes are independent reads. Start both when
+  // the clip-targets stage begins so they overlap; an earlier transport
+  // failure still stops the flight before either request is sent.
+  let profilesRefresh: (() => Promise<unknown>) | null = null;
+  const clipTargetsRefresh = () => {
+    const clipTargets = startOverlappedRefresh(refreshClipIngestTargetsIfStale);
+    profilesRefresh = startOverlappedRefresh(() => characterApi.refreshCache());
+    return clipTargets();
+  };
   const steps: Array<[SyncStage, string, () => Promise<unknown>, boolean?]> = [
     ["outbox", "outbox push", () => pushOutbox(authScope, context, mode)],
     ...(mode === "v3"
@@ -4749,14 +6632,16 @@ async function performSync(
     ["pending-clips", "pending clip ingests", flushPendingClipIngests],
     // サーバー未到達時にモバイルLLMだけで取り込めるよう、到達できたときに
     // 取り込み先設定のキャッシュを更新する。TTL 内は内部でスキップされる。
-    ["clip-targets", "clip ingest targets", refreshClipIngestTargetsIfStale],
+    ["clip-targets", "clip ingest targets", clipTargetsRefresh],
     // オフライン中も最後に取得したsystem prompt等を使えるよう、
     // 接続できた同期のたびにサーバーの全プロフィールを更新する。
     // 既存の保留同期を、キャラクターAPIの一時的な断線で止めないため最後に行う。
-    ["profiles", "character profiles", () => characterApi.refreshCache()],
+    ["profiles", "character profiles", () => (profilesRefresh ?? (() => characterApi.refreshCache()))()],
   ];
 
   for (const [stage, label, operation, continueAfterConnectionFailure] of steps) {
+    let stageOutcome: "success" | "error" | "interrupted" = "success";
+    beginSyncStageWatchdog(context, stage);
     try {
       assertSyncExecutionActive(context);
       reportSyncStage(authScope, context, stage);
@@ -4767,11 +6652,13 @@ async function performSync(
         error instanceof SyncExecutionInterruptedError
         || isSyncExecutionInterrupted(context)
       ) {
+        stageOutcome = "interrupted";
         if (label === "Docs pull") {
           markStagedDocsPromotionsFailed(context.diagnostic);
         }
         return "interrupted";
       }
+      stageOutcome = "error";
       hadFailure = true;
       if (label === "Docs pull") {
         markStagedDocsPromotionsFailed(context.diagnostic);
@@ -4789,6 +6676,8 @@ async function performSync(
       if (isApiConnectionError(error) && !continueAfterConnectionFailure) {
         break;
       }
+    } finally {
+      finishSyncStageWatchdog(context, stage, stageOutcome);
     }
   }
 
@@ -4906,11 +6795,23 @@ function runSyncForToken(
       // A newer enqueue must win over a summary that was started earlier.
       const terminalMutationRevision = useSyncStatusStore.getState().mutationRevision;
       let outboxState: OutboxSyncState = "retrying";
+      beginSyncStageWatchdog(context, "finalizing");
+      const terminalReadStartedAt = Date.now();
+      logSyncStageCheckpoint(context, "terminal_summary_start", "finalizing");
+      let terminalReadErrorKind: string | null = null;
       try {
         assertSyncExecutionActive(context);
         outboxState = await getOutboxState(authScope);
-      } catch {
+      } catch (error) {
         outboxState = "retrying";
+        terminalReadErrorKind = error instanceof Error ? error.name : "UnknownError";
+      } finally {
+        logSyncStageCheckpoint(context, "terminal_summary_finish", "finalizing", {
+          durationMs: Math.max(0, Date.now() - terminalReadStartedAt),
+          outcome: terminalReadErrorKind ? "fallback" : "success",
+          ...(terminalReadErrorKind ? { errorKind: terminalReadErrorKind } : {}),
+        });
+        finishSyncStageWatchdog(context, "finalizing", terminalReadErrorKind ? "error" : "success");
       }
       // The read itself can span lifecycle/account changes. Its success or
       // rejection never authorizes a terminal receipt for an obsolete flight.

@@ -14,7 +14,7 @@ import json
 import os
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 
@@ -29,7 +29,7 @@ from ..security.media_credential_crypto import decrypt_media_credential, encrypt
 from .media_credential_package import CredentialPackage
 from .media_credential_provider_verifier import MediaCredentialProviderVerifier, has_trusted_identity_evidence
 from .media_credential_vault_service import MediaCredentialVaultService
-from .media_operations_service import MediaOperationsConflictError, MediaOperationsValidationError, _actor_id
+from .media_operations_service import MediaOperationsConflictError, MediaOperationsError, MediaOperationsValidationError, _actor_id
 
 
 OAUTH_SCOPES = {
@@ -39,6 +39,12 @@ OAUTH_SCOPES = {
 AUTHORIZE_URLS = {"x": "https://x.com/i/oauth2/authorize", "youtube": "https://accounts.google.com/o/oauth2/v2/auth"}
 TOKEN_URLS = {"x": "https://api.x.com/2/oauth2/token", "youtube": "https://oauth2.googleapis.com/token"}
 MAX_TOKEN_RESPONSE = 64 * 1024
+
+
+class MediaPlatformOAuthOutcomeUnknownError(MediaOperationsError):
+    """The callback result could not be safely reconciled after a database error."""
+
+    status_code = 503
 
 
 def _config(project_id, platform):
@@ -85,28 +91,121 @@ class MediaPlatformOAuthService:
             await session.refresh(credential)
         return account, revision, credential
 
+    async def _uses_manual_bridge(self, session, account):
+        if not account.connection_id:
+            return False
+        from ..memory.models import ExternalConnection
+        from .media_bridge_connection import manual_bridge
+
+        connection = await session.get(ExternalConnection, account.connection_id)
+        return manual_bridge(connection)
+
+    async def _completed_callback_result(self, session, actor, account_id, account_ref):
+        credential = await self.vault.get_credential(session, actor, account_id)
+        capabilities = credential.get("capabilities")
+        if (
+            credential.get("platform_account_id") != str(account_id)
+            or credential.get("account_ref") != account_ref
+            or credential.get("connection_type") != "oauth"
+            or credential.get("status") != "verified"
+            or credential.get("verification_code") != "identity_match"
+            or not credential.get("last_verified_at")
+            or not isinstance(capabilities, dict)
+            or capabilities.get("identity") != "available"
+        ):
+            raise MediaPlatformOAuthOutcomeUnknownError(
+                "OAuth callback outcome is uncertain; check the workspace before retrying"
+            )
+        return {
+            "status": "connected",
+            "platform_account_id": str(account_id),
+            "credential": credential,
+        }
+
+    async def _reconcile_callback_outcome(self, session, actor, request_id, account_id, account_ref):
+        """Resolve commit acknowledgement failures without overwriting a committed success."""
+        try:
+            await self.vault._rollback(session)
+        except Exception:
+            pass
+        for _ in range(2):
+            try:
+                request = await session.scalar(
+                    select(MediaPlatformOAuthRequest)
+                    .where(MediaPlatformOAuthRequest.id == request_id)
+                    .execution_options(populate_existing=True)
+                )
+                if request is None:
+                    raise MediaPlatformOAuthOutcomeUnknownError(
+                        "OAuth callback outcome is uncertain; check the workspace before retrying"
+                    )
+                if request.status == "completed":
+                    return await self._completed_callback_result(
+                        session, actor, account_id, account_ref
+                    )
+                if request.status == "failed":
+                    return {
+                        "status": "connection_failed",
+                        "platform_account_id": str(account_id),
+                        "credential": None,
+                    }
+                if request.status != "exchanging":
+                    raise MediaPlatformOAuthOutcomeUnknownError(
+                        "OAuth callback outcome is uncertain; check the workspace before retrying"
+                    )
+                transitioned = await session.execute(
+                    update(MediaPlatformOAuthRequest)
+                    .where(
+                        MediaPlatformOAuthRequest.id == request_id,
+                        MediaPlatformOAuthRequest.status == "exchanging",
+                    )
+                    .values(status="failed")
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+                if transitioned.rowcount == 1:
+                    return {
+                        "status": "connection_failed",
+                        "platform_account_id": str(account_id),
+                        "credential": None,
+                    }
+            except MediaPlatformOAuthOutcomeUnknownError:
+                try:
+                    await self.vault._rollback(session)
+                except Exception:
+                    pass
+                raise
+            except Exception:
+                try:
+                    await self.vault._rollback(session)
+                except Exception:
+                    pass
+        raise MediaPlatformOAuthOutcomeUnknownError(
+            "OAuth callback outcome is uncertain; check the workspace before retrying"
+        ) from None
+
     async def metadata(self, session, actor, account_id):
         account, revision, credential = await self._binding(session, actor, account_id, require_active=False)
         config = self.config_loader(account.project_id, account.platform)
-        blockers = _config_blockers(config)
+        configuration_blockers = _config_blockers(config)
+        blockers = list(configuration_blockers)
         if account.status != "active":
             blockers.append("platform_account_inactive")
+        if await self._uses_manual_bridge(session, account):
+            blockers.append("oauth_manual_bridge_identity_only")
         return {"platform_account_id": str(account.id), "project_id": str(account.project_id),
                 "platform": account.platform, "account_ref": account.account_ref,
                 "account_revision": revision.version, "credential_revision": credential.revision if credential else 0,
-                "configured": not blockers, "blockers": blockers, "required_scopes": OAUTH_SCOPES[account.platform],
-                "redirect_uri": config.get("redirect_uri") if not blockers else None,
-                "client_ref": hashlib.sha256(config["client_id"].encode()).hexdigest()[:16] if not blockers else None,
+                "configured": not configuration_blockers, "blockers": blockers, "required_scopes": OAUTH_SCOPES[account.platform],
+                "redirect_uri": config.get("redirect_uri") if not configuration_blockers else None,
+                "client_ref": hashlib.sha256(config["client_id"].encode()).hexdigest()[:16] if not configuration_blockers else None,
                 "external_checks": ["developer_app_and_api_access", "credits_and_rate_limits"] if account.platform == "x"
                   else ["youtube_api_enabled", "oauth_consent_verified", "upload_project_audit_for_public_visibility", "custom_thumbnail_channel_permission"]}
 
     async def start(self, session, actor, account_id, *, expected_account_revision, expected_credential_revision):
         account, revision, credential = await self._binding(session, actor, account_id)
-        if account.connection_id:
-            from ..memory.models import ExternalConnection
-            from .media_bridge_connection import manual_bridge
-            if manual_bridge(await session.get(ExternalConnection, account.connection_id)):
-                raise MediaOperationsConflictError("Bridge manual identity does not authorize an OAuth grant")
+        if await self._uses_manual_bridge(session, account):
+            raise MediaOperationsConflictError("Bridge manual identity does not authorize an OAuth grant")
         actual_credential_revision = credential.revision if credential else 0
         if revision.version != expected_account_revision or actual_credential_revision != expected_credential_revision:
             raise MediaOperationsConflictError("OAuth account or credential revision changed")
@@ -132,7 +231,7 @@ class MediaPlatformOAuthService:
         if account.platform == "youtube":
             params.update(access_type="offline", prompt="consent", include_granted_scopes="false")
         return {"authorization_url": AUTHORIZE_URLS[account.platform] + "?" + urlencode(params),
-                "expires_at": row.expires_at.isoformat(), "platform_account_id": str(account.id),
+                "expires_at": row.expires_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"), "platform_account_id": str(account.id),
                 "project_id": str(account.project_id), "platform": account.platform, "account_ref": account.account_ref}
 
     async def callback(self, session, actor, *, state, code=None, error=None):
@@ -201,29 +300,35 @@ class MediaPlatformOAuthService:
                 or account.account_ref != secret.get("account_ref")):
                 raise ValueError("binding changed during exchange")
             package_bytes = json.dumps(payload)
+            # Credential write, provider verification audit, and completed
+            # OAuth request share the final transaction. A failure cannot
+            # leave a previous credential replaced by a pending candidate.
             if current is None:
                 saved = await self.vault.create_credential(session, actor, account.id, package=package_bytes,
-                    connection_type="oauth", idempotency_key=f"oauth-add-{row.id}")
+                    connection_type="oauth", idempotency_key=f"oauth-add-{row.id}", commit=False)
             else:
                 saved = await self.vault.rotate_credential(session, actor, account.id, expected_revision=current.revision,
-                    package=package_bytes, connection_type="oauth", idempotency_key=f"oauth-rotate-{row.id}")
+                    package=package_bytes, connection_type="oauth", idempotency_key=f"oauth-rotate-{row.id}", commit=False)
             class Preverified:
                 async def verify(self, candidate, *, account_ref):
                     if candidate.payload != payload or account_ref != account.account_ref:
                         raise MediaOperationsConflictError("OAuth identity binding changed")
                     return verified
             saved = await self.vault.verify_credential(session, actor, account.id, expected_revision=saved["revision"],
-                idempotency_key=f"oauth-verify-{row.id}", verifier=Preverified())
+                idempotency_key=f"oauth-verify-{row.id}", verifier=Preverified(), commit=False)
             if saved.get("status") != "verified":
                 raise ValueError("saved credential was not verified")
             await session.execute(update(MediaPlatformOAuthRequest).where(MediaPlatformOAuthRequest.id == row.id).values(status="completed"))
             await session.commit()
             return {"status": "connected", "platform_account_id": str(account.id), "credential": saved}
         except Exception:
-            await session.rollback()
-            await session.execute(update(MediaPlatformOAuthRequest).where(MediaPlatformOAuthRequest.id == request_id).values(status="failed"))
-            await session.commit()
-            return {"status": "connection_failed", "platform_account_id": str(account_uuid), "credential": None}
+            return await self._reconcile_callback_outcome(
+                session,
+                actor,
+                request_id,
+                account_uuid,
+                secret.get("account_ref"),
+            )
         finally:
             if isinstance(token, dict):
                 token.clear()

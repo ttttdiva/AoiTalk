@@ -12,8 +12,14 @@ import json
 import re
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, text, tuple_
+from sqlalchemy import exists, func, or_, select, text, tuple_
+from sqlalchemy.orm import aliased
 
+from ..memory.models.conversations import (
+    ConversationMessage,
+    ConversationParticipant,
+    ConversationSession,
+)
 from ..memory.models.personal_draft import PersonalDraftEvent as Event
 from .personal_async_guard import run_personal_guard
 from .personal_ledger_service import (
@@ -79,7 +85,17 @@ def _manual_evidence(proposal: dict, source: str) -> dict:
             continue  # An opaque neutral alias is assigned by the owner.
         token = str(value)
         # Exact explicit values only. No date arithmetic, OCR or semantic claims.
-        match = re.search(r"(?<![\w.-])" + re.escape(token) + r"(?![\w.-])", source)
+        if field == "due_date" and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", token):
+            # ISO dates may be adjacent to Japanese prose (期限は...です),
+            # while ASCII/number continuations remain a different token.
+            boundary = (
+                r"(?<![A-Za-z0-9_-])"
+                + re.escape(token)
+                + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+            )
+        else:
+            boundary = r"(?<![\w.-])" + re.escape(token) + r"(?![\w.-])"
+        match = re.search(boundary, source)
         if match is None:
             raise LedgerValidationError("evidence does not contain the explicit field value")
         spans[field] = {"start": match.start(), "end": match.end()}
@@ -152,11 +168,262 @@ class PersonalDraftService:
         finally:
             await session.close()
 
+    async def list_unproposed_evidence(self, *, actor, limit=100):
+        """List only this human owner's saved evidence that has no draft yet."""
+        _actor(actor, human=True)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise LedgerValidationError("invalid limit")
+        evidence_row = aliased(Event)
+        proposed_row = aliased(Event)
+        session = await self.ledger._open()
+        try:
+            refs = (await session.execute(
+                select(evidence_row.id)
+                .where(
+                    evidence_row.owner_user_id == actor.user_id,
+                    evidence_row.event_type == "evidence",
+                    ~exists(select(1).select_from(proposed_row).where(
+                        proposed_row.owner_user_id == actor.user_id,
+                        proposed_row.event_type == "proposed",
+                        proposed_row.evidence_ref == evidence_row.id,
+                    )),
+                )
+                .order_by(evidence_row.recorded_at.desc(), evidence_row.id.desc())
+                .limit(limit)
+            )).scalars().all()
+            items = []
+            for ref in refs:
+                evidence = await self._evidence(session, actor.user_id, ref)
+                items.append({
+                    "evidence_ref": str(ref),
+                    "proposal": evidence["proposal"],
+                    "source_text": evidence["source_text"],
+                })
+            return {"items": items}
+        finally:
+            await session.close()
+
+    async def record_agent_evidence_and_propose(
+        self,
+        *,
+        actor,
+        proposal,
+        source_text,
+        source_message_id,
+        source_session_id,
+        source_agent_id,
+        idempotency_key,
+        guard=None,
+    ):
+        """Atomically persist one trusted Agent observation and its draft.
+
+        This is intentionally a separate, narrow seam from ``record_evidence``.
+        The latter remains the human-only HTTP evidence route.  This seam is
+        reserved for an already-authorized Agent turn and records the source
+        message identity alongside the encrypted evidence so a retry with the
+        same key but changed content conflicts before any second row is added.
+        No ledger entry is materialized here.
+        """
+
+        _actor(actor)
+        if actor.kind != "agent":
+            raise LedgerPermissionError("Agent evidence requires an Agent actor")
+        if guard is None:
+            raise LedgerPermissionError("current Agent guard is required")
+
+        async def _guard_current() -> None:
+            result = await run_personal_guard(guard)
+            if result is False:
+                raise LedgerPermissionError("current Agent authority denied")
+
+        proposal = normalize_proposal(proposal)
+        if proposal["kind"] != "deadline":
+            raise LedgerPermissionError("Agent chat evidence supports deadline proposals only")
+        try:
+            message_id = _uuid(source_message_id, "source_message_id")
+            session_id = _uuid(source_session_id, "source_session_id")
+            agent_id = _uuid(source_agent_id, "source_agent_id")
+        except LedgerValidationError:
+            raise
+
+        # Keep the source identity opaque and bounded.  It is stored only in
+        # encrypted evidence; the operation key contains only the UUID.
+        evidence = _manual_evidence(proposal, source_text)
+        evidence["recorded_by"] = "agent"
+        evidence["source_message_id"] = str(message_id)
+        evidence["source_session_id"] = str(session_id)
+        evidence["source_agent_id"] = str(agent_id)
+        request = {
+            "source_message_id": str(message_id),
+            "source_session_id": str(session_id),
+            "source_agent_id": str(agent_id),
+            "proposal": proposal,
+            "evidence": evidence,
+            "recorded_by": "agent",
+            "actor_kind": actor.kind,
+        }
+        evidence_key = _key("agent-evidence", idempotency_key)
+        propose_key = _key("agent-propose", idempotency_key)
+        session = await self.ledger._open()
+        try:
+            await _guard_current()  # after opening the owner session
+            async with session.begin():
+                await _guard_current()  # after transaction enter
+                await self._lock(session, actor.user_id)
+                await _guard_current()  # after the owner lock
+
+                bad_participant = exists(
+                    select(ConversationParticipant.id).where(
+                        ConversationParticipant.session_id == ConversationSession.id,
+                        ~or_(
+                            (
+                                ConversationParticipant.participant_type == "user"
+                            )
+                            & (ConversationParticipant.participant_id == str(actor.user_id)),
+                            (
+                                ConversationParticipant.participant_type == "character"
+                            )
+                            & (ConversationParticipant.status == "joined")
+                            & (
+                                func.lower(func.trim(ConversationParticipant.participant_id))
+                                == func.lower(func.trim(ConversationSession.character_name))
+                            ),
+                        ),
+                    )
+                )
+                source_statement = (
+                    select(ConversationMessage)
+                    .join(
+                        ConversationSession,
+                        ConversationSession.id == ConversationMessage.session_id,
+                    )
+                    .where(
+                        ConversationMessage.id == message_id,
+                        ConversationMessage.session_id == session_id,
+                        ConversationMessage.deleted_at.is_(None),
+                        ConversationMessage.role == "user",
+                        ConversationMessage.sender_type.in_(("user", "human")),
+                        ConversationMessage.sender_id == str(actor.user_id),
+                        ConversationSession.id == session_id,
+                        ConversationSession.user_id == str(actor.user_id),
+                        ConversationSession.deleted_at.is_(None),
+                        ConversationSession.is_active.is_not(False),
+                        ConversationSession.is_group_chat.is_not(True),
+                        ConversationSession.project_id.is_(None),
+                        ConversationSession.app_id.is_(None),
+                        ConversationSession.app_target_id.is_(None),
+                        ConversationSession.parent_session_id.is_(None),
+                        ConversationSession.agent_id == agent_id,
+                        ~bad_participant,
+                    )
+                    .with_for_update(of=ConversationMessage)
+                )
+                source_result = await session.execute(source_statement)
+                await _guard_current()
+                source_row = source_result.scalar_one_or_none()
+                if source_row is None:
+                    raise LedgerConflictError("source message changed")
+                current_source_text = source_row.content
+                if current_source_text != source_text:
+                    raise LedgerConflictError("source message changed")
+
+                existing_evidence = await self._by_key(session, actor.user_id, evidence_key)
+                await _guard_current()
+                existing_proposed = await self._by_key(session, actor.user_id, propose_key)
+                await _guard_current()
+
+                if existing_evidence is not None or existing_proposed is not None:
+                    # Evidence and proposal are committed together.  Seeing
+                    # only one row means a previous write was not produced by
+                    # this seam and must never be completed by a retry.
+                    if existing_evidence is None or existing_proposed is None:
+                        raise LedgerConflictError("agent draft transaction is incomplete")
+                    self._replay(existing_evidence, request)
+                    proposed_payload = self._replay(existing_proposed, {
+                        "evidence_ref": str(existing_evidence.id),
+                        "proposal": proposal,
+                        "actor_kind": actor.kind,
+                        "source_message_id": str(message_id),
+                        "source_session_id": str(session_id),
+                        "source_agent_id": str(agent_id),
+                    })
+                    return proposed_payload["result"]
+
+                evidence_row = await self._insert(
+                    session,
+                    actor=actor,
+                    event_type="evidence",
+                    operation_key=evidence_key,
+                    payload={
+                        "request_digest": digest(request),
+                        "evidence": evidence,
+                        "recorded_by": "agent",
+                    },
+                )
+                await _guard_current()  # flushed evidence is still rollbackable
+
+                draft_id = uuid4()
+                snapshot = {
+                    "schema": 1,
+                    "revision": 1,
+                    "draft_ref": str(draft_id),
+                    "proposal": proposal,
+                    "evidence_ref": str(evidence_row.id),
+                    "evidence": evidence,
+                    "proposed_by": "agent",
+                }
+                result = {
+                    "draft_ref": str(draft_id),
+                    "confirmed_digest": digest(snapshot),
+                    "status": "awaiting_user_review",
+                    "effective_ledger_change": False,
+                }
+                proposed_request = {
+                    "evidence_ref": str(evidence_row.id),
+                    "proposal": proposal,
+                    "actor_kind": actor.kind,
+                    "source_message_id": str(message_id),
+                    "source_session_id": str(session_id),
+                    "source_agent_id": str(agent_id),
+                }
+                proposed_row = Event(
+                    id=draft_id,
+                    owner_user_id=actor.user_id,
+                    event_type="proposed",
+                    evidence_ref=evidence_row.id,
+                    operation_key=propose_key,
+                )
+                proposed_row.payload = {
+                    "request_digest": digest(proposed_request),
+                    "result": result,
+                    "snapshot_digest": digest(snapshot),
+                    "proposed_by": "agent",
+                    "proposal": proposal,
+                    "evidence_digest": digest(evidence),
+                    "source_message_id": str(message_id),
+                    "source_session_id": str(session_id),
+                    "source_agent_id": str(agent_id),
+                }
+                session.add(proposed_row)
+                await session.flush()
+                await _guard_current()  # flush happened; commit is still gated
+                return result
+        finally:
+            await session.close()
+
     async def _evidence(self, session, owner, ref, guard=None):
         row = await self._owned(session, owner, ref, "evidence")
         await run_personal_guard(guard)  # right after the DB await, before the payload is read/decrypted
         evidence = row.payload["evidence"]
-        if evidence != _manual_evidence(evidence["proposal"], evidence["source_text"]):
+        expected = _manual_evidence(evidence["proposal"], evidence["source_text"])
+        if evidence.get("recorded_by") == "agent":
+            expected.update({
+                "recorded_by": "agent",
+                "source_message_id": str(_uuid(evidence.get("source_message_id"), "source_message_id")),
+                "source_session_id": str(_uuid(evidence.get("source_session_id"), "source_session_id")),
+                "source_agent_id": str(_uuid(evidence.get("source_agent_id"), "source_agent_id")),
+            })
+        if evidence != expected:
             raise LedgerConflictError("source integrity mismatch")
         return evidence
 

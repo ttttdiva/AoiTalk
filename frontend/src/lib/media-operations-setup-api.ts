@@ -37,6 +37,8 @@ export type PlatformAccountCreateInput = OptionalDefaults<
 >;
 export type PlatformAccountRevisionInput =
   Schemas["PlatformAccountRevisionCreateRequest"];
+export type YouTubeChannelSlotUpdateInput =
+  Schemas["YouTubeChannelSlotUpdateRequest"];
 
 /** Credential Vault DTOs are generated from the FastAPI contract.  The
  * generated projection intentionally contains status/capability metadata
@@ -342,6 +344,21 @@ export const mediaOperationsSetupApi = {
   ): Promise<PlatformAccountDetail> {
     return request<PlatformAccountDetail>(
       `/operations/media/platform-accounts/${encodeId(id)}`,
+    );
+  },
+
+  async updateYouTubeChannelSlot(
+    id: string,
+    input: YouTubeChannelSlotUpdateInput,
+    idempotencyKey: string,
+  ): Promise<PlatformAccountDetail> {
+    return request<PlatformAccountDetail>(
+      `/operations/media/platform-accounts/${encodeId(id)}/youtube-channel`,
+      {
+        method: "POST",
+        ...jsonBody(input),
+      },
+      idempotencyKey,
     );
   },
 

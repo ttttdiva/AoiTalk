@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import threading
 import uuid
 import zipfile
@@ -15,6 +16,8 @@ from typing import Iterable
 from uuid import UUID
 
 import yaml
+
+from src.runtime_release_contract import persistent_path
 
 from .app_git_service import AppGitService
 from .app_manifest_service import (
@@ -31,7 +34,6 @@ from .app_storage import (
     DEFAULT_MANIFEST,
     README_TEMPLATE,
     get_app_workspace_path,
-    get_workspaces_root,
     is_private_app_path,
     normalize_app_relative_path,
     resolve_app_file,
@@ -111,6 +113,39 @@ def _copy_file(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    """Return true for symlinks and Windows junction/reparse entries."""
+
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        item_stat = path.lstat()
+        return bool(
+            getattr(item_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError):
+        # A path that cannot be inspected is not safe to mutate.
+        return True
+
+
+def _has_link_or_reparse_component(path: Path) -> bool:
+    """Check existing lexical components without resolving through them."""
+
+    path = Path(path)
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current = current / component
+        if _is_link_or_reparse(current):
+            return True
+    return False
+
+
 def _is_untouched_starter_manifest(manifest: dict[str, object], app: object) -> bool:
     """Only replace the scaffold Manifest before any field was authored.
 
@@ -162,8 +197,147 @@ class AppSourceUpdateService:
         self.cache_root = (
             Path(cache_root).expanduser().resolve()
             if cache_root is not None
-            else Path(__file__).resolve().parents[2] / "cache"
+            else persistent_path("cache", Path(__file__).resolve().parents[2])
         )
+
+    def _safe_staging_path(self, path: Path) -> Path:
+        """Resolve a staging path without following a replaced namespace."""
+
+        candidate = Path(path)
+        if _has_link_or_reparse_component(candidate):
+            raise AppSourceUpdateError("App source staging pathのsymlink/reparseは許可されません")
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise AppSourceUpdateError("App source staging pathを確認できません") from exc
+        if _has_link_or_reparse_component(candidate):
+            raise AppSourceUpdateError("App source staging pathのsymlink/reparseは許可されません")
+        return resolved
+
+    def _configured_workspace_root(self) -> Path:
+        """Return the lexical workspace root for legacy read compatibility."""
+
+        value = self.workspace_root or os.environ.get("AOITALK_WORKSPACES_DIR", "./workspaces")
+        root = Path(value).expanduser()
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        return Path(os.path.abspath(os.fspath(root)))
+
+    def _create_staging_directory(self, app_id: str, import_id: str) -> Path:
+        """Create one explicitly owned preview directory."""
+
+        staging = self._staging_root(app_id, import_id)
+        if _has_link_or_reparse_component(self.cache_root):
+            raise AppSourceUpdateError("App source cache rootのsymlink/reparseは許可されません")
+        if _has_link_or_reparse_component(staging):
+            raise AppSourceUpdateError("App source staging pathのsymlink/reparseは許可されません")
+        created = False
+        try:
+            staging.parent.mkdir(parents=True, exist_ok=True)
+            if _has_link_or_reparse_component(staging.parent):
+                raise AppSourceUpdateError("App source staging parentのsymlink/reparseは許可されません")
+            staging.mkdir(parents=False, exist_ok=False)
+            created = True
+            owner = {
+                "producer": "app_source_update",
+                "app_id": str(UUID(str(app_id))),
+                "import_id": str(UUID(str(import_id))),
+            }
+            (staging / ".producer-owner.json").write_text(
+                json.dumps(owner, ensure_ascii=False), encoding="utf-8"
+            )
+        except FileExistsError as exc:
+            raise AppSourceUpdateError("同じApp source importが既に存在します", status_code=409) from exc
+        except OSError as exc:
+            if created:
+                try:
+                    if not _has_link_or_reparse_component(staging) and not _is_link_or_reparse(staging):
+                        shutil.rmtree(staging, ignore_errors=False)
+                except OSError:
+                    logger.debug("App source staging creation cleanup deferred", exc_info=True)
+            raise AppSourceUpdateError("App source staging領域を作成できません") from exc
+        except BaseException:
+            if created:
+                try:
+                    if not _has_link_or_reparse_component(staging) and not _is_link_or_reparse(staging):
+                        shutil.rmtree(staging, ignore_errors=False)
+                except OSError:
+                    logger.debug("App source staging creation cleanup deferred", exc_info=True)
+            raise
+        return staging
+
+    def _cleanup_staging(self, staging: Path | None, *, allow_legacy: bool = False) -> None:
+        """Best-effort cleanup of a task-owned preview directory.
+
+        The path is revalidated before every removal.  A collision or a
+        replaced reparse component leaves the directory for an operator to
+        inspect instead of risking a delete outside the cache namespace.
+        """
+
+        if staging is None:
+            return
+        try:
+            candidate = self._safe_staging_path(Path(staging))
+            if (
+                not candidate.exists()
+                or candidate.is_symlink()
+                or _is_link_or_reparse(candidate)
+                or _has_link_or_reparse_component(candidate)
+            ):
+                return
+            owner_path = candidate / ".producer-owner.json"
+            cache_root = self._safe_staging_path(self.cache_root)
+            try:
+                candidate.relative_to(cache_root / "app_source_updates")
+                is_current = True
+            except ValueError:
+                is_current = False
+            if is_current:
+                if not owner_path.is_file() or _is_link_or_reparse(owner_path):
+                    # A directory without this producer marker may be a
+                    # legacy/foreign run.  Leave it for its owner.
+                    return
+                try:
+                    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                    if (
+                        not isinstance(owner, dict)
+                        or owner.get("producer") != "app_source_update"
+                        or str(owner.get("app_id")) != candidate.parent.name
+                        or str(owner.get("import_id")) != candidate.name
+                    ):
+                        return
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    return
+            elif allow_legacy:
+                legacy_root = self._safe_staging_path(
+                    self._configured_workspace_root() / "cache" / "app_source_updates"
+                )
+                candidate.relative_to(legacy_root)
+                metadata_path = candidate / "metadata.json"
+                if _is_link_or_reparse(metadata_path) or not metadata_path.is_file():
+                    return
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(metadata, dict)
+                    or str(metadata.get("app_id")) != candidate.parent.name
+                    or str(metadata.get("import_id")) != candidate.name
+                ):
+                    return
+            else:
+                return
+            shutil.rmtree(candidate, ignore_errors=False)
+            # Empty per-App/import parents are producer-owned scratch.  Keep
+            # the shared cache roots themselves for other runs.
+            for parent in (candidate.parent, candidate.parent.parent):
+                if parent == cache_root or parent == cache_root.parent:
+                    continue
+                try:
+                    if parent.exists() and not _has_link_or_reparse_component(parent) and not any(parent.iterdir()):
+                        parent.rmdir()
+                except OSError:
+                    break
+        except (AppSourceUpdateError, OSError, ValueError):
+            logger.debug("App source staging cleanup deferred", exc_info=True)
 
     def _staging_root(self, app_id: str, import_id: str) -> Path:
         try:
@@ -172,7 +346,9 @@ class AppSourceUpdateService:
         except (TypeError, ValueError, AttributeError) as exc:
             raise AppSourceUpdateError("AppまたはimportのIDが不正です") from exc
         staging_root = self.cache_root / "app_source_updates"
-        return (staging_root / str(app_uuid) / str(import_uuid)).resolve()
+        return self._safe_staging_path(
+            staging_root / str(app_uuid) / str(import_uuid)
+        )
 
     def _legacy_staging_root(self, app_id: str, import_id: str) -> Path:
         """Resolve the pre-cache-root location for unexpired previews only."""
@@ -181,15 +357,17 @@ class AppSourceUpdateService:
             import_uuid = UUID(str(import_id))
         except (TypeError, ValueError, AttributeError) as exc:
             raise AppSourceUpdateError("AppまたはimportのIDが不正です") from exc
-        root = get_workspaces_root(self.workspace_root) / "cache" / "app_source_updates"
-        return (root / str(app_uuid) / str(import_uuid)).resolve()
+        root = self._configured_workspace_root() / "cache" / "app_source_updates"
+        return self._safe_staging_path(
+            root / str(app_uuid) / str(import_uuid)
+        )
 
     def _workspace_files(self, workspace: Path) -> dict[str, Path]:
         result: dict[str, Path] = {}
         if not workspace.exists():
             return result
         for path in workspace.rglob("*"):
-            if path.is_symlink() or not path.is_file() or ".git" in {part.casefold() for part in path.relative_to(workspace).parts}:
+            if _is_link_or_reparse(path) or not path.is_file() or ".git" in {part.casefold() for part in path.relative_to(workspace).parts}:
                 continue
             relative = path.relative_to(workspace).as_posix()
             parts = {part.casefold() for part in relative.split("/")}
@@ -201,6 +379,8 @@ class AppSourceUpdateService:
         return result
 
     def _extract_zip(self, archive_path: Path, destination: Path) -> None:
+        if _has_link_or_reparse_component(destination):
+            raise AppSourceUpdateError("ZIP展開先のsymlink/reparseは許可されません")
         try:
             archive = zipfile.ZipFile(archive_path)
         except zipfile.BadZipFile as exc:
@@ -208,6 +388,8 @@ class AppSourceUpdateService:
         with archive:
             total_size = 0
             for member in archive.infolist():
+                if _has_link_or_reparse_component(destination):
+                    raise AppSourceUpdateError("ZIP展開先のsymlink/reparseは許可されません")
                 if _is_symlink_member(member):
                     raise AppSourceUpdateError("ZIP内のシンボリックリンクは取り込めません")
                 if member.is_dir():
@@ -223,6 +405,8 @@ class AppSourceUpdateService:
                     target.relative_to(destination.resolve())
                 except ValueError as exc:
                     raise AppSourceUpdateError("ZIPがstaging領域の外へ展開されます") from exc
+                if _has_link_or_reparse_component(target) or _is_link_or_reparse(target):
+                    raise AppSourceUpdateError("ZIP展開先のsymlink/reparseは許可されません")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(member) as source, target.open("wb") as output:
                     shutil.copyfileobj(source, output, length=1024 * 1024)
@@ -230,7 +414,7 @@ class AppSourceUpdateService:
     def _normalize_incoming(self, root: Path, *, root_mode: str) -> tuple[dict[str, Path], list[dict[str, str]]]:
         files: list[tuple[str, Path]] = []
         for path in root.rglob("*"):
-            if path.is_symlink():
+            if _is_link_or_reparse(path):
                 raise AppSourceUpdateError("シンボリックリンクは取り込めません")
             if path.is_file():
                 files.append((path.relative_to(root).as_posix(), path))
@@ -292,8 +476,12 @@ class AppSourceUpdateService:
     ) -> tuple[dict[str, Path], list[dict[str, str]]]:
         incoming = staging / "incoming"
         expanded = staging / "expanded"
+        if _has_link_or_reparse_component(incoming) or _has_link_or_reparse_component(expanded):
+            raise AppSourceUpdateError("upload staging pathのsymlink/reparseは許可されません")
         incoming.mkdir(parents=True, exist_ok=True)
         expanded.mkdir(parents=True, exist_ok=True)
+        if _has_link_or_reparse_component(incoming) or _has_link_or_reparse_component(expanded):
+            raise AppSourceUpdateError("upload staging pathのsymlink/reparseは許可されません")
         total_upload_size = 0
         upload_count = 0
         for index, (source, relative_name) in enumerate(uploaded):
@@ -301,6 +489,8 @@ class AppSourceUpdateService:
             if upload_count > MAX_FILES:
                 raise AppSourceUpdateError("取り込みファイル数が上限を超えています")
             try:
+                if _has_link_or_reparse_component(source) or _is_link_or_reparse(source):
+                    raise AppSourceUpdateError("シンボリックリンクは取り込めません")
                 upload_size = source.stat().st_size
             except OSError as exc:
                 raise AppSourceUpdateError("アップロードファイルを読み込めません") from exc
@@ -321,6 +511,8 @@ class AppSourceUpdateService:
                     destination.relative_to(expanded.resolve())
                 except ValueError as exc:
                     raise AppSourceUpdateError("アップロードpathがstaging領域の外へ出ます") from exc
+                if _has_link_or_reparse_component(destination) or _is_link_or_reparse(destination):
+                    raise AppSourceUpdateError("upload staging pathのsymlink/reparseは許可されません")
                 _copy_file(target, destination)
         normalized, rejected = self._normalize_incoming(expanded, root_mode=root_mode)
         # ``strip_common`` changes the logical App path (for example
@@ -328,7 +520,11 @@ class AppSourceUpdateService:
         # that normalized tree so preview/apply address the same files instead
         # of retaining the dropped folder name in staging.
         normalized_root = staging / "normalized"
+        if _has_link_or_reparse_component(normalized_root):
+            raise AppSourceUpdateError("normalized staging pathのsymlink/reparseは許可されません")
         normalized_root.mkdir(parents=True, exist_ok=True)
+        if _has_link_or_reparse_component(normalized_root):
+            raise AppSourceUpdateError("normalized staging pathのsymlink/reparseは許可されません")
         materialized: dict[str, Path] = {}
         for relative, source in normalized.items():
             target = (normalized_root / normalize_app_relative_path(relative)).resolve()
@@ -336,6 +532,8 @@ class AppSourceUpdateService:
                 target.relative_to(normalized_root.resolve())
             except ValueError as exc:
                 raise AppSourceUpdateError("normalized pathがstaging外へ出ます") from exc
+            if _has_link_or_reparse_component(target) or _is_link_or_reparse(target):
+                raise AppSourceUpdateError("normalized staging pathのsymlink/reparseは許可されません")
             _copy_file(source, target)
             materialized[relative] = target
         return materialized, rejected
@@ -349,10 +547,9 @@ class AppSourceUpdateService:
         root_mode: str = "strip_common",
     ) -> dict[str, object]:
         import_id = str(uuid.uuid4())
-        staging = self._staging_root(app_id, import_id)
-        staging.parent.mkdir(parents=True, exist_ok=True)
-        staging.mkdir(parents=True, exist_ok=False)
+        staging: Path | None = None
         try:
+            staging = self._create_staging_directory(app_id, import_id)
             workspace = get_app_workspace_path(app_id, workspace_root=self.workspace_root)
             git = AppGitService(workspace_root=self.workspace_root)
             status = git.status(app_id)
@@ -417,8 +614,8 @@ class AppSourceUpdateService:
                 "current_files": current_files,
                 "manifest": manifest_info,
             }
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+        except BaseException:
+            self._cleanup_staging(staging, allow_legacy=True)
             raise
 
     def _load_metadata(self, app_id: str, import_id: str) -> tuple[Path, dict[str, object]]:
@@ -429,6 +626,8 @@ class AppSourceUpdateService:
         except ValueError as exc:
             raise AppSourceUpdateError("import_id が不正です") from exc
         staging = self._staging_root(app_id, import_id)
+        if _has_link_or_reparse_component(staging):
+            raise AppSourceUpdateError("差分プレビューのpathが不正です", status_code=404)
         metadata_path = staging / "metadata.json"
         if not metadata_path.is_file():
             legacy_staging = self._legacy_staging_root(app_id, import_id)
@@ -437,6 +636,11 @@ class AppSourceUpdateService:
                 raise AppSourceUpdateError("差分プレビューが見つからないか期限切れです", status_code=404)
             staging = legacy_staging
             metadata_path = legacy_metadata
+        if (
+            _has_link_or_reparse_component(staging)
+            or _is_link_or_reparse(metadata_path)
+        ):
+            raise AppSourceUpdateError("差分プレビューのpathが不正です", status_code=404)
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if not isinstance(metadata, dict):
@@ -444,11 +648,14 @@ class AppSourceUpdateService:
             created = datetime.fromisoformat(str(metadata.get("created_at")))
         except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AppSourceUpdateError("差分プレビューが壊れているか期限切れです", status_code=404) from exc
-        if _utcnow() - created > IMPORT_TTL:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise AppSourceUpdateError("差分プレビューの有効期限が切れています", status_code=410)
         if str(metadata.get("app_id")) != str(app_id):
             raise AppSourceUpdateError("Appとimportの組み合わせが不正です", status_code=403)
+        metadata_import_id = metadata.get("import_id")
+        if metadata_import_id not in (None, "") and str(metadata_import_id) != str(import_id):
+            raise AppSourceUpdateError("Appとimportの組み合わせが不正です", status_code=403)
+        if _utcnow() - created > IMPORT_TTL:
+            self._cleanup_staging(staging, allow_legacy=True)
+            raise AppSourceUpdateError("差分プレビューの有効期限が切れています", status_code=410)
         return staging, metadata
 
     async def apply_async(
@@ -515,6 +722,8 @@ class AppSourceUpdateService:
                 raise AppSourceUpdateError("取り込み拒否ファイルが残っています。対象から外して再確認してください")
             workspace = get_app_workspace_path(app_id, workspace_root=self.workspace_root)
             normalized_root = staging / "normalized"
+            if _has_link_or_reparse_component(normalized_root):
+                raise AppSourceUpdateError("normalized staging pathのsymlink/reparseは許可されません")
             incoming_paths: list[str] = []
             for item in metadata.get("files", []):
                 try:
@@ -530,6 +739,8 @@ class AppSourceUpdateService:
             # snapshot even when they were not part of the uploaded files.
             touched = set(incoming_paths) | set(delete_normalized) | {"aoitalk.app.yaml", "README.md"}
             backup_root = staging / "backup"
+            if _has_link_or_reparse_component(backup_root):
+                raise AppSourceUpdateError("backup staging pathのsymlink/reparseは許可されません")
             for relative in touched:
                 try:
                     target = resolve_app_file(app_id, relative, workspace_root=self.workspace_root)
@@ -537,16 +748,22 @@ class AppSourceUpdateService:
                     raise AppSourceUpdateError("更新pathがApp workspace外へ出ます") from exc
                 if target.exists() and target.is_file():
                     backup = backup_root / relative
+                    if _has_link_or_reparse_component(backup):
+                        raise AppSourceUpdateError("backup staging pathのsymlink/reparseは許可されません")
                     _copy_file(target, backup)
                     backups[relative] = backup
                 else:
                     backups[relative] = None
             for relative in incoming_paths:
+                if _has_link_or_reparse_component(normalized_root):
+                    raise AppSourceUpdateError("normalized staging pathのsymlink/reparseは許可されません")
                 source = (normalized_root / Path(relative)).resolve()
                 try:
                     source.relative_to(normalized_root.resolve())
                 except ValueError as exc:
                     raise AppSourceUpdateError("normalized pathがstaging外へ出ます") from exc
+                if _has_link_or_reparse_component(source) or _is_link_or_reparse(source):
+                    raise AppSourceUpdateError("normalized source pathのsymlink/reparseは許可されません")
                 if not source.is_file():
                     raise AppSourceUpdateError(f"incoming fileがありません: {relative}")
                 destination = resolve_app_file(app_id, relative, workspace_root=self.workspace_root)
@@ -612,10 +829,15 @@ class AppSourceUpdateService:
                 "targets": [target.to_dict() for target in targets],
                 "readme_node_id": str(node.id) if node is not None else str(app.readme_node_id) if app.readme_node_id else None,
             }
-            shutil.rmtree(staging, ignore_errors=True)
+            self._cleanup_staging(staging, allow_legacy=True)
             return result
-        except Exception:
-            await session.rollback()
+        except BaseException:
+            try:
+                await session.rollback()
+            except BaseException:
+                # Preserve the operation's original exception and still run
+                # the filesystem cleanup below (including cancellation).
+                logger.exception("App source update session rollback failed: app_id=%s", app_id)
             if (
                 checkpoint_revision
                 and previous_revision
@@ -642,7 +864,7 @@ class AppSourceUpdateService:
                                 target.unlink()
                         elif backup.exists():
                             _copy_file(backup, target)
-                    except Exception:
+                    except BaseException:
                         # rollback 中の失敗で元の失敗原因を差し替えない。
                         # 1ファイル分の巻き戻しに失敗しても残りは戻し切る。
                         logger.exception(
@@ -650,6 +872,7 @@ class AppSourceUpdateService:
                             app_id,
                             relative,
                         )
+            self._cleanup_staging(staging, allow_legacy=True)
             raise
         finally:
             lock.release()

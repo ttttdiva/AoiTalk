@@ -153,7 +153,10 @@ def _reject_link_components(root: Path, relative: Path) -> None:
 
 
 def _trusted_workspace_root(
-    value: str | os.PathLike[str] | None, *, create_root: bool = True
+    value: str | os.PathLike[str] | None,
+    *,
+    create_root: bool = False,
+    allow_missing_root: bool = False,
 ) -> Path:
     """Validate and resolve a root, optionally creating it for writers.
 
@@ -161,7 +164,9 @@ def _trusted_workspace_root(
     move ClipIngest's namespace outside the operator's intended workspace.
     Validate the lexical path first, then retain a canonical resolved anchor
     for all later under-root checks. Readers require an existing directory
-    and never create missing original storage.
+    and never create missing original storage unless an explicit caller opts
+    into a deferred writer root; that mode stores the path and lets the
+    writer boundary create it later.
     """
 
     raw = value or os.environ.get("AOITALK_WORKSPACES_DIR", "./workspaces")
@@ -179,7 +184,9 @@ def _trusted_workspace_root(
             candidate.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise ClipUploadError("workspace rootを作成できません") from exc
-    elif not candidate.is_dir():
+    elif candidate.exists() and not candidate.is_dir():
+        raise ClipUploadError("workspace rootが見つかりません")
+    elif not candidate.exists() and not allow_missing_root:
         raise ClipUploadError("workspace rootが見つかりません")
     # Recheck the anchor before resolving, including after writer mkdir.
     current = Path(candidate.anchor)
@@ -188,7 +195,7 @@ def _trusted_workspace_root(
         if _is_storage_link_or_reparse(current):
             raise ClipUploadError("workspace rootのシンボリックリンクは許可されません")
     try:
-        return candidate.resolve(strict=True)
+        return candidate.resolve(strict=not allow_missing_root)
     except OSError as exc:
         raise ClipUploadError("workspace rootを解決できません") from exc
 
@@ -272,9 +279,14 @@ class ClipIngestStorage:
         max_upload_bytes: int | None = None,
         max_files: int = _DEFAULT_MAX_FILES,
         defer_staging_cleanup: bool = False,
-        create_root: bool = True,
+        create_root: bool = False,
+        allow_missing_root: bool = False,
     ) -> None:
-        self.workspace_root = _trusted_workspace_root(workspace_root, create_root=create_root)
+        self.workspace_root = _trusted_workspace_root(
+            workspace_root,
+            create_root=create_root,
+            allow_missing_root=allow_missing_root,
+        )
         configured = max_upload_bytes
         if configured is None:
             try:
@@ -380,6 +392,57 @@ class ClipIngestStorage:
     def _payload_path(self, user_id: Any, upload_id: Any) -> Path:
         return self._upload_dir(user_id, upload_id) / "payload"
 
+    def _prepare_staging_root(self, user_id: Any) -> Path:
+        """Create the upload namespace for an explicit staging write.
+
+        Path lookup helpers intentionally never create ``_users`` or the
+        per-user namespace.  This writer-only helper performs the mkdir and
+        validates the full lexical ancestry both before and after it, so a
+        replaced ``_users``/user directory cannot redirect the write through
+        a symlink or Windows reparse point.
+        """
+
+        users_root = self.workspace_root / "_users"
+        staging = self.staging_root(user_id)
+        self._validate_gc_path(users_root, require_existing=False)
+        self._validate_gc_path(staging, require_existing=False)
+        staging.mkdir(parents=True, exist_ok=True)
+        self._validate_gc_path(users_root, require_existing=True)
+        self._validate_gc_path(staging, require_existing=True)
+        if not staging.is_dir() or _is_storage_link_or_reparse(staging):
+            raise ClipUploadError("staging namespaceが不正です")
+        return staging
+
+    def _remove_staging_directory(
+        self,
+        directory: Path,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> bool:
+        """Remove one task-owned upload directory after a final path check."""
+
+        try:
+            users_root = self.workspace_root / "_users"
+            self._validate_gc_path(users_root, require_existing=True)
+            self._validate_gc_path(directory, require_existing=True)
+            if (
+                not directory.is_dir()
+                or directory.is_symlink()
+                or _is_storage_link_or_reparse(directory)
+            ):
+                return False
+            if expected_identity is not None:
+                info = directory.lstat()
+                identity = (int(getattr(info, "st_dev", 0)), int(getattr(info, "st_ino", 0)))
+                if identity != expected_identity:
+                    return False
+            shutil.rmtree(directory, ignore_errors=False)
+            return not directory.exists()
+        except (ClipUploadError, OSError):
+            # Cleanup is best effort.  The maintenance GC will retry only
+            # after the same trust-boundary checks pass again.
+            return False
+
     async def stage_upload(self, user_id: Any, upload: Any) -> ClipUpload:
         """Stream one FastAPI ``UploadFile`` into user-scoped staging."""
 
@@ -390,13 +453,24 @@ class ClipIngestStorage:
         mime_type = mime_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
         upload_id = uuid4()
         directory = self._upload_dir(user_id, upload_id)
-        root = self.staging_root(user_id)
-        root.mkdir(parents=True, exist_ok=True)
-        directory.mkdir(parents=False, exist_ok=False)
         payload_path = directory / "payload"
         digest = hashlib.sha256()
         total = 0
+        created_directory = False
+        directory_identity: tuple[int, int] | None = None
         try:
+            root = self._prepare_staging_root(user_id)
+            # ``_prepare_staging_root`` created the namespace only.  The
+            # upload UUID directory is the per-request owned resource.
+            self._validate_gc_path(root, require_existing=True)
+            directory.mkdir(parents=False, exist_ok=False)
+            created_directory = True
+            info = directory.lstat()
+            directory_identity = (
+                int(getattr(info, "st_dev", 0)),
+                int(getattr(info, "st_ino", 0)),
+            )
+            self._validate_gc_path(directory, require_existing=True)
             with payload_path.open("xb") as destination:
                 while True:
                     reader = getattr(upload, "read", None)
@@ -443,8 +517,12 @@ class ClipIngestStorage:
                 created_at=created_at,
                 _payload_path=payload_path,
             )
-        except Exception:
-            shutil.rmtree(directory, ignore_errors=True)
+        except BaseException:
+            if created_directory:
+                self._remove_staging_directory(
+                    directory,
+                    expected_identity=directory_identity,
+                )
             raise
 
     async def stage_uploads(self, user_id: Any, uploads: Iterable[Any]) -> list[ClipUpload]:
@@ -458,7 +536,7 @@ class ClipIngestStorage:
             for upload in values:
                 staged.append(await self.stage_upload(user_id, upload))
             return staged
-        except Exception:
+        except BaseException:
             await self.cleanup_uploads(user_id, [item.upload_id for item in staged])
             raise
 
@@ -731,9 +809,17 @@ class ClipIngestStorage:
         # ``resolve_upload`` is deliberately repeated at the promotion
         # boundary, closing the race between planner execution and final move.
         target_node = _parse_uuid(node_id, "node_id")
+        attachments_root = self.workspace_root / "_docs" / "attachments"
+        # Promotion is the writer boundary for the Docs attachment namespace.
+        # Validate the lexical ancestors before mkdir; a replaced ``_docs``
+        # or ``attachments`` entry must never redirect a write outside the
+        # configured workspace.
+        self._validate_gc_path(attachments_root, require_existing=False)
         destination_root = self.workspace_root / "_docs" / "attachments" / str(target_node)
         destination_root = _assert_under(destination_root, self.workspace_root / "_docs" / "attachments")
         destination_root.mkdir(parents=True, exist_ok=True)
+        self._validate_gc_path(attachments_root, require_existing=True)
+        self._validate_gc_path(destination_root, require_existing=True)
         # The upload UUID is the idempotency key.  A worker retry after a
         # process crash may have already moved the payload while the database
         # transaction was rolling back; in that case reuse the verified file
@@ -743,7 +829,11 @@ class ClipIngestStorage:
 
         def _matches_expected(path: Path) -> bool:
             try:
-                if not path.is_file() or path.stat().st_size != int(upload.size_bytes):
+                if (
+                    _is_storage_link_or_reparse(path)
+                    or not path.is_file()
+                    or path.stat().st_size != int(upload.size_bytes)
+                ):
                     return False
                 digest = hashlib.sha256()
                 with path.open("rb") as handle:
@@ -889,8 +979,7 @@ class ClipIngestStorage:
                 directory = self._upload_dir(user_id, value)
             except ClipUploadError:
                 continue
-            if directory.exists() or directory.is_symlink():
-                shutil.rmtree(directory, ignore_errors=True)
+            if self._remove_staging_directory(directory):
                 removed += 1
         return removed
 

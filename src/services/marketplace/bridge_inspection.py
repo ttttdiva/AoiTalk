@@ -31,6 +31,17 @@ def require_crowdworks_url(url: Any) -> str:
     return url
 
 
+def require_crowdworks_job_url(url: Any, remote_id: str) -> str:
+    """Accept only the canonical detail path extracted from a listing link."""
+    if not isinstance(remote_id, str) or re.fullmatch(r"[0-9]{1,32}", remote_id) is None:
+        raise RuntimeError("crowdworks_detail_url_invalid")
+    require_crowdworks_url(url)
+    parsed = urlsplit(url)
+    if parsed.path != f"/public/jobs/{remote_id}" or parsed.query or parsed.fragment:
+        raise RuntimeError("crowdworks_detail_url_invalid")
+    return url
+
+
 def require_complete_inspection(observation: Any) -> dict[str, Any]:
     if not isinstance(observation, dict) or set(observation) != {"origin", "candidates", "text", "coverage"}:
         raise RuntimeError("crowdworks_inspection_incomplete")

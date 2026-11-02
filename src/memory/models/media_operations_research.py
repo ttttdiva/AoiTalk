@@ -1509,4 +1509,121 @@ class ContentItemFinding(Base):
             "created_at": _dt(self.created_at),
         }
 
+
+class ContentItemStockDecision(Base):
+    """Append-only human stock adoption ledger for one ContentItem."""
+
+    __tablename__ = "media_content_item_stock_decisions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    content_item_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("media_content_items.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    owner_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    sequence = Column(Integer, nullable=False)
+    event_type = Column(String(16), nullable=False)
+    from_status = Column(String(16), nullable=False)
+    to_status = Column(String(16), nullable=False)
+    content_item_version = Column(Integer, nullable=False)
+    content_item_hash = Column(String(64), nullable=False, index=True)
+    snapshot_json = Column("snapshot", JSON, nullable=False, default=dict, server_default="{}")
+    actor_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    actor_type = Column(String(16), nullable=False)
+    idempotency_key = Column(String(255), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    decision_hash = Column(String(64), nullable=False, index=True)
+    prev_event_hash = Column(String(64), nullable=True)
+    event_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        CheckConstraint("sequence > 0", name="ck_media_content_item_stock_sequence"),
+        CheckConstraint(
+            "event_type IN ('adopt', 'withdraw')",
+            name="ck_media_content_item_stock_event_type",
+        ),
+        CheckConstraint(
+            "(event_type = 'adopt' AND from_status = 'draft' AND to_status = 'ready') OR "
+            "(event_type = 'withdraw' AND from_status = 'ready' AND to_status = 'draft')",
+            name="ck_media_content_item_stock_event_target",
+        ),
+        CheckConstraint("content_item_version > 1", name="ck_media_content_item_stock_version"),
+        CheckConstraint("length(content_item_hash) = 64", name="ck_media_content_item_stock_content_hash"),
+        CheckConstraint("actor_type IN ('human', 'admin')", name="ck_media_content_item_stock_actor_type"),
+        CheckConstraint("length(trim(idempotency_key)) BETWEEN 1 AND 255", name="ck_media_content_item_stock_idempotency_key"),
+        CheckConstraint("length(request_hash) = 64", name="ck_media_content_item_stock_request_hash"),
+        CheckConstraint("length(decision_hash) = 64", name="ck_media_content_item_stock_decision_hash"),
+        CheckConstraint(
+            "prev_event_hash IS NULL OR length(prev_event_hash) = 64",
+            name="ck_media_content_item_stock_prev_event_hash",
+        ),
+        CheckConstraint("length(event_hash) = 64", name="ck_media_content_item_stock_event_hash"),
+        UniqueConstraint(
+            "content_item_id",
+            "sequence",
+            name="uq_media_content_item_stock_sequence",
+        ),
+        UniqueConstraint(
+            "content_item_id",
+            "idempotency_key",
+            name="uq_media_content_item_stock_idempotency",
+        ),
+        Index(
+            "ix_media_content_item_stock_owner_project",
+            "owner_user_id",
+            "project_id",
+        ),
+        Index(
+            "ix_media_content_item_stock_item_created",
+            "content_item_id",
+            "created_at",
+        ),
+    )
+
+    @property
+    def owner_id(self):
+        return self.owner_user_id
+
+    def to_safe_dict(self) -> Dict[str, Any]:
+        return {
+            "id": _uuid(self.id),
+            "content_item_id": _uuid(self.content_item_id),
+            "owner_user_id": _uuid(self.owner_user_id),
+            "project_id": _uuid(self.project_id),
+            "sequence": int(self.sequence),
+            "event_type": self.event_type,
+            "from_status": self.from_status,
+            "to_status": self.to_status,
+            "content_item_version": int(self.content_item_version),
+            "content_item_hash": self.content_item_hash,
+            "snapshot": dict(self.snapshot_json or {}),
+            "actor_id": _uuid(self.actor_id),
+            "actor_type": self.actor_type,
+            "request_hash": self.request_hash,
+            "decision_hash": self.decision_hash,
+            "prev_event_hash": self.prev_event_hash,
+            "event_hash": self.event_hash,
+            "created_at": _dt(self.created_at),
+        }
+
+    to_dict = to_safe_dict
+
     to_dict = to_safe_dict

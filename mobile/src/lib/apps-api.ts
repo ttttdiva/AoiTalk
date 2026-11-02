@@ -222,6 +222,13 @@ function runtimeString(value: unknown, label: string): string {
   return value;
 }
 
+function runtimeStringValue(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new AppRuntimeContractError(`${label}がstringではありません`);
+  }
+  return value;
+}
+
 function runtimeBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new AppRuntimeContractError(`${label}がbooleanではありません`);
   return value;
@@ -430,7 +437,9 @@ function parseRuntimeTarget(value: unknown): AppRuntimeWireResponse["target"] {
   return {
     id: runtimeString(raw.id, "runtime.target.id"),
     target_key: runtimeString(raw.target_key, "runtime.target.target_key"),
-    entrypoint: runtimeString(raw.entrypoint, "runtime.target.entrypoint"),
+    // The shared API schema requires a string but permits an empty entrypoint.
+    // Headless PC Action targets use their saved Action and need no file entrypoint.
+    entrypoint: runtimeStringValue(raw.entrypoint, "runtime.target.entrypoint"),
     surface: raw.surface as AppRuntimeWireResponse["target"]["surface"],
     runtime: raw.runtime as AppRuntimeWireResponse["target"]["runtime"],
     execution_host: raw.execution_host as AppRuntimeWireResponse["target"]["execution_host"],

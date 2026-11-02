@@ -1,3 +1,4 @@
+import { downloadPhaseLabel, downloadStateForEvent, formatDownloadBytes, type FilesDownloadViewState } from "../../../features/files/files-download-progress";
 import { ScopeSwitcher } from "../../../components/scope-switcher";
 import { NativeStorageWorkspace } from "../../../components/files/storage-workspace";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -289,7 +290,14 @@ function ManagedFilesScreen() {
   const longPressedEntryKeyRef = useRef<string | null>(null);
   const clipboardRef = useRef<ClipboardState | null>(null);
   clipboardRef.current = clipboard;
-  const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
+  const [downloadProgress, setDownloadProgress] =
+    useState<FilesDownloadViewState | null>(null);
+  const downloadRequestRef = useRef<{
+    id: number;
+    entryPath: string;
+    locationIdentity: string;
+  } | null>(null);
+  const downloadRequestIdRef = useRef(0);
   const [audioState, setAudioState] = useState<AudioState>({
     track: null,
     playlist: [],
@@ -355,6 +363,11 @@ function ManagedFilesScreen() {
     authScope,
     projectId: selectedProjectId,
   };
+  const activeDownloadProgress =
+    downloadProgress?.locationIdentity === activeLocationIdentity
+      ? downloadProgress
+      : null;
+  const downloadingPath = activeDownloadProgress?.entryPath ?? null;
 
   const isFilesUploadLocationCurrent = useCallback(
     (location: FilesUploadLocation) => {
@@ -408,9 +421,20 @@ function ManagedFilesScreen() {
     filesScreenMountedRef.current = true;
     return () => {
       filesScreenMountedRef.current = false;
+      downloadRequestRef.current = null;
       settleUploadConflict("skip");
     };
   }, [settleUploadConflict]);
+
+  useEffect(() => {
+    const request = downloadRequestRef.current;
+    if (!request || request.locationIdentity === activeLocationIdentity) return;
+    // A navigation invalidates the visible operation immediately.  The
+    // underlying native request may still finish, but its callbacks cannot
+    // repopulate the newly selected location.
+    downloadRequestRef.current = null;
+    setDownloadProgress(null);
+  }, [activeLocationIdentity]);
 
   useEffect(() => {
     const pending = uploadConflictWaiterRef.current;
@@ -1727,25 +1751,58 @@ function ManagedFilesScreen() {
   };
 
   const downloadEntry = async (entry: FilesEntry) => {
-    if (entry.type !== "file" || downloadingPath) return;
-    setDownloadingPath(entry.path);
+    if (entry.type !== "file" || downloadRequestRef.current) return;
+    const request = {
+      id: downloadRequestIdRef.current + 1,
+      entryPath: entry.path,
+      locationIdentity: activeLocationIdentity,
+    };
+    downloadRequestIdRef.current = request.id;
+    downloadRequestRef.current = request;
+    const isCurrent = () =>
+      filesScreenMountedRef.current &&
+      downloadRequestRef.current === request &&
+      activeLocationRef.current.source === source &&
+      activeLocationRef.current.scope === scope &&
+      activeLocationRef.current.path === activePath &&
+      activeLocationRef.current.authScope === authScope &&
+      activeLocationRef.current.projectId === selectedProjectId;
+    setDownloadProgress({
+      entryPath: entry.path,
+      entryName: entry.name,
+      locationIdentity: activeLocationIdentity,
+      phase: "preparing",
+    });
     try {
-      const result = await filesApi.download(entry);
-      if (result.status === "saved") {
+      const result = await filesApi.download(entry, (event) => {
+        if (!isCurrent()) return;
+        setDownloadProgress((previous) => {
+          if (!previous || previous.locationIdentity !== activeLocationIdentity) {
+            return previous;
+          }
+          return downloadStateForEvent(previous, event);
+        });
+      });
+      if (isCurrent() && result.status === "saved") {
         Alert.alert(
           "ダウンロード完了",
           `${entry.name} を選択したフォルダーに保存しました。`,
         );
       }
     } catch (downloadError) {
-      Alert.alert(
-        "ダウンロードに失敗",
-        downloadError instanceof Error
-          ? downloadError.message
-          : "ファイルを保存できませんでした。",
-      );
+      if (isCurrent()) {
+        Alert.alert(
+          "ダウンロードに失敗",
+          downloadError instanceof Error
+            ? downloadError.message
+            : "ファイルを保存できませんでした。",
+        );
+      }
     } finally {
-      setDownloadingPath(null);
+      if (downloadRequestRef.current === request) {
+        downloadRequestRef.current = null;
+        setDownloadProgress(null);
+      }
     }
   };
 
@@ -3015,6 +3072,58 @@ function ManagedFilesScreen() {
           />
         </Surface>
       ) : null}
+
+      {activeDownloadProgress ? (
+        <Surface
+          style={styles.downloadProgressBar}
+          elevation={3}
+          testID="files-download-progress"
+        >
+          <View style={styles.downloadProgressInfo}>
+            <Text
+              style={styles.downloadProgressPhase}
+              testID="files-download-progress-phase"
+            >
+              {downloadPhaseLabel(activeDownloadProgress.phase)}
+            </Text>
+            <Text
+              style={styles.downloadProgressName}
+              numberOfLines={1}
+              testID="files-download-progress-name"
+            >
+              {activeDownloadProgress.entryName}
+            </Text>
+            {activeDownloadProgress.receivedBytes !== undefined ? (
+              <Text
+                style={styles.downloadProgressBytes}
+                testID="files-download-progress-bytes"
+              >
+                {formatDownloadBytes(activeDownloadProgress.receivedBytes)}
+                {activeDownloadProgress.totalBytes !== undefined
+                  ? ` / ${formatDownloadBytes(activeDownloadProgress.totalBytes)}`
+                  : ""}
+                {activeDownloadProgress.percent !== undefined &&
+                (activeDownloadProgress.phase === "receiving" ||
+                  activeDownloadProgress.phase === "completed")
+                  ? ` (${Math.round(activeDownloadProgress.percent)}%)`
+                  : ""}
+              </Text>
+            ) : null}
+            {activeDownloadProgress.percent !== undefined &&
+            (activeDownloadProgress.phase === "receiving" ||
+              activeDownloadProgress.phase === "completed") ? (
+              <ProgressBar
+                progress={Math.max(
+                  0,
+                  Math.min(1, activeDownloadProgress.percent / 100),
+                )}
+                color="#a78bfa"
+                style={styles.downloadProgressIndicator}
+              />
+            ) : null}
+          </View>
+        </Surface>
+      ) : null}
           </>
         )}
       >
@@ -3068,11 +3177,13 @@ function ManagedFilesScreen() {
             />
           }
           ListEmptyComponent={
-            <View style={styles.center}>
-              <Text style={styles.emptyText}>
-                この場所にはまだファイルがありません。
-              </Text>
-            </View>
+            error ? null : (
+              <View style={styles.center}>
+                <Text style={styles.emptyText}>
+                  この場所にはまだファイルがありません。
+                </Text>
+              </View>
+            )
           }
           contentContainerStyle={
             filteredItems.length === 0
@@ -3636,6 +3747,18 @@ const styles = StyleSheet.create({
   audioTitle: { color: "#cdd6f4", fontSize: 13, fontWeight: "600" },
   audioTime: { color: "#a6adc8", fontSize: 10, marginTop: 2 },
   audioProgress: { height: 3, borderRadius: 2, marginTop: 5 },
+  downloadProgressBar: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#1e1e2e",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#313244",
+  },
+  downloadProgressInfo: { minWidth: 0 },
+  downloadProgressPhase: { color: "#cdd6f4", fontSize: 13, fontWeight: "600" },
+  downloadProgressName: { color: "#a6adc8", fontSize: 11, marginTop: 2 },
+  downloadProgressBytes: { color: "#a6adc8", fontSize: 11, marginTop: 4 },
+  downloadProgressIndicator: { height: 3, borderRadius: 2, marginTop: 5 },
   viewerContainer: { flex: 1, backgroundColor: "#050509" },
   viewerHeader: {
     position: "absolute",

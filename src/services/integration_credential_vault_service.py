@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
@@ -17,7 +16,6 @@ from typing import Any
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID, uuid4
 
-import httpx
 from sqlalchemy import select, update
 
 from ..features import Features
@@ -32,7 +30,6 @@ from ..security.integration_credential_crypto import (
 
 PROVIDER_CAPABILITIES = MappingProxyType({
     "procurement": ("procurement.place_order",),
-    "openai_realtime_sip": ("telephony.control",),
 })
 _EVIDENCE = object()
 _SAFE_CODES = frozenset({"provider_verified", "provider_unavailable", "provider_unsupported",
@@ -58,11 +55,9 @@ def _field(actor: Any, key: str, default: Any = None) -> Any:
     return actor.get(key, default) if isinstance(actor, dict) else getattr(actor, key, default)
 
 
-def require_integration_features(provider_key: str | None = None) -> None:
+def require_integration_features() -> None:
     try:
         allowed = Features.virtual_company() is True and Features.autonomous_agent_runtime() is True
-        if provider_key == "openai_realtime_sip":
-            allowed = allowed and Features.voice_input() is True
     except Exception:
         allowed = False
     if not allowed:
@@ -114,17 +109,12 @@ def _verification_binding(provider_key: str, payload: dict[str, str]) -> str:
 
 
 class IntegrationCredentialProviderVerifier:
-    """Code-owned providers; injected transport supports tests, never browsers.
+    """Code-owned providers; constructor-injected callbacks are trusted only.
 
-OpenAI checks access to the fixed realtime model via a read-only provider API.
-It does not attest SIP trunk configuration, routing, or webhook-secret validity;
-the telephony service must establish those separately before accepting calls.
 No production procurement verifier exists, so it remains unavailable.
 """
 
-    def __init__(self, *, client_factory=None,
-                 provider_policies: Mapping[str, IntegrationCredentialVerifierPolicy] | None = None):
-        self._client_factory = client_factory or httpx.AsyncClient
+    def __init__(self, *, provider_policies: Mapping[str, IntegrationCredentialVerifierPolicy] | None = None):
         policies = dict(provider_policies or {})
         for provider, policy in policies.items():
             if (provider not in PROVIDER_CAPABILITIES or type(policy) is not IntegrationCredentialVerifierPolicy
@@ -139,7 +129,7 @@ No production procurement verifier exists, so it remains unavailable.
         if policy:
             return {key: "available" if key in policy.capabilities else "unknown"
                     for key in PROVIDER_CAPABILITIES[provider_key]}
-        return {"telephony.control": "available"} if provider_key == "openai_realtime_sip" else None
+        return None
 
     async def verify(self, *, provider_key: str, credential: SecretCredentialHandle) -> IntegrationCredentialVerificationResult:
         unknown = {key: "unknown" for key in PROVIDER_CAPABILITIES.get(provider_key, ())}
@@ -156,32 +146,7 @@ No production procurement verifier exists, so it remains unavailable.
             except Exception:
                 pass
             return IntegrationCredentialVerificationResult("verification_pending", unknown, "provider_response_invalid")
-        if provider_key != "openai_realtime_sip":
-            return IntegrationCredentialVerificationResult("unsupported", unknown, "provider_unavailable")
-        payload = credential.reveal()
-        try:
-            async with self._client_factory(timeout=10.0, follow_redirects=False, trust_env=False) as client:
-                async with client.stream("GET", "https://api.openai.com/v1/models/gpt-realtime",
-                                         headers={"Authorization": "Bearer " + payload["api_key"]}) as response:
-                    if response.status_code in (401, 403):
-                        return IntegrationCredentialVerificationResult("invalid", unknown, "provider_unauthorized")
-                    if response.status_code != 200:
-                        return IntegrationCredentialVerificationResult("verification_pending", unknown, "provider_unavailable")
-                    raw = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        raw.extend(chunk)
-                        if len(raw) > 64 * 1024:
-                            raise ValueError
-                    data = json.loads(raw)
-                    if type(data) is not dict or data.get("id") != "gpt-realtime" or data.get("object") != "model":
-                        raise ValueError
-            return IntegrationCredentialVerificationResult(
-                "verified", {"telephony.control": "available"}, "provider_verified",
-                _EVIDENCE, _verification_binding(provider_key, payload),
-            )
-        except Exception:
-            # Never retain a provider exception, body, URL, or request object.
-            return IntegrationCredentialVerificationResult("verification_pending", unknown, "provider_response_invalid")
+        return IntegrationCredentialVerificationResult("unsupported", unknown, "provider_unavailable")
 
 
 def _validated_result(result: Any, provider_key: str, payload: dict[str, str],
@@ -210,10 +175,9 @@ def _validated_result(result: Any, provider_key: str, payload: dict[str, str],
 
 
 class IntegrationCredentialVaultService:
-    def __init__(self, *, key_provider=None, verifier=None, config=None):
+    def __init__(self, *, key_provider=None, verifier=None):
         self.key_provider = key_provider
         self.verifier = verifier or IntegrationCredentialProviderVerifier()
-        self.config = config
 
     async def _connection(self, session, connection_id, *, lock=False):
         require_integration_features()
@@ -223,7 +187,6 @@ class IntegrationCredentialVaultService:
         connection = (await session.execute(statement)).scalar_one_or_none()
         if connection is None:
             raise IntegrationCredentialError("integration_connection_not_found", 404)
-        require_integration_features(connection.provider_key)
         return connection
 
     async def _authorize(self, session, actor, connection):
@@ -251,7 +214,7 @@ class IntegrationCredentialVaultService:
     def _payload(provider_key, credential_kind, payload):
         if provider_key not in PROVIDER_CAPABILITIES:
             raise IntegrationCredentialError("integration_provider_unsupported", 422)
-        allowed = {"api_key", "webhook_secret"} if provider_key == "openai_realtime_sip" else {"api_key"}
+        allowed = {"api_key"}
         if (credential_kind != "api_key" or type(payload) is not dict or "api_key" not in payload
                 or not set(payload).issubset(allowed)):
             raise IntegrationCredentialError("integration_payload_invalid", 422)
@@ -338,27 +301,7 @@ class IntegrationCredentialVaultService:
         try:
             payload = self._decrypt(row, connection)
             try:
-                async def verify(protected_metadata):
-                    if protected_metadata != {"model": "gpt-realtime"}:
-                        raise IntegrationCredentialError("integration_privacy_blocked")
-                    return await self.verifier.verify(provider_key=connection.provider_key, credential=SecretCredentialHandle(payload))
-
-                if connection.provider_key == "openai_realtime_sip":
-                    from .outbound_privacy_service import EgressDescriptor, OutboundPrivacyGateway
-
-                    project = await session.get(Project, connection.project_id) if connection.project_id else None
-                    gateway = OutboundPrivacyGateway(self.config, user_id=str(actor_id),
-                        project_metadata=getattr(project, "project_metadata", None))
-                    # Only fixed model metadata is reviewable/auditable. The
-                    # credential stays in the in-memory Authorization header
-                    # inside the approved sender, as in LiveVoice/telephony.
-                    result = await gateway.execute({"model": "gpt-realtime"}, provider="openai",
-                        descriptor=EgressDescriptor(action="integration.credential.verify", transport="httpx",
-                            destination="https://api.openai.com/v1/models/gpt-realtime", provider="openai",
-                            model="gpt-realtime"), sender=verify, base_url="https://api.openai.com",
-                        source_kind="integration_credential_verification", model="gpt-realtime")
-                else:
-                    result = await self.verifier.verify(provider_key=connection.provider_key, credential=SecretCredentialHandle(payload))
+                result = await self.verifier.verify(provider_key=connection.provider_key, credential=SecretCredentialHandle(payload))
             except Exception:
                 result = None
             trusted_caps = (self.verifier.verified_capabilities(connection.provider_key)

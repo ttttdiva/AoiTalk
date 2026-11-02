@@ -44,6 +44,7 @@ from ...memory.models import (
     KnowledgeNodeSupertag,
     KnowledgeSupertag,
 )
+from ...memory.models.tasks import task_audit_iso
 from ...memory.project_repository import ProjectRepository
 from ...task_time import (
     DEFAULT_TASK_TIMEZONE, normalize_task_timezone, timer_db_datetime, timer_now_db,
@@ -660,6 +661,10 @@ class TaskCrudMixin:
             user_id=user_id,
             require_read=True,
         )
+        if tag_ids:
+            await self._validate_project_tags(
+                session, project_id=target_project_id, tag_ids=tag_ids
+            )
         if knowledge_node_id is not None:
             await self._validate_knowledge_node_binding(
                 session,
@@ -1044,9 +1049,7 @@ class TaskCrudMixin:
                     ),
                     "start_at": task.start_at.isoformat() if task.start_at else None,
                     "end_at": task.end_at.isoformat() if task.end_at else None,
-                    "updated_at": (
-                        task.updated_at.isoformat() if task.updated_at else None
-                    ),
+                    "updated_at": task_audit_iso(task.updated_at),
                     "assignees": assignees_by_task.get(task.id, []),
                     "tags": tags_by_task.get(task.id, []),
                     "description_excerpt": self._task_candidate_snippet(
@@ -2212,6 +2215,10 @@ class TaskCrudMixin:
             session,
             project_ids=(task.project_id, target_project_id),
             user_id=user_id,
+            require_read=(
+                updates.get("tag_ids") is not None
+                or target_project_id != task.project_id
+            ),
         )
         if isinstance(session, AsyncSession):
             # Every ORM write must lock the Task only after the project
@@ -2340,6 +2347,19 @@ class TaskCrudMixin:
                 knowledge_node_id=next_knowledge_node_id,
                 task_project_id=target_project_id,
                 user_id=user_id,
+            )
+        if updates.get("tag_ids") is not None:
+            await self._validate_project_tags(
+                session, project_id=target_project_id, tag_ids=list(updates["tag_ids"])
+            )
+        elif project_will_change:
+            existing_tag_ids = await session.execute(
+                select(TaskTag.tag_id).where(TaskTag.task_id == task.id)
+            )
+            await self._validate_project_tags(
+                session,
+                project_id=target_project_id,
+                tag_ids=list(existing_tag_ids.scalars().all()),
             )
         if project_will_change:
             task, target_parent = await prepare_task_project_move(

@@ -27,7 +27,8 @@ describe("Agent一覧での検索と選択", () => {
       { id: "agent-c", job_title: "資料整理" },
     ]} />);
     const rows = within(screen.getByRole("region", { name: "Agentの検索結果" })).getAllByRole("button");
-    expect(within(rows[0]).getAllByText("SNS共有調査担当")).toHaveLength(1);
+    expect(within(rows[0]).getAllByText("SNS共有調査担当")).toHaveLength(2);
+    expect(rows[0].querySelector(".text-muted-foreground")).toBeNull();
     expect(within(rows[1]).queryByText("offby1 ブランド担当")).toBeNull();
     expect(within(rows[2]).getByText("資料整理")).toBeVisible();
     expect(screen.queryByText("役割未設定")).toBeNull();
@@ -80,6 +81,36 @@ describe("Agent一覧での検索と選択", () => {
     expect(search).toHaveValue("調査");
     expect(results.scrollTop).toBe(640);
     expect(within(results).getByRole("button", { pressed: true })).toHaveTextContent("調査担当");
+  });
+
+  it("hides only retired agents by default and preserves search and selection across the toggle and return", async () => {
+    const user = userEvent.setup();
+    const onShowDetail = vi.fn();
+    const extra: Employee[] = [
+      { id: "agent-c", slug: "qa-gateway", display_name: "QA Gateway", state: "retired" },
+      { id: "agent-d", slug: "root", display_name: "Root", state: "paused" },
+    ];
+    const all = [...agents, ...extra];
+    const { rerender } = render(<EmployeeDirectory {...props} agents={all} selected="agent-c" onShowDetail={onShowDetail} />);
+    expect(screen.queryByText("QA Gateway")).toBeNull();
+    expect(screen.getAllByText("Root")[0]).toBeVisible();
+    expect(screen.getAllByText("備品担当")[0]).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("表示 3 / 全 4件（退役済み 1件）");
+    await user.click(screen.getByRole("button", { name: "選択中の詳細へ" }));
+    expect(onShowDetail).toHaveBeenCalledOnce();
+    const search = screen.getByRole("searchbox");
+    await user.type(search, "ＱＡ");
+    expect(screen.queryByText("QA Gateway")).toBeNull();
+    const toggle = screen.getByRole("checkbox", { name: "退役済みも表示" });
+    await user.click(toggle);
+    expect(screen.getByRole("button", { pressed: true })).toHaveTextContent("QA Gateway");
+    rerender(<EmployeeDirectory {...props} agents={all} selected="agent-c" onShowDetail={onShowDetail} visible={false} />);
+    rerender(<EmployeeDirectory {...props} agents={all} selected="agent-c" onShowDetail={onShowDetail} visible />);
+    expect(search).toHaveValue("ＱＡ");
+    expect(screen.getByRole("button", { pressed: true })).toHaveFocus();
+    await user.click(toggle);
+    expect(screen.queryByText("QA Gateway")).toBeNull();
+    expect(search).toHaveValue("ＱＡ");
   });
 
   it("distinguishes loading, an empty directory, failure and an empty search", () => {

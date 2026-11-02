@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-_LAUNCHER_MARKER = Path(".local") / "launcher-generation.txt"
+_LAUNCHER_MARKER = Path("data") / "launcher-generation.txt"
 _LAUNCHER_GRACE_SECONDS = 12.0
 _PROBE_INTERVAL_SECONDS = 0.25
 

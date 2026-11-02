@@ -161,11 +161,11 @@ describe("closed MediaOps bootstrap", () => {
 it("rejects a revision without an exact corresponding model binding", async () => {
   const plan = await fixture();
   const revision = await seal({ key: "revision:director", endpoint: ["/api/agents/", { $ref: "agent:director", path: ["id"] }, "/revisions"],
-    payload: { display_name: "Director", agent_team_id: "team", execution_profile_id: "profile", allowed_subagent_ids: ["worker"] },
+    payload: { display_name: "Director", model_overrides: {}, tool_ids: ["worker"], delegate_policy: { agents: [], workers: [] } },
     read_path: "/api/agent-revisions/{id}", unwrap: "revision", reuse: null, rollback: null });
   plan.actions.push(revision);
   await expect(parseBootstrapPlan(JSON.stringify(await reseal(plan)))).rejects.toThrow("binding");
-  plan.role_bindings.director = { agent_team_id: "team", execution_profile_id: "different-profile", allowed_subagent_ids: ["worker"], resolved_provider: "codex-cli", resolved_model_id: "example-model" };
+  plan.role_bindings.director = { model_overrides: {}, tool_ids: ["different-worker"], delegate_policy: { agents: [], workers: [] }, resolved_provider: "codex-cli", resolved_model_id: "example-model" };
   await expect(parseBootstrapPlan(JSON.stringify(await reseal(plan)))).rejects.toThrow("binding");
 });
 

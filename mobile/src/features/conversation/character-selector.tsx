@@ -30,6 +30,7 @@ type CharacterSelectorProps = {
   runState: RunState;
   onChange: (slug: string) => Promise<void>;
   locked?: boolean;
+  compact?: boolean;
 };
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -49,6 +50,7 @@ export function CharacterSelector({
   runState,
   onChange,
   locked = false,
+  compact = false,
 }: CharacterSelectorProps) {
   const [visible, setVisible] = useState(false);
   const [characters, setCharacters] = useState<ManagedCharacter[]>([]);
@@ -146,10 +148,16 @@ export function CharacterSelector({
         onPress={open}
         style={[
           styles.chip,
+          compact && styles.compactChip,
           !availability.allowed ? styles.chipUnavailable : null,
         ]}
       >
-        <Text style={styles.chipLabel}>
+        <Text
+          testID="character-selector-label"
+          style={[styles.chipLabel, compact && styles.compactChipLabel]}
+          numberOfLines={compact ? 1 : undefined}
+          ellipsizeMode={compact ? "tail" : undefined}
+        >
           {currentLabel}
         </Text>
         <Text style={styles.chevron}>⌄</Text>
@@ -269,6 +277,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
     paddingVertical: 5,
   },
+  compactChip: { alignItems: "center" },
   chipUnavailable: { opacity: 0.72 },
   chipLabel: {
     flex: 1,
@@ -279,6 +288,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     paddingVertical: 4,
   },
+  compactChipLabel: { fontSize: 12, paddingVertical: 0 },
   chevron: { color: "#a6adc8", fontSize: 12, marginLeft: 3, paddingTop: 4, flexShrink: 0 },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },

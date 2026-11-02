@@ -105,7 +105,9 @@ _WORKSPACE_MUTATION_NAMES = (
 _DIALOGUE_TOOL_NAMES = frozenset(
     {
         "list_agent_workers",
+        "delegate",
         "delegate_agent_work",
+        "delegate_worker",
         "get_agent_work_status",
         "send_agent_work_message",
         "answer_agent_work_question",
@@ -121,9 +123,6 @@ _EXTERNAL_TOOL_NAMES = frozenset(
         "send_message",
         "send_email",
         "send_sms",
-        "place_call",
-        "transfer_call",
-        "telephony_control",
     }
 )
 _RAW_RESOURCE_ARGUMENTS = frozenset(
@@ -354,14 +353,12 @@ def _is_workspace_mutation(
         "external_action",
         "network",
         "approval",
-        "telephony",
     }:
         return False
     if owner in {
         "agent_dialogue",
         "dialogue",
         "external_action",
-        "telephony",
         "operations",
         "media",
         "spotify",
@@ -370,6 +367,11 @@ def _is_workspace_mutation(
         "cloud_advisor",
         "search",
         "mcp",
+        # Personal deadline drafts are owner/session/message-bound database
+        # candidates. Their PersonalAgentTools authority and atomic draft
+        # service own the resource boundary; they do not mutate a Project or
+        # Agent workspace and must not borrow a shared-workspace lease.
+        "personal_deadline_draft",
     }:
         return False
     if name == "execute_command":

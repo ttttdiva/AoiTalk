@@ -164,6 +164,8 @@ class TurnContext:
     project_id: str | None = None
     include_project_context: bool | None = None
     session_id: str | None = None
+    quota_reservation_id: str | None = None
+    billing_scope_id: str | None = None
     # ``task_id`` is a specific, already-authorized Task scope.  It is kept
     # separate from ``session_id`` (the AoiTalk conversation id) and from
     # provider-native continuation ids.
@@ -263,6 +265,8 @@ def set_turn_context(
     project_id: str | None = None,
     include_project_context: bool | None = None,
     session_id: str | None = None,
+    quota_reservation_id: str | None = None,
+    billing_scope_id: str | None = None,
     task_id: str | None = None,
     message_id: str | None = None,
     client_message_id: str | None = None,
@@ -384,6 +388,12 @@ def set_turn_context(
                 else None
             ),
             session_id=str(session_id).strip() if session_id else None,
+            quota_reservation_id=(
+                str(quota_reservation_id).strip() if quota_reservation_id else None
+            ),
+            billing_scope_id=(
+                str(billing_scope_id).strip() if billing_scope_id else None
+            ),
             task_id=str(task_id).strip() if task_id else None,
             message_id=str(message_id).strip() if message_id else None,
             client_message_id=(

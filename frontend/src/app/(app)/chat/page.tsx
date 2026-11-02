@@ -43,6 +43,7 @@ import {
 import type { ChatAppContextSelection } from "@/components/chat/app-context-picker";
 import { ConversationSearchDialog } from "@/components/chat/conversation-search-dialog";
 import { ChatAgentSelector } from "@/components/chat/chat-agent-selector";
+import { ConversationDelegationMap } from "@/components/chat/conversation-delegation-map";
 import { useProject } from "@/contexts/project-context";
 import {
   useChatSessions,
@@ -142,6 +143,7 @@ function ChatPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const currentUserId = useCurrentUserId();
+  const [delegationMapOpen, setDelegationMapOpen] = useState(false);
   const {
     visible: contextRailVisible,
     hydrated: contextRailVisibilityHydrated,
@@ -971,10 +973,12 @@ function ChatPageInner() {
     conversationSearchOpen,
     setConversationSearchOpen,
     handleSelectSearchResult,
+    provideScrollToMessage,
   } = useConversationSearch({
     router,
     searchParams,
     activateSession,
+    activeSessionId,
     isLoadingMessages,
     messages,
   });
@@ -982,6 +986,12 @@ function ChatPageInner() {
   const {
     maybeGenerateLoadedSessionTitle,
     refreshPersistedMessages,
+    loadOlderMessages,
+    hasMoreMessages,
+    isLoadingOlderMessages,
+    messageHistoryGeneration,
+    messageHistoryEpoch,
+    messageHistoryIndex,
     bumpSessionForAssistant,
     handleCreateGroupChat,
     handleSendMessage,
@@ -1367,6 +1377,12 @@ function ChatPageInner() {
             onRetryMessage={handleRetryMessage}
             onRetryMessagePersistence={retryDeepResearchAssistantPersistence}
             onSwitchBranch={handleSwitchBranch}
+            onLoadOlderMessages={loadOlderMessages}
+            hasMoreMessages={hasMoreMessages}
+            isLoadingOlderMessages={isLoadingOlderMessages}
+            onProvideScrollToMessage={provideScrollToMessage}
+            navigationKey={`${activeSessionId ?? "__none__"}:${sessionLoadAttempt}:${messageHistoryGeneration}:${messageHistoryEpoch}`}
+            messageHistoryIndex={messageHistoryIndex}
             responseModelOptions={responseModelOptions}
             responseModelOptionsLoading={responseModelOptionsLoading}
           />
@@ -1424,6 +1440,7 @@ function ChatPageInner() {
               onSessionUpdated={upsertSession}
             />
           </div>
+          <Button type="button" variant="ghost" size="sm" aria-expanded={delegationMapOpen} onClick={() => setDelegationMapOpen((value) => !value)}>委任の流れ</Button>
           <div className="ml-auto flex gap-1" role="group" aria-label="チャットの表示">
             <Button variant={memoryMode ? "ghost" : "secondary"} size="sm" aria-pressed={!memoryMode} onClick={() => changeChatDisplay("normal")}>通常</Button>
             <Button variant={memoryMode ? "secondary" : "ghost"} size="sm" aria-pressed={memoryMode} onClick={() => changeChatDisplay("memory", "graph")}>記憶可視化</Button>
@@ -1578,6 +1595,8 @@ function ChatPageInner() {
         </div>
         </div>
       </div>
+
+      <ConversationDelegationMap sessionId={currentSession?.id === activeSessionId ? activeSessionId : null} ownerId={currentUserId} serverIdentity={typeof window === "undefined" ? "" : window.location.origin + window.location.pathname} open={delegationMapOpen} onClose={() => setDelegationMapOpen(false)} />
 
       {isMobile && (
         <Sheet

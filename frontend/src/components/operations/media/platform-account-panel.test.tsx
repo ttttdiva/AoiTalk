@@ -125,6 +125,20 @@ describe("PlatformAccountPanel", () => {
     expect(screen.queryByText(/safe-state-hash/i)).not.toBeInTheDocument();
   });
 
+  it("shows an expired credential separately from a generic invalid credential", async () => {
+    vi.mocked(mediaOperationsSetupApi.listPlatformAccounts).mockResolvedValue([account] as never);
+    vi.mocked(mediaOperationsSetupApi.getPlatformCredential).mockResolvedValue({
+      ...credential,
+      status: "invalid",
+      verification_code: "credential_expired",
+    } as never);
+
+    render(<PlatformAccountPanel characterId="character-1" />);
+
+    const status = await screen.findByText("認証 期限切れ");
+    expect(status).toHaveAttribute("data-credential-status", "expired");
+  });
+
   it("uploads a bounded package through the Character connection endpoint and clears the file", async () => {
     const user = userEvent.setup();
     const onChanged = vi.fn();

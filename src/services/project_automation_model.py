@@ -621,7 +621,7 @@ def create_project_automation_llm_client(
     try:
         from ..llm.manager import create_llm_client_for_target
 
-        return create_llm_client_for_target(
+        client = create_llm_client_for_target(
             config,
             provider=resolved.provider,
             model=resolved.model,
@@ -634,6 +634,19 @@ def create_project_automation_llm_client(
                 "lightweight_client": bool(lightweight_client),
             },
         )
+        if resolved.provider == "openai":
+            consumer_id = "project_automation"
+            try:
+                setattr(client, "_provider_key_consumer_id", consumer_id)
+            except Exception:
+                pass
+            try:
+                raw_client = getattr(client, "_openai_client", None)
+                if raw_client is not None:
+                    setattr(raw_client, "_aoitalk_provider_key_consumer_id", consumer_id)
+            except Exception:
+                pass
+        return client
     except ProjectAutomationRouteError:
         raise
     except Exception as exc:

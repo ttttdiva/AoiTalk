@@ -102,7 +102,6 @@ export async function refreshLlmModelCatalog(
 ): Promise<LlmModelCatalogResponse> {
   const scope = currentScope(explicitScope);
   ensureScope(scope);
-  if (catalogCache?.scope === scope) catalogCache = null;
   const existing = catalogRefreshFlights.get(scope);
   if (existing) return existing;
   // Invalidate an older normal read as well; its late response must not

@@ -1,6 +1,7 @@
 "use client";
 
-import { memo, useLayoutEffect, useRef, useMemo, useState, useCallback } from "react";
+import { memo, useLayoutEffect, useRef, useMemo, useState, useCallback, useEffect, type FocusEvent } from "react";
+import { defaultRangeExtractor, observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
 import {
   Pencil,
   Check,
@@ -46,6 +47,7 @@ import {
 import type {
   ChatAttachmentMetadata,
   ChatGenerationMetrics,
+  ConversationMessageHistoryIndexEntry,
   ChatToolResultMetadata,
   ChatResponseModelOption,
   ChatResponseModelSelection,
@@ -251,6 +253,14 @@ type MessageListProps = {
   onRetryMessagePersistence?: (
     clientMessageId: string,
   ) => void | Promise<unknown>;
+  /** Fetch one older page when the user reaches the top of the timeline. */
+  onLoadOlderMessages?: () => boolean | void | Promise<boolean | void>;
+  hasMoreMessages?: boolean;
+  isLoadingOlderMessages?: boolean;
+  /** Register the single history navigation path for search and deep links. */
+  onProvideScrollToMessage?: (handler: ((messageId: string) => Promise<boolean>) | null) => void;
+  navigationKey?: string | null;
+  messageHistoryIndex?: ConversationMessageHistoryIndexEntry[];
   responseModelOptions?: ChatResponseModelOption[];
   responseModelOptionsLoading?: boolean;
 };
@@ -903,12 +913,47 @@ export function MessageList({
   onRerunMessage,
   onRetryMessage,
   onRetryMessagePersistence,
+  onLoadOlderMessages,
+  hasMoreMessages = false,
+  isLoadingOlderMessages = false,
+  onProvideScrollToMessage,
+  navigationKey = null,
+  messageHistoryIndex = [],
   responseModelOptions = [],
   responseModelOptionsLoading = false,
 }: MessageListProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottomRef = useRef(true);
+  const lastBottomWriteTopRef = useRef<number | null>(null);
+  const olderRequestInFlightRef = useRef(false);
+  const prependReadyRef = useRef(false);
+  const prependBaselineFirstIdRef = useRef<string | null>(null);
+  const [prependAdjustmentVersion, setPrependAdjustmentVersion] = useState(0);
+  const prependAnchorRef = useRef<{
+    messageId: string | null;
+    offsetTop: number;
+    scrollTop: number;
+    expectedScrollTop: number;
+    totalSize: number;
+  } | null>(null);
+  const releasePrependAnchor = useCallback(() => {
+    if (!prependAnchorRef.current) return;
+    prependAnchorRef.current = null;
+    prependReadyRef.current = false;
+    prependBaselineFirstIdRef.current = null;
+    const scrollContainer = scrollContainerRef.current;
+    isPinnedToBottomRef.current = scrollContainer
+      ? isChatScrollPinnedToBottom(scrollContainer)
+      : false;
+    setPrependAdjustmentVersion((version) => version + 1);
+  }, []);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [openDropdownMessageId, setOpenDropdownMessageId] = useState<string | null>(null);
+  const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
+  const [messageNavigationStatus, setMessageNavigationStatus] = useState<{
+    navigationKey: string | null;
+    text: string;
+  }>({ navigationKey, text: "" });
   const [editContent, setEditContent] = useState("");
   const editTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [feedbackTarget, setFeedbackTarget] =
@@ -1159,7 +1204,10 @@ export function MessageList({
           </Button>
         )}
         {showModelMenu && (
-          <DropdownMenu>
+          <DropdownMenu
+            open={openDropdownMessageId === msg.id}
+            onOpenChange={(open) => setOpenDropdownMessageId(open ? msg.id : null)}
+          >
             <DropdownMenuTrigger
               render={
                 <Button
@@ -1220,8 +1268,10 @@ export function MessageList({
       onForkMessage,
       onRerunMessage,
       openFeedback,
+      openDropdownMessageId,
       responseModelOptions,
       responseModelOptionsLoading,
+      setOpenDropdownMessageId,
       startEditing,
     ],
   );
@@ -1293,6 +1343,171 @@ export function MessageList({
     () => visibleMessages.map(messageRenderKey),
     [visibleMessages],
   );
+  const messageIndexById = useMemo(() => {
+    const indexes = new Map<string, number>();
+    visibleMessages.forEach((message, index) => indexes.set(message.id, index));
+    return indexes;
+  }, [visibleMessages]);
+  const messagePositionById = useMemo(
+    () => new Map(messageHistoryIndex.map((entry) => [entry.id, entry.position])),
+    [messageHistoryIndex],
+  );
+  const historyRailMessages = useMemo(() => {
+    if (messageHistoryIndex.length === 0) return visibleMessages;
+    const loadedMessagesById = new Map(visibleMessages.map((message) => [message.id, message]));
+    return messageHistoryIndex.map((entry) => {
+      const loaded = loadedMessagesById.get(entry.id);
+      return loaded
+        ? { ...entry, preview: "", content: loaded.content, metadata: loaded.metadata }
+        : entry;
+    });
+  }, [messageHistoryIndex, visibleMessages]);
+  const pinnedMessageIndexes = useMemo(() => {
+    const indexes = new Set<number>();
+    for (const id of [editingId, feedbackTarget?.id, openDropdownMessageId, focusedMessageId]) {
+      if (!id) continue;
+      const index = messageIndexById.get(id);
+      if (index !== undefined) indexes.add(index);
+    }
+    return [...indexes].map((index) => index + (hasMoreMessages ? 1 : 0));
+  }, [editingId, feedbackTarget?.id, focusedMessageId, hasMoreMessages, messageIndexById, openDropdownMessageId]);
+  const messageVirtualOffset = hasMoreMessages ? 1 : 0;
+  const rangeExtractor = useCallback(
+    (range: Parameters<typeof defaultRangeExtractor>[0]) => {
+      const indexes = new Set(defaultRangeExtractor(range));
+      if (hasMoreMessages && range.count > 0) indexes.add(0);
+      const nextIndex = range.endIndex + 1;
+      if (nextIndex < range.count) indexes.add(nextIndex);
+      for (const index of pinnedMessageIndexes) indexes.add(index);
+      const prependAnchorId = prependAnchorRef.current?.messageId;
+      const prependAnchorIndex = prependAnchorId
+        ? messageIndexById.get(prependAnchorId)
+        : undefined;
+      if (prependAnchorIndex !== undefined) {
+        indexes.add(prependAnchorIndex + messageVirtualOffset);
+      }
+      return [...indexes].sort((left, right) => left - right);
+    },
+    [hasMoreMessages, messageIndexById, messageVirtualOffset, pinnedMessageIndexes],
+  );
+  // TanStack Virtual exposes imperative methods on its virtualizer instance.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const rowVirtualizer = useVirtualizer({
+    count: visibleMessages.length + messageVirtualOffset,
+    getScrollElement: () => scrollContainerRef.current,
+    getItemKey: (index) =>
+      hasMoreMessages
+        ? index === 0
+          ? "chat-history-loader"
+          : visibleMessageIds[index - 1] ?? index
+        : visibleMessageIds[index] ?? index,
+    estimateSize: (index) => (hasMoreMessages && index === 0 ? 56 : 220),
+    overscan: 8,
+    initialRect: { width: 0, height: 600 },
+    rangeExtractor,
+    observeElementRect: (instance, callback) =>
+      observeElementRect(instance, (rect) =>
+        callback(rect.height > 0 ? rect : { ...rect, height: 600 }),
+      ),
+  });
+  const shouldAdjustScrollPositionOnItemSizeChange = useCallback(
+    (item: { end: number }) => {
+      const scrollContainer = scrollContainerRef.current;
+      if (!scrollContainer || prependAnchorRef.current) return false;
+      return (
+        !isPinnedToBottomRef.current &&
+        item.end <= scrollContainer.scrollTop
+      );
+    },
+    [],
+  );
+  const measureVirtualizerElement = useCallback(
+    (element: HTMLDivElement | null) => {
+      rowVirtualizer.shouldAdjustScrollPositionOnItemSizeChange =
+        shouldAdjustScrollPositionOnItemSizeChange;
+      rowVirtualizer.measureElement(element);
+    },
+    [rowVirtualizer, shouldAdjustScrollPositionOnItemSizeChange],
+  );
+  useLayoutEffect(() => {
+    rowVirtualizer.shouldAdjustScrollPositionOnItemSizeChange =
+      shouldAdjustScrollPositionOnItemSizeChange;
+  }, [rowVirtualizer, shouldAdjustScrollPositionOnItemSizeChange]);
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  const virtualTotalSize = rowVirtualizer.getTotalSize();
+
+  const latestMessagesRef = useRef(visibleMessages);
+  const latestVisibleMessageIdsRef = useRef(visibleMessageIds);
+  const latestHasMoreRef = useRef(hasMoreMessages);
+  const latestLoadOlderRef = useRef(onLoadOlderMessages);
+  const navigationKeyRef = useRef(navigationKey);
+  latestMessagesRef.current = visibleMessages;
+  latestVisibleMessageIdsRef.current = visibleMessageIds;
+  latestHasMoreRef.current = hasMoreMessages;
+  latestLoadOlderRef.current = onLoadOlderMessages;
+  navigationKeyRef.current = navigationKey;
+
+  const scrollToMessage = useCallback(async (messageId: string) => {
+    releasePrependAnchor();
+    const initialNavigationKey = navigationKeyRef.current;
+    setMessageNavigationStatus({
+      navigationKey: initialNavigationKey,
+      text: "対象のメッセージを含む過去の履歴を検索しています…",
+    });
+    while (true) {
+      if (navigationKeyRef.current !== initialNavigationKey) return false;
+      const index = latestMessagesRef.current.findIndex(
+        (message) => message.id === messageId,
+      );
+      if (index >= 0) {
+        rowVirtualizer.scrollToIndex(
+          index + (latestHasMoreRef.current ? 1 : 0),
+          { align: "center", behavior: "smooth" },
+        );
+        setMessageNavigationStatus({ navigationKey: initialNavigationKey, text: "" });
+        return true;
+      }
+      if (!latestHasMoreRef.current || !latestLoadOlderRef.current) break;
+
+      const previousFirstId = latestMessagesRef.current[0]?.id ?? null;
+      const loaded = await latestLoadOlderRef.current();
+      if (navigationKeyRef.current !== initialNavigationKey) return false;
+      if (!loaded) break;
+      for (let frame = 0; frame < 3; frame += 1) {
+        await new Promise<void>((resolve) => {
+          if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(() => resolve());
+          } else {
+            window.setTimeout(resolve, 0);
+          }
+        });
+        if (
+          latestMessagesRef.current[0]?.id !== previousFirstId ||
+          latestMessagesRef.current.some((message) => message.id === messageId)
+        ) {
+          break;
+        }
+      }
+      if (
+        latestMessagesRef.current[0]?.id === previousFirstId &&
+        !latestMessagesRef.current.some((message) => message.id === messageId)
+      ) {
+        break;
+      }
+    }
+    if (navigationKeyRef.current === initialNavigationKey) {
+      setMessageNavigationStatus({
+        navigationKey: initialNavigationKey,
+        text: "対象のメッセージがこの会話に見つかりませんでした。",
+      });
+    }
+    return false;
+  }, [releasePrependAnchor, rowVirtualizer]);
+
+  useEffect(() => {
+    onProvideScrollToMessage?.(scrollToMessage);
+    return () => onProvideScrollToMessage?.(null);
+  }, [onProvideScrollToMessage, scrollToMessage]);
 
   const showEmptyState =
     visibleMessages.length === 0 &&
@@ -1303,8 +1518,168 @@ export function MessageList({
   const updatePinnedToBottom = useCallback(() => {
     const scrollContainer = scrollContainerRef.current;
     if (!scrollContainer) return;
+    if (prependAnchorRef.current) {
+      isPinnedToBottomRef.current = false;
+      return;
+    }
+    const lastBottomWriteTop = lastBottomWriteTopRef.current;
+    if (
+      isPinnedToBottomRef.current &&
+      lastBottomWriteTop !== null &&
+      Math.abs(scrollContainer.scrollTop - lastBottomWriteTop) <= 1.5
+    ) {
+      return;
+    }
     isPinnedToBottomRef.current = isChatScrollPinnedToBottom(scrollContainer);
   }, []);
+
+  const releasePrependAnchorForUserInput = useCallback(() => {
+    if (
+      !prependAnchorRef.current ||
+      olderRequestInFlightRef.current ||
+      prependBaselineFirstIdRef.current !== null
+    ) {
+      return;
+    }
+    releasePrependAnchor();
+  }, [releasePrependAnchor]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (
+      !onLoadOlderMessages ||
+      !hasMoreMessages ||
+      isLoadingOlderMessages ||
+      olderRequestInFlightRef.current
+    ) {
+      return;
+    }
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer) return;
+
+    olderRequestInFlightRef.current = true;
+    prependReadyRef.current = false;
+    const firstVisibleItem = rowVirtualizer
+      .getVirtualItems()
+      .find((item) => item.index >= messageVirtualOffset && item.end > scrollContainer.scrollTop);
+    const messageId = firstVisibleItem
+      ? visibleMessages[firstVisibleItem.index - messageVirtualOffset]?.id ?? null
+      : null;
+    const anchorElement = messageId
+      ? Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-chat-message-id]")).find(
+          (element) => element.dataset.chatMessageId === messageId,
+        )
+      : undefined;
+    prependAnchorRef.current = {
+      messageId,
+      offsetTop: anchorElement
+        ? anchorElement.getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top
+        : firstVisibleItem
+          ? firstVisibleItem.start - scrollContainer.scrollTop
+          : Number.NaN,
+      scrollTop: scrollContainer.scrollTop,
+      expectedScrollTop: scrollContainer.scrollTop,
+      totalSize: rowVirtualizer.getTotalSize(),
+    };
+    prependBaselineFirstIdRef.current = visibleMessageIds[0] ?? null;
+    try {
+      const loaded = await onLoadOlderMessages();
+      if (loaded === false) {
+        releasePrependAnchor();
+      } else {
+        prependReadyRef.current = true;
+        // The provider may dispatch before this promise continuation runs;
+        // force a layout pass after the callback has definitely completed so
+        // an append that arrived during the request cannot consume the anchor.
+        setPrependAdjustmentVersion((version) => version + 1);
+        const baselineFirstId = prependBaselineFirstIdRef.current;
+        const releaseUnchangedAnchor = () => {
+          if (
+            prependAnchorRef.current &&
+            prependReadyRef.current &&
+            prependBaselineFirstIdRef.current === baselineFirstId &&
+            latestVisibleMessageIdsRef.current[0] === baselineFirstId
+          ) {
+            releasePrependAnchor();
+          }
+        };
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(releaseUnchangedAnchor);
+        } else {
+          window.setTimeout(releaseUnchangedAnchor, 0);
+        }
+      }
+    } catch {
+      releasePrependAnchor();
+    } finally {
+      olderRequestInFlightRef.current = false;
+    }
+  }, [
+    hasMoreMessages,
+    isLoadingOlderMessages,
+    onLoadOlderMessages,
+    messageVirtualOffset,
+    releasePrependAnchor,
+    rowVirtualizer,
+    visibleMessages,
+    visibleMessageIds,
+  ]);
+
+  const handleScroll = useCallback(() => {
+    const scrollContainer = scrollContainerRef.current;
+    const anchor = prependAnchorRef.current;
+    if (scrollContainer && anchor) {
+      const baselineFirstId = prependBaselineFirstIdRef.current;
+      const baselineHeadUnchanged =
+        baselineFirstId !== null &&
+        latestVisibleMessageIdsRef.current[0] === baselineFirstId;
+      if (
+        baselineHeadUnchanged &&
+        Math.abs(scrollContainer.scrollTop - anchor.expectedScrollTop) > 1.5
+      ) {
+        const currentAnchorElement = anchor.messageId
+          ? Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-chat-message-id]")).find(
+              (element) => element.dataset.chatMessageId === anchor.messageId,
+            )
+          : undefined;
+        if (currentAnchorElement) {
+          anchor.offsetTop =
+            currentAnchorElement.getBoundingClientRect().top -
+            scrollContainer.getBoundingClientRect().top;
+          anchor.scrollTop = scrollContainer.scrollTop;
+          anchor.expectedScrollTop = scrollContainer.scrollTop;
+        } else {
+          const firstVisibleItem = rowVirtualizer
+            .getVirtualItems()
+            .find((item) => item.index >= messageVirtualOffset && item.end > scrollContainer.scrollTop);
+          const messageId = firstVisibleItem
+            ? visibleMessages[firstVisibleItem.index - messageVirtualOffset]?.id ?? null
+            : null;
+          const element = messageId
+            ? Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-chat-message-id]")).find(
+                (candidate) => candidate.dataset.chatMessageId === messageId,
+              )
+            : undefined;
+          if (messageId && firstVisibleItem) {
+            anchor.messageId = messageId;
+            anchor.offsetTop = element
+              ? element.getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top
+              : firstVisibleItem.start - scrollContainer.scrollTop;
+            anchor.scrollTop = scrollContainer.scrollTop;
+            anchor.expectedScrollTop = scrollContainer.scrollTop;
+          }
+        }
+      } else if (
+        baselineFirstId === null &&
+        Math.abs(scrollContainer.scrollTop - anchor.expectedScrollTop) > 1.5
+      ) {
+        releasePrependAnchor();
+      }
+    }
+    updatePinnedToBottom();
+    if (scrollContainer && scrollContainer.scrollTop <= 48) {
+      void loadOlderMessages();
+    }
+  }, [loadOlderMessages, messageVirtualOffset, releasePrependAnchor, rowVirtualizer, updatePinnedToBottom, visibleMessages]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     if (!isPinnedToBottomRef.current) return false;
@@ -1314,6 +1689,7 @@ export function MessageList({
       top: scrollContainer.scrollHeight,
       behavior,
     });
+    lastBottomWriteTopRef.current = scrollContainer.scrollTop;
     return true;
   }, []);
 
@@ -1354,19 +1730,122 @@ export function MessageList({
 
   useLayoutEffect(() => {
     const previousIds = previousVisibleMessageIdsRef.current;
+    const prependAnchor = prependAnchorRef.current;
+    const scrollContainer = scrollContainerRef.current;
+    let adjustedPrepend = false;
+    const prependFirstIdChanged =
+      visibleMessageIds[0] !== prependBaselineFirstIdRef.current;
+    if (
+      prependAnchor &&
+      prependReadyRef.current &&
+      prependFirstIdChanged &&
+      scrollContainer
+    ) {
+      const anchorIndex = prependAnchor.messageId
+        ? messageIndexById.get(prependAnchor.messageId) ?? -1
+        : -1;
+      const anchorElement = prependAnchor.messageId
+        ? Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-chat-message-id]")).find(
+            (element) => element.dataset.chatMessageId === prependAnchor.messageId,
+          )
+        : undefined;
+      if (anchorIndex >= 0 && anchorElement) {
+        const anchorOffset =
+          anchorElement.getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top;
+        scrollContainer.scrollTop = Math.max(
+          0,
+          scrollContainer.scrollTop + anchorOffset - prependAnchor.offsetTop,
+        );
+        prependAnchor.expectedScrollTop = scrollContainer.scrollTop;
+        isPinnedToBottomRef.current = false;
+        prependReadyRef.current = false;
+        prependBaselineFirstIdRef.current = null;
+        adjustedPrepend = true;
+      } else {
+        // A branch reset can remove the anchor row. Keep the historical
+        // height-delta fallback for that explicit replacement case.
+        const heightDelta =
+          rowVirtualizer.getTotalSize() - prependAnchor.totalSize;
+        scrollContainer.scrollTop = prependAnchor.scrollTop + heightDelta;
+        releasePrependAnchor();
+        isPinnedToBottomRef.current = false;
+        adjustedPrepend = true;
+      }
+    }
     const isAppendOnlyUpdate =
       previousIds.length <= visibleMessageIds.length &&
       previousIds.every((id, index) => visibleMessageIds[index] === id);
 
-    if (!isAppendOnlyUpdate) {
+    if (!prependAnchor && !adjustedPrepend && !isAppendOnlyUpdate) {
       isPinnedToBottomRef.current = true;
     }
 
     previousVisibleMessageIdsRef.current = visibleMessageIds;
-  }, [visibleMessageIds]);
+  }, [messageIndexById, messageVirtualOffset, prependAdjustmentVersion, releasePrependAnchor, rowVirtualizer, visibleMessageIds]);
+
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    const scrollContainer = scrollContainerRef.current;
+    if (
+      !anchor?.messageId ||
+      prependReadyRef.current ||
+      prependBaselineFirstIdRef.current !== null ||
+      !scrollContainer
+    ) {
+      return;
+    }
+    if (Math.abs(scrollContainer.scrollTop - anchor.expectedScrollTop) > 1.5) {
+      releasePrependAnchor();
+      return;
+    }
+    const anchorIndex = messageIndexById.get(anchor.messageId);
+    const anchorElement = Array.from(
+      scrollContainer.querySelectorAll<HTMLElement>("[data-chat-message-id]"),
+    ).find((element) => element.dataset.chatMessageId === anchor.messageId);
+    if (anchorIndex === undefined || !anchorElement) return;
+
+    const currentOffset =
+      anchorElement.getBoundingClientRect().top -
+      scrollContainer.getBoundingClientRect().top;
+    const adjustment = currentOffset - anchor.offsetTop;
+    if (Math.abs(adjustment) > 0.5) {
+      scrollContainer.scrollTop = Math.max(
+        0,
+        scrollContainer.scrollTop + adjustment,
+      );
+      isPinnedToBottomRef.current = false;
+    }
+    anchor.expectedScrollTop = scrollContainer.scrollTop;
+  }, [messageIndexById, releasePrependAnchor, virtualItems, virtualTotalSize]);
+
+  useLayoutEffect(() => {
+    const activeAnchor = prependAnchorRef.current;
+    if (
+      activeAnchor?.messageId &&
+      !prependReadyRef.current &&
+      prependBaselineFirstIdRef.current === null &&
+      !messageIndexById.has(activeAnchor.messageId)
+    ) {
+      releasePrependAnchor();
+    }
+  }, [messageIndexById, releasePrependAnchor]);
+
+  useLayoutEffect(() => {
+    const scrollContainer = scrollContainerRef.current;
+    if (
+      prependAnchorRef.current ||
+      !isPinnedToBottomRef.current ||
+      !scrollContainer
+    ) {
+      return;
+    }
+    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+    lastBottomWriteTopRef.current = scrollContainer.scrollTop;
+  }, [virtualItems, virtualTotalSize]);
 
   // 更新前のスクロール位置を一度描画してから移動すると、送信・streamごとに跳ねる。
   useLayoutEffect(() => {
+    if (prependAnchorRef.current) return;
     scrollToBottom();
   }, [
     visibleMessagesScrollKey,
@@ -1378,6 +1857,7 @@ export function MessageList({
     activityMessage,
     activeAgentRunId,
     showGenerationActivity,
+    prependAdjustmentVersion,
     scrollToBottom,
   ]);
 
@@ -1386,10 +1866,20 @@ export function MessageList({
       <div
         ref={scrollContainerRef}
         data-testid="chat-message-list"
-        className="h-full min-h-0 w-full overflow-y-auto overscroll-contain"
-        onScroll={updatePinnedToBottom}
+        role="feed"
+        aria-busy={isLoadingOlderMessages || undefined}
+        className="h-full min-h-0 w-full overflow-y-auto overscroll-contain [overflow-anchor:none]"
+        onWheelCapture={releasePrependAnchorForUserInput}
+        onPointerDownCapture={releasePrependAnchorForUserInput}
+        onTouchStartCapture={releasePrependAnchorForUserInput}
+        onKeyDownCapture={(event) => {
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+            releasePrependAnchorForUserInput();
+          }
+        }}
+        onScroll={handleScroll}
       >
-        <div className="chat-viewport-center mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-6">
+        <div className="chat-viewport-center mx-auto w-full max-w-5xl px-6 py-6">
         {showEmptyState && (
           <div className="flex justify-center py-20">
             <div className="max-w-md rounded-md border border-border-subtle bg-surface-container-low px-6 py-5 text-center text-sm text-text-secondary">
@@ -1398,7 +1888,52 @@ export function MessageList({
           </div>
         )}
 
-        {visibleMessages.map((msg) => {
+        <div
+          className="relative w-full"
+          style={{ height: `${virtualTotalSize}px` }}
+        >
+        {virtualItems.map((virtualRow) => {
+          if (hasMoreMessages && virtualRow.index === 0) {
+            return (
+              <div
+                key={virtualRow.key}
+                ref={measureVirtualizerElement}
+                data-index={virtualRow.index}
+                className="absolute left-0 top-0 flex w-full justify-center pb-3"
+                style={{ transform: `translateY(${virtualRow.start}px)` }}
+              >
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  data-testid="chat-load-older"
+                  disabled={isLoadingOlderMessages}
+                  onClick={() => void loadOlderMessages()}
+                >
+                  {isLoadingOlderMessages ? "過去のメッセージを読み込み中…" : "過去のメッセージを読み込む"}
+                </Button>
+              </div>
+            );
+          }
+          const messageIndex = virtualRow.index - messageVirtualOffset;
+          const msg = visibleMessages[messageIndex];
+          if (!msg) return null;
+          const rowProps = {
+            ref: measureVirtualizerElement,
+            "data-index": virtualRow.index,
+            role: "article" as const,
+            "aria-setsize": hasMoreMessages ? -1 : visibleMessages.length,
+            "aria-posinset": messagePositionById.get(msg.id) ?? messageIndex + 1,
+            style: {
+              transform: `translateY(${virtualRow.start}px)`,
+              paddingBottom: "1.5rem",
+            },
+            onFocusCapture: () => setFocusedMessageId(msg.id),
+            onBlurCapture: (event: FocusEvent<HTMLDivElement>) => {
+              if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+              setFocusedMessageId((current) => current === msg.id ? null : current);
+            },
+          };
           const branchNavigation = getBranchNavigationState(msg);
           const branchNavDisabled =
             branchSwitchingMessageId !== null ||
@@ -1411,9 +1946,10 @@ export function MessageList({
             return (
               <div
                 key={messageRenderKey(msg)}
+                {...rowProps}
                 id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
-                className="py-2 text-center text-xs text-muted-foreground"
+                className="absolute left-0 top-0 w-full box-border py-2 text-center text-xs text-muted-foreground"
               >
                 {msg.content}
               </div>
@@ -1458,12 +1994,13 @@ export function MessageList({
             return (
               <div
                 key={messageRenderKey(msg)}
+                {...rowProps}
                 id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
                 data-chat-message-delivery-state={
                   typeof deliveryState === "string" ? deliveryState : undefined
                 }
-                className="group/msg flex min-w-0 flex-col items-end gap-1"
+                className="group/msg absolute left-0 top-0 flex w-full min-w-0 box-border flex-col items-end gap-1"
               >
                 {isEditing ? (
                   <div className="flex min-w-0 w-full max-w-[80%] flex-col gap-2">
@@ -1621,9 +2158,10 @@ export function MessageList({
           return (
             <div
               key={messageRenderKey(msg)}
+              {...rowProps}
               id={getChatMessageDomId(msg.id)}
               data-chat-message-id={msg.id}
-              className="group/msg flex justify-start gap-3"
+              className="group/msg absolute left-0 top-0 flex w-full box-border justify-start gap-3"
             >
               <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
                 <Bot className="size-4" />
@@ -1717,6 +2255,7 @@ export function MessageList({
             </div>
           );
         })}
+        </div>
 
         {/* 待機→stream開始→本文受信でも同じ行・実行ログを維持する。 */}
         {(isStreaming || showGenerationActivity) && (
@@ -1771,9 +2310,18 @@ export function MessageList({
           </div>
         )}
 
+        {messageNavigationStatus.navigationKey === navigationKey && messageNavigationStatus.text && (
+          <div role="status" aria-live="polite" className="py-3 text-center text-sm text-muted-foreground">
+            {messageNavigationStatus.text}
+          </div>
+        )}
+
         </div>
       </div>
-      <ChatMessageHistoryRail messages={visibleMessages} />
+      <ChatMessageHistoryRail
+        messages={historyRailMessages}
+        onScrollToMessage={scrollToMessage}
+      />
       <Dialog
         open={!!feedbackTarget}
         onOpenChange={(open) => !open && setFeedbackTarget(null)}

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+
+from src.runtime_release_contract import is_runtime_release_active
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +190,10 @@ def _move_file_fail_open(source: Path, destination: Path) -> None:
 
 
 def get_log_layout(project_root: Path | None = None) -> LogLayout:
+    runtime_log_root = os.environ.get("AOITALK_RUNTIME_LOG_ROOT", "").strip()
+    source_root = Path(__file__).resolve().parents[2]
+    if is_runtime_release_active(source_root) and runtime_log_root:
+        return LogLayout(Path(runtime_log_root).parent)
     if project_root is None:
-        project_root = Path(__file__).resolve().parents[2]
+        project_root = source_root
     return LogLayout(project_root)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import socket
 import threading
@@ -36,12 +37,7 @@ from ...services.llm_model_catalog import (
     save_model_catalog_cache,
     update_model_catalog_cache,
 )
-from ...services.agent_team_service import agent_team_orchestration_mode
-from ...services.execution_profile_service import (
-    execution_profile_envelope,
-    resolve_execution_main_route,
-)
-from ...services.agent_team_v3 import agent_team_v3_teams
+from ...services.model_roles_service import resolve_execution_main_route
 from ...services.conversation_session_selection import (
     merge_session_llm_settings,
     new_chat_llm_defaults_envelope,
@@ -50,7 +46,6 @@ from ...services.conversation_session_selection import (
     session_llm_settings_envelope,
     validate_session_llm_settings,
 )
-from ...services.session_llm_runtime import restore_session_agent_team_registry
 from ...services.provider_runtime_ownership import (
     ProviderRuntimeOwnership,
     provider_runtime_ownership,
@@ -78,6 +73,7 @@ from ...llm.openai_compatible_local_profiles import (
     llama_cpp_model_profiles,
     strata_model_profile,
     strata_model_profiles,
+    STRATA_SOURCE_REVISION,
     llama_cpp_model_profile,
     llama_cpp_reasoning_effort_metadata,
     llama_cpp_runtime_distribution,
@@ -101,6 +97,38 @@ if TYPE_CHECKING:
     from ..server import WebChatServer
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_deepseek_strata_settings(
+    settings: dict[str, Any], profile: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Project legacy UI GGUF input onto DeepSeek's isolated model key."""
+
+    result = dict(settings)
+    is_deepseek = bool(
+        profile
+        and str(profile.get("setup_family") or "").casefold() == "deepseek41"
+    )
+    if not is_deepseek:
+        return result
+    if not result.get("deepseek_model_dir") and result.get("gguf_dir"):
+        result["deepseek_model_dir"] = result["gguf_dir"]
+    if not result.get("deepseek_source_root") and result.get("source_root"):
+        source_root = Path(str(result["source_root"])).expanduser()
+        if (
+            source_root.name.casefold() == STRATA_SOURCE_REVISION.casefold()
+            and source_root.parent.name.casefold() == "strata"
+        ):
+            result["deepseek_source_root"] = str(
+                source_root.parent / str(profile.get("source_revision") or "")
+            )
+        else:
+            result["deepseek_source_root"] = str(source_root)
+    return {
+        key: result[key]
+        for key in ("deepseek_model_dir", "deepseek_source_root")
+        if result.get(key)
+    }
 
 
 from ..broadcast_scope import broadcast_llm_state_change
@@ -1342,6 +1370,7 @@ def _local_runtime_api_payload(
     profile_downloadable = bool(
         profile
         and profile.get("source_repository")
+        and not profile.get("local_only")
         and (runtime in {"freetoken", "strata"} or profile.get("gguf_filename"))
     )
     explicit_runtime_downloadable = runtime_install_state.get(
@@ -2244,8 +2273,16 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 raise HTTPException(status_code=400, detail="公式setup実行・大容量downloadの確認が必要です")
             try:
                 settings = normalize_strata_settings(body.get("strata", {}))
+                profile = strata_model_profile(model_id)
+                deepseek_profile = bool(
+                    profile
+                    and str(profile.get("setup_family") or "").casefold()
+                    == "deepseek41"
+                )
+                if deepseek_profile:
+                    settings = _normalize_deepseek_strata_settings(settings, profile)
                 changes = {f"openai_compatible_local.strata.{key}": value for key, value in settings.items()}
-                endpoint = body.get("base_url")
+                endpoint = None if deepseek_profile else body.get("base_url")
                 if endpoint is not None:
                     from urllib.parse import urlsplit
 
@@ -2260,7 +2297,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # regenerates --prefill and --vram-reserve-mib with its own
                 # defaults, while Strata's generated JSON is not the durable
                 # AoiTalk settings store.
-                for performance_key in ("prefill", "vram_reserve_mib", "expert_cache"):
+                for performance_key in (
+                    ()
+                    if deepseek_profile
+                    else ("prefill", "vram_reserve_mib", "expert_cache")
+                ):
                     if (
                         performance_key not in settings
                         and effective.get(performance_key) is not None
@@ -2270,7 +2311,18 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                         ] = effective[performance_key]
                 if not configure_only and not effective["auto_start"]:
                     raise ValueError("外部Strataのsetupはoperatorが行ってください")
-                if not configure_only and not settings.get("data_dir") and not server.config.get("openai_compatible_local.strata.data_dir", ""):
+                if deepseek_profile and not effective.get("deepseek_model_dir"):
+                    raise ValueError(
+                        "DeepSeek V4.1のdeepseek_model_dirを明示してください"
+                    )
+                if (
+                    not configure_only
+                    and not deepseek_profile
+                    and not settings.get("data_dir")
+                    and not server.config.get(
+                        "openai_compatible_local.strata.data_dir", ""
+                    )
+                ):
                     raise ValueError("大容量データの保存先（repository外）を明示してください")
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2956,7 +3008,6 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             "persisted_provider": provider,
             "persisted_model": model,
             "available_included": include_available,
-            "execution_profile": execution_profile_envelope(server.config),
             "effective_main": resolve_execution_main_route(server.config),
         }
         if include_available:
@@ -3295,15 +3346,6 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 raise HTTPException(
                     status_code=400,
                     detail="未対応のルーティングプロファイルです",
-                )
-            if (
-                provider == "routing-profile"
-                and model == "free-team"
-                and agent_team_orchestration_mode(server.config) == "director"
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Directorモードでは無料Teamを選択できません",
                 )
             if (
                 provider == "routing-profile"
@@ -4089,42 +4131,6 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             raise HTTPException(status_code=404, detail="pull task not found")
         return JSONResponse(task)
 
-    @app.get("/api/llm/execution-profiles")
-    async def get_execution_profiles(_: None = Depends(require_auth)):
-        return JSONResponse(execution_profile_envelope(server.config))
-
-    @app.put("/api/llm/execution-profiles")
-    async def put_execution_profiles(request: Request, _: None = Depends(require_auth)):
-        await _require_global_config_admin(request)
-        del request
-        # Global Execution Profiles are no longer a routing source of truth.
-        # Team-scoped profiles live on Agent Team config.  This leftover
-        # endpoint does not mutate Main or persist a second canonical store.
-        return JSONResponse(execution_profile_envelope(server.config))
-
-    @app.post("/api/llm/execution-profiles/{profile_id}/activate")
-    async def activate_execution_profile_route(
-        profile_id: str,
-        request: Request,
-        _: None = Depends(require_auth),
-    ):
-        await _require_global_config_admin(request)
-        del profile_id, request
-        main_route = resolve_execution_main_route(server.config)
-        return JSONResponse(
-            {
-                "success": True,
-                "profile": None,
-                "execution_profile": execution_profile_envelope(server.config),
-                "effective_main": {
-                    "provider": main_route.get("provider"),
-                    "model": main_route.get("model"),
-                    "effort": main_route.get("effort")
-                    or main_route.get("reasoning_effort"),
-                },
-            }
-        )
-
     @app.get("/api/llm/session-settings")
     async def get_session_llm_settings(
         request: Request,
@@ -4142,15 +4148,6 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         row = await repo.get_session_by_id(session_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        from ...services.session_llm_runtime import restore_session_agent_team_registry
-        from ...services.conversation_session_selection import read_session_llm_settings
-
-        settings = read_session_llm_settings(row.context)
-        restore_session_agent_team_registry(
-            str(row.user_id),
-            session_id,
-            settings,
-        )
         return JSONResponse(
             session_llm_settings_envelope(row.context, server.config)
         )
@@ -4216,6 +4213,12 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         from ...memory.database import get_database_manager
 
         body = await request.json()
+        update_last_used = body.get("update_last_used", True)
+        if type(update_last_used) is not bool:
+            raise HTTPException(
+                status_code=400,
+                detail="update_last_used must be a boolean",
+            )
         session_id = str(body.get("session_id") or "").strip()
         if not session_id:
             raise HTTPException(status_code=400, detail="session_id is required")
@@ -4227,7 +4230,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         patch = {
             key: value
             for key, value in body.items()
-            if key not in {"session_id"}
+            if key not in {"session_id", "update_last_used"}
         }
         if isinstance(patch.get("settings"), dict):
             patch = patch["settings"]
@@ -4387,7 +4390,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                         "ローカルLLM runtimeの切替を延期しました。"
                         f"次の送信時に再試行します: {exc}"
                     )
-        if "main_route" in patch:
+        if update_last_used and "main_route" in patch:
             main_route = (
                 settings.get("main_route")
                 if isinstance(settings.get("main_route"), dict)
@@ -4408,11 +4411,6 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                         await record_user_last_used_main_route(owner_id, main_route)
                 except Exception:
                     pass
-        restore_session_agent_team_registry(
-            str(row.user_id or ""),
-            session_id,
-            settings,
-        )
         from ...services.session_llm_generation import invalidate_session_llm_client_cache
 
         invalidate_session_llm_client_cache(

@@ -35,6 +35,19 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_RESULT_PAGE_CHARS = 8000  # Even JSON-escaped controls fit the output byte cap.
 DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+FREE_TEAM_POOL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,139}$")
+FREE_TEAM_REASON_RE = re.compile(r"^[a-z][a-z0-9_:-]{0,95}$")
+FREE_TEAM_SECRET_MARKERS = ("api_key", "credential", "fingerprint", "secret", "token", "auth")
+FREE_TEAM_USAGE_KEYS = {
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "requests",
+}
+FREE_TEAM_USAGE_PROJECTION_KEYS = FREE_TEAM_USAGE_KEYS | {"input_cached_tokens"}
+FREE_TEAM_RESERVATION_STATUSES = ("committed", "uncertain", "released", "reserved")
+FREE_TEAM_RESERVATION_LIMIT = 64
+FREE_TEAM_AGGREGATE_QUOTA_LIMIT = 32
 MAX_WAIT_SECONDS = 20.0
 POLL_INTERVAL = 1.0
 TERMINAL_STATES = {"completed", "succeeded", "failed", "cancelled", "stopped", "interrupted"}
@@ -272,7 +285,9 @@ def _required_outputs(value: Any, name: str = "required_outputs") -> list[str]:
     return outputs
 
 
-def _status(task: Any, *, expected_id: str | None = None) -> dict[str, Any]:
+def _status(
+    task: Any, *, expected_id: str | None = None, settings: aoitalk.Settings | None = None
+) -> dict[str, Any]:
     if not isinstance(task, dict):
         raise AgentTaskError("invalid_response")
     task_id = task.get("task_id")
@@ -306,7 +321,340 @@ def _status(task: Any, *, expected_id: str | None = None) -> dict[str, Any]:
                        "summary_text", "failure_reason", "failure_detail"} and not isinstance(task[key], str):
                 raise AgentTaskError("invalid_response")
             result[key] = task[key]
+    free_team = _free_team_status_projection(task.get("free_team"), settings=settings)
+    if free_team is not None:
+        result["free_team"] = free_team
     return result
+
+
+def _free_team_pool_id(value: Any, settings: aoitalk.Settings | None = None) -> bool:
+    return (
+        isinstance(value, str)
+        and FREE_TEAM_POOL_ID_RE.fullmatch(value) is not None
+        and not any(marker in value.lower() for marker in FREE_TEAM_SECRET_MARKERS)
+        and not (settings is not None and _credential_overlap(value, settings))
+    )
+
+
+def _free_team_status_projection(
+    value: Any, settings: aoitalk.Settings | None = None
+) -> dict[str, Any] | None:
+    """Allowlist bounded complimentary route evidence; malformed details never reject task status."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key, max_length in (("billing_mode", 40), ("candidate", 140),
+                            ("provider", 80), ("model", 240)):
+        item = value.get(key)
+        if (isinstance(item, str) and 0 < len(item) <= max_length
+                and not any(ord(char) < 32 for char in item)
+                and not any(marker in item.lower() for marker in FREE_TEAM_SECRET_MARKERS)):
+            if settings is None or not _credential_overlap(item, settings):
+                result[key] = item
+    pool_ids = value.get("quota_pool_ids")
+    if isinstance(pool_ids, list):
+        safe_pool_ids = [item for item in pool_ids[:8] if _free_team_pool_id(item, settings)]
+        if safe_pool_ids:
+            result["quota_pool_ids"] = safe_pool_ids
+    reservation_id = value.get("reservation_id")
+    if (isinstance(reservation_id, str) and len(reservation_id) == 36
+            and re.fullmatch(r"[a-fA-F0-9-]{36}", reservation_id)
+            and (settings is None or not _credential_overlap(reservation_id, settings))):
+        result["reservation_id"] = reservation_id.lower()
+
+    settlement = value.get("settlement")
+    if isinstance(settlement, dict) and settlement.get("status") in {"committed", "uncertain", "released"}:
+        raw_usage = settlement.get("actual_usage")
+        if isinstance(raw_usage, dict):
+            actual_usage: dict[str, Any] = {}
+            for key in FREE_TEAM_USAGE_KEYS:
+                number = raw_usage.get(key)
+                if type(number) is int and 0 <= number <= 2**63 - 1:
+                    actual_usage[key] = number
+            quota_actual = raw_usage.get("quota_actual")
+            if isinstance(quota_actual, dict):
+                safe_actual: dict[str, int] = {}
+                for quota_id, number in list(quota_actual.items())[:8]:
+                    if _free_team_pool_id(quota_id, settings) and type(number) is int and 0 <= number <= 2**63 - 1:
+                        safe_actual[quota_id] = number
+                if safe_actual:
+                    actual_usage["quota_actual"] = safe_actual
+            result["settlement"] = {
+                "status": settlement["status"],
+                "actual_usage": actual_usage,
+            }
+
+    wait = value.get("wait")
+    if isinstance(wait, dict):
+        safe_wait: dict[str, Any] = {}
+        reset_at = wait.get("quota_reset_at")
+        if isinstance(reset_at, str) and 0 < len(reset_at) <= 64 and not any(ord(c) < 32 for c in reset_at):
+            safe_wait["quota_reset_at"] = reset_at
+        reset_kind = wait.get("quota_reset_kind")
+        if reset_kind in {"daily", "minute", "cooldown"}:
+            safe_wait["quota_reset_kind"] = reset_kind
+        quota_ids = wait.get("quota_ids")
+        if isinstance(quota_ids, list):
+            safe_quota_ids = [item for item in quota_ids[:8] if _free_team_pool_id(item, settings)]
+            if safe_quota_ids:
+                safe_wait["quota_ids"] = safe_quota_ids
+        reason = wait.get("deferred_reason")
+        if isinstance(reason, str) and FREE_TEAM_REASON_RE.fullmatch(reason):
+            safe_wait["deferred_reason"] = reason
+        if safe_wait:
+            result["wait"] = safe_wait
+    reservations_total = _free_team_reservations_total(value.get("reservations_total"), settings=settings)
+    if reservations_total is not None:
+        result["reservations_total"] = reservations_total
+    non_free = value.get("non_free_reservation_detected")
+    if isinstance(non_free, bool):
+        result["non_free_reservation_detected"] = non_free
+    return result or None
+
+
+def _free_team_reservations_total(
+    value: Any, *, settings: aoitalk.Settings | None = None
+) -> dict[str, Any] | None:
+    """Validate one bounded reservation aggregate; reject a malformed aggregate atomically."""
+
+    if not isinstance(value, dict):
+        return None
+    count = value.get("count")
+    truncated = value.get("truncated")
+    by_status = value.get("by_status")
+    actual_usage = value.get("actual_usage")
+    hold = value.get("uncertain_estimated_hold")
+    if (
+        type(count) is not int
+        or not 0 <= count <= FREE_TEAM_RESERVATION_LIMIT
+        or not isinstance(truncated, bool)
+        or not isinstance(by_status, dict)
+        or set(by_status) != set(FREE_TEAM_RESERVATION_STATUSES)
+        or not isinstance(actual_usage, dict)
+        or set(actual_usage) != FREE_TEAM_USAGE_KEYS | {"quota_actual"}
+        or not isinstance(hold, dict)
+        or len(hold) > FREE_TEAM_AGGREGATE_QUOTA_LIMIT
+    ):
+        return None
+    safe_counts: dict[str, int] = {}
+    for status in FREE_TEAM_RESERVATION_STATUSES:
+        number = by_status.get(status)
+        if type(number) is not int or not 0 <= number <= FREE_TEAM_RESERVATION_LIMIT:
+            return None
+        safe_counts[status] = number
+    if sum(safe_counts.values()) != count:
+        return None
+
+    safe_usage: dict[str, Any] = {}
+    for key in FREE_TEAM_USAGE_KEYS:
+        number = actual_usage.get(key)
+        if type(number) is not int or not 0 <= number <= 2**63 - 1:
+            return None
+        safe_usage[key] = number
+    quota_actual = actual_usage.get("quota_actual")
+    if not isinstance(quota_actual, dict) or len(quota_actual) > FREE_TEAM_AGGREGATE_QUOTA_LIMIT:
+        return None
+    safe_quota_actual: dict[str, int] = {}
+    for quota_id, number in quota_actual.items():
+        if (
+            not _free_team_pool_id(quota_id, settings)
+            or type(number) is not int
+            or not 0 <= number <= 2**63 - 1
+        ):
+            return None
+        safe_quota_actual[quota_id] = number
+    safe_usage["quota_actual"] = safe_quota_actual
+
+    safe_hold: dict[str, int] = {}
+    for quota_id, number in hold.items():
+        if (
+            not _free_team_pool_id(quota_id, settings)
+            or type(number) is not int
+            or not 0 <= number <= 2**63 - 1
+        ):
+            return None
+        safe_hold[quota_id] = number
+    return {
+        "count": count,
+        "by_status": safe_counts,
+        "actual_usage": safe_usage,
+        "uncertain_estimated_hold": safe_hold,
+        "truncated": truncated,
+    }
+
+
+def _quota_number(value: Any, *, allow_negative: bool = False) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    if abs(value) > 2**63 - 1 or (not allow_negative and value < 0):
+        return None
+    return int(value) if int(value) == value else float(value)
+
+
+def _quota_code(value: Any, *, max_length: int = 128) -> str | None:
+    if (not isinstance(value, str) or len(value) > max_length
+            or any(ord(char) < 32 for char in value)):
+        return None
+    if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", value):
+        return None
+    return value
+
+
+def _free_team_usage_actual_projection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"groups": {}, "unknown_models": []}
+    raw_groups = value.get("groups")
+    groups: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_groups, dict):
+        for name in ("sol", "luna"):
+            raw = raw_groups.get(name)
+            if not isinstance(raw, dict):
+                continue
+            group: dict[str, Any] = {}
+            group_id = _quota_code(raw.get("group"), max_length=16)
+            source = raw.get("source")
+            if group_id in {"1m", "10m"}:
+                group["group"] = group_id
+            if source in {"ledger", "openai_usage_api"}:
+                group["source"] = source
+            state = _quota_code(raw.get("actual_usage_state"), max_length=48)
+            if state in {"ok", "not_configured", "stale"} or (state and state.startswith("error:")):
+                group["actual_usage_state"] = state
+            for field in (
+                "actual_usage",
+                "input_tokens",
+                "output_tokens",
+                "input_cached_tokens",
+                "requests",
+                "limit",
+                "effective_cap",
+                "external_usage_estimate",
+            ):
+                number = raw.get(field)
+                if number is None:
+                    group[field] = None
+                elif type(number) is int and 0 <= number <= 2**53 - 1:
+                    group[field] = number
+            for field in ("ratio", "unavailable_margin"):
+                number = _quota_number(raw.get(field))
+                if number is not None:
+                    group[field] = number
+            synced = raw.get("last_synced_at")
+            if synced is None or (isinstance(synced, str) and len(synced) <= 64):
+                group["last_synced_at"] = synced
+            if group:
+                groups[name] = group
+    unknown_models: list[dict[str, Any]] = []
+    raw_unknown = value.get("unknown_models")
+    if isinstance(raw_unknown, list):
+        for item in raw_unknown[:20]:
+            if not isinstance(item, dict):
+                continue
+            model = _quota_code(item.get("model"), max_length=160)
+            if model is None:
+                continue
+            projected: dict[str, Any] = {"model": model}
+            for field in (
+                "input_tokens",
+                "output_tokens",
+                "input_cached_tokens",
+                "total_tokens",
+                "requests",
+            ):
+                count = item.get(field)
+                if type(count) is int and 0 <= count <= 2**53 - 1:
+                    projected[field] = count
+            unknown_models.append(projected)
+    return {"groups": groups, "unknown_models": unknown_models}
+
+
+def _free_team_usage_projection(value: Any, openrouter: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not isinstance(value.get("quota_pools"), list):
+        raise AgentTaskError("invalid_response")
+    pools: list[dict[str, Any]] = []
+    for item in value["quota_pools"][:32]:
+        if not isinstance(item, dict):
+            continue
+        quota_id = item.get("id")
+        if not _free_team_pool_id(quota_id):
+            continue
+        effective = _quota_number(item.get("effective_daily_cap", item.get("daily_cap")))
+        configured = _quota_number(item.get("configured_daily_cap"))
+        # OpenAI's `consumed` includes central usage and external delta, while
+        # OpenRouter keeps its local amount in `consumed`; normalize `used` to
+        # local + central so the separately reported external delta is counted once.
+        local_used = _quota_number(item.get("local_consumed", item.get("consumed")))
+        central_used = _quota_number(item.get("central_unmetered_usage", 0))
+        used = local_used + central_used if local_used is not None and central_used is not None else None
+        reserved = _quota_number(item.get("reserved"))
+        external_delta = _quota_number(item.get("provider_external_delta"))
+        remaining = _quota_number(item.get("available"), allow_negative=True)
+        if any(number is None for number in (effective, configured, used, reserved, external_delta, remaining)):
+            continue
+        pool = {
+            "id": quota_id,
+            "configured_daily_cap": configured,
+            "effective_daily_cap": effective,
+            "used": used,
+            "reserved": reserved,
+            "external_delta": external_delta,
+            "remaining": remaining,
+        }
+        window_end = item.get("window_end")
+        if window_end is None or (isinstance(window_end, str) and len(window_end) <= 64):
+            pool["window_end"] = window_end
+        status = _quota_code(item.get("status"), max_length=40)
+        if status is not None:
+            pool["status"] = status
+        stop_reason = _quota_code(item.get("stop_reason"))
+        if stop_reason is not None:
+            pool["stop_reason"] = stop_reason
+        pools.append(pool)
+
+    verification_source = value.get("verification")
+    verification: dict[str, str] = {}
+    if isinstance(verification_source, dict):
+        for key, max_length in (("status", 40), ("stop_reason", 128), ("external_usage_visibility", 160)):
+            safe_value = _quota_code(verification_source.get(key), max_length=max_length)
+            if safe_value is not None:
+                verification[key] = safe_value
+
+    observed = openrouter.get("provider_observed") if isinstance(openrouter, dict) else None
+    observed_status = _quota_code(observed.get("status"), max_length=40) if isinstance(observed, dict) else None
+    if observed_status is None:
+        raise AgentTaskError("invalid_response")
+    projection = {
+        "ok": True,
+        "quota_pools": pools,
+        "verification": verification,
+        "openrouter_provider_observed": {"status": observed_status},
+        "openai_usage_actual": _free_team_usage_actual_projection(
+            value.get("openai_usage_actual")
+        ),
+    }
+    blocked = value.get("provider_blocked")
+    if type(blocked) is bool:
+        projection["provider_blocked"] = blocked
+    reason = _quota_code(value.get("provider_block_reason_code"), max_length=80)
+    if reason is not None:
+        projection["provider_block_reason_code"] = reason
+    blocked_until = value.get("provider_blocked_until")
+    if blocked_until is None or (isinstance(blocked_until, str) and len(blocked_until) <= 64):
+        projection["provider_blocked_until"] = blocked_until
+    half_open = value.get("provider_half_open")
+    if type(half_open) is bool:
+        projection["provider_half_open"] = half_open
+    persistence = _quota_code(value.get("provider_block_persistence"), max_length=40)
+    if persistence is not None:
+        projection["provider_block_persistence"] = persistence
+    next_probe_at = value.get("next_probe_at")
+    if next_probe_at is None or (isinstance(next_probe_at, str) and len(next_probe_at) <= 64):
+        projection["next_probe_at"] = next_probe_at
+    probe_interval = value.get("probe_interval_minutes")
+    if type(probe_interval) is int and probe_interval >= 5:
+        projection["probe_interval_minutes"] = probe_interval
+    return projection
 
 
 def _redact_result_text(value: str, settings: aoitalk.Settings) -> str:
@@ -325,7 +673,9 @@ def _sanitize(value: Any, settings: aoitalk.Settings) -> dict[str, Any]:
     def encoded_size(item: Any) -> int:
         return len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
-    def visit(item: Any, depth: int = 0, *, result_text: bool = False) -> Any:
+    def visit(
+        item: Any, depth: int = 0, *, result_text: bool = False, safe_usage_context: bool = False
+    ) -> Any:
         nonlocal remaining, truncated
         if remaining <= 0:
             truncated = True
@@ -370,7 +720,10 @@ def _sanitize(value: Any, settings: aoitalk.Settings) -> dict[str, Any]:
                 if remaining <= 0:
                     truncated = True
                     break
-                safe = visit(child, depth + 1, result_text=result_text)
+                safe = visit(
+                    child, depth + 1, result_text=result_text,
+                    safe_usage_context=safe_usage_context,
+                )
                 if safe is not omitted:
                     output.append(safe)
             if len(item) > len(output):
@@ -380,7 +733,12 @@ def _sanitize(value: Any, settings: aoitalk.Settings) -> dict[str, Any]:
             remaining -= 2  # {}
             output = {}
             for key, child in item.items():
-                if not isinstance(key, str) or SECRET_KEY.search(key):
+                safe_usage_counter = (
+                    safe_usage_context
+                    and isinstance(key, str)
+                    and key in FREE_TEAM_USAGE_PROJECTION_KEYS
+                )
+                if not isinstance(key, str) or (SECRET_KEY.search(key) and not safe_usage_counter):
                     truncated = True
                     continue
                 if key == "idempotency_key" and isinstance(child, str) and _credential_overlap(child, settings):
@@ -395,7 +753,13 @@ def _sanitize(value: Any, settings: aoitalk.Settings) -> dict[str, Any]:
                 if remaining <= 0:
                     truncated = True
                     break
-                safe = visit(child, depth + 1, result_text=result_text or (depth == 0 and key == "result"))
+                safe = visit(
+                    child,
+                    depth + 1,
+                    result_text=result_text or (depth == 0 and key == "result"),
+                    safe_usage_context=safe_usage_context
+                    or (depth == 0 and key in {"free_team", "openai_usage_actual"}),
+                )
                 if safe is not omitted:
                     output[clean_key] = safe
             return output
@@ -412,8 +776,10 @@ def _sanitize(value: Any, settings: aoitalk.Settings) -> dict[str, Any]:
     return safe
 
 
-def _response_task(data: dict[str, Any], *, expected_id: str | None = None) -> dict[str, Any]:
-    return _status(data.get("task"), expected_id=expected_id)
+def _response_task(
+    data: dict[str, Any], *, expected_id: str | None = None, settings: aoitalk.Settings | None = None
+) -> dict[str, Any]:
+    return _status(data.get("task"), expected_id=expected_id, settings=settings)
 
 
 async def aoitalk_agent_task_start(
@@ -555,7 +921,7 @@ async def aoitalk_agent_task_start(
             http_status, data = await client.call(
                 "POST", "/api/agent-tasks", json=body, headers={"Idempotency-Key": key}
             )
-            task = _response_task(data)
+            task = _response_task(data, settings=client.settings)
             created = data.get("created")
             if not isinstance(created, bool):
                 raise AgentTaskError("invalid_response", http_status)
@@ -580,6 +946,20 @@ async def aoitalk_agent_task_start(
                       next_step=retry_step)
 
 
+async def aoitalk_free_team_status() -> dict[str, Any]:
+    """Read complimentary quota and verification status using the two canonical GET endpoints only."""
+
+    try:
+        async def read(client: AgentTaskClient) -> dict[str, Any]:
+            _, usage = await client.call("GET", "/api/free-team/usage")
+            _, openrouter = await client.call("GET", "/api/free-team/openrouter/quota")
+            return _free_team_usage_projection(usage, openrouter)
+
+        return await _session(read)
+    except AgentTaskError as exc:
+        return _error(exc)
+
+
 async def aoitalk_agent_task_status(
     task_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")],
     wait_seconds: Annotated[float, Field(ge=0, le=20)] = 0,
@@ -600,7 +980,7 @@ async def aoitalk_agent_task_status(
             deadline = time.monotonic() + wait_seconds
             while True:
                 _, data = await client.call("GET", f"/api/agent-tasks/{task_id}")
-                task = _response_task(data, expected_id=task_id)
+                task = _response_task(data, expected_id=task_id, settings=client.settings)
                 if (task["status"] in TERMINAL_STATES or task.get("is_terminal") is True
                         or time.monotonic() >= deadline):
                     return {"ok": True, **task}
@@ -678,7 +1058,7 @@ async def aoitalk_agent_task_result(
 
         async def read(client: AgentTaskClient) -> dict[str, Any]:
             _, data = await client.call("GET", f"/api/agent-tasks/{task_id}")
-            task = _response_task(data, expected_id=task_id)
+            task = _response_task(data, expected_id=task_id, settings=client.settings)
             if task["status"] not in {"completed", "succeeded"}:
                 raise AgentTaskError("result_not_ready")
             if task.get("is_terminal") is False:
@@ -713,6 +1093,8 @@ async def aoitalk_agent_task_result(
                 "offset": offset, "next_offset": end if end < len(clean) else None,
                 "output_truncated": offset > 0 or end < len(clean),
             }
+            if "free_team" in task:
+                page["free_team"] = task["free_team"]
             if len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_OUTPUT_BYTES:
                 raise AgentTaskError("invalid_response")
             return page
@@ -736,7 +1118,7 @@ async def aoitalk_agent_task_cancel(
 
         async def cancel(client: AgentTaskClient) -> dict[str, Any]:
             _, data = await client.call("POST", f"/api/agent-tasks/{task_id}/cancel")
-            task = _response_task(data, expected_id=task_id)
+            task = _response_task(data, expected_id=task_id, settings=client.settings)
             requested = data.get("cancellation_requested")
             if not isinstance(requested, bool):
                 raise AgentTaskError("invalid_response")
@@ -749,5 +1131,7 @@ async def aoitalk_agent_task_cancel(
 
 
 TOOLS = [aoitalk_agent_task_start, aoitalk_agent_task_status,
+         aoitalk_free_team_status,
          aoitalk_agent_task_tail, aoitalk_agent_task_result, aoitalk_agent_task_cancel]
-READ_ONLY_TOOLS = {aoitalk_agent_task_status, aoitalk_agent_task_tail, aoitalk_agent_task_result}
+READ_ONLY_TOOLS = {aoitalk_agent_task_status, aoitalk_free_team_status,
+                   aoitalk_agent_task_tail, aoitalk_agent_task_result}

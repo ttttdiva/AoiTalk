@@ -13,23 +13,18 @@ type SaveRequest = components["schemas"]["OpenAIConfirmationRequest"];
 export function OpenAIConfirmationPanel({ onChanged }: { onChanged: () => Promise<void> }) {
   const [open, setOpen] = useState(false);
   const [context, setContext] = useState<Context | null>(null);
-  const [reference, setReference] = useState<SaveRequest["credential_reference"]>("openai_api_key");
   const [scope, setScope] = useState("");
   const [tier, setTier] = useState<SaveRequest["usage_tier"]>("tier_3_plus");
   const [source, setSource] = useState("本人が現在の資格情報と組織の無料枠・参加状態を確認済み");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  const credential = context?.credentials.find((item) => item.reference === reference);
+  const credential = context?.credentials.find((item) => item.reference === "openai_api_key");
 
   async function load() {
     setBusy(true); setMessage("");
     try {
       const data = await pyFetch<Context>("/free-team/openai-confirmation");
       setContext(data); setScope(data.billing_scope_id);
-      const savedReference = data.record.credential_reference;
-      const selected = data.credentials.find((item) => item.reference === savedReference)
-        ?? data.credentials.find((item) => item.configured);
-      if (selected) setReference(selected.reference as SaveRequest["credential_reference"]);
       setTier(data.usage_tier === "tier_1_2" ? "tier_1_2" : "tier_3_plus");
       if (data.record.source_reference) setSource(data.record.source_reference);
     } catch (error) {
@@ -40,7 +35,7 @@ export function OpenAIConfirmationPanel({ onChanged }: { onChanged: () => Promis
   async function write(revoke = false) {
     if (!credential || !context) return;
     setBusy(true); setMessage("");
-    const body: SaveRequest = { credential_reference: reference, fingerprint: credential.fingerprint,
+    const body: SaveRequest = { credential_reference: "openai_api_key", fingerprint: credential.fingerprint,
       expected_record_id: context.record.record_id ?? null, billing_scope_id: scope.trim(), usage_tier: tier,
       eligible: true, enrolled: true, source_reference: source.trim() };
     try {
@@ -64,11 +59,7 @@ export function OpenAIConfirmationPanel({ onChanged }: { onChanged: () => Promis
       <p className="text-muted-foreground">Providerの自動attestationではありません。組織外部の同時消費はこの記録では把握できません。</p>
       {context && <>
         <div className="grid gap-3 sm:grid-cols-2">
-          <label>既存資格情報<AppSelect value={reference} onChange={(event) => setReference(event.target.value as SaveRequest["credential_reference"])}>
-            {context.credentials.map((item) => <option key={item.reference} value={item.reference} disabled={!item.configured}>
-              {item.reference === "openai_api_key" ? "現在のOpenAIキー" : "既存無料Teamキー"}{!item.configured ? "（未設定）" : ""}
-            </option>)}
-          </AppSelect></label>
+          <div className="space-y-1"><span>使用する資格情報</span><p>通常のOpenAIキー（共有client）</p></div>
           <label>確認済み請求組織scope<Input value={scope} maxLength={200} onChange={(event) => setScope(event.target.value)} placeholder="org-…" /></label>
           <label>確認済み無料枠<AppSelect value={tier} onChange={(event) => setTier(event.target.value as SaveRequest["usage_tier"])}>
             <option value="tier_3_plus">Sol 1M / Luna 10M token/日</option>

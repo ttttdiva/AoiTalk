@@ -11,6 +11,8 @@ from uuid import UUID
 
 import yaml
 
+from src.runtime_release_contract import config_path as runtime_config_path
+
 from .models import SkillDefinition, SkillTriggerMode
 from .registry import get_skill_registry, register_skill
 from ..services.project_workspace_cleanup import get_project_workspace_path
@@ -23,7 +25,7 @@ from ..services.skill_target_io import (
 
 logger = logging.getLogger(__name__)
 
-SKILLS_DIR = Path(__file__).resolve().parents[2] / "config" / "skills"
+SKILLS_DIR = runtime_config_path("config/skills", Path(__file__).resolve().parents[2])
 
 # Keep the process-local global registry in sync when a canonical YAML is
 # deleted at runtime.  Without this ledger, a previously loaded

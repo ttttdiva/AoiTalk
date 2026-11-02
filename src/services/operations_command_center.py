@@ -570,6 +570,17 @@ class OperationsCommandCenterService:
             latest_revision = (await session.execute(select(AgentRevision).where(AgentRevision.agent_id == agent.id).order_by(AgentRevision.version.desc()).limit(1))).scalars().first()
             if latest_revision is not None:
                 revision_payload = _safe_row(latest_revision)
+                raw_revision_legacy = revision_payload.get("legacy")
+                revision_legacy = {
+                    key: raw_revision_legacy.get(key)
+                    for key in (
+                        "agent_team_id",
+                        "execution_profile_id",
+                        "allowed_subagent_ids",
+                    )
+                    if isinstance(raw_revision_legacy, Mapping)
+                    and raw_revision_legacy.get(key) not in (None, "", [])
+                } if isinstance(raw_revision_legacy, Mapping) else {}
                 revision_payload = {
                     key: revision_payload.get(key)
                     for key in (
@@ -577,17 +588,16 @@ class OperationsCommandCenterService:
                         "agent_id",
                         "version",
                         "display_name",
-                        "agent_team_id",
-                        "execution_profile_id",
                         "capability_ceiling",
                         "content_hash",
                         "created_at",
                     )
                     if revision_payload.get(key) is not None
                 }
+                if revision_legacy:
+                    revision_payload["legacy"] = revision_legacy
+                    projection["legacy"] = revision_legacy
                 projection["latest_revision"] = revision_payload
-                projection["agent_team_id"] = revision_payload.get("agent_team_id")
-                projection["execution_profile_id"] = revision_payload.get("execution_profile_id")
                 projection["capabilities"] = revision_payload.get("capability_ceiling") or []
             grant_stmt = select(AgentProjectGrant).where(
                 AgentProjectGrant.agent_id == agent.id,
@@ -941,9 +951,6 @@ class OperationsCommandCenterService:
             admin=_is_admin(actor),
             agent_id=requested_agent,
         )
-        for projection in agent_projections:
-            activity.extend(dict(call, kind="telephony_call") for call in
-                            projection["employee_observability"]["phone"]["recent_calls"])
         activity = sorted(activity, key=lambda row: str(row.get("created_at") or row.get("occurred_at") or row.get("started_at") or ""), reverse=True)[:safe_limit]
         return {
             "schema_version": "operations-command-center-v1",

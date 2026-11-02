@@ -256,8 +256,12 @@ export function useTaskPersistence({
         onNewTaskKept?.();
         onTaskUpdated(created);
         if (created.project_id) {
-          const tagList = await taskApi.listTags(created.project_id);
-          if (isCurrentLifecycle(lifecycleGeneration)) setTags(tagList);
+          try {
+            const tagList = await taskApi.listTags(created.project_id);
+            if (isCurrentLifecycle(lifecycleGeneration)) setTags(tagList);
+          } catch (err) {
+            console.error("タグ取得失敗:", err);
+          }
         }
         return created;
       })();

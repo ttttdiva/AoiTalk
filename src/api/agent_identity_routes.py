@@ -13,7 +13,7 @@ import inspect
 import logging
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -115,77 +115,157 @@ class AgentThumbnailResponse(BaseModel):
     artifact_id: UUID | None
 
 
-class AgentRuntimeProfileDiagnostic(BaseModel):
-    profile_id: str
-    reason: str
+class AgentIdentityListItem(BaseModel):
+    """Safe Agent identity row used by the Operations catalog."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    display_name: str
+    slug: str | None = None
+    state: str
+    character_id: str | None = None
+    thumbnail_artifact_id: str | None = None
+    create_hash: str
+    created_by: str | None = None
+    created_by_user_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    is_default_chat_agent: bool = False
 
 
-class AgentRuntimeExecutionProfile(BaseModel):
-    profile_id: str
-    name: str
-    is_default: bool
-    acting_subagent_id: str
+class AgentIdentityListResponse(BaseModel):
+    """Canonical ``GET /api/agents`` envelope."""
+
+    success: bool = True
+    agents: list[AgentIdentityListItem]
+    total: int
+
+
+class AgentToolCatalogItem(BaseModel):
+    id: str
+    label: str
+    group: str
+    description: str
+    requires_capabilities: list[str]
+
+
+class AgentToolCatalogResponse(BaseModel):
+    tools: list[AgentToolCatalogItem]
+
+
+class AgentLlmRoute(BaseModel):
+    kind: Literal["llm"]
     provider: str
-    model: str | None = None
+    model: str
     effort: str | None = None
-    ingress: Literal["api", "cli_session", "remote_agent"]
-    available: bool = Field(
-        description="Whether this explicit ingress is eligible for the supplied caller context; live provider delivery is separate"
-    )
-    availability_category: Literal[
-        "available",
-        "context_required",
-        "policy_denied",
-        "provider_unavailable",
-        "ingress_unavailable",
-    ]
-    availability_reason: str | None = None
-    provider_readiness: Literal["unknown", "ready", "unavailable", "not_applicable"]
-    provider_readiness_reason: str | None = None
 
 
-class AgentRuntimeProfileCatalogResponse(BaseModel):
+class AgentPoolRoute(BaseModel):
+    kind: Literal["pool"]
+    pool_id: str
+
+
+AgentRevisionRoute = Annotated[
+    Union[AgentLlmRoute, AgentPoolRoute],
+    Field(discriminator="kind"),
+]
+
+
+class AgentModelOverride(BaseModel):
+    routes: list[AgentRevisionRoute]
+    allow_paid_fallback: bool | None = None
+    fallback_on: list[Literal["model_unavailable", "provider_unavailable", "rate_limited", "connect_timeout"]] | None = None
+
+    @field_validator("fallback_on", mode="before")
+    @classmethod
+    def validate_fallback_on(cls, value: Any) -> Any:
+        from ..services.agent_route_fallback_policy import normalize_fallback_on
+
+        normalized = normalize_fallback_on(value)
+        return list(normalized) if normalized is not None else None
+
+
+class AgentDelegatePolicy(BaseModel):
+    agents: list[str] | Literal["any_owned"]
+    workers: list[str]
+
+
+class AgentEffectiveModelRoute(BaseModel):
+    route: AgentRevisionRoute
+    source: Literal["agent", "global", "inherit_chat", "legacy"]
+
+
+class AgentRevisionLegacy(BaseModel):
+    """Historical Team/Profile pins retained only for old revision display."""
+
+    agent_team_id: str | None = None
+    execution_profile_id: str | None = None
+    allowed_subagent_ids: list[str] | None = None
+
+
+class AgentRevisionProjection(BaseModel):
+    id: UUID
     agent_id: UUID
-    agent_revision_id: UUID
-    agent_team_id: str
-    acting_role: Literal["operator"]
-    default_execution_profile_id: str
-    context_source: Literal["agent_revision", "session_binding"]
-    session_id: UUID | None = None
-    binding_id: UUID | None = None
-    profiles: list[AgentRuntimeExecutionProfile]
-    diagnostics: list[AgentRuntimeProfileDiagnostic]
+    version: int
+    display_name: str
+    mission: str
+    responsibility_summary: str
+    operational_instructions: str
+    legacy: AgentRevisionLegacy | None = None
+    capability_ceiling: list[str]
+    wake_policy: dict[str, Any]
+    budget_policy: dict[str, Any]
+    concurrency_policy: dict[str, Any]
+    model_overrides: dict[str, AgentModelOverride] | None
+    tool_ids: list[str] | None
+    delegate_policy: AgentDelegatePolicy | None
+    effective_model_routes: dict[str, AgentEffectiveModelRoute]
+    content_hash: str
+    created_by: UUID | None
+    created_by_user_id: UUID | None
+    created_at: str | None
+    route_warnings: list[dict[str, str]] | None = None
+
+
+class AgentRevisionEnvelope(BaseModel):
+    success: bool
+    revision: AgentRevisionProjection
+
+
+class AgentRevisionListEnvelope(BaseModel):
+    success: bool
+    revisions: list[AgentRevisionProjection]
+    total: int
 
 
 class CreateRevisionRequest(_CommandModel):
-    display_name: str = Field(min_length=1, max_length=160)
-    mission: str = Field(default="", max_length=10_000)
-    responsibility_summary: str = Field(default="", max_length=10_000)
-    operational_instructions: str = Field(default="", max_length=30_000)
-    agent_team_id: str = Field(
-        min_length=1,
-        max_length=100,
-        validation_alias=AliasChoices("agent_team_id", "team_id"),
-    )
-    execution_profile_id: str = Field(
-        min_length=1,
-        max_length=100,
-        validation_alias=AliasChoices("execution_profile_id", "execution_profile"),
-    )
-    allowed_subagent_ids: list[str] = Field(default_factory=list, max_length=_MAX_LIST_ITEMS)
-    capability_ceiling: list[str] = Field(
-        default_factory=list,
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+    mission: str | None = Field(default=None, max_length=10_000)
+    responsibility_summary: str | None = Field(default=None, max_length=10_000)
+    operational_instructions: str | None = Field(default=None, max_length=30_000)
+    capability_ceiling: list[str] | None = Field(
+        default=None,
         max_length=_MAX_LIST_ITEMS,
         validation_alias=AliasChoices("capability_ceiling", "capability_ceiling_json"),
     )
     wake_policy: dict[str, Any] | None = None
     budget_policy: dict[str, Any] | None = None
     concurrency_policy: dict[str, Any] | None = None
+    model_overrides: dict[str, Any] | None = None
+    tool_ids: list[str] | None = Field(default=None, max_length=_MAX_LIST_ITEMS)
+    delegate_policy: dict[str, Any] | None = None
     idempotency_key: str | None = Field(default=None, max_length=255)
     version: int | None = Field(default=None, ge=1, le=2_000_000_000)
     content_hash: str | None = Field(default=None, min_length=64, max_length=64)
 
-    _policy_limit = field_validator("wake_policy", "budget_policy", "concurrency_policy")(_bounded_map)
+    _policy_limit = field_validator(
+        "wake_policy",
+        "budget_policy",
+        "concurrency_policy",
+        "model_overrides",
+        "delegate_policy",
+    )(_bounded_map)
 
 
 class OrganizationProfilePatchRequest(_CommandModel):
@@ -296,7 +376,33 @@ def _json_safe(value: Any, *, _depth: int = 0) -> Any:
     return None
 
 
+def _revision_api_projection(value: Any) -> Any:
+    """Move retired topology pins under ``legacy`` at the HTTP boundary.
+
+    The ORM and historical readers still expose the old columns so route
+    snapshots and old revisions can be inspected.  They are intentionally
+    removed from the current revision contract and cannot be sent back as
+    writable top-level fields.
+    """
+
+    if not isinstance(value, Mapping):
+        return value
+    result = dict(value)
+    legacy = result.pop("legacy", None)
+    legacy_payload = dict(legacy) if isinstance(legacy, Mapping) else {}
+    for key in ("agent_team_id", "team_id", "execution_profile_id", "allowed_subagent_ids"):
+        if key in result:
+            raw = result.pop(key)
+            canonical = "agent_team_id" if key == "team_id" else key
+            legacy_payload.setdefault(canonical, raw)
+    if legacy_payload:
+        result["legacy"] = legacy_payload
+    return result
+
+
 def _response(key: str, value: Any, *, status_code: int = 200) -> JSONResponse:
+    if key == "revision":
+        value = _revision_api_projection(value)
     return JSONResponse(
         content={"success": True, key: _json_safe(value)},
         status_code=status_code,
@@ -305,6 +411,8 @@ def _response(key: str, value: Any, *, status_code: int = 200) -> JSONResponse:
 
 def _list_response(key: str, values: Any) -> JSONResponse:
     items = values if isinstance(values, (list, tuple)) else []
+    if key == "revisions":
+        items = [_revision_api_projection(item) for item in items]
     safe = _json_safe(list(items))
     return JSONResponse(content={"success": True, key: safe, "total": len(items)})
 
@@ -453,15 +561,31 @@ def create_agent_identity_router(
         body["idempotency_key"] = key
         return _response("agent", await _invoke(identity.create_agent, **body, actor_user_id=actor_id), status_code=201)
 
-    @router.get("/agents")
+    @router.get("/agents", response_model=AgentIdentityListResponse)
     async def get_agents(
         request: Request,
         state: str | None = Query(default=None, max_length=16),
         limit: int = Query(default=100, ge=1, le=200),
         _: Any = Depends(require_auth_dependency),
-    ) -> JSONResponse:
-        await current_user(request)
-        return _list_response("agents", await _invoke(identity.list_agents, state=state, limit=limit))
+    ) -> AgentIdentityListResponse:
+        user = await current_user(request)
+        actor_id = _user_field(user, "id") or _user_field(user, "user_id")
+        role = str(_user_field(user, "role", "user") or "user").strip().casefold()
+        kwargs: dict[str, Any] = {"state": state, "limit": limit}
+        # Operations users see the Agents they own, including the lazily
+        # provisioned default Chat Agent.  Administrators retain the existing
+        # all-Agent catalog.  The service marks the default by its stable
+        # provisioning key, never by its mutable display name or slug.
+        if role != "admin":
+            if actor_id in (None, ""):
+                raise HTTPException(status_code=401, detail="Not authenticated")
+            kwargs["owner_user_id"] = actor_id
+        values = await _invoke(identity.list_agents, **kwargs)
+        items = values if isinstance(values, (list, tuple)) else []
+        return AgentIdentityListResponse(
+            agents=[AgentIdentityListItem.model_validate(item) for item in _json_safe(list(items))],
+            total=len(items),
+        )
 
     @router.get("/agents/catalog")
     async def get_employee_catalog(request: Request, _: Any = Depends(require_auth_dependency)) -> dict[str, Any]:
@@ -471,34 +595,16 @@ def create_agent_identity_router(
         actor_id = await admin_actor(request)
         return await _invoke(identity.employee_catalog, actor_user_id=actor_id)
 
-    @router.get(
-        "/agents/{agent_id}/execution-profiles",
-        response_model=AgentRuntimeProfileCatalogResponse,
-    )
-    async def get_agent_runtime_execution_profiles(
-        agent_id: UUID,
+    @router.get("/agent-tools/catalog", response_model=AgentToolCatalogResponse)
+    async def get_agent_tools_catalog(
         request: Request,
-        agent_revision_id: UUID | None = Query(default=None),
-        session_id: UUID | None = Query(default=None),
-        project_id: UUID | None = Query(default=None),
-        working_directory: str | None = Query(default=None, max_length=1024),
         _: Any = Depends(require_auth_dependency),
-    ) -> AgentRuntimeProfileCatalogResponse:
-        company_enabled()
-        if not Features.autonomous_agent_runtime():
-            raise HTTPException(status_code=404, detail="employee runtime is disabled")
-        actor_id, actor_role = await human_actor(request)
-        result = await _invoke(
-            identity.runtime_execution_profile_catalog,
-            agent_id=agent_id,
-            actor_user_id=actor_id,
-            actor_role=actor_role,
-            agent_revision_id=agent_revision_id,
-            session_id=session_id,
-            project_id=project_id,
-            working_directory=working_directory,
-        )
-        return AgentRuntimeProfileCatalogResponse.model_validate(result)
+    ) -> JSONResponse:
+        await current_user(request)
+        # This catalog is server-owned metadata and is available to all
+        # authenticated users; authority still comes from each AgentRevision
+        # ceiling and the existing runtime guards.
+        return JSONResponse(content=_json_safe(identity.agent_tools_catalog()))
 
     @router.get("/agents/{agent_id}")
     async def get_agent(agent_id: str, request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:
@@ -520,10 +626,14 @@ def create_agent_identity_router(
         request: Request,
         _: Any = Depends(require_auth_dependency),
     ) -> JSONResponse:
-        actor_id = await admin_actor(request)
+        actor_id, _actor_role = await human_actor(request)
         return _response("agent", await _invoke(identity.transition_agent, agent_id, payload.state, actor_user_id=actor_id, expected_state=payload.expected_state))
 
-    @router.post("/agents/{agent_id}/revisions", status_code=201)
+    @router.post(
+        "/agents/{agent_id}/revisions",
+        status_code=201,
+        response_model=AgentRevisionEnvelope,
+    )
     async def post_agent_revision(
         agent_id: str,
         payload: CreateRevisionRequest,
@@ -531,8 +641,11 @@ def create_agent_identity_router(
         header_idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255),
         _: Any = Depends(require_auth_dependency),
     ) -> JSONResponse:
-        actor_id = await admin_actor(request)
-        body = _dump(payload)
+        actor_id, _actor_role = await human_actor(request)
+        # Preserve omitted legacy/P2 fields so the service can inherit them
+        # from the latest immutable revision. Explicit values still pass
+        # through the same bounded service validation.
+        body = _dump(payload, exclude_unset=True)
         body_key = body.pop("idempotency_key", None)
         if body_key and header_idempotency_key and body_key != header_idempotency_key:
             raise HTTPException(status_code=409, detail="idempotency key header/body mismatch")
@@ -542,7 +655,10 @@ def create_agent_identity_router(
         body["idempotency_key"] = key
         return _response("revision", await _invoke(identity.create_revision, agent_id=agent_id, **body, actor_user_id=actor_id), status_code=201)
 
-    @router.get("/agents/{agent_id}/revisions")
+    @router.get(
+        "/agents/{agent_id}/revisions",
+        response_model=AgentRevisionListEnvelope,
+    )
     async def get_agent_revisions(
         agent_id: str,
         request: Request,
@@ -552,7 +668,10 @@ def create_agent_identity_router(
         await current_user(request)
         return _list_response("revisions", await _invoke(identity.list_revisions, agent_id, limit=limit))
 
-    @router.get("/agent-revisions/{revision_id}")
+    @router.get(
+        "/agent-revisions/{revision_id}",
+        response_model=AgentRevisionEnvelope,
+    )
     async def get_revision(revision_id: str, request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:
         await current_user(request)
         result = await _invoke(identity.get_revision, revision_id)
@@ -796,7 +915,17 @@ __all__ = [
     "OrganizationPatchRequest",
     "CreateAgentRequest",
     "AgentStateRequest",
+    "AgentIdentityListItem",
+    "AgentIdentityListResponse",
     "CreateRevisionRequest",
+    "AgentRevisionEnvelope",
+    "AgentRevisionListEnvelope",
+    "AgentRevisionProjection",
+    "AgentRevisionLegacy",
+    "AgentEffectiveModelRoute",
+    "AgentRevisionRoute",
+    "AgentToolCatalogItem",
+    "AgentToolCatalogResponse",
     "OrganizationProfilePatchRequest",
     "SpaceAssignmentRequest",
     "ProjectGrantRequest",

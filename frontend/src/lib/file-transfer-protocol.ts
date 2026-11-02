@@ -13,6 +13,18 @@ export const MAX_COMPAT_METADATA_BYTES = 256 * 1024;
 export const MAX_COMPAT_DOWNLOAD_CHUNK_BYTES = 64 * 1024;
 export const MAX_COMPAT_DOWNLOAD_FILE_BYTES = 64 * 1024 * 1024;
 
+/**
+ * Response checks that the compatibility route is allowed to enforce. ZIP
+ * archives carry their media type explicitly; App file, artifact, and run
+ * downloads retain the upstream media type while requiring an attachment and
+ * redirect-safe response.
+ */
+export type FileTransferDownloadResponseContract = {
+  expectedContentType?: "application/zip";
+  requireAttachment?: true;
+  rejectRedirects?: true;
+};
+
 export type FileTransferMeta =
   | {
       operation: "upload";
@@ -26,11 +38,7 @@ export type FileTransferMeta =
       url: string;
       paths?: string[];
       fallbackFilename?: string;
-      responseContract?: {
-        expectedContentType: "application/zip";
-        requireAttachment: true;
-        rejectRedirects: true;
-      };
+      responseContract?: FileTransferDownloadResponseContract;
     }
   | {
       operation: "save";

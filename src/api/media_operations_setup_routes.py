@@ -315,6 +315,32 @@ class PlatformAccountRevisionCreateRequest(
     )
 
 
+class YouTubeChannelSlotUpdateRequest(
+    _SetupCommandModel
+):
+    expected_version: int = Field(ge=1)
+    channel_id: str = Field(
+        min_length=24,
+        max_length=24,
+        pattern=r"^UC[A-Za-z0-9_-]{22}$",
+    )
+    activate: bool = False
+
+
+class PlatformAccountRefUpdateRequest(
+    _SetupCommandModel
+):
+    account_ref: str = Field(
+        min_length=1,
+        max_length=16,
+        pattern=r"^@?[A-Za-z0-9_]{1,15}$",
+    )
+    expected_version: int = Field(
+        ge=1,
+        strict=True,
+    )
+
+
 class PlatformAccountRevisionResponse(
     _SetupResponseModel
 ):
@@ -1074,6 +1100,69 @@ def create_media_operations_setup_router(
                 session,
                 actor,
                 account_id,
+            ),
+        )
+
+    @router.post(
+        "/platform-accounts/{account_id}/youtube-channel",
+        response_model=PlatformAccountDetailResponse,
+        operation_id="media_update_youtube_channel_slot",
+    )
+    async def update_youtube_channel_slot(
+        account_id: str,
+        payload: YouTubeChannelSlotUpdateRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=220),
+        ],
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        response.headers["Cache-Control"] = "no-store"
+        return await _with_session(
+            get_db_manager,
+            lambda session: _invoke(
+                setup.update_youtube_channel_slot,
+                session,
+                actor,
+                account_id,
+                expected_version=payload.expected_version,
+                channel_id=payload.channel_id,
+                activate=payload.activate,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+    @router.post(
+        "/platform-accounts/{account_id}/account-ref",
+        response_model=PlatformAccountDetailResponse,
+        operation_id="media_update_platform_account_ref",
+    )
+    async def update_platform_account_ref(
+        account_id: str,
+        payload: PlatformAccountRefUpdateRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=220),
+        ],
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        response.headers["Cache-Control"] = "no-store"
+        return await _with_session(
+            get_db_manager,
+            lambda session: _invoke(
+                setup.update_platform_account_ref,
+                session,
+                actor,
+                account_id,
+                account_ref=payload.account_ref,
+                expected_version=payload.expected_version,
+                idempotency_key=idempotency_key,
             ),
         )
 

@@ -4,7 +4,6 @@ import { useFocusEffect, useRouter } from "expo-router";
 import { List, Searchbar, Text } from "react-native-paper";
 import { ScreenHeader } from "../../../components/screen-header";
 import { OutboxDiagnostics } from "../../../components/outbox-diagnostics";
-import { OutboxResolutionHistory } from "../../../components/outbox-resolution-history";
 import { ScreenShell } from "../../../components/screen-primitives";
 import { useAuth } from "../../../contexts/AuthContext";
 import { filterMobileSettingsItems, MOBILE_SETTINGS_CATEGORIES } from "../../../lib/mobile-settings-registry";
@@ -32,8 +31,6 @@ export default function SettingsScreen() {
   const lastIdentityRef = useRef<typeof resolutionIdentity>(null);
   if (resolutionIdentity) lastIdentityRef.current = resolutionIdentity;
   const [query, setQuery] = useState("");
-  const [showResolutionHistory, setShowResolutionHistory] = useState(false);
-  const [historyRequest, setHistoryRequest] = useState(0);
   useFocusEffect(useCallback(() => {
     setIsFocused(true);
     setFocusGeneration((value) => value + 1);
@@ -43,8 +40,6 @@ export default function SettingsScreen() {
       // server snapshot or leave an adoption confirmation actionable.
       setFocusGeneration((value) => value + 1);
       setIsFocused(false);
-      setShowResolutionHistory(false);
-      setHistoryRequest(0);
     };
   }, []));
   const stableIdentity = resolutionIdentity ?? lastIdentityRef.current;
@@ -54,10 +49,6 @@ export default function SettingsScreen() {
     identityReady && ownAuthScope && (readOnlyDiagnostics
       || (currentAuthScope === ownAuthScope && outboxState !== "empty")),
   );
-  const showResolutionHistoryEntry = Boolean(
-    !readOnlyDiagnostics && isFocused && identityReady && ownAuthScope,
-  );
-  const shouldMountHistory = Boolean(stableIdentity && ownAuthScope);
 
   const items = useMemo(
     () => filterMobileSettingsItems(query, {
@@ -119,37 +110,6 @@ export default function SettingsScreen() {
         </View>
       ) : null}
 
-      {shouldMountHistory && !readOnlyDiagnostics ? (
-        <View
-          style={showResolutionHistoryEntry ? styles.resolutionHistory : styles.historyHidden}
-          testID="sync-outbox-resolution-history"
-        >
-          <Pressable
-            accessibilityRole="button"
-            accessibilityState={{ expanded: showResolutionHistory }}
-            style={styles.historyButton}
-            onPress={() => {
-              setShowResolutionHistory((value) => {
-                if (!value) setHistoryRequest((request) => request + 1);
-                return !value;
-              });
-            }}
-          >
-            <Text style={styles.historyButtonText}>保存した原値と下書きを確認</Text>
-          </Pressable>
-          {ownAuthScope ? (
-            <View style={showResolutionHistory ? styles.historyPanelVisible : styles.historyPanelHidden}>
-              <OutboxResolutionHistory
-                authScope={ownAuthScope}
-                loadRequest={historyRequest}
-                active={showResolutionHistoryEntry && showResolutionHistory}
-                namespaceKey={stableIdentity ? outboxResolutionNamespaceKey(stableIdentity) : undefined}
-              />
-            </View>
-          ) : null}
-        </View>
-      ) : null}
-
       {items.length === 0 ? (
         <View style={styles.empty}>
           <Text style={styles.emptyTitle}>該当する設定はありません</Text>
@@ -169,12 +129,6 @@ const styles = StyleSheet.create({
   section: { marginTop: 18 },
   sectionTitle: { color: "#8f8aa8", fontSize: 12, fontWeight: "600", marginHorizontal: 22, marginBottom: 5 },
   outboxDiagnostics: { marginHorizontal: 12, marginTop: 18, padding: 16, borderRadius: 12, backgroundColor: "#1b1a2b" },
-  resolutionHistory: { marginHorizontal: 12, marginTop: 12, padding: 16, borderRadius: 12, backgroundColor: "#1b1a2b" },
-  historyHidden: { display: "none" },
-  historyButton: { minHeight: 44, justifyContent: "center", borderWidth: 1, borderColor: "#777294", borderRadius: 8, paddingHorizontal: 12 },
-  historyButtonText: { color: "#f0efff", fontSize: 14, fontWeight: "500" },
-  historyPanelVisible: { display: "flex" },
-  historyPanelHidden: { display: "none" },
   rows: { marginHorizontal: 12, overflow: "hidden", borderRadius: 12 },
   row: { minHeight: 52, paddingHorizontal: 4, paddingVertical: 1, backgroundColor: "transparent" },
   rowBorder: { borderBottomWidth: 1, borderBottomColor: "#26243a" },

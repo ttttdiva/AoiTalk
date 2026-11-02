@@ -22,6 +22,8 @@ __all__ = [
     "allocate_free_tier",
     "free_tier_usage",
     "free_tier_limits_for",
+    "free_tier_limit_for_group",
+    "free_tier_max_limit_for_group",
 ]
 
 DEFAULT_BILLING_SCOPE_ID = "default"
@@ -73,6 +75,16 @@ class FreeTierAllocation:
 def free_tier_limits_for(tier: Optional[str]) -> Dict[str, int]:
     """tier 名から上限表を引く。未知の tier は tier_1_2 扱い。"""
     return FREE_TIER_LIMITS.get(tier or "tier_1_2", FREE_TIER_LIMITS["tier_1_2"])
+
+
+def free_tier_limit_for_group(group: str, tier: Optional[str]) -> int:
+    """Return one configured group limit, failing closed to the smaller tier."""
+    return int(free_tier_limits_for(tier).get(group, 0))
+
+
+def free_tier_max_limit_for_group(group: str) -> int:
+    """Return the largest declared local tier limit for display/validation only."""
+    return max((int(values.get(group, 0)) for values in FREE_TIER_LIMITS.values()), default=0)
 
 
 def _is_eligible(record: AllocatableRecord) -> bool:

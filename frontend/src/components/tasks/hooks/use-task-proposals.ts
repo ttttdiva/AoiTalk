@@ -55,18 +55,87 @@ type LoadOptions = {
 
 function normalizedIds(taskIds: readonly string[] | undefined): string[] {
   return [
-    ...new Set(
-      (taskIds ?? []).map((taskId) => taskId.trim()).filter(Boolean),
-    ),
-  ];
+    ...new Set((taskIds ?? []).map((taskId) => taskId.trim()).filter(Boolean)),
+  ].sort();
 }
+
+type ScopedTaskProposalViewState = TaskProposalViewState & {
+  scopeKey: string;
+};
+
+type ResolvedTaskProposalSnapshot = {
+  scopeKey: string;
+  taskIds: string[];
+  state: TaskProposalViewState;
+};
 
 function proposalKey(proposal: Pick<TaskProposal, "id" | "revision">): string {
   return `${proposal.id}:${proposal.revision}`;
 }
 
+function scopesOverlap(
+  taskIds: readonly string[],
+  resolvedIds: readonly string[],
+) {
+  if (taskIds.length === 0 || resolvedIds.length === 0) return false;
+  const resolvedIdSet = new Set(resolvedIds);
+  return taskIds.some((taskId) => resolvedIdSet.has(taskId));
+}
+
+function viewStateForScope(
+  state: ScopedTaskProposalViewState,
+  scopeKey: string,
+  taskIds: readonly string[],
+  fallbackStatus: TaskProposalCollectionStatus,
+  snapshot: ResolvedTaskProposalSnapshot | null,
+): ScopedTaskProposalViewState {
+  if (state.scopeKey === scopeKey) return state;
+  if (!snapshot || !scopesOverlap(taskIds, snapshot.taskIds)) {
+    return {
+      scopeKey,
+      status: fallbackStatus,
+      proposals: [],
+      error: null,
+      uncertainNotice: null,
+    };
+  }
+
+  const allowedTaskIds = new Set(taskIds);
+  const proposals = snapshot.state.proposals.filter((proposal) =>
+    allowedTaskIds.has(proposal.task_id),
+  );
+  const status =
+    snapshot.state.status === "ready" || snapshot.state.status === "empty"
+      ? proposals.length > 0
+        ? "ready"
+        : "empty"
+      : snapshot.state.status;
+
+  return {
+    ...snapshot.state,
+    status,
+    proposals,
+    scopeKey,
+  };
+}
+
+function withoutProposal<T extends TaskProposalViewState>(
+  state: T,
+  key: string,
+): T {
+  const proposals = state.proposals.filter((item) => proposalKey(item) !== key);
+  return {
+    ...state,
+    status: proposals.length > 0 ? "ready" : "empty",
+    proposals,
+    uncertainNotice: null,
+  } as T;
+}
+
 function messageForError(error: unknown): string {
-  return error instanceof Error ? error.message : "承認待ちの提案を取得できませんでした";
+  return error instanceof Error
+    ? error.message
+    : "承認待ちの提案を取得できませんでした";
 }
 
 function proposalErrorCode(error: unknown): string | null {
@@ -94,7 +163,10 @@ function decisionFailureMessage(error: unknown): {
   }
   if (error instanceof TaskProposalsApiError) {
     if (error.status === 403) {
-      return { uncertain: false, message: "この提案を決定する権限がありません。" };
+      return {
+        uncertain: false,
+        message: "この提案を決定する権限がありません。",
+      };
     }
     if (error.status === 404 || error.status === 409) {
       return {
@@ -120,8 +192,10 @@ export function useTaskProposals({
   enabled = true,
   loading = false,
 }: UseTaskProposalsOptions = {}) {
-  const ids = useMemo(() => normalizedIds(taskIds), [taskIds]);
-  const [state, setState] = useState<TaskProposalViewState>({
+  const scopeKey = JSON.stringify(normalizedIds(taskIds));
+  const ids = useMemo(() => JSON.parse(scopeKey) as string[], [scopeKey]);
+  const [state, setState] = useState<ScopedTaskProposalViewState>({
+    scopeKey,
     status: enabled && (loading || ids.length > 0) ? "loading" : "empty",
     proposals: [],
     error: null,
@@ -130,14 +204,30 @@ export function useTaskProposals({
   const [decisionStates, setDecisionStates] = useState<
     Record<string, TaskProposalDecisionState>
   >({});
+  const [resolvedSnapshot, setResolvedSnapshot] =
+    useState<ResolvedTaskProposalSnapshot | null>(null);
   const generationRef = useRef(0);
   const decisionLocksRef = useRef(new Set<string>());
+  const loadingRef = useRef(loading);
+  const resolvedSnapshotRef = useRef<ResolvedTaskProposalSnapshot | null>(null);
+  const effectScopeKeyRef = useRef(scopeKey);
+  const effectEnabledRef = useRef(enabled);
+
+  const updateResolvedSnapshot = useCallback(
+    (snapshot: ResolvedTaskProposalSnapshot | null) => {
+      resolvedSnapshotRef.current = snapshot;
+      setResolvedSnapshot(snapshot);
+    },
+    [],
+  );
 
   const load = useCallback(
     async ({ silent = false }: LoadOptions = {}) => {
       const requestGeneration = ++generationRef.current;
       if (!enabled) {
+        updateResolvedSnapshot(null);
         setState((current) => ({
+          scopeKey,
           status: "empty",
           proposals: [],
           error: null,
@@ -145,70 +235,137 @@ export function useTaskProposals({
         }));
         return;
       }
-      if (loading) {
-        setState((current) => ({
-          ...current,
-          status: "loading",
-          error: null,
-          uncertainNotice: silent ? current.uncertainNotice : null,
-        }));
+      if (loadingRef.current) {
+        const fallbackStatus =
+          enabled && (loadingRef.current || ids.length > 0)
+            ? "loading"
+            : "empty";
+        setState((current) =>
+          viewStateForScope(
+            current,
+            scopeKey,
+            ids,
+            fallbackStatus,
+            resolvedSnapshotRef.current,
+          ),
+        );
         return;
       }
       if (ids.length === 0) {
-        setState((current) => ({
+        const uncertainNotice = silent
+          ? (resolvedSnapshotRef.current?.state.uncertainNotice ?? null)
+          : null;
+        const nextState: ScopedTaskProposalViewState = {
+          scopeKey,
           status: "empty",
           proposals: [],
           error: null,
-          uncertainNotice: silent ? current.uncertainNotice : null,
-        }));
+          uncertainNotice,
+        };
+        updateResolvedSnapshot({
+          scopeKey,
+          taskIds: [...ids],
+          state: nextState,
+        });
+        setState(nextState);
         return;
       }
       if (!silent) {
-        setState((current) => ({
-          ...current,
-          status: "loading",
-          error: null,
-          uncertainNotice: null,
-        }));
+        const fallbackStatus =
+          enabled && (loadingRef.current || ids.length > 0)
+            ? "loading"
+            : "empty";
+        setState((current) => {
+          const currentScope = viewStateForScope(
+            current,
+            scopeKey,
+            ids,
+            fallbackStatus,
+            resolvedSnapshotRef.current,
+          );
+          return {
+            ...currentScope,
+            status: "loading",
+            error: null,
+            uncertainNotice: null,
+          };
+        });
       }
       try {
         const proposals = await taskProposalsApi.list(ids);
         if (generationRef.current !== requestGeneration) return;
-        setState((current) => ({
+        const nextState: ScopedTaskProposalViewState = {
+          scopeKey,
           status: proposals.length > 0 ? "ready" : "empty",
           proposals,
           error: null,
-          uncertainNotice: silent ? current.uncertainNotice : null,
-        }));
+          uncertainNotice: silent
+            ? (resolvedSnapshotRef.current?.state.uncertainNotice ?? null)
+            : null,
+        };
+        updateResolvedSnapshot({
+          scopeKey,
+          taskIds: [...ids],
+          state: nextState,
+        });
+        setState(nextState);
       } catch (error) {
         if (generationRef.current !== requestGeneration) return;
         const unavailable =
           error instanceof TaskProposalsApiError &&
           [404, 405, 501].includes(error.status);
         const uncertain = isProposalUncertainError(error);
-        setState((current) => ({
-          status: uncertain ? "uncertain" : unavailable ? "unavailable" : "error",
+        const nextState: ScopedTaskProposalViewState = {
+          scopeKey,
+          status: uncertain
+            ? "uncertain"
+            : unavailable
+              ? "unavailable"
+              : "error",
           proposals: [],
-          error: uncertain ? TASK_PROPOSAL_UNCERTAIN_MESSAGE : messageForError(error),
-          uncertainNotice: silent ? current.uncertainNotice : null,
-        }));
+          error: uncertain
+            ? TASK_PROPOSAL_UNCERTAIN_MESSAGE
+            : messageForError(error),
+          uncertainNotice: silent
+            ? (resolvedSnapshotRef.current?.state.uncertainNotice ?? null)
+            : null,
+        };
+        updateResolvedSnapshot({
+          scopeKey,
+          taskIds: [...ids],
+          state: nextState,
+        });
+        setState(nextState);
       }
     },
-    [enabled, ids, loading],
+    [enabled, ids, scopeKey, updateResolvedSnapshot],
   );
 
   useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
+    const scopeChanged = effectScopeKeyRef.current !== scopeKey;
+    const becameEnabled = !effectEnabledRef.current && enabled;
+    effectScopeKeyRef.current = scopeKey;
+    effectEnabledRef.current = enabled;
+    const resolvedSnapshot = resolvedSnapshotRef.current;
+    const silent =
+      !becameEnabled &&
+      ((!scopeChanged && resolvedSnapshot?.scopeKey === scopeKey) ||
+        (enabled && scopesOverlap(ids, resolvedSnapshot?.taskIds ?? [])));
     let cancelled = false;
     void Promise.resolve().then(() => {
-      if (!cancelled) void load();
+      if (!cancelled) void load({ silent });
     });
     return () => {
       cancelled = true;
     };
-  }, [load]);
+  }, [enabled, ids, load, loading, scopeKey]);
 
   useEffect(() => {
-    if (!enabled || loading || typeof window === "undefined") return;
+    if (!enabled || typeof window === "undefined") return;
     const refreshFromDecision = () => {
       void load({ silent: true });
     };
@@ -218,7 +375,7 @@ export function useTaskProposals({
         TASK_PROPOSALS_REFRESH_EVENT,
         refreshFromDecision,
       );
-  }, [enabled, load, loading]);
+  }, [enabled, load]);
 
   const refresh = useCallback(() => load(), [load]);
 
@@ -262,17 +419,14 @@ export function useTaskProposals({
           ...current,
           [key]: action === "approve" ? "accepted" : "rejected",
         }));
-        setState((current) => {
-          const proposals = current.proposals.filter(
-            (item) => proposalKey(item) !== key,
-          );
-          return {
-            ...current,
-            status: proposals.length > 0 ? "ready" : "empty",
-            proposals,
-            uncertainNotice: null,
-          };
-        });
+        setState((current) => withoutProposal(current, key));
+        const currentResolvedSnapshot = resolvedSnapshotRef.current;
+        if (currentResolvedSnapshot) {
+          updateResolvedSnapshot({
+            ...currentResolvedSnapshot,
+            state: withoutProposal(currentResolvedSnapshot.state, key),
+          });
+        }
         if (typeof window !== "undefined") {
           window.dispatchEvent(new Event(TASK_PROPOSALS_REFRESH_EVENT));
         }
@@ -291,6 +445,16 @@ export function useTaskProposals({
             ...current,
             uncertainNotice: failure.message,
           }));
+          const currentResolvedSnapshot = resolvedSnapshotRef.current;
+          if (currentResolvedSnapshot) {
+            updateResolvedSnapshot({
+              ...currentResolvedSnapshot,
+              state: {
+                ...currentResolvedSnapshot.state,
+                uncertainNotice: failure.message,
+              },
+            });
+          }
         }
         if (typeof window !== "undefined") {
           window.dispatchEvent(new Event(TASK_PROPOSALS_REFRESH_EVENT));
@@ -303,21 +467,28 @@ export function useTaskProposals({
         };
       }
     },
-    [decisionStates],
+    [decisionStates, updateResolvedSnapshot],
   );
 
-  const exposedState: TaskProposalViewState =
-    enabled && loading
-      ? {
-          status: "loading",
-          proposals: [],
-          error: null,
-          uncertainNotice: state.uncertainNotice,
-        }
-      : state;
+  const scopedState = viewStateForScope(
+    state,
+    scopeKey,
+    ids,
+    enabled && (loading || ids.length > 0) ? "loading" : "empty",
+    resolvedSnapshot,
+  );
+  const exposedState: TaskProposalViewState = enabled
+    ? scopedState
+    : {
+        status: "empty",
+        proposals: [],
+        error: null,
+        uncertainNotice: scopedState.uncertainNotice,
+      };
 
   return {
     ...exposedState,
+    scopeKey: scopedState.scopeKey,
     refresh,
     decide,
     getDecisionState,

@@ -585,6 +585,11 @@ class MediaIndexWorker:
         # claim or queue write happens; accepted in-flight work is untouched.
         if not runtime_embedding_enabled():
             return False
+        from ..utils import qdrant_readiness
+
+        # A job claimed before Qdrant is ready would fail and spend an attempt.
+        if qdrant_readiness.starting():
+            return False
         admission = get_gpu_admission()
         ticket = admission.admit_job()
         if ticket is None:

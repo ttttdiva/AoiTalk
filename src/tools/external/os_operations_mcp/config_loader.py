@@ -58,7 +58,6 @@ def resolve_path_for_user(path: str, user_id: Optional[str] = None) -> str:
 
     if user_id:
         user_workspace = user_files_root / "_users" / f"user_{user_id}"
-        user_workspace.mkdir(parents=True, exist_ok=True)
         return str(user_workspace / path)
     else:
         return str(user_files_root / path)

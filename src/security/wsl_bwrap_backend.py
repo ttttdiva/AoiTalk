@@ -133,19 +133,25 @@ def _guest_bootstrap_command(
 
 
 def _verification_temp_dir() -> Path:
-    """Return the repository-owned scratch root for private verification data."""
+    """Return the OS temp root for private verification scratch.
 
-    root = Path(__file__).resolve().parents[2] / ".local" / "wsl-bwrap-verification"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    The caller creates a fresh directory directly under this root. Reject a
+    temp root inside the repository before creating any verification data.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if temp_root == repo_root or repo_root in temp_root.parents:
+        raise WslBwrapError("verification temp is inside the repository")
+    return temp_root
 
 
 def _mkdtemp_for_verification(prefix: str) -> Path:
-    """Create private verification storage under the repository scratch root.
+    """Create private verification storage under the OS temp scratch root.
 
     Test fixtures replace ``tempfile.mkdtemp`` to keep their own artifacts in
     pytest's temporary tree.  Preserve that explicit test injection while the
-    real runtime always uses the repository-owned ``.local`` scratch area.
+    real runtime always uses the OS temp area outside the repository.
     """
 
     maker = tempfile.mkdtemp

@@ -35,6 +35,7 @@ _FALLBACK_SECRET_ENV_NAMES: tuple[str, ...] = (
     "AOITALK_BOOTSTRAP_ADMIN_PASSWORD",
     "AOITALK_FIELD_CRYPTO_KEY_B64",
     "OPENAI_API_KEY",
+    "OPENAI_ADMIN_KEY",
     "OPENROUTER_API_KEY",
     "MOONSHOT_API_KEY",
     "GEMINI_API_KEY",
@@ -53,7 +54,6 @@ _FALLBACK_SECRET_ENV_NAMES: tuple[str, ...] = (
     "SGLANG_API_KEY",
     "HF_TOKEN",
     "HUGGING_FACE_HUB_TOKEN",
-    "OPENAI_FREE_TEAM_API_KEY",
     "GEMINI_FREE_API_KEY",
     "OPENROUTER_FREE_TEAM_API_KEY",
     "GEMINI_PROMO_API_KEY",
@@ -135,6 +135,40 @@ PROVIDER_SECRET_NAMES: Mapping[str, tuple[str, ...]] = {
     if isinstance(provider, str) and isinstance(details, dict)
 }
 
+_OPENAI_ADMIN_KEY: str | None = None
+
+
+def _capture_openai_admin_key(environ: MutableMapping[str, str] | None = None) -> bool:
+    """Move the Usage API credential out of the inherited process environment.
+
+    The captured value is private to this process and is intentionally absent
+    from all subprocess environments. Only the private Usage API accessor can
+    provide it to the fixed organization Usage API client; it must never be
+    logged or serialized.
+    """
+    global _OPENAI_ADMIN_KEY
+    target = os.environ if environ is None else environ
+    if "OPENAI_ADMIN_KEY" not in target:
+        return False
+    value = str(target.pop("OPENAI_ADMIN_KEY") or "")
+    if target is os.environ:
+        _OPENAI_ADMIN_KEY = value
+    return bool(value)
+
+
+def openai_admin_key_configured() -> bool:
+    """Return presence only; the key itself never leaves this module."""
+    if "OPENAI_ADMIN_KEY" in os.environ:
+        _capture_openai_admin_key()
+    return bool(_OPENAI_ADMIN_KEY)
+
+
+def _openai_admin_key_for_usage_api() -> str:
+    """Private credential accessor for the fixed organization Usage API client."""
+    if "OPENAI_ADMIN_KEY" in os.environ:
+        _capture_openai_admin_key()
+    return _OPENAI_ADMIN_KEY or ""
+
 
 def _strict_permissions(target: Mapping[str, str]) -> bool:
     """Enable host secret ownership checks for Enterprise/direct root launchers."""
@@ -204,6 +238,8 @@ def load_secret_environment(
         target[name] = value
         # Do not let a child process retry or discover the root-only path.
         target.pop(file_name, None)
+    if target is os.environ:
+        _capture_openai_admin_key()
 
 
 __all__ = [
@@ -214,4 +250,5 @@ __all__ = [
     "SECRET_SCHEMA_PATH",
     "SECRET_SPECS",
     "load_secret_environment",
+    "openai_admin_key_configured",
 ]

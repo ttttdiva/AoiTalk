@@ -10,8 +10,12 @@ import type { FilerTab } from "@/contexts/explorer-context";
 export type FilesSidebarSnapshot = {
   currentPath: string;
   browseData: ExplorerListResponse | null;
+  /** Scope that produced the currently retained directory listing. */
+  browseDataScopeKey: string | null;
   /** True while the canonical ExplorerProvider is fetching a directory. */
   loading: boolean;
+  /** Most recent directory-list request error, if any. */
+  error: string | null;
   filerTab: FilerTab;
   focusedItemPath: string | null;
   /** The file opened by the editor, when the canvas focus is in CodeMirror. */
@@ -53,7 +57,9 @@ const noop = () => undefined;
 const EMPTY_SNAPSHOT: FilesSidebarSnapshot = {
   currentPath: "",
   browseData: null,
+  browseDataScopeKey: null,
   loading: true,
+  error: null,
   filerTab: "workspace",
   focusedItemPath: null,
   editingFilePath: null,
@@ -75,6 +81,10 @@ const EMPTY_SNAPSHOT: FilesSidebarSnapshot = {
   closeEditor: noop,
   refreshBookmarks: async () => undefined,
 };
+
+export function filesSidebarBrowseScopeKey(scopeKey: string, scopeRoot: string): string {
+  return `${scopeKey}|${scopeRoot}`;
+}
 
 let snapshot = EMPTY_SNAPSHOT;
 const listeners = new Set<() => void>();
@@ -119,7 +129,9 @@ export function publishFilesSidebarState(
   if (
     snapshot.currentPath === next.currentPath &&
     snapshot.browseData === next.browseData &&
+    snapshot.browseDataScopeKey === next.browseDataScopeKey &&
     snapshot.loading === next.loading &&
+    snapshot.error === next.error &&
     snapshot.filerTab === next.filerTab &&
     snapshot.focusedItemPath === next.focusedItemPath &&
     snapshot.editingFilePath === next.editingFilePath &&

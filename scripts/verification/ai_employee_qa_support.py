@@ -64,15 +64,6 @@ def fixture_dependencies(manifest: dict, *, evidence_name="provider-evidence.jso
     policies = {
         "procurement": IntegrationCredentialVerifierPolicy(capabilities=("procurement.place_order",), verify=verify),
     }
-    if manifest.get("phone_fixture"):
-        from scripts.verification.ai_employee_qa_phone import phone_test_module
-        phone_fixture = phone_test_module()
-
-        async def verify_phone(credential):
-            payload = credential.reveal()
-            return hmac.compare_digest(payload.get("api_key", ""), phone_fixture.API_KEY) and hmac.compare_digest(payload.get("webhook_secret", ""), phone_fixture.SECRET)
-
-        policies["openai_realtime_sip"] = IntegrationCredentialVerifierPolicy(capabilities=("telephony.control",), verify=verify_phone)
     verifier = IntegrationCredentialProviderVerifier(provider_policies=policies)
     vault = IntegrationCredentialVaultService(key_provider=Keys(), verifier=verifier)
     manager = get_database_manager()

@@ -346,7 +346,9 @@ async def migrate_jsonl_to_database() -> int:
 
 def _get_feedback_file_path() -> Path:
     """Get the path to the feedback logs file."""
-    logs_dir = Path(__file__).parent.parent.parent / "logs"
+    from src.runtime_release_contract import persistent_path
+
+    logs_dir = persistent_path("logs", Path(__file__).parent.parent.parent)
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir / "feedback_logs.jsonl"
 

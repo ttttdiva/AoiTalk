@@ -186,7 +186,7 @@ class CreativeRecipeRevisionFields(_GenerationCommandModel):
     )
     width: int | None = Field(default=None, ge=1, le=16_384)
     height: int | None = Field(default=None, ge=1, le=16_384)
-    duration_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    duration_seconds: float | None = Field(default=None, ge=1, le=86_400)
     frame_count: int | None = Field(default=None, ge=1, le=100_000)
     storyboard: list[str] = Field(default_factory=list, max_length=100)
     candidate_count: int = Field(default=1, ge=1, le=20)
@@ -235,7 +235,7 @@ class CreativeRecipeRevisionResponse(_GenerationResponseModel):
     aspect_ratio: str | None
     width: int | None
     height: int | None
-    duration_seconds: int | None
+    duration_seconds: float | None
     frame_count: int | None
     storyboard: list[str] = Field(max_length=100)
     candidate_count: int = Field(ge=1, le=20)
@@ -330,7 +330,7 @@ class GenerationRequestSpecRequest(_GenerationCommandModel):
         max_length=16,
         pattern=r"^[1-9][0-9]{0,2}:[1-9][0-9]{0,2}$",
     )
-    duration_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    duration_seconds: float | None = Field(default=None, ge=1, le=86_400)
     frame_count: int | None = Field(default=None, ge=1, le=100_000)
     storyboard: list[str] = Field(default_factory=list, max_length=100)
 
@@ -400,6 +400,18 @@ class GenerationPlanCreateRequest(_GenerationCommandModel):
     request_spec: GenerationRequestSpecRequest
 
 
+class VideoPlanRecoveryResponse(_GenerationResponseModel):
+    status: Literal["found", "not_found_or_scope_mismatch", "unavailable", "failed", "uncertain"]
+    reason_code: str | None = Field(default=None, max_length=128)
+    video_plan_id: str | None = Field(default=None, pattern=r"^vpl_[A-Za-z0-9_-]{8,160}$")
+    plan_checksum: Sha256 | None = None
+    plan_status: Literal["draft", "previewed", "validated", "applied", "queued", "failed"] | None = None
+
+
+class ReceiptRecoveryResponse(_GenerationResponseModel):
+    video_plan: VideoPlanRecoveryResponse
+
+
 class GenerationPlanResponse(_GenerationResponseModel):
     id: str
     owner_user_id: str
@@ -415,6 +427,7 @@ class GenerationPlanResponse(_GenerationResponseModel):
     # Derived solely from the opaque selection ID/request fields.  The client
     # cannot choose a conflicting kind or smuggle provider metadata here.
     generation_kind: Literal["image", "video"]
+    receipt_recovery: ReceiptRecoveryResponse | None = None
     plan_hash: Sha256
     status: Literal["draft", "submitted", "unavailable", "uncertain", "succeeded", "failed"]
     created_by: str | None = None
@@ -911,8 +924,18 @@ def _project_submit(value: Any) -> dict[str, Any]:
         "external_idempotency_key",
         "",
     )
+    plan = _project_plan(_field(value, "plan", {}))
+    recovery = _field(value, "receipt_recovery", {})
+    video_plan = _field(recovery, "video_plan")
+    if isinstance(video_plan, Mapping):
+        # Only the closed, bounded read projection crosses the HTTP boundary.
+        plan["receipt_recovery"] = {"video_plan": {
+            key: video_plan[key] for key in (
+                "status", "reason_code", "video_plan_id", "plan_checksum", "plan_status"
+            ) if key in video_plan
+        }}
     return {
-        "plan": _project_plan(_field(value, "plan", {})),
+        "plan": plan,
         "intent": _project_intent(intent),
         "run": _project_run(run) if run is not None else None,
         "outputs": [_project_output(item) for item in outputs[:20]],

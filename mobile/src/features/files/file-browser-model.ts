@@ -175,7 +175,10 @@ export function resolveFilesParentPath(options: {
     const current = options.currentPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
     // `__drives__` is the synthetic admin listing and has no parent.  Do not
     // derive an empty path for it from the lexical string below.
-    if (!current || current === "__drives__") return null;
+    if (current === "__drives__") return null;
+    // The server workspace root is an empty path, but an administrator may
+    // still have an API-authorized physical parent above it.
+    if (!current) return options.canGoUp ? options.parentPath : null;
     // Some namespace-root listings omit parent metadata. An administrator can
     // still return through _projects/_users to the administrator root. This
     // mirrors the Web explorer's direct use of the server parent path while

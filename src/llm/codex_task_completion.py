@@ -39,8 +39,31 @@ class CodexTaskProtocolError(RuntimeError):
         super().__init__(message)
 
 
+# Reviewed discriminants from the supported native ThreadItem protocol.  Only
+# this fixed set may appear in durable diagnostics; item contents never do.
+_NATIVE_ITEM_TYPES = frozenset({
+    "userMessage", "hookPrompt", "agentMessage", "functionCallOutput", "plan",
+    "reasoning", "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
+    "collabAgentToolCall", "subAgentActivity", "webSearch", "imageView", "sleep",
+    "imageGeneration", "enteredReviewMode", "exitedReviewMode", "contextCompaction",
+})
+_ALLOWED_NATIVE_ITEM_TYPES = frozenset({
+    "userMessage", "agentMessage", "reasoning", "dynamicToolCall", "plan", "contextCompaction",
+})
+
+
+def _check_native_item(item: Any) -> str:
+    kind = item.get("type") if isinstance(item, dict) else None
+    if not isinstance(kind, str) or kind not in _ALLOWED_NATIVE_ITEM_TYPES:
+        safe_kind = kind if isinstance(kind, str) and kind in _NATIVE_ITEM_TYPES else "unknown"
+        raise CodexTaskProtocolError(
+            "codex_task_unexpected_native_item", detail={"native_item_type": safe_kind},
+        )
+    return kind
+
+
 MAX_MESSAGE_CHARS = 1024 * 1024
-SUPPORTED_CODEX_VERSIONS = ("0.159.2", "0.160.0", "0.162.0")
+SUPPORTED_CODEX_VERSIONS = ("0.159.2", "0.160.0", "0.162.0", "0.163.0")
 _CODEX_VERSION_RE = re.compile(
     r"/(?:" + "|".join(re.escape(version) for version in SUPPORTED_CODEX_VERSIONS) + r")(?:\s|$)"
 )
@@ -164,7 +187,7 @@ def is_supported_codex_user_agent(value: Any) -> bool:
 
 
 def isolated_thread_config(effective_config: dict[str, Any]) -> dict[str, Any]:
-    """Use the reviewed 0.159.2/0.160.0/0.162.0 isolation contract."""
+    """Use the reviewed 0.159.2/0.160.0/0.162.0/0.163.0 isolation contract."""
     config = {"features." + key: False for key in _DISABLED_FEATURES}
     config.update({
         "cloud.skills.enabled": False,
@@ -954,9 +977,7 @@ class CodexTaskCompletionClient:
                 raise CodexTaskProtocolError("codex_task_mismatched_item_owner")
             self._event_turn_id = event_turn
             item = params.get("item") or {}
-            kind = item.get("type")
-            if kind not in {"userMessage", "agentMessage", "reasoning", "dynamicToolCall"}:
-                raise CodexTaskProtocolError("codex_task_unexpected_native_item")
+            kind = _check_native_item(item)
             if kind == "agentMessage" and method == "item/completed" and item.get("phase") in (None, "final_answer"):
                 self._final_text = str(item.get("text") or "")
         elif method == "turn/completed":
@@ -972,9 +993,8 @@ class CodexTaskCompletionClient:
             if self._awaiting or self._queued_calls:
                 raise CodexTaskProtocolError("codex_task_completed_with_pending_tools")
             for item in turn.get("items") or []:
-                if not isinstance(item, dict) or item.get("type") not in {"userMessage", "agentMessage", "reasoning", "dynamicToolCall"}:
-                    raise CodexTaskProtocolError("codex_task_unexpected_native_item")
-                if item.get("type") == "agentMessage" and item.get("phase") in (None, "final_answer"):
+                kind = _check_native_item(item)
+                if kind == "agentMessage" and item.get("phase") in (None, "final_answer"):
                     self._final_text = str(item.get("text") or "")
             if not self._final_text:
                 raise CodexTaskProtocolError("codex_task_empty_final_answer")

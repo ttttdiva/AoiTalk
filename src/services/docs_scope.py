@@ -12,8 +12,8 @@ from enum import Enum
 from typing import Any, Iterable
 from uuid import UUID
 
-from sqlalchemy import select
-from sqlalchemy.orm import load_only
+from sqlalchemy import String, cast, literal, select
+from sqlalchemy.orm import aliased, load_only
 
 from ..memory.models import DocsLibrary, KnowledgeNode, Project, ProjectKnowledgeRef
 from ..memory.project_repository import ProjectRepository
@@ -42,6 +42,20 @@ class DocsScope:
     related_node_ids: tuple[UUID, ...]
     personal_allowed: bool
     reason: str | None = None
+    # Point reads use the authorized root and these membership anchors as the
+    # stable scope identity.  The ordinary resolver leaves this empty and
+    # continues to return the complete corpus identifier set.
+    anchor_node_ids: tuple[UUID, ...] = ()
+    # A Personal root in a project-plus-personal request still follows the
+    # historical personal-node boundary: project-bound descendants are not
+    # part of that lane unless a ProjectKnowledgeRef proves membership.
+    personal_projection_only: bool = False
+    # A Personal project-information hub may expose the requested Project's
+    # canonical subtree as a compact point-read allow-set.  ``None`` means
+    # that the projection can rely on root containment and ACL predicates.
+    point_allowed_node_ids: tuple[UUID, ...] | None = None
+    point_canonical_seed_ids: tuple[UUID, ...] = ()
+    point_related_seed_ids: tuple[UUID, ...] = ()
 
 
 def _as_uuid(value: UUID | str | None) -> UUID | None:
@@ -70,6 +84,333 @@ def _empty_scope(
         related_node_ids=(),
         personal_allowed=False,
         reason=reason,
+    )
+
+
+async def _resolve_point_ancestors(
+    session: Any,
+    *,
+    root_id: UUID,
+    library_id: UUID,
+) -> set[UUID]:
+    """Return only the same-library ancestor chain for one requested root.
+
+    The protocol read path needs to prove that a root is below a canonical or
+    explicitly referenced anchor.  Walking the whole library would recreate the
+    expensive corpus scan this helper is meant to avoid, so the recursive query
+    follows parent pointers upward and carries a text path to terminate cycles.
+    """
+
+    path = literal("|") + cast(KnowledgeNode.id, String) + literal("|")
+    ancestors = select(
+        KnowledgeNode.id.label("id"),
+        KnowledgeNode.parent_id.label("parent_id"),
+        KnowledgeNode.docs_library_id.label("docs_library_id"),
+        path.label("path"),
+    ).where(
+        KnowledgeNode.id == root_id,
+        KnowledgeNode.docs_library_id == library_id,
+    ).cte("docs_point_ancestors", recursive=True)
+    parent = aliased(KnowledgeNode)
+    parent_path = ancestors.c.path + cast(parent.id, String) + literal("|")
+    ancestors = ancestors.union_all(
+        select(
+            parent.id,
+            parent.parent_id,
+            parent.docs_library_id,
+            parent_path,
+        )
+        .join(ancestors, parent.id == ancestors.c.parent_id)
+        .where(parent.docs_library_id == ancestors.c.docs_library_id)
+        .where(
+            ~ancestors.c.path.like(
+                literal("%|") + cast(parent.id, String) + literal("|%")
+            )
+        )
+    )
+    rows = await _scalars(session, select(ancestors.c.id))
+    return {
+        node_id
+        for node in rows
+        if (node_id := _as_uuid(node)) is not None
+    }
+
+
+async def _resolve_personal_project_point_scope(
+    *,
+    session: Any,
+    actor_user_id: UUID,
+    project: Project,
+    project_id: UUID,
+    root: KnowledgeNode,
+    library: DocsLibrary,
+    library_id: UUID,
+) -> DocsScope:
+    """Resolve Project seeds below one Personal point-read root.
+
+    PROJECT_PLUS_PERSONAL historically admits Personal rows and the direct
+    Project canonical/reference closures in the same library.  Keep that union
+    exact for one requested root by retaining only direct seeds whose ancestor
+    chain contains the root.  No subtree or Personal corpus is materialized.
+    """
+
+    try:
+        root_readable = await can_read_node(
+            session,
+            root,
+            actor_user_id,
+            library=library,
+        )
+    except Exception:
+        root_readable = False
+    if not root_readable:
+        return _empty_scope(
+            DocsScopeMode.PROJECT_PLUS_PERSONAL,
+            reason="root_out_of_scope",
+            project_id=project_id,
+        )
+
+    canonical, related, _library_ids = await _resolve_project_nodes(
+        session=session,
+        actor_user_id=actor_user_id,
+        project=project,
+        expand_subtrees=False,
+    )
+
+    root_ancestors = await _resolve_point_ancestors(
+        session,
+        root_id=root.id,
+        library_id=library_id,
+    )
+
+    async def seed_below_root(node: KnowledgeNode) -> bool:
+        if _as_uuid(getattr(node, "docs_library_id", None)) != library_id:
+            return False
+        ancestors = await _resolve_point_ancestors(
+            session,
+            root_id=node.id,
+            library_id=library_id,
+        )
+        return root.id in ancestors
+
+    canonical_seeds: list[UUID] = []
+    canonical_anchors: list[UUID] = []
+    for node in canonical:
+        node_id = _as_uuid(getattr(node, "id", None))
+        if node_id is None:
+            continue
+        if node_id in root_ancestors:
+            # The projection starts at the requested Personal root, so retain
+            # the original canonical seed as proof but normalize the effective
+            # lane to that root for descendants below a hidden Personal node.
+            canonical_anchors.append(node_id)
+            canonical_seeds.append(root.id)
+        elif await seed_below_root(node):
+            canonical_anchors.append(node_id)
+            canonical_seeds.append(node_id)
+    related_seeds: list[UUID] = []
+    related_anchors: list[UUID] = []
+    for node in related:
+        node_id = _as_uuid(getattr(node, "id", None))
+        if node_id is None:
+            continue
+        if node_id in root_ancestors:
+            related_anchors.append(node_id)
+            related_seeds.append(root.id)
+        elif await seed_below_root(node):
+            related_anchors.append(node_id)
+            related_seeds.append(node_id)
+
+    anchors = tuple(
+        dict.fromkeys(
+            (root.id, *canonical_anchors, *related_anchors, *canonical_seeds, *related_seeds)
+        )
+    )
+    return DocsScope(
+        mode=DocsScopeMode.PROJECT_PLUS_PERSONAL,
+        project_id=project_id,
+        project_ids=(project_id,),
+        allowed_library_ids=(library_id,),
+        canonical_node_ids=tuple(dict.fromkeys(canonical_seeds)),
+        related_node_ids=tuple(dict.fromkeys((root.id, *related_seeds))),
+        personal_allowed=True,
+        anchor_node_ids=anchors,
+        personal_projection_only=True,
+        point_canonical_seed_ids=tuple(dict.fromkeys(canonical_seeds)),
+        point_related_seed_ids=tuple(dict.fromkeys(related_seeds)),
+    )
+
+
+async def _resolve_protocol_point_scope(
+    *,
+    session: Any,
+    actor_user_id: UUID,
+    project: Project | None,
+    project_id: UUID | None,
+    mode: DocsScopeMode,
+    root_id: UUID,
+) -> DocsScope:
+    """Authorize one protocol root without resolving the surrounding corpus."""
+
+    root = await session.get(KnowledgeNode, root_id)
+    if root is None or getattr(root, "archived_at", None) is not None:
+        return _empty_scope(mode, reason="root_not_found", project_id=project_id)
+    library_id = _as_uuid(getattr(root, "docs_library_id", None))
+    if library_id is None:
+        return _empty_scope(mode, reason="root_not_found", project_id=project_id)
+    library = await session.get(DocsLibrary, library_id)
+    if library is None:
+        return _empty_scope(mode, reason="root_not_found", project_id=project_id)
+
+    if mode is DocsScopeMode.PERSONAL_ONLY:
+        # PERSONAL_ONLY has historically excluded project-bound rows even when
+        # they happen to live in a Personal Docs library.
+        if getattr(root, "project_id", None) is not None:
+            return _empty_scope(mode, reason="root_out_of_scope")
+        if str(getattr(library, "library_type", "") or "").casefold() != "personal":
+            return _empty_scope(mode, reason="root_out_of_scope")
+        try:
+            readable = await can_read_node(
+                session,
+                root,
+                actor_user_id,
+                library=library,
+            )
+        except Exception:
+            readable = False
+        if not readable:
+            return _empty_scope(mode, reason="root_access_denied")
+        return DocsScope(
+            mode=mode,
+            project_id=None,
+            project_ids=(),
+            allowed_library_ids=(library_id,),
+            canonical_node_ids=(),
+            related_node_ids=(root.id,),
+            personal_allowed=True,
+            anchor_node_ids=(root.id,),
+            personal_projection_only=True,
+        )
+
+    if project is None or project_id is None:
+        return _empty_scope(mode, reason="project_required")
+
+    if (
+        mode is DocsScopeMode.PROJECT_PLUS_PERSONAL
+        and getattr(root, "project_id", None) is None
+        and str(getattr(library, "library_type", "") or "").casefold()
+        == "personal"
+    ):
+        return await _resolve_personal_project_point_scope(
+            session=session,
+            actor_user_id=actor_user_id,
+            project=project,
+            project_id=project_id,
+            root=root,
+            library=library,
+            library_id=library_id,
+        )
+
+    # A root and its proof anchors must remain in one Docs library.  The
+    # recursive CTE follows only same-library parent edges, so a malformed
+    # cross-library parent cannot satisfy this membership test.
+    ancestor_ids = await _resolve_point_ancestors(
+        session,
+        root_id=root.id,
+        library_id=library_id,
+    )
+    if root.id not in ancestor_ids:
+        return _empty_scope(mode, reason="root_not_found", project_id=project_id)
+
+    anchors: list[UUID] = []
+    canonical_root = await get_canonical_project_information_node(
+        session,
+        project_id=project.id,
+        actor_user_id=actor_user_id,
+    )
+    canonical_id = _as_uuid(getattr(canonical_root, "id", None))
+    if canonical_root is not None and canonical_id in ancestor_ids:
+        # Canonical containment retains its strict project_id boundary.
+        root_project_id = _as_uuid(getattr(root, "project_id", None))
+        if root_project_id == project_id:
+            try:
+                readable = await can_read_node(
+                    session,
+                    canonical_root,
+                    actor_user_id,
+                )
+            except Exception:
+                readable = False
+            if readable:
+                anchors.append(canonical_id)
+
+    # Fetch only references whose target is on this root's ancestor chain.  A
+    # whole-project ref listing is still cheap compared with a Personal corpus
+    # scan, but this predicate also keeps unrelated references out of the read
+    # authorization and edit-session binding.
+    ref_rows = await _scalars(
+        session,
+        select(ProjectKnowledgeRef).where(
+            ProjectKnowledgeRef.project_id == project_id,
+            ProjectKnowledgeRef.knowledge_node_id.in_(ancestor_ids),
+        ),
+    )
+    for ref in ref_rows:
+        relation = str(getattr(ref, "relation_type", "related") or "related").casefold()
+        ref_node_id = _as_uuid(getattr(ref, "knowledge_node_id", None))
+        if ref_node_id is None or ref_node_id not in ancestor_ids:
+            continue
+        # A relationship label cannot make a different node canonical.
+        if relation == "canonical" and (
+            canonical_id is None
+            or ref_node_id != canonical_id
+            or _as_uuid(getattr(root, "project_id", None)) != project_id
+        ):
+            continue
+        node = await session.get(KnowledgeNode, ref_node_id)
+        if (
+            node is None
+            or _as_uuid(getattr(node, "docs_library_id", None)) != library_id
+            or getattr(node, "archived_at", None) is not None
+        ):
+            continue
+        try:
+            readable = await can_read_node(
+                session,
+                node,
+                actor_user_id,
+                library=library,
+            )
+        except Exception:
+            readable = False
+        if readable:
+            anchors.append(ref_node_id)
+
+    try:
+        root_readable = await can_read_node(
+            session,
+            root,
+            actor_user_id,
+            library=library,
+        )
+    except Exception:
+        root_readable = False
+    if not root_readable:
+        return _empty_scope(mode, reason="root_out_of_scope", project_id=project_id)
+
+    if not anchors:
+        return _empty_scope(mode, reason="root_out_of_scope", project_id=project_id)
+
+    unique_anchors = tuple(dict.fromkeys(anchors))
+    return DocsScope(
+        mode=mode,
+        project_id=project_id,
+        project_ids=(project_id,),
+        allowed_library_ids=(library_id,),
+        canonical_node_ids=(),
+        related_node_ids=(root.id,),
+        personal_allowed=mode is DocsScopeMode.PROJECT_PLUS_PERSONAL,
+        anchor_node_ids=unique_anchors,
     )
 
 
@@ -428,6 +769,7 @@ async def resolve_docs_scope(
     mode: DocsScopeMode,
     max_personal_nodes: int | None = None,
     expand_project_subtrees: bool = True,
+    target_node_id: UUID | None = None,
 ) -> DocsScope:
     """Resolve the actor's compact Docs scope for one request.
 
@@ -445,6 +787,19 @@ async def resolve_docs_scope(
     actor = _as_uuid(actor_user_id)
     if actor is None:
         return _empty_scope(normalized_mode, reason="invalid_actor")
+
+    if target_node_id is not None and normalized_mode is DocsScopeMode.PERSONAL_ONLY:
+        target = _as_uuid(target_node_id)
+        if target is None:
+            return _empty_scope(normalized_mode, reason="root_not_found")
+        return await _resolve_protocol_point_scope(
+            session=session,
+            actor_user_id=actor,
+            project=None,
+            project_id=None,
+            mode=normalized_mode,
+            root_id=target,
+        )
 
     if normalized_mode is DocsScopeMode.ACCESSIBLE:
         if project_id is not None:
@@ -505,6 +860,23 @@ async def resolve_docs_scope(
         allowed = False
     if not allowed:
         return _empty_scope(normalized_mode, reason="project_access_denied")
+
+    if target_node_id is not None:
+        target = _as_uuid(target_node_id)
+        if target is None:
+            return _empty_scope(
+                normalized_mode,
+                reason="root_not_found",
+                project_id=project,
+            )
+        return await _resolve_protocol_point_scope(
+            session=session,
+            actor_user_id=actor,
+            project=project_row,
+            project_id=project,
+            mode=normalized_mode,
+            root_id=target,
+        )
 
     canonical, related, project_library_ids = await _resolve_project_nodes(
         session=session,

@@ -7,11 +7,7 @@ import re
 from typing import Dict, Iterable, Optional
 
 from ..config import Config
-from ..services.agent_team_service import config_get
-from ..services.agent_team_v3 import (
-    agent_team_v3_delegation_enabled,
-    agent_team_v3_subagents,
-)
+from ..services.runtime_policy_utils import config_get
 from .harness_instructions import with_common_harness_instructions
 from .tool_policy import (
     is_knowledge_search_enabled, is_memory_search_enabled,
@@ -229,50 +225,13 @@ def _cloud_advisor_guidance(
     )
 
 
-def _docs_agent_delegation_guidance(config: Optional[Config], available_tool_names=None) -> str:
-    """Tell Main to prefer the configured Docs specialist over direct tools.
+def _docs_agent_delegation_guidance(
+    config: Optional[Config], available_tool_names=None
+) -> str:
+    """Legacy Team specialist guidance is retired with the Team runtime."""
 
-    The section is emitted only when the runtime can actually expose the
-    ``docs_operator`` Subagent.  This keeps prompts for installations without an
-    Agent Team truthful while making the routing contract explicit for native
-    function-calling models (where static tool references are intentionally
-    omitted).
-    """
-
-    if config is None:
-        return ""
-    if _runtime_capability_for_tool("docs_read", config=config) is not None:
-        return ""
-    if available_tool_names is not None and "agent_team_delegate" not in available_tool_names:
-        return ""
-    try:
-        if not (
-            agent_team_v3_delegation_enabled(config)
-            and any(
-                item.get("subagent_id") == "docs_operator"
-                and item.get("enabled", True)
-                for item in agent_team_v3_subagents(config, include_disabled=False)
-            )
-        ):
-            return ""
-    except Exception:
-        return ""
-    return (
-        "Execution Team委譲ルール:\n"
-        "- ユーザーがDocs操作エージェント、`docs_operator`、Docs specialistなどの"
-        "Subagentを明示した場合、MainはDocsの直接ツール（`docs_search`、"
-        "`docs_read`、`docs_query`、`docs_create_nodes`、`docs_update_node`、"
-        "`docs_move_node`、`docs_archive_node`など）を呼ばず、"
-        "利用可能なTeamを選び、`agent_team_delegate`へ subagent=`docs_operator` として委譲してください。\n"
-        "- この明示があるturnでは、読み取りだけ・対象が曖昧・確認が必要な場合もMain自身で"
-        "回答や確認質問を返さず、必ずdocs_operatorへ委譲してください。曖昧性の確認質問や"
-        "安全なno-write判断はdocs_operatorの結果として返してください。\n"
-        "- 必要なら `load_agent_team` でmanual Teamを読み込み、その後に"
-        "`agent_team_delegate`を呼び出してください。\n"
-        "- 委譲タスクには対象Project、読み取り/変更範囲、対象ノード、完了条件を"
-        "明記し、Docs specialistの結果を受け取ってからユーザーへ回答してください。"
-    )
-
+    del config, available_tool_names
+    return ""
 
 def _build_static_tool_reference_section(
     config: Optional[Config],

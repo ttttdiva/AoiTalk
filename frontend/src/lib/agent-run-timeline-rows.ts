@@ -295,7 +295,7 @@ function summaryFromItem(
     name:
       item.actor_label?.trim() ||
       item.actor_key?.trim() ||
-      "サブエージェント",
+      "旧実行",
     action: item.action?.trim() || item.message?.trim() || "作業を実行",
     status: normalizedStatus(item),
     provider: item.provider?.trim() || null,
@@ -316,7 +316,7 @@ function mergeSummary(
   return {
     ...preferred,
     key: current.key,
-    name: next.name !== "サブエージェント" ? next.name : current.name,
+    name: next.name !== "旧実行" ? next.name : current.name,
     action: next.action !== "作業を実行" ? next.action : current.action,
     provider: next.provider ?? current.provider,
     model: next.model ?? current.model,
@@ -630,7 +630,7 @@ export function timelineItemTitle(item: AgentRunTimelineItem): string {
   if (kind === "thinking") return thinkingRowLabel(item);
   if (kind === "review") return displayMessage || item.action || "結果を検証";
   if (kind === "progress") return displayMessage || item.action || "進捗を更新";
-  if (kind === "director") return displayMessage || item.action || "Directorと通信";
+  if (kind === "director") return displayMessage || item.action || "旧Directorの記録";
   return item.action || item.actor_label || item.tool_name || "処理を実行";
 }
 

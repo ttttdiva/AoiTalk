@@ -491,8 +491,7 @@ _DESTRUCTIVE_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bdiskpart\b", re.IGNORECASE),
     re.compile(r"\bFormat-Volume\b", re.IGNORECASE),
     re.compile(r"\bdd\s+[^|]*\bof=", re.IGNORECASE),
-    # 上書きリダイレクト。>> の追記、`2>&1` のような fd 複製、
-    # /dev/null・$null・NUL への破棄はファイルを壊さないので対象外。
+    # 上書きリダイレクト。>> の追記、`2>&1` のような fd 複製は対象外。
     re.compile(r"\bOut-File\b(?![^|]*-Append)", re.IGNORECASE),
     re.compile(r"\bSet-Content\b", re.IGNORECASE),
     # 破壊的な git 操作
@@ -513,10 +512,18 @@ _DESTRUCTIVE_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-# 上書きリダイレクト。>> の追記、`2>&1` のような fd 複製、
-# /dev/null・$null・NUL への破棄はファイルを壊さないので対象外。
+# POSIX shell 向けの共通判定。Windows shell では `$null` と NUL を
+# それぞれの shell 専用パターンで扱い、/dev/null は通常ファイル扱いする。
 _OVERWRITE_REDIRECT_PATTERN = re.compile(
     r"(?<!>)>(?!>)(?!&)\s*(?!(?:/dev/null|\$null|nul\b))\S",
+    re.IGNORECASE,
+)
+_POWERSHELL_OVERWRITE_REDIRECT_PATTERN = re.compile(
+    r"(?<!>)>(?!>)(?!&)\s*(?!\$null\b)\S",
+    re.IGNORECASE,
+)
+_CMD_OVERWRITE_REDIRECT_PATTERN = re.compile(
+    r"(?<!>)>(?!>)(?!&)\s*(?!nul(?:\s|$))\S",
     re.IGNORECASE,
 )
 
@@ -772,9 +779,18 @@ def _command_looks_destructive(command: str, *, shell: Optional[str] = None) -> 
         return False
     if any(pattern.search(text) for pattern in _DESTRUCTIVE_COMMAND_PATTERNS):
         return True
-    if str(shell or "").strip().casefold() != "cmd":
+    shell_name = str(shell or "auto").strip().casefold()
+    if shell_name not in {"cmd", "cmd.exe"}:
         text = _mask_awk_program_args(text)
-    return bool(_OVERWRITE_REDIRECT_PATTERN.search(_mask_python_code_args(text)))
+    if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"} or (
+        shell_name == "auto" and os.name == "nt"
+    ):
+        redirect_pattern = _POWERSHELL_OVERWRITE_REDIRECT_PATTERN
+    elif shell_name in {"cmd", "cmd.exe"}:
+        redirect_pattern = _CMD_OVERWRITE_REDIRECT_PATTERN
+    else:
+        redirect_pattern = _OVERWRITE_REDIRECT_PATTERN
+    return bool(redirect_pattern.search(_mask_python_code_args(text)))
 
 
 def _command_program_name(command: str) -> str:

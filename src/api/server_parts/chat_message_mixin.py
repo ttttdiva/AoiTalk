@@ -3,6 +3,7 @@
 server.py から移設。ロジックは一切変更していない。
 """
 
+import asyncio
 import re
 import uuid
 from collections.abc import Mapping
@@ -1562,6 +1563,25 @@ class ChatMessageMixin:
 
     async def _handle_user_message(self, data: dict):
         """Handle user message with optional image, session_id, and project_id"""
+        from ...services.admin_restart_admission import (
+            begin_chat_request,
+            finish_chat_request,
+        )
+
+        active_task = asyncio.current_task()
+        session_id = data.get("session_id") if isinstance(data, dict) else None
+        if active_task is not None and session_id is not None:
+            try:
+                setattr(active_task, "_conversation_session_id", str(session_id).strip())
+            except Exception:
+                pass
+        admission_task = begin_chat_request(self)
+        try:
+            return await self._handle_user_message_admitted(data)
+        finally:
+            finish_chat_request(self, admission_task)
+
+    async def _handle_user_message_admitted(self, data: dict):
         message = data.get("message", "").strip()
         raw_user_message = message
         raw_response_started_at = data.get("_response_started_at_monotonic")
@@ -1873,11 +1893,6 @@ class ChatMessageMixin:
             nonlocal agent_run_id
             if not session_id or agent_run_id:
                 return True
-            if data.get("execution_profile_id") is not None:
-                # An explicit execution profile is only honoured by HTTP
-                # admission, which pins it into the immutable binding.  The
-                # direct-WS fallback never silently falls back to the default.
-                raise RuntimeError("agent_admission_execution_profile_unsupported")
             try:
                 from ...services.agent_run_service import AgentRunService
 
@@ -2702,6 +2717,11 @@ class ChatMessageMixin:
                     mentions=mentions,
                     task_id=task_id,
                     explicit_references=explicit_references,
+                    agent_dialogue=data.get("agent_dialogue"),
+                    dialogue_transport=data.get("_dialogue_transport") is True,
+                    typed_resume_answer=typed_resume_answer,
+                    typed_resume_answer_body=typed_resume_answer_body,
+                    typed_resume_answer_id=typed_resume_answer_id,
                     cloud_advisor_origin=cloud_advisor_origin,
                     context_project_hint_id=context_project_hint_id,
                     verified_project_attachment=verified_project_attachment,
@@ -2861,6 +2881,11 @@ class ChatMessageMixin:
         media_recognition_metadata: Optional[List[Dict[str, Any]]] = None,
         docs_reference_ids: Optional[Iterable[str]] = None,
         mentions: Optional[Iterable[Dict[str, Any]]] = None,
+        agent_dialogue: Optional[Mapping[str, Any]] = None,
+        dialogue_transport: bool = False,
+        typed_resume_answer: bool = False,
+        typed_resume_answer_body: Optional[str] = None,
+        typed_resume_answer_id: Optional[str] = None,
         task_id: Optional[str] = None,
         explicit_references: Optional[Iterable[Any]] = None,
         cloud_advisor_origin: Any | None = None,
@@ -2965,9 +2990,9 @@ class ChatMessageMixin:
                 persisted_sender_id = str(
                     getattr(persisted, "sender_id", "") or ""
                 ).strip()
-                dialogue_marker = data.get("agent_dialogue")
+                dialogue_marker = agent_dialogue
                 internal_dialogue_message = bool(
-                    data.get("_dialogue_transport") is True
+                    dialogue_transport is True
                     and isinstance(dialogue_marker, Mapping)
                 )
                 expected_sender_type = (

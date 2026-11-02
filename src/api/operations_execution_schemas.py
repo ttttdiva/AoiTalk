@@ -52,12 +52,19 @@ class OperationsExecutionWork(_Projection):
     source_ref: OperationsCanonicalSourceRef | None = None
 
 
+class OperationsExecutionRunLegacy(_Projection):
+    """Historical AgentRun pins; never a current route selector."""
+
+    acting_subagent_id: str | None = None
+    route_snapshot: dict[str, object] | None = None
+
+
 class OperationsExecutionRun(_Projection):
     id: str
     work_item_id: str | None = None
     parent_run_id: str | None = None
     root_run_id: str | None = None
-    acting_subagent_id: str | None = None
+    legacy: OperationsExecutionRunLegacy | None = None
     work_item_attempt: int | None = None
     status: str
     phase: str | None = None

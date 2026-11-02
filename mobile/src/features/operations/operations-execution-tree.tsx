@@ -1,7 +1,12 @@
 import React from "react";
 import { StyleSheet, View } from "react-native";
 import { Text } from "react-native-paper";
-import { activityTime, duration, type WorkExecution } from "../../lib/operations-api";
+import {
+  activityTime,
+  duration,
+  operationsRunLabel,
+  type WorkExecution,
+} from "../../lib/operations-api";
 
 type RunRow = {
   run: WorkExecution["runs"][number];
@@ -44,7 +49,7 @@ export function OperationsExecutionTree({ data }: { data: WorkExecution }) {
           style={[styles.run, { marginLeft: Math.min(depth, 6) * 6 }]}
         >
           <Text variant="titleMedium" style={styles.title}>
-            {run.acting_subagent_id || (run.parent_run_id ? "Subagent" : "Main agent")}
+            {operationsRunLabel(run)}
           </Text>
           <Text style={styles.text}>
             Run {run.id} · 仕事 {run.work_item_id || "未記録"} · {depth ? `Level ${depth} · ` : ""}{run.status} · Attempt {run.work_item_attempt ?? "未記録"}

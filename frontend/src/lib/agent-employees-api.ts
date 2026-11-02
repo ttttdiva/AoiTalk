@@ -1,3 +1,6 @@
+import { withBasePath } from "@/lib/base-path";
+import type { ModelRoute, WorkRole } from "@/lib/model-roles-api";
+
 /** Agent management uses the authenticated FastAPI proxy, never the projection writer. */
 export class EmployeeApiError extends Error {
   constructor(public readonly status: number) {
@@ -14,7 +17,7 @@ export class EmployeeApiError extends Error {
 export function employeeKey(): string { return crypto.randomUUID(); }
 export async function employeeRequest<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   // Error bodies may contain echoed credentials or validation input; never retain them.
-  const response = await fetch(`/api/python-proxy${path.replace(/^\/api(?=\/)/u, "")}`, {
+  const response = await fetch(withBasePath(`/api/python-proxy${path.replace(/^\/api(?=\/)/u, "")}`), {
     method, credentials: "include", cache: "no-store",
     headers: { "Content-Type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -23,45 +26,41 @@ export async function employeeRequest<T>(path: string, method = "GET", body?: un
   return response.json() as Promise<T>;
 }
 export async function employeeScopeRequest<T>(path: string): Promise<T> {
-  const response = await fetch(path, { credentials: "include", cache: "no-store" })
+  const response = await fetch(withBasePath(path), { credentials: "include", cache: "no-store" })
     .catch(() => { throw new EmployeeApiError(0); });
   if (!response.ok) throw new EmployeeApiError(response.status);
   return response.json() as Promise<T>;
 }
-export type Employee = { id: string; display_name: string; slug: string; state: "draft" | "active" | "paused" | "retired"; character_id?: string | null; thumbnail_artifact_id?: string | null; updated_at?: string };
+export type Employee = { id: string; display_name: string; slug: string; state: "draft" | "active" | "paused" | "retired"; character_id?: string | null; thumbnail_artifact_id?: string | null; updated_at?: string; is_default_chat_agent?: boolean };
+/** Per-role model routes of one Agent revision; roles without an entry use the global role table. */
+export type AgentModelOverrides = Partial<Record<"chat" | WorkRole, { routes: ModelRoute[]; allow_paid_fallback?: boolean; fallback_on?: ("model_unavailable" | "provider_unavailable" | "rate_limited" | "connect_timeout")[] | null }>>;
+export type AgentDelegatePolicy = { agents: string[] | "any_owned"; workers: string[] };
+export type AgentEffectiveRoute = { route: ModelRoute | null; source: "agent" | "global" | "inherit_chat" | "legacy" | string };
+export type AgentToolCatalogEntry = { id: string; label: string; group: string; description?: string; requires_capabilities: string[] };
+export type LegacyRevisionProjection = {
+  agent_team_id?: string | null;
+  execution_profile_id?: string | null;
+  allowed_subagent_ids?: string[] | null;
+  route_warnings?: { code: string; subagent_id: string; message: string }[] | null;
+};
 export type EmployeeRevision = {
   id: string; agent_id: string; version: number; display_name: string; mission: string;
-  responsibility_summary: string; operational_instructions: string; agent_team_id: string;
-  execution_profile_id: string; allowed_subagent_ids: string[]; capability_ceiling: string[];
+  responsibility_summary: string; operational_instructions: string; capability_ceiling: string[];
   budget_policy: { max_run_cost_micros?: number; max_daily_cost_micros?: number; currency?: string };
   concurrency_policy: { max_parallel_runs?: number; max_parallel_tasks?: number; queue_class?: string };
   wake_policy?: Record<string, string | number>; created_at?: string;
-  route_warnings?: { code: string; subagent_id: string; message: string }[];
+  /** Null on revisions written before Agents carried their own models and tools. */
+  model_overrides?: AgentModelOverrides | null;
+  tool_ids?: string[] | null;
+  delegate_policy?: AgentDelegatePolicy | null;
+  /** Read-only historical route fields; new revisions never write them. */
+  legacy?: LegacyRevisionProjection | null;
+  effective_model_routes?: Partial<Record<"chat" | WorkRole, AgentEffectiveRoute>>;
 };
-/** Read-only effective model route of one Subagent (identifiers only, never credentials). */
-export type EmployeeSubagentRoute = {
-  subagent_id: string; name: string; provider?: string; model?: string; effort?: string | null;
-  route_source?: "subagent_override" | "profile_default" | "standard_model" | "free_team" | "legacy_profile" | string;
-  inherits_main?: boolean; backend?: "local" | "api" | "cli" | string; error_code?: string;
-  /** Newer catalog responses may attach a canonical role/phase projection. */
-  role?: string; phase?: string; route_label?: string; acting_subagent_id?: string;
-};
-export type EmployeePhaseRoute = EmployeeSubagentRoute & {
-  phase: string;
-  role?: string;
-  acting_subagent_id?: string;
-};
-export type EmployeeExecutionProfile = {
-  profile_id?: string; name: string; description?: string; team_id?: string;
-  routes?: EmployeeSubagentRoute[];
-  phase_routes?: EmployeePhaseRoute[] | Record<string, EmployeePhaseRoute>;
-  preset_id?: string; preset?: boolean;
-};
+export type EmployeeRevisionInput = Omit<EmployeeRevision, "id" | "agent_id" | "created_at" | "effective_model_routes" | "legacy">
+  & { idempotency_key: string };
 export type EmployeeCatalog = {
   can_manage: boolean; runtime_profile?: string;
-  teams: { team_id: string; name: string; subagents: { subagent_id: string; name: string; capability_ids: string[] }[]; execution_profiles?: EmployeeExecutionProfile[]; execution_profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile>; profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile> }[];
-  execution_profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile>;
-  profile_presets?: EmployeeExecutionProfile[] | Record<string, EmployeeExecutionProfile>;
   capabilities: { id: string; family: string; access: string; native: boolean }[];
 };
 export type EmployeeProfile = { job_title?: string; responsibility_summary?: string; primary_space_id?: string | null; autonomy_level?: string; employment_state?: string };
@@ -91,6 +90,7 @@ export const employeeApi = {
   create: (body: { display_name: string; slug?: string; character_id?: string; idempotency_key: string }) => employeeRequest<{ agent: Employee }>("/api/agents", "POST", body),
   state: (id: string, state: Employee["state"], expected_state: Employee["state"]) => employeeRequest<{ agent: Employee }>(`${employeePath(id)}/state`, "PATCH", { state, expected_state }),
   thumbnail: (id: string, body: import("@/lib/api-types.gen").components["schemas"]["AgentThumbnailPatchRequest"]) => employeeRequest<import("@/lib/api-types.gen").components["schemas"]["AgentThumbnailResponse"]>(`${employeePath(id)}/thumbnail`, "PATCH", body),
-  revision: (id: string, body: Omit<EmployeeRevision, "id" | "agent_id" | "created_at"> & { idempotency_key: string }) => employeeRequest<{ revision: EmployeeRevision }>(`${employeePath(id)}/revisions`, "POST", body),
+  revision: (id: string, body: EmployeeRevisionInput) => employeeRequest<{ revision: EmployeeRevision }>(`${employeePath(id)}/revisions`, "POST", body),
+  toolCatalog: () => employeeRequest<{ tools: AgentToolCatalogEntry[] }>("/api/agent-tools/catalog"),
   saveProfile: (id: string, body: EmployeeProfile) => employeeRequest<{ organization_profile: EmployeeProfile }>(`${employeePath(id)}/organization-profile`, "PATCH", body),
 };

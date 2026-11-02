@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 from sqlalchemy import func, select
@@ -13,9 +14,21 @@ from ..memory.models.media_operations_content import (
 )
 from ..memory.models.media_operations_generation import GenerationOutput
 from ..memory.models.media_operations import Persona, PersonaRevision
-from ..memory.models.media_operations_research import ContentItem, EditorialProgram
+from ..memory.models.media_operations_metrics import MetricSnapshot
+from ..memory.models.media_operations_research import (
+    ContentItem,
+    ContentItemFinding,
+    ContentItemStockDecision,
+    EditorialProgram,
+    ResearchFinding,
+    ResearchFindingEvidence,
+)
 from ..memory.models.media_operations_setup import PlatformAccount, PlatformAccountRevision
-from .media_operations_research_service import MediaOperationsResearchService
+from .media_operations_research_service import (
+    MediaOperationsResearchService,
+    _actor_type,
+    _is_human_actor,
+)
 from .media_platform_readiness import platform_payload_blockers, product_rights_blockers
 from .media_output_integrity import generation_output_blockers
 from .media_operations_service import (
@@ -56,6 +69,12 @@ _TEXT_FIELDS = frozenset({"text", "title", "caption", "description", "body", "pu
 _LIST_TEXT_FIELDS = frozenset({"links", "hashtags", "tags", "tier_refs", "captions"})
 _BOOL_FIELDS = frozenset({"sensitive_content", "ai_generated", "r18", "r18g", "ai_disclosure"})
 _REF_FIELDS = frozenset({"media", "attachments", "preview_assets", "thumbnail_assets", "media_asset", "thumbnail", "cover"})
+_STOCK_PUBLICATION_ONLY_BLOCKERS = frozenset({
+    "account_binding_missing",
+    "persona_account_binding_missing_or_mismatch",
+})
+_STOCK_MAX_VARIANTS = 100
+_STOCK_MAX_ITEMS = 500
 
 
 def _platform(value: Any) -> str:
@@ -564,6 +583,534 @@ class MediaOperationsContentService(MediaOperationsResearchService):
         elif rights.result != "cleared":
             reasons.append(f"rights_{rights.result}")
         return {"content_variant_id": str(variant.id), "variant_id": str(variant.id), "revision_id": str(revision.id), "revision_hash": revision.content_hash, "ready": not reasons, "publication_allowed": not reasons, "status": "ready" if not reasons else "blocked", "qa_result": qa.result if qa else None, "rights_result": rights.result if rights else None, "blockers": list(reasons), "blocking_reasons": reasons, "qa": _readiness_assessment_projection(qa), "rights": _readiness_assessment_projection(rights)}
+
+    async def _stock_findings(self, session: Any, item: ContentItem) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        links = await self._scalars(
+            session,
+            select(ContentItemFinding)
+            .where(
+                ContentItemFinding.content_item_id == item.id,
+                ContentItemFinding.owner_user_id == item.owner_user_id,
+                (
+                    ContentItemFinding.project_id.is_(None)
+                    if item.project_id is None
+                    else ContentItemFinding.project_id == item.project_id
+                ),
+            )
+            .order_by(ContentItemFinding.ordinal.asc(), ContentItemFinding.id.asc())
+            .limit(21),
+        )
+        if len(links) > 20:
+            return [], [], ["analysis_evidence_missing"]
+
+        rows: list[tuple[ContentItemFinding, ResearchFinding, list[ResearchFindingEvidence]]] = []
+        artifact_hashes: set[str] = set()
+        for link in links:
+            finding = await self._scalar(
+                session,
+                select(ResearchFinding)
+                .where(ResearchFinding.id == link.finding_id)
+                .limit(1),
+            )
+            if (
+                finding is None
+                or finding.owner_user_id != item.owner_user_id
+                or finding.project_id != item.project_id
+            ):
+                continue
+            evidence_rows = await self._scalars(
+                session,
+                select(ResearchFindingEvidence)
+                .where(
+                    ResearchFindingEvidence.finding_id == finding.id,
+                    ResearchFindingEvidence.owner_user_id == item.owner_user_id,
+                    (
+                        ResearchFindingEvidence.project_id.is_(None)
+                        if item.project_id is None
+                        else ResearchFindingEvidence.project_id == item.project_id
+                    ),
+                )
+                .order_by(ResearchFindingEvidence.ordinal.asc(), ResearchFindingEvidence.id.asc())
+                .limit(20),
+            )
+            for evidence in evidence_rows:
+                if evidence.evidence_type == "artifact" and evidence.artifact_sha256:
+                    artifact_hashes.add(str(evidence.artifact_sha256).lower())
+            rows.append((link, finding, evidence_rows))
+
+        metric_by_hash: dict[str, MetricSnapshot] = {}
+        if artifact_hashes:
+            metric_conditions = [
+                MetricSnapshot.owner_user_id == item.owner_user_id,
+                MetricSnapshot.snapshot_hash.in_(artifact_hashes),
+                MetricSnapshot.ingestion_status == "accepted",
+            ]
+            metric_conditions.append(
+                MetricSnapshot.project_id.is_(None)
+                if item.project_id is None
+                else MetricSnapshot.project_id == item.project_id
+            )
+            metric_rows = await self._scalars(
+                session,
+                select(MetricSnapshot)
+                .where(*metric_conditions)
+                .order_by(MetricSnapshot.observed_at.desc(), MetricSnapshot.id.desc())
+                .limit(100),
+            )
+            metric_by_hash = {
+                str(row.snapshot_hash).lower(): row
+                for row in metric_rows
+            }
+
+        findings: list[dict[str, Any]] = []
+        snapshot_findings: list[dict[str, Any]] = []
+        has_analysis_evidence = False
+        for link, finding, evidence_rows in rows:
+            safe_evidence: list[dict[str, Any]] = []
+            for evidence in evidence_rows:
+                if evidence.evidence_type == "url" and evidence.source_url:
+                    try:
+                        url = _validated_resource_url(evidence.source_url)
+                    except MediaOperationsValidationError:
+                        url = None
+                    if url:
+                        safe_evidence.append({"type": "url", "url": url})
+                elif evidence.evidence_type == "artifact" and evidence.artifact_sha256:
+                    metric = metric_by_hash.get(str(evidence.artifact_sha256).lower())
+                    if metric is not None:
+                        safe_evidence.append(
+                            {
+                                "type": "metric_snapshot",
+                                "snapshot_id": str(metric.id),
+                                "snapshot_hash": str(metric.snapshot_hash),
+                            }
+                        )
+
+            kind = str(finding.kind or "").strip().lower()
+            is_supported = kind in {"fact", "signal"} and bool(safe_evidence)
+            has_analysis_evidence = has_analysis_evidence or is_supported
+            entry = {
+                "id": str(finding.id),
+                "kind": kind,
+                "statement": str(finding.statement or "")[:2000],
+                "evidence": safe_evidence[:20],
+            }
+            findings.append(entry)
+            snapshot_findings.append(
+                {
+                    "finding_id": str(finding.id),
+                    "finding_hash": str(finding.finding_hash),
+                    "kind": kind,
+                    "supported": is_supported,
+                    "evidence": safe_evidence[:20],
+                }
+            )
+
+        blockers = [] if has_analysis_evidence else ["analysis_evidence_missing"]
+        return findings[:20], snapshot_findings[:20], blockers
+
+    async def _stock_readiness(self, session: Any, actor: Any, item: ContentItem) -> dict[str, Any]:
+        variants = await self._scalars(
+            session,
+            select(ContentVariant)
+            .where(
+                ContentVariant.content_item_id == item.id,
+                ContentVariant.owner_user_id == item.owner_user_id,
+                (
+                    ContentVariant.project_id.is_(None)
+                    if item.project_id is None
+                    else ContentVariant.project_id == item.project_id
+                ),
+            )
+            .order_by(ContentVariant.platform.asc(), ContentVariant.id.asc())
+            .limit(_STOCK_MAX_VARIANTS + 1),
+        )
+        blockers: list[str] = []
+        variant_projections: list[dict[str, Any]] = []
+        snapshot_variants: list[dict[str, Any]] = []
+        if not variants:
+            blockers.append("content_variant_missing")
+        if len(variants) > _STOCK_MAX_VARIANTS:
+            blockers.append("content_variant_limit_exceeded")
+            variants = variants[:_STOCK_MAX_VARIANTS]
+
+        for variant in variants:
+            readiness = await self.get_readiness(session, actor, variant.id)
+            revisions = await self._revision_rows(session, variant)
+            revision = revisions[0] if revisions else None
+            if (
+                variant.content_item_id != item.id
+                or variant.owner_user_id != item.owner_user_id
+                or variant.project_id != item.project_id
+            ):
+                variant_blockers = ["content_variant_scope_mismatch"]
+            else:
+                variant_blockers = [
+                    str(reason)
+                    for reason in (
+                        readiness.get("blockers")
+                        or readiness.get("blocking_reasons")
+                        or []
+                    )
+                    if str(reason) not in _STOCK_PUBLICATION_ONLY_BLOCKERS
+                ]
+            if revision is not None and revision.content_item_hash != item.content_hash:
+                variant_blockers.append("content_item_revision_mismatch")
+            for reason in variant_blockers:
+                if reason not in blockers:
+                    blockers.append(reason)
+
+            qa = await self._latest_assessment(session, QAAssessment, revision.id) if revision else None
+            rights = await self._latest_assessment(session, RightsAssessment, revision.id) if revision else None
+            raw_refs = revision.generation_output_refs_json if revision else []
+            selected_outputs = []
+            if isinstance(raw_refs, list):
+                for ref in raw_refs[:100]:
+                    if not isinstance(ref, Mapping):
+                        continue
+                    output_id = ref.get("generation_output_id")
+                    digest = ref.get("sha256")
+                    if isinstance(output_id, str) and isinstance(digest, str):
+                        selected_outputs.append(
+                            {"generation_output_id": output_id, "sha256": digest}
+                        )
+
+            variant_projections.append(
+                {
+                    "id": str(variant.id),
+                    "platform": str(variant.platform),
+                    "revision_id": str(revision.id) if revision else None,
+                    "revision_hash": revision.content_hash if revision else None,
+                    "selected_outputs": selected_outputs,
+                    "qa_result": qa.result if qa else None,
+                    "rights_result": rights.result if rights else None,
+                    "blockers": list(dict.fromkeys(variant_blockers)),
+                }
+            )
+            snapshot_variants.append(
+                {
+                    "variant_id": str(variant.id),
+                    "platform": str(variant.platform),
+                    "revision_id": str(revision.id) if revision else None,
+                    "revision_hash": revision.content_hash if revision else None,
+                    "selected_outputs": selected_outputs,
+                    "qa": (
+                        {
+                            "id": str(qa.id),
+                            "revision_hash": qa.revision_hash,
+                            "assessment_hash": qa.assessment_hash,
+                            "result": qa.result,
+                        }
+                        if qa is not None
+                        else None
+                    ),
+                    "rights": (
+                        {
+                            "id": str(rights.id),
+                            "revision_hash": rights.revision_hash,
+                            "assessment_hash": rights.assessment_hash,
+                            "result": rights.result,
+                        }
+                        if rights is not None
+                        else None
+                    ),
+                }
+            )
+
+        findings, snapshot_findings, finding_blockers = await self._stock_findings(session, item)
+        for reason in finding_blockers:
+            if reason not in blockers:
+                blockers.append(reason)
+        snapshot = {
+            "schema": 1,
+            "content_item_hash": str(item.content_hash),
+            "finding_ids": [entry["finding_id"] for entry in snapshot_findings],
+            "findings": snapshot_findings,
+            "variants": snapshot_variants,
+        }
+        return {
+            "ready": not blockers,
+            "blockers": blockers,
+            "findings": findings,
+            "variants": variant_projections,
+            "snapshot": snapshot,
+        }
+
+    async def get_stock_readiness(self, session: Any | None = None, actor: Any | None = None, content_item_id: UUID | str | None = None) -> dict[str, Any]:
+        session = self._resolve_session(session)
+        if actor is None or content_item_id is None:
+            raise MediaOperationsValidationError("actor and content_item_id are required")
+        item = await self._get_row(session, ContentItem, content_item_id, "content_item_id")
+        await self._assert_entity_access(session, actor, item, permission="read")
+        return await self._stock_readiness(session, actor, item)
+
+    async def _stock_decision_response(self, decision: ContentItemStockDecision) -> dict[str, Any]:
+        return decision.to_safe_dict()
+
+    async def change_content_item_stock(self, session: Any | None = None, actor: Any | None = None, content_item_id: UUID | str | None = None, *, action: Any, expected_content_item_hash: Any, expected_version: Any, idempotency_key: Any) -> dict[str, Any]:
+        session = self._resolve_session(session)
+        if actor is None or content_item_id is None:
+            raise MediaOperationsValidationError("actor and content_item_id are required")
+        action_value = str(getattr(action, "value", action) or "").strip().lower()
+        if action_value not in {"adopt", "withdraw"}:
+            raise MediaOperationsValidationError("action must be adopt or withdraw")
+        item = await self._get_row(
+            session,
+            ContentItem,
+            content_item_id,
+            "content_item_id",
+            for_update=True,
+        )
+        await self._assert_entity_access(session, actor, item, permission="write")
+        if not _is_human_actor(actor):
+            raise MediaOperationsAuthorizationError(
+                "only an explicitly human actor may change stock adoption"
+            )
+
+        key = _idempotency_key(idempotency_key)
+        expected_hash = _validated_sha256(
+            expected_content_item_hash,
+            "expected_content_item_hash",
+        )
+        if isinstance(expected_version, bool):
+            raise MediaOperationsValidationError("expected_version must be an integer")
+        try:
+            version_value = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise MediaOperationsValidationError("expected_version must be an integer") from exc
+        if version_value < 1:
+            raise MediaOperationsValidationError("expected_version must be positive")
+
+        actor_id = _actor_id(actor)
+        actor_type = _actor_type(actor, default="unknown")
+        request_hash = sha256_json(
+            {
+                "content_item_id": str(item.id),
+                "action": action_value,
+                "expected_content_item_hash": expected_hash,
+                "expected_version": version_value,
+                "actor_id": str(actor_id),
+                "actor_type": actor_type,
+            }
+        )
+        replay = await self._scalar(
+            session,
+            select(ContentItemStockDecision)
+            .where(
+                ContentItemStockDecision.content_item_id == item.id,
+                ContentItemStockDecision.idempotency_key == key,
+            )
+            .limit(1),
+        )
+        if replay is not None:
+            if replay.request_hash != request_hash:
+                raise MediaOperationsConflictError(
+                    "idempotency key was already used with a different stock decision"
+                )
+            return await self._stock_decision_response(replay)
+
+        if expected_hash != str(item.content_hash).lower() or version_value != int(item.version):
+            raise MediaOperationsConflictError(
+                "ContentItem changed; expected hash and version do not match"
+            )
+        expected_status, next_status = (
+            ("draft", "ready") if action_value == "adopt" else ("ready", "draft")
+        )
+        if str(item.status or "").lower() != expected_status:
+            raise MediaOperationsConflictError(
+                f"ContentItem must be {expected_status} before {action_value}"
+            )
+
+        projection = await self._stock_readiness(session, actor, item)
+        if action_value == "adopt" and projection["blockers"]:
+            raise MediaOperationsConflictError(
+                "stock adoption is blocked: " + ", ".join(projection["blockers"])
+            )
+
+        previous = await self._scalar(
+            session,
+            select(ContentItemStockDecision)
+            .where(ContentItemStockDecision.content_item_id == item.id)
+            .order_by(
+                ContentItemStockDecision.sequence.desc(),
+                ContentItemStockDecision.id.desc(),
+            )
+            .limit(1)
+            .with_for_update(),
+        )
+        sequence = int(previous.sequence if previous is not None else 0) + 1
+        previous_hash = previous.event_hash if previous is not None else None
+        next_version = version_value + 1
+        decision_hash = sha256_json(
+            {
+                "content_item_id": str(item.id),
+                "content_item_hash": str(item.content_hash),
+                "sequence": sequence,
+                "event_type": action_value,
+                "from_status": expected_status,
+                "to_status": next_status,
+                "content_item_version": next_version,
+                "snapshot": projection["snapshot"],
+                "request_hash": request_hash,
+                "actor_id": str(actor_id),
+                "actor_type": actor_type,
+            }
+        )
+        event_hash = sha256_json(
+            {"decision_hash": decision_hash, "prev_event_hash": previous_hash}
+        )
+        decision = ContentItemStockDecision(
+            id=uuid4(),
+            content_item_id=item.id,
+            owner_user_id=item.owner_user_id,
+            project_id=item.project_id,
+            sequence=sequence,
+            event_type=action_value,
+            from_status=expected_status,
+            to_status=next_status,
+            content_item_version=next_version,
+            content_item_hash=item.content_hash,
+            snapshot_json=projection["snapshot"],
+            actor_id=actor_id,
+            actor_type=actor_type,
+            idempotency_key=key,
+            request_hash=request_hash,
+            decision_hash=decision_hash,
+            prev_event_hash=previous_hash,
+            event_hash=event_hash,
+            created_at=datetime.utcnow(),
+        )
+        item.status = next_status
+        item.version = next_version
+        session.add(decision)
+        try:
+            await self._flush_commit(session)
+        except IntegrityError as exc:
+            await self._rollback(session)
+            recovered_item = await self._get_row(
+                session,
+                ContentItem,
+                item.id,
+                "content_item_id",
+            )
+            await self._assert_entity_access(session, actor, recovered_item, permission="read")
+            recovered = await self._scalar(
+                session,
+                select(ContentItemStockDecision)
+                .where(
+                    ContentItemStockDecision.content_item_id == recovered_item.id,
+                    ContentItemStockDecision.idempotency_key == key,
+                )
+                .limit(1),
+            )
+            if recovered is not None and recovered.request_hash == request_hash:
+                return await self._stock_decision_response(recovered)
+            raise MediaOperationsConflictError(
+                "ContentItem stock decision conflicts with an existing record"
+            ) from exc
+        return await self._stock_decision_response(decision)
+
+    async def list_stock_items(self, session: Any | None = None, actor: Any | None = None, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        session = self._resolve_session(session)
+        if actor is None:
+            raise MediaOperationsValidationError("actor is required")
+        page_limit = min(_STOCK_MAX_ITEMS, max(1, int(limit)))
+        page_offset = max(0, int(offset))
+        owner_id = _actor_id(actor)
+        items = await self._scalars(
+            session,
+            select(ContentItem)
+            .where(
+                ContentItem.owner_user_id == owner_id,
+                ContentItem.status.in_(["draft", "ready"]),
+            )
+            .order_by(ContentItem.created_at.desc(), ContentItem.id.desc())
+            .limit(page_limit)
+            .offset(page_offset),
+        )
+        results: list[dict[str, Any]] = []
+        for item in items:
+            await self._assert_entity_access(session, actor, item, permission="read")
+            readiness = await self._stock_readiness(session, actor, item)
+            decision = await self._scalar(
+                session,
+                select(ContentItemStockDecision)
+                .where(ContentItemStockDecision.content_item_id == item.id)
+                .order_by(
+                    ContentItemStockDecision.sequence.desc(),
+                    ContentItemStockDecision.id.desc(),
+                )
+                .limit(1),
+            )
+            blockers = list(readiness["blockers"])
+            status = "awaiting_adoption"
+            if decision is not None and decision.event_type == "adopt":
+                if (
+                    item.status == "ready"
+                    and int(item.version) == int(decision.content_item_version)
+                    and item.content_hash == decision.content_item_hash
+                    and dict(decision.snapshot_json or {}) == readiness["snapshot"]
+                ):
+                    status = "adopted"
+                else:
+                    status = "needs_review"
+                    if "stock_snapshot_changed" not in blockers:
+                        blockers.append("stock_snapshot_changed")
+            elif item.status == "ready":
+                status = "needs_review"
+                if "stock_adoption_record_missing" not in blockers:
+                    blockers.append("stock_adoption_record_missing")
+            elif decision is not None and (
+                item.status != decision.to_status
+                or int(item.version) != int(decision.content_item_version)
+            ):
+                status = "needs_review"
+                if "stock_state_changed" not in blockers:
+                    blockers.append("stock_state_changed")
+
+            program = await self._scalar(
+                session,
+                select(EditorialProgram)
+                .where(EditorialProgram.id == item.editorial_program_id)
+                .limit(1),
+            )
+            brand_name = None
+            if program is not None:
+                persona = await self._scalar(
+                    session,
+                    select(Persona)
+                    .where(Persona.id == program.persona_id)
+                    .limit(1),
+                )
+                if persona is not None:
+                    persona_revision = await self._scalar(
+                        session,
+                        select(PersonaRevision)
+                        .where(PersonaRevision.persona_id == persona.id)
+                        .order_by(PersonaRevision.version.desc(), PersonaRevision.id.desc())
+                        .limit(1),
+                    )
+                    brand_name = persona_revision.display_name if persona_revision else None
+
+            results.append(
+                {
+                    "id": str(item.id),
+                    "owner_user_id": str(item.owner_user_id),
+                    "project_id": str(item.project_id) if item.project_id else None,
+                    "brand_name": brand_name or "ブランド未設定",
+                    "title": item.title,
+                    "brief": item.brief,
+                    "status": item.status,
+                    "version": int(item.version),
+                    "content_hash": item.content_hash,
+                    "stock_status": status,
+                    "blockers": blockers,
+                    "findings": readiness["findings"],
+                    "variants": readiness["variants"],
+                    "latest_decision": decision.to_safe_dict() if decision else None,
+                }
+            )
+        return results
 
     async def _variant_detail(self, session: Any, actor: Any, variant: ContentVariant) -> dict[str, Any]:
         await self._assert_entity_access(session, actor, variant, permission="read")

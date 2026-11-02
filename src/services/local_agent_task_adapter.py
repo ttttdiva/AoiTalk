@@ -10,6 +10,9 @@ import asyncio
 import dataclasses
 import inspect
 import importlib
+import hashlib
+import json
+import logging
 import os
 import threading
 import time
@@ -26,6 +29,8 @@ from .local_agent_tasks import (
     _cfg, validate_task_request, resolve_task_route,
 )
 
+logger = logging.getLogger(__name__)
+
 ADAPTER_KEY = "local_agent_task"
 LOCAL_PROVIDERS = frozenset({"openai_compatible_local", "ollama"})
 WORK_STATUS = {
@@ -35,6 +40,14 @@ WORK_STATUS = {
     "succeeded": "completed", "failed": "failed", "dead_letter": "failed",
     "cancelled": "cancelled",
 }
+
+
+def _require_independent_host_child(child: Any) -> None:
+    # Native source ZIP inputs are frozen at admission. Dependency pins arrive
+    # only after upstream return/review, so releasing a prepared dependent
+    # child would bypass ready_phase and omit those frozen inputs.
+    if (child.planning_policy_json or {}).get("dependencies"):
+        raise LocalAgentTaskError("permission_denied", "Host dependencies are not supported for native admission", 403)
 
 
 def selected_agent_id(config: Any, requested: Any) -> str:
@@ -229,11 +242,12 @@ class CanonicalLocalAgentTasks:
                     **SecretRedactor().value(dict(payload), 2000)})
             self._update(task_id, event_count=count, last_progress_at=time.time())
 
-    async def _authority(self, agent_id: str, revision_id: str, capabilities: tuple[str, ...]) -> None:
+    async def _authority(self, agent_id: str, revision_id: str, capabilities: tuple[str, ...],
+                         *, project_id: str | None = None) -> None:
         from .agent_authority import AgentAuthorityResolver
         resolver = AgentAuthorityResolver(self.db, config=self.config)
         for capability in capabilities:
-            decision = await resolver.resolve(agent_id=agent_id, revision_id=revision_id,
+            decision = await resolver.resolve(agent_id=agent_id, revision_id=revision_id, project_id=project_id,
                 required_capability=capability, tool_capabilities=capabilities, harness_capabilities=capabilities)
             if not decision.allowed:
                 raise LocalAgentTaskError("permission_denied", "Current Agent authority does not permit this task scope", 403)
@@ -254,99 +268,216 @@ class CanonicalLocalAgentTasks:
         if isinstance(prepared, str):
             raise LocalAgentTaskError("command_runtime_unavailable", "The existing file-scoped WSL/bubblewrap runtime is not ready", 409)
 
-    async def _admit(self, record: Mapping[str, Any], spec: LocalAgentTaskSpec, *, actor_role: str) -> None:
+    async def _admit(self, record: Mapping[str, Any], spec: LocalAgentTaskSpec, *, actor_role: str, fixed_binding: Any = None, db_session: Any = None) -> None:
         from sqlalchemy import select
         from ..memory.conversation_repository import ConversationRepository
         from ..memory.models import AgentWorkItem
-        from .agent_model_routing import AgentRoutingPins, resolve_agent_role_route
+        from .agent_model_routing import AgentRoutingPins, resolve_agent_role_route, resolve_native_code_route
         from .agent_run_service import AgentRunService, _binding_audit_projection
         from .agent_work_runtime import WorkCandidate
         from .conversation_agent_service import ConversationAgentService
 
         task_id, owner = record["task_id"], record["owner"]
-        aid = selected_agent_id(self.config, spec.agent_id)
         caps = task_capabilities(spec)
         if spec.allow_commands:
             command_workspace_root(self.config, spec.workspace)
         agents = ConversationAgentService(self.db, config=self.config)
-        agent, revision = await agents.validate_agent_selection(agent_id=aid, actor_user_id=owner, actor_role=actor_role)
-        route = resolve_agent_role_route(self.config, AgentRoutingPins.from_revision(revision), "operator")
-        validate_canonical_local_route(self.config, spec, route)
-        await self._authority(aid, str(revision.id), caps)
-        # The ordinary session repository and binding service remain the only
-        # identity boundary. Never attach delegation to an unrelated Chat.
-        async def remember_session(_dbs, row):
-            # Save the allocated identity before the repository's commit
-            # await, so a disconnected admission never loses its own session.
-            self._update(task_id, session_id=str(row.id))
+        project_id = record.get("project_id")
+        if fixed_binding is not None:
+            from ..memory.models import ConversationSession
+            supplied = fixed_binding.binding
+            aid, sid = str(supplied.agent_id), str(supplied.session_id)
+            dbs = db_session if db_session is not None else await self._session()
+            try:
+                conversation = await dbs.get(ConversationSession, uuid.UUID(sid))
+                if (conversation is None or str(conversation.user_id) != owner
+                        or str(conversation.project_id) != project_id):
+                    raise LocalAgentTaskError("permission_denied", "Fixed binding session mismatch", 403)
+                binding = await agents.resolve_execution_binding_by_id(
+                    binding_id=supplied.binding_id, session_id=sid, agent_id=aid,
+                    agent_revision_id=supplied.agent_revision_id, db_session=dbs)
+                if binding.snapshot_hash != supplied.snapshot_hash:
+                    raise LocalAgentTaskError("permission_denied", "Fixed binding snapshot mismatch", 403)
+            finally:
+                if db_session is None:
+                    await dbs.close()
+            self._update(task_id, session_id=sid)
+            route = resolve_native_code_route(self.config, binding.routing_pins())
+            resolved = {k: str(getattr(route, k, None) or "") for k in ("provider", "model", "effort")}
+            from .codex_development_runtime import CodexNativeWorkerPolicy
+            policy = CodexNativeWorkerPolicy.from_deployment()
+            if not policy.sealed:
+                raise LocalAgentTaskError("agent_route_mismatch", "Native policy is not sealed", 409)
+            policy._check_context(owner_id=owner, role="code_worker", mode=spec.mode, **resolved)
+            await self._authority(aid, binding.agent_revision_id, caps, project_id=project_id)
+        else:
+            aid = selected_agent_id(self.config, spec.agent_id)
+            agent, revision = await agents.validate_agent_selection(agent_id=aid, actor_user_id=owner, actor_role=actor_role)
+            route = resolve_agent_role_route(self.config, AgentRoutingPins.from_revision(revision), "operator")
+            validate_canonical_local_route(self.config, spec, route)
+            await self._authority(aid, str(revision.id), caps)
+            # The ordinary session repository and binding service remain the only
+            # identity boundary. Never attach delegation to an unrelated Chat.
+            async def remember_session(_dbs, row):
+                # Save the allocated identity before the repository's commit
+                # await, so a disconnected admission never loses its own session.
+                self._update(task_id, session_id=str(row.id))
 
-        repository_session = await self._session()
-        try:
-            conversation = await ConversationRepository(repository_session).create_session(user_id=owner, character_name="",
-                title=spec.goal[:120], owner_participant={"participant_id": owner, "role": "owner"},
-                initialize_agent=remember_session)
-        finally:
-            await repository_session.close()
-        sid = str(conversation.id)
-        self._update(task_id, session_id=sid)
-        bound = await agents.bind_session_agent(session_id=sid, agent_id=aid, actor_user_id=owner,
-            actor_role=actor_role, expected_agent_id=None)
-        binding = bound.binding
-        if binding is None:
-            raise LocalAgentTaskError("agent_revision_missing", "The selected Agent has no immutable binding", 409)
-        # Recheck the actual persisted snapshot after the selection transaction.
-        route = resolve_agent_role_route(self.config, binding.routing_pins(), "operator")
-        resolved = validate_canonical_local_route(self.config, spec, route)
-        await self._authority(aid, binding.agent_revision_id, caps)
+            repository_session = await self._session()
+            try:
+                conversation = await ConversationRepository(repository_session).create_session(user_id=owner, character_name="",
+                    title=spec.goal[:120], owner_participant={"participant_id": owner, "role": "owner"},
+                    initialize_agent=remember_session)
+            finally:
+                await repository_session.close()
+            sid = str(conversation.id)
+            self._update(task_id, session_id=sid)
+            bound = await agents.bind_session_agent(session_id=sid, agent_id=aid, actor_user_id=owner,
+                actor_role=actor_role, expected_agent_id=None)
+            binding = bound.binding
+            if binding is None:
+                raise LocalAgentTaskError("agent_revision_missing", "The selected Agent has no immutable binding", 409)
+            # Recheck the actual persisted snapshot after the selection transaction.
+            route = resolve_agent_role_route(self.config, binding.routing_pins(), "operator")
+            resolved = validate_canonical_local_route(self.config, spec, route)
+            await self._authority(aid, binding.agent_revision_id, caps)
+
         self._update(task_id, agent_id=aid, agent_revision_id=binding.agent_revision_id,
             binding_id=binding.binding_id, snapshot_hash=binding.snapshot_hash, resolved_route=resolved, llm=resolved)
         deadline = datetime.utcfromtimestamp(float(record["deadline_at"]))
+        plan_ref = fixed_binding.plan_ref if fixed_binding is not None else None
         candidate = WorkCandidate(source_type=ADAPTER_KEY, source_id=task_id,
+            parent_work_item_id=plan_ref.producer_work_id if plan_ref else None,
+            root_work_item_id=plan_ref.root_work_id if plan_ref else None,
+            causal_depth=plan_ref.causal_depth if plan_ref else 0,
             source_revision=record["request_fingerprint"], intent_key="delegate", domain="local_workspace",
-            conversation_session_id=sid, assigned_agent_id=aid, agent_revision_id=binding.agent_revision_id,
+            conversation_session_id=sid, project_id=project_id, assigned_agent_id=aid, agent_revision_id=binding.agent_revision_id,
             required_capabilities=caps, execution_adapter=ADAPTER_KEY, max_attempts=1,
             # Until Run linkage is durable this item can only expire, never run.
             not_before=deadline, deadline=deadline,
             concurrency_key=workspace_concurrency_key(spec.workspace),
             metadata={"local_task_id": task_id, "owner_user_id": owner, "session_id": sid,
-                "request_fingerprint": record["request_fingerprint"], "binding_id": binding.binding_id})
-        work_session = await self._session()
+                "request_fingerprint": record["request_fingerprint"], "binding_id": binding.binding_id,
+                **({"software_graph": record["software_graph"]} if fixed_binding else {})})
+        work_session = db_session if db_session is not None else await self._session()
         try:
             work = await self.coordinator.materialize(candidate, session=work_session)
             if not work or not work.get("id"):
                 raise LocalAgentTaskError("canonical_runtime_unavailable", "Common AgentWork admission is unavailable", 409)
             wid = str(work["id"])
             self._update(task_id, work_id=wid)
-            await work_session.commit()
+            if db_session is None:
+                await work_session.commit()
+            else:
+                await work_session.flush()
         except BaseException:
-            await work_session.rollback()
+            if db_session is None:
+                await work_session.rollback()
             raise
         finally:
-            await work_session.close()
+            if db_session is None:
+                await work_session.close()
         manifest = {"schema_version": 2, "source": ADAPTER_KEY, "agent_id": aid,
             "agent_revision_id": binding.agent_revision_id, "work_item_id": wid,
-            "team_id": binding.agent_team_id, "execution_profile_id": binding.execution_profile_id,
             "capabilities": list(caps), "route_snapshot": binding.routing_pins().route_snapshot.get("roles", binding.routing_pins().route_snapshot)}
-        run = await AgentRunService(self.db, config=self.config).create_run(session_id=sid, user_id=owner,
+        if fixed_binding:
+            manifest.update(project_id=project_id, authority_hash=record["request_fingerprint"],
+                software_graph=record["software_graph"])
+        run = await AgentRunService(self.db, config=self.config).create_run(session_id=sid, user_id=owner, project_id=project_id,
             agent_id=aid, agent_revision_id=binding.agent_revision_id, work_item_id=wid, work_item_attempt=1,
             run_type="autonomous_work", title=spec.goal[:120], objective=spec.goal,
-            provider=resolved["provider"], model=resolved["model"], acting_subagent_id=route.acting_subagent_id,
-            execution_manifest=manifest, metadata={"local_task_id": task_id,
+            provider=resolved["provider"], model=resolved["model"],
+            **({"db_session": db_session} if db_session is not None else {}), execution_manifest=manifest, metadata={"local_task_id": task_id,
                 "agent_binding": _binding_audit_projection(binding), "requested_route": record["requested_route"],
-                "resolved_route": resolved, "workspace": spec.workspace})
+                "resolved_route": resolved, "workspace": spec.workspace,
+                **({"software_graph": record["software_graph"], "project_id": project_id} if fixed_binding else {})})
         rid = str(run["id"])
         self._update(task_id, agent_run_id=rid)
         if spec.allow_commands:
             await self._preflight_commands(spec, rid)
             if float(record["deadline_at"]) <= time.time():
                 raise LocalAgentTaskError("task_timeout", "The task deadline elapsed during command preflight", 409)
-        dbs = await self._session()
+        dbs = db_session if db_session is not None else await self._session()
         try:
             row = (await dbs.execute(select(AgentWorkItem).where(AgentWorkItem.id == uuid.UUID(wid)).with_for_update())).scalars().first()
             if (row is None or row.state != "pending" or row.active_agent_run_id is not None
-                    or str(row.assigned_agent_id) != aid or str(row.agent_revision_id) != binding.agent_revision_id):
+                    or str(row.assigned_agent_id) != aid or str(row.agent_revision_id) != binding.agent_revision_id
+                    or str(row.project_id or "") != str(project_id or "")):
                 raise LocalAgentTaskError("canonical_runtime_unavailable", "Work admission fence changed", 409)
             row.active_agent_run_id = uuid.UUID(rid)
+            if plan_ref is None:
+                row.not_before = datetime.utcnow()
+            if db_session is None:
+                await dbs.commit()
+            else:
+                await dbs.flush()
+        except BaseException:
+            if db_session is None:
+                await dbs.rollback()
+            raise
+        finally:
+            if db_session is None:
+                await dbs.close()
+        self._update(task_id, execution_state="pending", latest_activity="queued on common AgentWork")
+        self._event(task_id, "admitted", {"agent_id": aid, "agent_revision_id": binding.agent_revision_id,
+            "agent_run_id": rid, "work_id": wid, "session_id": sid, "resolved_route": resolved})
+
+    async def activate_host_software_graph(self, task_id: str, *, owner: str) -> None:
+        """Release a prepared Work only after its adopted child link is durable.
+
+        Call after committing the parent adoption and child link. This method
+        reads those rows in its own transaction; rollback cannot release Work.
+        """
+        from sqlalchemy import select
+        from ..memory.models import AgentDelegation, AgentWorkItem
+        from .agent_delegation_service import AgentDelegationService, adopted_artifact, phase_items
+
+        record = self._record(task_id, _owner(owner))
+        graph = record.get("software_graph") or {}
+        ref = graph.get("plan_ref") or {}
+        try:
+            order_id = uuid.UUID(ref["order_id"])
+            work_id = uuid.UUID(record["work_id"])
+            run_id = uuid.UUID(record["agent_run_id"])
+        except (KeyError, TypeError, ValueError):
+            raise LocalAgentTaskError("permission_denied", "Host plan link is invalid", 403) from None
+        dbs = await self._session()
+        try:
+            order = (await dbs.execute(select(AgentDelegation).where(
+                AgentDelegation.id == order_id).with_for_update())).scalar_one_or_none()
+            row = (await dbs.execute(select(AgentWorkItem).where(AgentWorkItem.id == work_id).with_for_update())).scalar_one_or_none()
+            children = (await dbs.execute(select(AgentDelegation).where(
+                AgentDelegation.parent_delegation_id == order_id,
+                AgentDelegation.linked_work_item_id == work_id))).scalars().all()
+            child = next((c for c in children if (c.planning_policy_json or {}).get("graph_task", {}).get("key") == ref.get("task_key")), None)
+            items = await phase_items(dbs, order) if order else {}
+            plan = items.get("plan")
+            artifact = await adopted_artifact(dbs, plan, order, "plan") if order else None
+            if (order is None or order.cancelled_at or order.planning_error_code or child is None or child.cancelled_at
+                    or child.work_role != "code_worker"
+                    or artifact is None or str(artifact.id) != ref.get("artifact_id") or artifact.sha256 != ref.get("sha256")
+                    or order.adopted_plan_artifact_id != artifact.id or order.adopted_plan_sha256 != artifact.sha256
+                    or child.parent_plan_artifact_id != artifact.id or child.parent_plan_sha256 != artifact.sha256
+                    or child.parent_round != order.plan_round or str(child.created_by) != owner
+                    or (child.planning_policy_json or {}).get("graph_task", {}).get("graph_revision_id") != graph.get("graph_ref", {}).get("graph_revision_id")
+                    or (child.planning_policy_json or {}).get("graph_task", {}).get("graph_hash") != graph.get("graph_ref", {}).get("graph_hash")
+                    or str(child.project_id) != record.get("project_id")
+                    or str(child.worker_agent_id) != record.get("agent_id")
+                    or str(child.worker_revision_id) != record.get("agent_revision_id")
+                    or str(child.reviewer_agent_id) != graph.get("reviewer_pin", {}).get("agent_id")
+                    or str(child.reviewer_revision_id) != graph.get("reviewer_pin", {}).get("agent_revision_id")
+                    or row is None or row.state != "pending" or row.active_agent_run_id != run_id
+                    or str(row.parent_work_item_id) != ref.get("producer_work_id")
+                    or str(plan.id) != ref.get("producer_work_id") or str(artifact.agent_run_id) != ref.get("producer_run_id")
+                    or (row.metadata_json or {}).get("software_graph") != graph
+                    or row.deadline is None or row.deadline <= datetime.utcnow()):
+                raise LocalAgentTaskError("permission_denied", "Host plan link is not durable", 403)
+            _require_independent_host_child(child)
+            await AgentDelegationService(self.db, config=self.config).validate_authority(dbs, child)
+            await self._authority(record["agent_id"], record["agent_revision_id"], tuple(record["required_capabilities"]),
+                project_id=record.get("project_id"))
+            await self._authority(graph["reviewer_pin"]["agent_id"], graph["reviewer_pin"]["agent_revision_id"],
+                ("workspace_read",), project_id=record.get("project_id"))
             row.not_before = datetime.utcnow()
             await dbs.commit()
         except BaseException:
@@ -354,9 +485,38 @@ class CanonicalLocalAgentTasks:
             raise
         finally:
             await dbs.close()
-        self._update(task_id, execution_state="pending", latest_activity="queued on common AgentWork")
-        self._event(task_id, "admitted", {"agent_id": aid, "agent_revision_id": binding.agent_revision_id,
-            "agent_run_id": rid, "work_id": wid, "session_id": sid, "resolved_route": resolved})
+
+    async def reconcile_prepared_software_graphs(self) -> None:
+        """Release committed host links after a crash or missed post-commit activation.
+
+        The selection transaction ends before activation opens its own locking
+        transaction. Only unreleased, unexpired software graph Work is eligible;
+        activation independently checks the complete current host authority.
+        """
+        from sqlalchemy import select
+        from ..memory.models import AgentDelegation, AgentWorkItem
+
+        dbs = await self._session()
+        try:
+            rows = (await dbs.execute(select(AgentWorkItem).join(
+                AgentDelegation, AgentDelegation.linked_work_item_id == AgentWorkItem.id
+            ).where(
+                AgentWorkItem.source_type == ADAPTER_KEY,
+                AgentWorkItem.state == "pending",
+                AgentWorkItem.active_agent_run_id.is_not(None),
+                AgentWorkItem.not_before == AgentWorkItem.deadline,
+                AgentWorkItem.deadline > datetime.utcnow(),
+            ))).scalars().all()
+            candidates = [(row.source_id, (row.metadata_json or {}).get("owner_user_id"))
+                          for row in rows if (row.metadata_json or {}).get("software_graph")]
+        finally:
+            await dbs.close()
+        for task_id, owner in candidates:
+            try:
+                await self.activate_host_software_graph(task_id, owner=owner)
+            except Exception:
+                # One stale or revoked host link must not stop other work.
+                logger.warning("Unable to activate prepared software graph task")
 
     async def _cancel_admission(self, task_id: str, owner: str, reason: str) -> None:
         """Reconcile an unknown admission result using durable source identity."""
@@ -402,6 +562,62 @@ class CanonicalLocalAgentTasks:
 
     async def submit(self, payload: Mapping[str, Any], *, owner: str, idempotency_key: str | None = None,
                      actor_role: str = "") -> tuple[dict[str, Any], bool]:
+        return await self._submit(payload, owner=owner, idempotency_key=idempotency_key, actor_role=actor_role)
+
+    async def submit_software_graph(self, *, binding: Any, graph_ref: Mapping[str, Any],
+                                    worker_pin: Mapping[str, Any], reviewer_pin: Mapping[str, Any],
+                                    input_artifact_refs: list[Any], project_workspace: str,
+                                    goal: str, constraints: Any, completion_criteria: Any,
+                                    idempotency_key: str, db_session: Any = None) -> tuple[dict[str, Any], bool]:
+        """Admit an already authorized Graph with its prepared immutable binding."""
+        from .software_graph_binding import SoftwareGraphBinding
+        from .harness_execution_scope_service import _workspace_root, _project_root, _protected_roots
+        if db_session is not None and (not isinstance(binding, SoftwareGraphBinding) or binding.plan_ref is None):
+            raise LocalAgentTaskError("permission_denied", "Caller session requires a host plan binding", 403)
+        if not isinstance(binding, SoftwareGraphBinding) or binding.role != "code_worker":
+            raise LocalAgentTaskError("permission_denied", "Prepared Graph binding required", 403)
+        if binding.plan_ref is not None and db_session is None:
+            raise LocalAgentTaskError("permission_denied", "Host plan binding requires caller session", 403)
+        if not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+            raise LocalAgentTaskError("invalid_input", "idempotency_key is invalid")
+        if not all(isinstance(x, Mapping) and x for x in (graph_ref, worker_pin, reviewer_pin)) or not isinstance(input_artifact_refs, list):
+            raise LocalAgentTaskError("invalid_input", "Graph references and pins are required")
+        if (str(worker_pin.get("agent_id")) != str(binding.binding.agent_id)
+                or str(worker_pin.get("agent_revision_id")) != str(binding.binding.agent_revision_id)):
+            raise LocalAgentTaskError("permission_denied", "Worker pin does not match binding", 403)
+        if (str(reviewer_pin.get("agent_id") or "") == str(worker_pin.get("agent_id"))
+                or not reviewer_pin.get("agent_id") or not reviewer_pin.get("agent_revision_id")):
+            raise LocalAgentTaskError("invalid_input", "A separate pinned reviewer is required")
+        if binding.plan_ref is not None:
+            if input_artifact_refs != binding.plan_ref.input_artifact_refs:
+                raise LocalAgentTaskError("permission_denied", "Graph input references do not match", 403)
+            ref = binding.plan_ref
+            if (dict(graph_ref) != ref.graph_ref or dict(worker_pin) != ref.worker_pin
+                    or dict(reviewer_pin) != ref.reviewer_pin):
+                raise LocalAgentTaskError("permission_denied", "Graph plan pins do not match", 403)
+        root = _workspace_root(self.config)
+        try:
+            workspace = _project_root({"id": str(binding.project_id), "project_storage_path": project_workspace},
+                project_id=str(binding.project_id), workspace=root, protected_roots=_protected_roots(self.config, root))
+            command_workspace_root(self.config, str(workspace))
+            graph = json.loads(json.dumps({"schema_version": 1, "graph_ref": graph_ref,
+                "source": binding.source, "worker_pin": worker_pin, "reviewer_pin": reviewer_pin,
+                "input_artifact_refs": input_artifact_refs, "model_role": "code", "execution_lane": "native_code",
+                **({"plan_ref": binding.plan_ref.to_dict()} if binding.plan_ref else {})},
+                ensure_ascii=False, allow_nan=False))
+        except (ValueError, TypeError) as exc:
+            raise LocalAgentTaskError("invalid_input", "Invalid Graph context", 400) from exc
+        from .agent_work_runtime import _safe_json
+        if _safe_json(graph) != graph:
+            raise LocalAgentTaskError("invalid_input", "Graph context exceeds safe metadata bounds")
+        payload = {"goal": goal, "constraints": constraints, "completion_criteria": completion_criteria,
+                   "workspace": str(workspace), "mode": "mutate", "allow_commands": True}
+        return await self._submit(payload, owner=str(binding.owner_user_id), idempotency_key=idempotency_key,
+                                  actor_role="", fixed_binding=binding, software_graph=graph,
+                                  **({"db_session": db_session} if db_session is not None else {}))
+
+    async def _submit(self, payload: Mapping[str, Any], *, owner: str, idempotency_key: str | None,
+                      actor_role: str, fixed_binding: Any = None, software_graph: dict | None = None, db_session: Any = None) -> tuple[dict[str, Any], bool]:
         owner = _owner(owner)
         payload = {"allow_commands": False, **dict(payload)}
         spec = validate_task_request(payload, allowed_roots=self.manager.allowed_roots,
@@ -412,16 +628,25 @@ class CanonicalLocalAgentTasks:
         if key is not None and (not isinstance(key, str) or not IDEMPOTENCY_KEY_RE.fullmatch(key)):
             raise LocalAgentTaskError("invalid_input", "idempotency_key is invalid")
         fingerprint = spec.fingerprint()
+        if fixed_binding is not None:
+            snapshot = fixed_binding.binding.to_dict(include_prose=True)
+            for field in ("id", "session_id", "created_at", "created_by", "snapshot_hash"):
+                snapshot.pop(field, None)
+            fingerprint = hashlib.sha256(json.dumps({"spec": spec.to_dict(), "project_id": str(fixed_binding.project_id),
+                "software_graph": software_graph, "binding": snapshot}, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
         async with self._submit_lock:
+            retry_receipt = False
             existing = self.manager.store.find_key(owner, key) if key else None
             if existing:
                 record = self._record(existing["task_id"], owner)
                 if existing.get("fingerprint") != fingerprint:
                     raise LocalAgentTaskError("idempotency_conflict", "idempotency_key was already used for a different request", 409)
-                return await self.get(record["task_id"], owner=owner), False
+                if db_session is None or not await self._host_receipt_retryable(db_session, fixed_binding, record, fingerprint):
+                    return await self.get(record["task_id"], owner=owner, **({"db_session": db_session} if db_session is not None else {})), False
+                retry_receipt = True
             caps = task_capabilities(spec)
             # Resolve defaults before creating the receipt; no arbitrary Agent.
-            aid = selected_agent_id(self.config, spec.agent_id)
+            aid = str(fixed_binding.binding.agent_id) if fixed_binding is not None else selected_agent_id(self.config, spec.agent_id)
             if not self.coordinator._runtime_enabled() or self.coordinator.adapters.get(ADAPTER_KEY) is not self.adapter:
                 raise LocalAgentTaskError("canonical_runtime_unavailable", "Common AgentWork is not connected", 409)
             require_workspace_runtime()
@@ -433,38 +658,76 @@ class CanonicalLocalAgentTasks:
                 "agent_id": aid, "required_capabilities": list(caps), "idempotency_key": key,
                 "created_at": now, "updated_at": now, "last_progress_at": now, "deadline_at": now + spec.timeout_sec, "boot_id": self.manager.boot_id,
                 "event_count": 0, "counters": {}, "cancel_requested": False}
+            if fixed_binding is not None:
+                record.update(project_id=str(fixed_binding.project_id), software_graph=software_graph)
             try:
-                self.manager.store.create(record)
+                if retry_receipt:
+                    self._update(task_id, **{k: v for k, v in record.items() if k != "task_id"})
+                else:
+                    self.manager.store.create(record)
             except FileExistsError:
                 # The deterministic receipt is the cross-process first-writer
                 # fence, including a crash before the auxiliary key index.
-                record = self._record(task_id, owner)
-                if record.get("request_fingerprint") != fingerprint:
+                old_record = self._record(task_id, owner)
+                if old_record.get("request_fingerprint") != fingerprint:
                     raise LocalAgentTaskError("idempotency_conflict", "idempotency_key was already used for a different request", 409) from None
-                return await self.get(task_id, owner=owner), False
+                if db_session is None or not await self._host_receipt_retryable(db_session, fixed_binding, old_record, fingerprint):
+                    return await self.get(task_id, owner=owner, **({"db_session": db_session} if db_session is not None else {})), False
+                self._update(task_id, **{**{k: v for k, v in record.items() if k != "task_id"},
+                    "failure_reason": None, "finished_at": None})
             try:
                 if key:
                     self.manager.store.put_key(owner, key, task_id, fingerprint)
-                await self._admit(record, spec, actor_role=actor_role)
-                return await self.get(task_id, owner=owner), True
+                await self._admit(record, spec, actor_role=actor_role, **({"fixed_binding": fixed_binding} if fixed_binding is not None else {}),
+                    **({"db_session": db_session} if db_session is not None else {}))
+                return await self.get(task_id, owner=owner, **({"db_session": db_session} if db_session is not None else {})), True
             except asyncio.CancelledError:
                 self._update(task_id, status="interrupted", execution_state="uncertain", failure_reason="admission_interrupted")
-                await self._shield_admission_cleanup(task_id, owner, "admission_interrupted")
+                if db_session is None:
+                    await self._shield_admission_cleanup(task_id, owner, "admission_interrupted")
                 raise
             except Exception as exc:
                 safe = _error(exc)
                 self._update(task_id, status="failed", execution_state="admission_failed", failure_reason=safe.code,
                     finished_at=time.time())
-                await self._shield_admission_cleanup(task_id, owner, "admission_failed")
+                if db_session is None:
+                    await self._shield_admission_cleanup(task_id, owner, "admission_failed")
                 # No automatic admission replay. A gated Work remains unable
                 # to run, and the same key always returns this receipt.
+                if db_session is not None:
+                    raise
                 raise safe from None
 
-    async def _work_projection(self, record: Mapping[str, Any]) -> dict[str, Any]:
+    async def _host_receipt_retryable(self, session: Any, binding: Any, record: Mapping[str, Any], fingerprint: str) -> bool:
+        from sqlalchemy import select
+        from ..memory.models import AgentDelegation, AgentWorkItem
+        from .agent_delegation_service import adopted_artifact, phase_items
+
+        ref = binding.plan_ref if binding is not None else None
+        if ref is None or record.get("cancel_requested") or record.get("request_fingerprint") != fingerprint:
+            return False
+        order = (await session.execute(select(AgentDelegation).where(
+            AgentDelegation.id == uuid.UUID(ref.order_id)).with_for_update())).scalar_one_or_none()
+        if order is None or order.cancelled_at or order.planning_error_code:
+            raise LocalAgentTaskError("permission_denied", "Host plan is unavailable", 403)
+        items = await phase_items(session, order)
+        plan = items.get("plan")
+        artifact = await adopted_artifact(session, plan, order, "plan")
+        if (artifact is None or str(artifact.id) != ref.artifact_id or artifact.sha256 != ref.sha256
+                or str(plan.id) != ref.producer_work_id or str(artifact.agent_run_id) != ref.producer_run_id):
+            raise LocalAgentTaskError("permission_denied", "Host plan changed", 403)
+        work = (await session.execute(select(AgentWorkItem).where(
+            AgentWorkItem.source_type == ADAPTER_KEY, AgentWorkItem.source_id == record["task_id"]))).scalars().first()
+        if work is not None and (work.source_revision != fingerprint
+                or (work.metadata_json or {}).get("request_fingerprint") != fingerprint):
+            raise LocalAgentTaskError("idempotency_conflict", "Host Work fingerprint changed", 409)
+        return work is None
+
+    async def _work_projection(self, record: Mapping[str, Any], db_session: Any = None) -> dict[str, Any]:
         from ..memory.models import AgentWorkItem
         if not record.get("work_id"):
             return {}
-        dbs = await self._session()
+        dbs = db_session if db_session is not None else await self._session()
         try:
             row = await dbs.get(AgentWorkItem, uuid.UUID(record["work_id"]))
             if row is None and record.get("execution_state") in {"admission_failed", "uncertain"}:
@@ -476,16 +739,22 @@ class CanonicalLocalAgentTasks:
                 "worker_alive": bool(row.state in {"claimed", "running"} and row.lease_expires_at is not None
                     and row.lease_expires_at > datetime.utcnow())}
         finally:
-            await dbs.close()
+            if db_session is None:
+                await dbs.close()
 
-    async def get(self, task_id: str, *, owner: str, allow_profile: bool = True, **_: Any) -> dict[str, Any]:
+    async def get(self, task_id: str, *, owner: str, allow_profile: bool = True, db_session: Any = None, **_: Any) -> dict[str, Any]:
         record = self._record(task_id, owner)
         if record.get("executor") != "aoitalk_agent":
             return self.manager.get(task_id, owner=owner, allow_profile=allow_profile)
-        work = await self._work_projection(record)
+        work = await self._work_projection(record, **({"db_session": db_session} if db_session is not None else {}))
         state = work.get("state")
+        terminal_blocked = (state == "blocked" and bool(work.get("completed_at"))
+            and "active_agent_run_id" in work and work["active_agent_run_id"] is None
+            and work.get("safe_error_code") in {"agent_blocked", "authority_revoked"})
         if state:
             status = WORK_STATUS.get(state, "waiting")
+            if terminal_blocked:
+                status = "failed"
             if state == "cancelled" and task_id in self.adapter._active:
                 status, state = "running", "cancelling"
             # Pending gated admission after process loss is never replayed.
@@ -500,6 +769,8 @@ class CanonicalLocalAgentTasks:
         elif record.get("execution_state") == "accepted" and record.get("boot_id") != self.manager.boot_id:
             record = {**record, "status": "interrupted", "execution_state": "uncertain", "failure_reason": "admission_interrupted"}
         view = self.manager.view(record)
+        if terminal_blocked:
+            view["finished_at"] = work["completed_at"]
         if view["status"] == "running":
             # The common lease heartbeat, rather than a provider response or
             # this process's legacy worker thread, proves liveness.
@@ -562,6 +833,7 @@ class LocalTaskWorkSource:
                 and record.get("owner") == claim.metadata.get("owner_user_id")
                 and record.get("agent_id") == claim.assigned_agent_id
                 and record.get("agent_revision_id") == claim.agent_revision_id
+                and str(record.get("project_id") or "") == str(getattr(claim, "project_id", None) or "")
                 and record.get("session_id") == claim.conversation_session_id)
         except LocalAgentTaskError:
             return False
@@ -593,7 +865,9 @@ class LocalTaskExecutionAdapter:
         return True
 
     async def _checkpoint(self, claim: Any, run_id: str, record: Mapping[str, Any]) -> None:
-        from ..memory.models import AgentRun, AgentWorkItem
+        from sqlalchemy import select
+        from ..memory.models import AgentDelegation, AgentRun, AgentWorkItem
+        from .agent_delegation_service import AgentDelegationService, DelegationError
         service = self.service
         dbs = await service._session()
         try:
@@ -605,7 +879,8 @@ class LocalTaskExecutionAdapter:
                     or str(current_run.agent_id) != record["agent_id"]
                     or str(current_run.agent_revision_id) != record["agent_revision_id"]
                     or str(current_run.work_item_id) != claim.work_item_id
-                    or current_run.work_item_attempt != claim.attempt):
+                    or current_run.work_item_attempt != claim.attempt
+                    or str(current_run.project_id or "") != str(record.get("project_id") or "")):
                 raise LocalAgentTaskError("permission_denied", "The canonical Run binding is no longer active", 403)
             if row is not None and row.deadline is not None and row.deadline <= datetime.utcnow():
                 raise LocalAgentTaskError("task_timeout", "The task deadline has elapsed", 409)
@@ -618,14 +893,39 @@ class LocalTaskExecutionAdapter:
                     or str(row.conversation_session_id) != record["session_id"]
                     or (row.metadata_json or {}).get("owner_user_id") != record["owner"]
                     or tuple(row.required_capabilities_json or ()) != tuple(record["required_capabilities"])
+                    or str(row.project_id or "") != str(record.get("project_id") or "")
                     or str(row.active_agent_run_id) != run_id or row.lease_expires_at is None
                     or row.lease_expires_at <= datetime.utcnow()):
                 raise LocalAgentTaskError("permission_denied", "The AgentWork lease is no longer active", 403)
+            # Reconcile every persisted origin, including absence, before choosing
+            # public execution. A removed metadata field must not downgrade host work.
+            stored = service.manager.store.load(claim.source_id)
+            graph = record.get("software_graph")
+            work_graph = (row.metadata_json or {}).get("software_graph")
+            manifest = current_run.resolved_execution_manifest or {}
+            manifest_graph = manifest.get("software_graph")
+            children = (await dbs.execute(select(AgentDelegation).where(
+                AgentDelegation.linked_work_item_id == row.id))).scalars().all()
+            if graph is not None or work_graph is not None or manifest_graph is not None or children:
+                ref = graph.get("plan_ref", {}) if isinstance(graph, Mapping) else {}
+                matches = [child for child in children if str(child.parent_delegation_id) == ref.get("order_id")
+                    and (child.planning_policy_json or {}).get("graph_task", {}).get("key") == ref.get("task_key")]
+                if (not graph or stored.get("software_graph") != graph or work_graph != graph
+                        or manifest_graph != graph or manifest.get("authority_hash") != record["request_fingerprint"]
+                        or (row.metadata_json or {}).get("request_fingerprint") != record["request_fingerprint"]
+                        or stored.get("request_fingerprint") != record["request_fingerprint"]
+                        or len(children) != 1 or len(matches) != 1 or matches[0].cancelled_at):
+                    raise LocalAgentTaskError("permission_denied", "The host task origin or child link changed", 403)
+                try:
+                    await AgentDelegationService(service.db, config=service.config).validate_authority(dbs, matches[0])
+                except DelegationError as exc:
+                    raise LocalAgentTaskError("permission_denied", "The host delegation authority changed", 403) from exc
         finally:
             await dbs.close()
         if service.manager.store.load(claim.source_id).get("cancel_requested"):
             raise LocalAgentTaskError("permission_denied", "The task has been cancelled", 403)
-        await service._authority(record["agent_id"], record["agent_revision_id"], tuple(record["required_capabilities"]))
+        await service._authority(record["agent_id"], record["agent_revision_id"], tuple(record["required_capabilities"]),
+                                 project_id=record.get("project_id"))
 
     async def _command_scope(self, claim: Any, run_id: str, record: Mapping[str, Any], spec: LocalAgentTaskSpec):
         from .agent_authority import AgentAuthorityResolver
@@ -633,7 +933,7 @@ class LocalTaskExecutionAdapter:
         from ..security.harness_execution_scope import ResourceLimits
         await self._checkpoint(claim, run_id, record)
         decision = await AgentAuthorityResolver(self.service.db, config=self.service.config).resolve(
-            agent_id=record["agent_id"], revision_id=record["agent_revision_id"],
+            agent_id=record["agent_id"], revision_id=record["agent_revision_id"], project_id=record.get("project_id"),
             required_capability="command_execute", tool_capabilities=claim.required_capabilities,
             harness_capabilities=claim.required_capabilities)
         if (not decision.allowed or not decision.organization_id or decision.agent_id != record["agent_id"]
@@ -646,7 +946,7 @@ class LocalTaskExecutionAdapter:
             resource_limits=ResourceLimits(timeout_seconds=min(spec.timeout_sec, spec.command_timeout_sec, 3600),
                 max_processes=32, max_output_bytes=min(self.service.manager.limits.tool_result_chars * 4, 1024 * 1024),
                 max_disk_bytes=256 * 1024 * 1024, max_background_seconds=min(spec.timeout_sec, 3600)),
-            agent_id=record["agent_id"], organization_id=decision.organization_id, project_id=None, app_id=None,
+            agent_id=record["agent_id"], organization_id=decision.organization_id, project_id=record.get("project_id"), app_id=None,
             run_id=run_id, audit_id=f"local-task:{claim.work_item_id}:{claim.attempt}",
             mode="workspace_write", delete_workspace=False)
 
@@ -682,7 +982,6 @@ class LocalTaskExecutionAdapter:
         from .agent_work_runtime import ExecutionOutcome
         from .chat_execution_adapter import bind_chat_agent_execution, resolve_chat_agent_execution
         from .turn_context import reset_turn_context, set_turn_context
-        from .scoped_local_mcp import scoped_local_mcp_tools
 
         service = self.service
         try:
@@ -696,15 +995,60 @@ class LocalTaskExecutionAdapter:
             return ExecutionOutcome(classification="blocked", error_code="permission_denied")
         spec = validate_task_request(record["request"], allowed_roots=service.manager.allowed_roots,
             limits=service.manager.limits, route_expectations=True)
-        if (spec.fingerprint() != record["request_fingerprint"] or task_capabilities(spec) != tuple(claim.required_capabilities)
+        if (task_capabilities(spec) != tuple(claim.required_capabilities)
                 or tuple(record["required_capabilities"]) != tuple(claim.required_capabilities)):
             return ExecutionOutcome(classification="blocked", error_code="permission_denied")
         execution = await resolve_chat_agent_execution(session_id=record["session_id"], run=run,
             config=service.config, db_manager=service.db)
         if execution is None or execution.binding.binding_id != record.get("binding_id"):
             return ExecutionOutcome(classification="blocked", error_code="agent_revision_missing")
+        graph = record.get("software_graph")
+        if graph is not None:
+            import hashlib
+            import json
+            if (str(execution.binding.agent_id) != str(record.get("agent_id"))
+                    or str(execution.binding.agent_revision_id) != str(record.get("agent_revision_id"))
+                    or str(execution.binding.snapshot_hash) != str(record.get("snapshot_hash"))):
+                return ExecutionOutcome(classification="blocked", error_code="permission_denied")
+            snapshot = execution.binding.to_dict(include_prose=True)
+            for field in ("id", "session_id", "created_at", "created_by", "snapshot_hash"):
+                snapshot.pop(field, None)
+            fingerprint = hashlib.sha256(json.dumps({"spec": spec.to_dict(), "project_id": str(record.get("project_id")),
+                "software_graph": graph, "binding": snapshot}, sort_keys=True, ensure_ascii=False,
+                separators=(",", ":")).encode()).hexdigest()
+        else:
+            fingerprint = spec.fingerprint()
+        if fingerprint != record["request_fingerprint"]:
+            return ExecutionOutcome(classification="blocked", error_code="permission_denied")
+        native = isinstance(graph, Mapping) and graph.get("execution_lane") == "native_code"
+        if graph is not None and not native:
+            return ExecutionOutcome(classification="blocked", error_code="native_graph_invalid")
+        from .agent_model_routing import AgentModelRouteError
         try:
-            resolved = validate_canonical_local_route(service.config, spec, execution.route)
+            if native:
+                from .agent_model_routing import resolve_native_code_route
+                route = resolve_native_code_route(service.config, execution.binding.routing_pins())
+                resolved = dict(record.get("resolved_route") or {})
+                if (graph != claim.metadata.get("software_graph")
+                        or graph.get("schema_version") != 1 or graph.get("model_role") != "code"
+                        or not all(graph.get(k) for k in ("graph_ref", "source", "worker_pin", "reviewer_pin"))
+                        or not isinstance(graph.get("input_artifact_refs"), list)
+                        or not spec.allow_commands or spec.mode != "mutate"
+                        or not record.get("project_id") or str(record.get("work_id")) != str(claim.work_item_id)
+                        or resolved.get("provider") != "codex-cli" or not resolved.get("model")
+                        or any(getattr(spec, k) is not None and getattr(spec, k) != resolved.get(k)
+                               for k in ("provider", "model", "effort"))
+                        or any(str(getattr(route, k, None) or "") != str(resolved.get(k) or "")
+                               for k in ("provider", "model", "effort"))):
+                    raise LocalAgentTaskError("permission_denied", "Invalid native graph binding", 403)
+                pin = graph["worker_pin"]
+                if (not isinstance(pin, Mapping) or str(pin.get("agent_id")) != record["agent_id"]
+                        or str(pin.get("agent_revision_id")) != record["agent_revision_id"]):
+                    raise LocalAgentTaskError("permission_denied", "Invalid native worker pin", 403)
+            else:
+                resolved = validate_canonical_local_route(service.config, spec, execution.route)
+        except AgentModelRouteError:
+            return ExecutionOutcome(classification="blocked", error_code="permission_denied")
         except LocalAgentTaskError as exc:
             return ExecutionOutcome(classification="blocked", error_code=exc.code, error_message=exc.message)
         if resolved != record.get("resolved_route"):
@@ -735,55 +1079,112 @@ class LocalTaskExecutionAdapter:
         try:
             async with self._workspace_lease(claim, run_id, record, spec, harness_scope) as workspace, \
                     bind_chat_agent_execution(execution, user_id=record["owner"], session_id=record["session_id"],
-                        project_id=None, config=service.config):
-                async with scoped_local_mcp_tools(config=service.config, workspace=spec.workspace,
-                        owner_id=record["owner"], agent_run_id=run_id) as tools:
-                    def checkpoint():
-                        if audit_failed.is_set():
-                            raise LocalAgentTaskError("audit_write_failed", "The canonical audit ledger could not be written", 409)
-                        future = asyncio.run_coroutine_threadsafe(self._checkpoint(claim, run_id, record), loop)
-                        try:
-                            future.result(timeout=30)
-                        except BaseException:
-                            future.cancel()
-                            stop.set()
-                            raise
-
-                    def update(fields):
-                        allowed = {k: v for k, v in fields.items() if k in {"execution_state", "current_step", "latest_activity", "counters", "baseline"}}
-                        service._update(claim.source_id, **allowed, last_progress_at=time.time(), heartbeat_at=time.time())
-
-                    def emit(kind, fields):
-                        service._event(claim.source_id, kind, fields)
-                        # The existing run ledger receives the same bounded,
-                        # redacted events; it is not a separate audit identity.
-                        future = asyncio.run_coroutine_threadsafe(AgentRunService(service.db, config=service.config).record_event(
-                            run_id, event_type="local_task." + kind, payload=SecretRedactor().value(dict(fields), 2000)), loop)
-                        try:
-                            if future.result(timeout=30) is None:
-                                raise RuntimeError("canonical audit event was not persisted")
-                        except BaseException:
-                            audit_failed.set()
-                            raise
-
-                    runner = LocalAgentTaskRunner(service.config, collect_git_metadata=False, harness_execution_scope=harness_scope)
+                        project_id=record.get("project_id"), config=service.config):
+                if native:
+                    from .codex_development_runtime import CodexDevelopmentRuntime
+                    if str(record["project_id"]) not in tuple(str(p) for p in harness_scope.project_ids):
+                        raise LocalAgentTaskError("permission_denied", "Native scope project mismatch", 403)
+                    from .software_graph_source_bundle import SourceBundleError, materialize_source_bundles
+                    session = await service._session()
+                    try:
+                        await materialize_source_bundles(session=session,
+                            actor={"id": record["owner"], "actor_type": "human"},
+                            target_project_id=record["project_id"], workspace=Path(spec.workspace),
+                            input_artifact_refs=graph["input_artifact_refs"])
+                    except SourceBundleError as exc:
+                        raise LocalAgentTaskError("native_input_invalid", str(exc), 409) from exc
+                    finally:
+                        await session.close()
+                    runtime = CodexDevelopmentRuntime(service.config)
+                    from .native_code_bundle_io import zip_tree
+                    before_archive, _, _ = await asyncio.to_thread(zip_tree, Path(spec.workspace), exclude_build=True)
+                    before_files = await asyncio.to_thread(_native_archive_files, before_archive, scan_secrets=False)
+                    await self._checkpoint(claim, run_id, record)
                     service._update(claim.source_id, status="running", execution_state="running", started_at=time.time())
-                    worker = asyncio.create_task(asyncio.to_thread(runner.run_inline, spec,
-                        task_id=run_id, user_id=record["owner"], cancel_event=stop,
-                        limits=service.manager.limits, extra_tools=tools, agent_system_prompt=execution.system_prompt,
-                        execution_checkpoint=checkpoint, update=update, emit=emit))
+                    worker = asyncio.create_task(asyncio.to_thread(runtime.run,
+                        goal=spec.goal, workspace=spec.workspace, model=resolved["model"],
+                        effort=resolved.get("effort") or "", owner_id=record["owner"],
+                        agent_id=record["agent_id"], task_id=claim.source_id, run_id=run_id,
+                        project_id=record["project_id"], scope=harness_scope,
+                        constraints=spec.constraints, completion_criteria=spec.completion_criteria,
+                        max_tool_rounds=spec.max_tool_rounds, timeout_sec=spec.timeout_sec,
+                        command_timeout_sec=spec.command_timeout_sec, limits=service.manager.limits,
+                        agent_instruction=execution.system_prompt,
+                        cancel_event=stop, isolated_backend_ready=True))
                     self._active[claim.source_id] = (stop, worker)
                     try:
-                        outcome = await asyncio.shield(worker)
-                    except asyncio.CancelledError:
-                        stop.set()
-                        # Do not close the MCP owner loop or release ownership
-                        # while its synchronous worker can still invoke tools.
-                        await asyncio.shield(worker)
-                        raise
+                        outcome = await _await_native_worker(worker, stop, lambda: self._checkpoint(claim, run_id, record))
                     finally:
-                        if worker.done():
-                            self._active.pop(claim.source_id, None)
+                        self._active.pop(claim.source_id, None)
+                    if outcome.get("status") == "completed":
+                        await self._checkpoint(claim, run_id, record)
+                        result, changed, deleted = await _native_graph_result(service, claim, run_id, record, spec, before_files,
+                            lambda: self._checkpoint(claim, run_id, record))
+                        outcome = {**outcome, "changed_files": changed, "deleted_paths": deleted,
+                                   "result": {"software_graph_result": result}}
+                else:
+                    from .scoped_local_mcp import scoped_local_mcp_tools
+                    async with scoped_local_mcp_tools(config=service.config, workspace=spec.workspace,
+                            owner_id=record["owner"], agent_run_id=run_id) as tools:
+                        def checkpoint():
+                            if audit_failed.is_set():
+                                raise LocalAgentTaskError("audit_write_failed", "The canonical audit ledger could not be written", 409)
+                            future = asyncio.run_coroutine_threadsafe(self._checkpoint(claim, run_id, record), loop)
+                            try:
+                                future.result(timeout=30)
+                            except BaseException:
+                                future.cancel()
+                                stop.set()
+                                raise
+
+                        def update(fields):
+                            allowed = {k: v for k, v in fields.items() if k in {"execution_state", "current_step", "latest_activity", "counters", "baseline"}}
+                            service._update(claim.source_id, **allowed, last_progress_at=time.time(), heartbeat_at=time.time())
+
+                        def emit(kind, fields):
+                            service._event(claim.source_id, kind, fields)
+                            # The existing run ledger receives the same bounded,
+                            # redacted events; it is not a separate audit identity.
+                            future = asyncio.run_coroutine_threadsafe(AgentRunService(service.db, config=service.config).record_event(
+                                run_id, event_type="local_task." + kind, payload=SecretRedactor().value(dict(fields), 2000)), loop)
+                            try:
+                                if future.result(timeout=30) is None:
+                                    raise RuntimeError("canonical audit event was not persisted")
+                            except BaseException:
+                                audit_failed.set()
+                                raise
+
+                        runner = LocalAgentTaskRunner(service.config, collect_git_metadata=False, harness_execution_scope=harness_scope)
+                        service._update(claim.source_id, status="running", execution_state="running", started_at=time.time())
+                        worker = asyncio.create_task(asyncio.to_thread(runner.run_inline, spec,
+                            task_id=run_id, user_id=record["owner"], cancel_event=stop,
+                            limits=service.manager.limits, extra_tools=tools, agent_system_prompt=execution.system_prompt,
+                            execution_checkpoint=checkpoint, update=update, emit=emit))
+                        self._active[claim.source_id] = (stop, worker)
+                        try:
+                            outcome = await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            stop.set()
+                            # Do not close the MCP owner loop or release ownership
+                            # while its synchronous worker can still invoke tools.
+                            # Further cancellation requests must not interrupt the
+                            # join and release the workspace lease early.
+                            while not worker.done():
+                                try:
+                                    await asyncio.shield(worker)
+                                except asyncio.CancelledError:
+                                    continue
+                                except BaseException:
+                                    break
+                            if worker.done():
+                                try:
+                                    worker.result()
+                                except BaseException:
+                                    pass
+                            raise
+                        finally:
+                            if worker.done():
+                                self._active.pop(claim.source_id, None)
         finally:
             reset_turn_context(context_token)
             if harness_scope is not None:
@@ -793,11 +1194,14 @@ class LocalTaskExecutionAdapter:
                     release_created_scratch_roots(harness_scope)
                 except Exception:  # noqa: BLE001 - cleanup must not mask the outcome
                     pass
+        if native and outcome.get("status") == "completed":
+            await self._checkpoint(claim, run_id, record)
         if service.manager.store.load(claim.source_id).get("cancel_requested"):
             await AgentRunService(service.db, config=service.config).cancel_run(run_id)
         service._update(claim.source_id, result=outcome.get("result"), summary_text=outcome.get("summary_text"),
             completion_summary=outcome.get("completion_summary"), changed_files=outcome.get("changed_files") or [],
-            failure_reason=outcome.get("failure_reason"), failure_detail=outcome.get("failure_detail"), finished_at=time.time())
+            failure_reason=outcome.get("failure_reason"), failure_detail=outcome.get("failure_detail"),
+            **({"deleted_paths": outcome.get("deleted_paths", [])} if native else {}), finished_at=time.time())
         if audit_failed.is_set():
             return ExecutionOutcome(classification="permanent", error_code="audit_write_failed")
         classification = {"completed": "succeeded", "cancelled": "cancelled", "waiting_approval": "awaiting_approval"}.get(outcome.get("status"), "permanent")
@@ -810,6 +1214,107 @@ class LocalTaskExecutionAdapter:
             metadata={"local_task_id": claim.source_id, "resolved_route": resolved})
 
 
+async def _await_native_worker(worker: asyncio.Task, stop: threading.Event, checkpoint: Any) -> Any:
+    """Keep the lease until the synchronous writer has stopped, even on repeated cancellation."""
+    try:
+        while True:
+            done, _ = await asyncio.wait({worker}, timeout=1.0)
+            await checkpoint()
+            if done:
+                return worker.result()
+    except BaseException:
+        stop.set()
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done():
+            try:
+                worker.result()
+            except BaseException:
+                pass
+        raise
+
+
+def _native_archive_files(raw: bytes, *, scan_secrets: bool = True) -> dict[str, str]:
+    """Validate every archived member and fingerprint its bytes without QA snippet limits."""
+    import hashlib
+    import io
+    import zipfile
+    from ..security.sensitive_files import is_sensitive_relative_path
+    from .local_llm_runtime_manager import validate_zip_archive_member
+    from .native_code_bundle_io import MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES
+
+    files: dict[str, str] = {}
+    seen: set[str] = set()
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if len(raw) > MAX_ARTIFACT_BYTES or len(members) > MAX_ARTIFACT_FILES or sum(m.file_size for m in members) > MAX_ARTIFACT_BYTES:
+                raise LocalAgentTaskError("native_output_unsafe", "Native source exceeds bounds", 409)
+            redactor = SecretRedactor()
+            for member in members:
+                path = str(validate_zip_archive_member(member))
+                if path in seen or is_sensitive_relative_path(path):
+                    raise LocalAgentTaskError("native_output_unsafe", "Native source is unsafe", 409)
+                seen.add(path)
+                if member.is_dir():
+                    continue
+                data = archive.read(member)
+                if len(data) != member.file_size:
+                    raise LocalAgentTaskError("native_output_unsafe", "Native source exceeds bounds", 409)
+                content = data.decode("utf-8", errors="replace")
+                if scan_secrets and redactor.text(content) != content:
+                    raise LocalAgentTaskError("native_output_unsafe", "Native source contains secrets", 409)
+                files[path] = hashlib.sha256(data).hexdigest()
+    except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, EOFError, NotImplementedError):
+        raise LocalAgentTaskError("native_output_unsafe", "Native source archive is invalid", 409) from None
+    return files
+
+
+async def _native_graph_result(service: Any, claim: Any, run_id: str, record: Mapping[str, Any],
+                               spec: LocalAgentTaskSpec, before_files: Mapping[str, str], checkpoint: Any) -> tuple[dict[str, Any], list[str], list[str]]:
+    import hashlib
+    from .marketplace.client_development import scan_for_secrets
+    from .native_code_bundle_io import zip_tree
+    from .operations_service import OperationsService
+
+    archive, _, _ = await asyncio.to_thread(zip_tree, Path(spec.workspace), exclude_build=True)
+    if await asyncio.to_thread(scan_for_secrets, Path(spec.workspace)):
+        raise LocalAgentTaskError("native_output_unsafe", "Native source contains secrets", 409)
+    after_files = await asyncio.to_thread(_native_archive_files, archive)
+    changed = sorted(path for path, digest in after_files.items() if before_files.get(path) != digest)
+    deleted = sorted(before_files.keys() - after_files.keys())
+    if not changed and not deleted:
+        raise LocalAgentTaskError("native_output_unchanged", "Native source has no net changes", 409)
+    digest = hashlib.sha256(archive).hexdigest()
+    graph = record["software_graph"]
+    from .agent_work_runtime import _safe_json
+    evidence = {"work_item_id": claim.work_item_id, "agent_run_id": run_id, "project_id": record["project_id"],
+        "worker_pin": graph["worker_pin"], "reviewer_pin": graph["reviewer_pin"],
+        "graph_ref": graph["graph_ref"], "source": graph["source"],
+        "artifact_version_id": "00000000-0000-0000-0000-000000000000", "sha256": digest, "size_bytes": len(archive)}
+    if "plan_ref" in graph:
+        evidence["plan_ref"] = graph["plan_ref"]
+    projection = {"software_graph_result": evidence}
+    if _safe_json(projection) != projection:
+        raise LocalAgentTaskError("native_result_bounds", "Graph evidence exceeds result bounds", 409)
+    await checkpoint()
+    session = await service._session()
+    try:
+        artifact = await OperationsService().create_artifact(session, {"id": record["owner"], "actor_type": "human"},
+            content=archive, filename="native-source.zip", mime_type="application/zip",
+            project_id=record["project_id"], provenance={"kind": "software_graph_native_source"},
+            sha256=digest, size_bytes=len(archive))
+    finally:
+        await session.close()
+    evidence["artifact_version_id"] = str(artifact["id"])
+    return evidence, changed, deleted
+
+
 def bind_local_agent_task_coordinator(manager: Any, coordinator: Any) -> CanonicalLocalAgentTasks:
     existing = getattr(manager, "canonical", None)
     if existing is not None:
@@ -819,5 +1324,8 @@ def bind_local_agent_task_coordinator(manager: Any, coordinator: Any) -> Canonic
     service = CanonicalLocalAgentTasks(manager, coordinator)
     coordinator.register_source(LocalTaskWorkSource(service))
     coordinator.register_adapter(service.adapter)
+    register_poll = getattr(coordinator, "register_poll_callback", None)
+    if callable(register_poll):
+        register_poll("local_agent_software_graph", service.reconcile_prepared_software_graphs)
     manager.canonical = service
     return service

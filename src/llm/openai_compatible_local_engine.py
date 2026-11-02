@@ -14,6 +14,7 @@ import concurrent.futures
 import contextvars
 import dataclasses
 import hashlib
+import ipaddress
 import inspect
 import json
 import logging
@@ -27,6 +28,7 @@ import urllib.request
 from datetime import datetime
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping
+from urllib.parse import urlsplit
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
 from uuid import uuid4
 
@@ -131,6 +133,7 @@ from .context_budget import (
 from .context_compression import compact_media_tool_result
 from .openai_compatible_local_profiles import (
     DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL,
+    STRATA_DEEPSEEK_MODEL_ID,
     llama_cpp_model_profile,
     llama_cpp_profile_capabilities,
     managed_local_runtime_for_model,
@@ -314,6 +317,7 @@ _LOCAL_PROVIDER_TURN_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextV
 
 
 _CATALOG_CAPTURE_ROOT_CONTROL_NAMES: tuple[str, ...] = (
+    "delegate",
     "delegate_agent_work",
     "get_agent_work_status",
     "send_agent_work_message",
@@ -356,6 +360,7 @@ CONSTRAINED_PRIORITY_NATIVE_TOOL_NAMES: tuple[str, ...] = ("media_search", "medi
 ROOT_DIALOGUE_NATIVE_TOOL_NAMES: tuple[str, ...] = (
     "send_agent_work_message",
     "get_agent_work_status",
+    "delegate",
     "delegate_agent_work",
     "answer_agent_work_question",
 )
@@ -926,6 +931,24 @@ def _normalize_base_url(base_url: str) -> str:
     if clean.endswith("/v1"):
         return clean
     return f"{clean}/v1"
+
+
+def _is_loopback_http_base_url(base_url: str) -> bool:
+    try:
+        parsed = urlsplit(str(base_url or ""))
+        if (
+            parsed.scheme.casefold() != "http"
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.hostname
+        ):
+            return False
+        host = parsed.hostname.rstrip(".").casefold()
+        if host == "localhost":
+            return True
+        return ipaddress.ip_address(host).is_loopback
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_local_model_loading_error(exc: Exception) -> bool:
@@ -2262,11 +2285,27 @@ class OpenAICompatibleLocalClient:
         self.provider_label = "openai_compatible_local"
         self.model_name = model or DEFAULT_LOCAL_MODEL
         self.api_key = api_key or DEFAULT_LOCAL_API_KEY
-        self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
         self._managed_local_runtime = managed_local_runtime_for_model(
             config,
             self.model_name,
         )
+        self._deepseek_managed_loopback_transport = bool(
+            self.model_name.casefold() == STRATA_DEEPSEEK_MODEL_ID.casefold()
+            and self._managed_local_runtime == "strata"
+            and _is_loopback_http_base_url(self.base_url)
+        )
+        sync_http_client = self._new_managed_loopback_http_client(
+            asynchronous=False
+        )
+        openai_kwargs = {}
+        if sync_http_client is not None:
+            openai_kwargs["http_client"] = sync_http_client
+        self.client = OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            **openai_kwargs,
+        )
+        self._configure_managed_loopback_sdk_client(self.client)
         self._llama_cpp_profile = (
             llama_cpp_model_profile(self.model_name)
             if self._managed_local_runtime != "freetoken"
@@ -2411,6 +2450,89 @@ class OpenAICompatibleLocalClient:
             "[OpenAICompatibleLocalClient] tools=auto response_format=%s extra_body=%s",
             self.enable_response_format,
             self.enable_extra_body,
+        )
+
+    def _new_managed_loopback_http_client(
+        self,
+        *,
+        asynchronous: bool,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
+    ) -> httpx.Client | httpx.AsyncClient | None:
+        if not getattr(self, "_deepseek_managed_loopback_transport", False):
+            return None
+        client_type = httpx.AsyncClient if asynchronous else httpx.Client
+        kwargs: dict[str, Any] = {
+            "trust_env": False,
+            "follow_redirects": False,
+        }
+        if transport is not None:
+            kwargs["transport"] = transport
+        return client_type(**kwargs)
+
+    def _new_bounded_openai_http_client(self) -> httpx.AsyncClient | None:
+        client = self._new_managed_loopback_http_client(asynchronous=True)
+        return client if isinstance(client, httpx.AsyncClient) else None
+
+    def _record_managed_loopback_transport_diagnostic(
+        self,
+        sdk_client: Any,
+        *,
+        client_type: str,
+    ) -> None:
+        if not getattr(self, "_deepseek_managed_loopback_transport", False):
+            return
+        from .native_runtime import (
+            _safe_transport_origin,
+            openai_transport_diagnostic,
+        )
+
+        origin = _safe_transport_origin(self.base_url)
+        if not origin:
+            return
+        try:
+            setattr(
+                sdk_client,
+                "_aoitalk_transport_diagnostic",
+                {
+                    "base_url_origin": origin,
+                    "proxy_mode": "explicit_no_proxy",
+                    "proxy_configured": False,
+                    "proxy_bypassed": True,
+                    "client_type": client_type,
+                },
+            )
+            setattr(
+                sdk_client,
+                "_aoitalk_transport_diagnostic",
+                openai_transport_diagnostic(sdk_client),
+            )
+        except Exception:
+            return
+
+    def _configure_managed_loopback_sdk_client(self, sdk_client: Any) -> None:
+        if not getattr(self, "_deepseek_managed_loopback_transport", False):
+            return
+        try:
+            setattr(
+                sdk_client,
+                "_aoitalk_bounded_http_client_factory",
+                self._new_bounded_openai_http_client,
+            )
+            setattr(
+                sdk_client,
+                "_aoitalk_transport_diagnostic_recorder",
+                self._record_managed_loopback_transport_diagnostic,
+            )
+        except Exception as exc:
+            close = getattr(sdk_client, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError(
+                "Managed DeepSeek loopback transport policy could not be attached"
+            ) from exc
+        self._record_managed_loopback_transport_diagnostic(
+            sdk_client,
+            client_type="OpenAI",
         )
 
     def _get_session_user_id(self) -> str:
@@ -2572,14 +2694,6 @@ class OpenAICompatibleLocalClient:
         self._last_context_snapshots = self._last_context_snapshots[-8:]
 
     def _capture_generation_metrics(self, response: Any) -> Dict[str, Any]:
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # A direct Help call may reuse a provider instance whose previous
-            # usage is still attached.  Do not replace that ordinary
-            # diagnostic with controller-turn telemetry (the outer terminal
-            # snapshot restores it for normal orchestration).
-            self._last_usage = {}
-            self._last_generation_metrics = None
-            return {}
         payload = _as_plain_dict(response)
         timings = _as_plain_dict(payload.get("timings"))
         usage = _as_plain_dict(payload.get("usage"))
@@ -2590,9 +2704,28 @@ class OpenAICompatibleLocalClient:
                 str(payload.get("model")) if payload.get("model") else None
             ),
         )
-        self._last_usage = {
+        from .image_budget import current_image_price, normalize_openai_image_response
+
+        image_price = current_image_price()
+        if image_price is not None:
+            # Preserve the ordinary collector's shape, but never infer an
+            # image receipt from incomplete or differently priced usage.
+            actual = normalize_openai_image_response(response, image_price)
+            normalized_usage = {**normalized_usage, **actual} if actual is not None else {}
+            if actual is None:
+                self._last_suppressed_stream_usage = {}
+        captured_usage = {
             key: value for key, value in normalized_usage.items() if value is not None
         }
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Keep ordinary diagnostics isolated while returning this response's
+            # confirmed usage to the trusted Run-budget ledger.
+            self._last_usage = {}
+            self._last_generation_metrics = None
+            if captured_usage:
+                self._last_suppressed_stream_usage = dict(captured_usage)
+            return captured_usage
+        self._last_usage = captured_usage
 
         tokens_per_second = _as_finite_float(
             _first_present(
@@ -2753,11 +2886,19 @@ class OpenAICompatibleLocalClient:
     ) -> Dict[str, Any]:
         """Capture and persist one successful local completion response."""
 
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            self._capture_generation_metrics(response)
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        usage = self._capture_generation_metrics(response)
+        from .agent_run_budget import get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        if run_budget is not None:
+            run_budget.record_provider_response(usage or None)
+        if suppress_automatic_context:
+            self._last_suppressed_stream_usage = {}
             return {}
 
-        usage = self._capture_generation_metrics(response)
         self._record_request_usage(usage)
         if usage:
             persist_usage_sync(
@@ -3440,8 +3581,11 @@ class OpenAICompatibleLocalClient:
         except RuntimeError:
             return asyncio.run(coro)
 
+        from contextvars import copy_context
+
+        context = copy_context()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
+            return pool.submit(context.run, asyncio.run, coro).result()
 
     def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
@@ -4089,35 +4233,50 @@ class OpenAICompatibleLocalClient:
         """Return validated profile-owned sampling defaults for the request.
 
         LFM2.5 publishes temperature/top-k/repetition settings alongside its
-        GGUF.  They are applied only for the always-thinking profile; generic
-        local endpoints and existing managed profiles retain their historical
-        request shape.  Caller-provided values in ``extra_body`` are merged
-        after this baseline and therefore win.
+        GGUF. They are applied for the always-thinking profile, while other
+        profiles must explicitly opt in through trusted profile metadata.
+        Generic local endpoints and existing managed profiles retain their
+        historical request shape. Caller-provided values in ``extra_body`` are
+        merged after this baseline and therefore win.
         """
 
-        if getattr(self, "_profile_thinking_mode", None) != "always":
-            return {}
         profile = getattr(self, "_llama_cpp_profile", None)
+        if not isinstance(profile, dict):
+            return {}
+        if (
+            getattr(self, "_profile_thinking_mode", None) != "always"
+            and profile.get("apply_sampling_defaults") is not True
+        ):
+            return {}
         raw = profile.get("sampling_defaults") if isinstance(profile, dict) else None
         if not isinstance(raw, dict):
             return {}
         result: Dict[str, Any] = {}
+
+        def finite_number(value: Any) -> Optional[float]:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return numeric if math.isfinite(numeric) else None
+
         temperature = raw.get("temperature")
-        try:
-            temperature_value = float(temperature)
-        except (TypeError, ValueError, OverflowError):
-            temperature_value = float("nan")
-        if math.isfinite(temperature_value) and 0.0 <= temperature_value <= 2.0:
+        temperature_value = finite_number(temperature)
+        if (
+            temperature_value is not None
+            and 0.0 <= temperature_value <= 2.0
+        ):
             result["temperature"] = temperature_value
+        top_p_value = finite_number(raw.get("top_p"))
+        if top_p_value is not None and 0.0 <= top_p_value <= 1.0:
+            result["top_p"] = top_p_value
         top_k = raw.get("top_k")
         if isinstance(top_k, int) and not isinstance(top_k, bool) and top_k > 0:
             result["top_k"] = top_k
-        repeat_penalty = raw.get("repeat_penalty")
-        try:
-            repeat_penalty_value = float(repeat_penalty)
-        except (TypeError, ValueError, OverflowError):
-            repeat_penalty_value = float("nan")
-        if math.isfinite(repeat_penalty_value) and repeat_penalty_value > 0.0:
+        repeat_penalty_value = finite_number(raw.get("repeat_penalty"))
+        if repeat_penalty_value is not None and repeat_penalty_value > 0.0:
             result["repeat_penalty"] = repeat_penalty_value
         return result
 
@@ -4941,42 +5100,10 @@ class OpenAICompatibleLocalClient:
     def _is_bound_aoidots_root_turn(self) -> bool:
         """Return whether this is the server-bound initial AoiDots Root turn."""
 
-        turn = get_turn_context()
-        if (
-            str(getattr(turn, "project_id", "") or "").strip()
-            or str(getattr(turn, "agent_dialogue_id", "") or "").strip()
-            or str(getattr(turn, "agent_dialogue_role", "") or "").strip()
-        ):
-            return False
-        binding = getattr(turn, "agent_execution_binding", None)
-        if binding is None or binding is not getattr(self, "_agent_execution_binding", None):
-            return False
-        try:
-            from ..services.chat_execution_adapter import InitialAoiDotsRootProof
-            from ..services.agent_run_service import get_current_agent_run_id
+        from ..services.chat_execution_adapter import is_bound_initial_aoidots_root_turn
 
-            proof = getattr(binding, "_initial_aoidots_root_proof", None)
-            current_run_id = get_current_agent_run_id()
-        except Exception:
-            return False
-        if not isinstance(proof, InitialAoiDotsRootProof) or not current_run_id:
-            return False
-        binding_marker = getattr(binding, "_root_scope_marker", None)
-        if not isinstance(binding_marker, Mapping) or dict(binding_marker) != proof.marker():
-            return False
-        return all(
-            (
-                str(getattr(turn, "user_id", "") or "") == proof.owner_user_id,
-                str(getattr(turn, "session_id", "") or "") == proof.session_id,
-                str(getattr(turn, "agent_id", "") or "") == proof.agent_id,
-                str(getattr(turn, "agent_revision_id", "") or "")
-                == proof.agent_revision_id,
-                str(current_run_id) == proof.run_id,
-                str(getattr(binding, "agent_id", "") or "") == proof.agent_id,
-                str(getattr(binding, "session_id", "") or "") == proof.session_id,
-                str(getattr(binding, "agent_revision_id", "") or "")
-                == proof.agent_revision_id,
-            )
+        return is_bound_initial_aoidots_root_turn(
+            get_turn_context(), getattr(self, "_agent_execution_binding", None)
         )
 
     def _is_bound_worker_dialogue_turn(self) -> bool:
@@ -5848,7 +5975,15 @@ class OpenAICompatibleLocalClient:
             active = current_generation_budget.get()
             return active.checkpoint() if active is not None else None
 
+        from .frozen_candidate_transport import (
+            classify_frozen_transport_failure, current_frozen_transport,
+        )
+
+        frozen_attempt = current_frozen_transport()
+        first_frozen_request = False
         lease_box: dict[str, Any] = {}
+        provider_send_started = False
+        provider_request_reserved = False
 
         def sender(final_payload: Any) -> Any:
             # The slot follows the actual request; a stream hands it to the
@@ -5869,12 +6004,26 @@ class OpenAICompatibleLocalClient:
             return result
 
         def raw_sender(final_payload: Any) -> Any:
+            nonlocal provider_send_started, provider_request_reserved, first_frozen_request
             if not isinstance(final_payload, dict):
                 raise PrivacyError("OpenAI-compatible outbound payload is malformed")
             self._validate_required_tool_contract(final_payload, required_tool_schema)
             self._last_privacy_payload = dict(final_payload)
             budget = current_generation_budget.get()
+            from .agent_run_budget import AgentRunBudgetStop, get_agent_run_budget
+
+            run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+            if run_budget is not None and not run_budget.begin_provider_request():
+                run_failure = run_budget.failure
+                if run_failure is not None:
+                    raise AgentRunBudgetStop(run_failure)
+            provider_send_started = False
+            provider_request_reserved = run_budget is not None
             client = self.client
+            if frozen_attempt is not None:
+                first_frozen_request = frozen_attempt.requests == 0
+                frozen_attempt.requests += 1
+                client = client.with_options(max_retries=0)
             if budget is not None:
                 budget.record_request(final_payload)
                 if budget.interruptible_transport:
@@ -5890,16 +6039,34 @@ class OpenAICompatibleLocalClient:
                     if final_payload.get("stream"):
                         extra_args["lease"] = lease_box.get("lease")
                         lease_box["handed"] = "interruptible"
-                    response = execute(
-                        client,
-                        final_payload,
-                        budget,
-                        on_send=lambda: self._emit_catalog_send_evidence(
+                    def on_provider_send() -> None:
+                        nonlocal provider_send_started
+                        provider_send_started = True
+                        self._emit_catalog_send_evidence(
                             final_payload,
                             sender_attempt_ordinal=sender_attempt_ordinal,
-                        ),
-                        **extra_args,
-                    )
+                        )
+
+                    try:
+                        response = execute(
+                            client,
+                            final_payload,
+                            budget,
+                            on_send=on_provider_send,
+                            **extra_args,
+                        )
+                    except Exception as error:
+                        from .agent_run_budget import is_http_429_error
+
+                        if run_budget is not None:
+                            if provider_send_started and is_http_429_error(error):
+                                run_budget.record_provider_response({"total_tokens": 0})
+                            elif provider_send_started:
+                                run_budget.mark_token_usage_unavailable()
+                            else:
+                                run_budget.abort_provider_request()
+                            provider_request_reserved = False
+                        raise
                     try:
                         self._last_provider_response_shape = (
                             _safe_completion_response_shape(response)
@@ -5927,7 +6094,19 @@ class OpenAICompatibleLocalClient:
                 # SDK retries would multiply the governor's 3-attempt bound and
                 # skip the privacy/budget boundary; retries stay explicit.
                 client = client.with_options(max_retries=0)
-            response = client.chat.completions.create(**final_payload)
+            provider_send_started = True
+            try:
+                response = client.chat.completions.create(**final_payload)
+            except Exception as error:
+                from .agent_run_budget import is_http_429_error
+
+                if run_budget is not None:
+                    if is_http_429_error(error):
+                        run_budget.record_provider_response({"total_tokens": 0})
+                    else:
+                        run_budget.mark_token_usage_unavailable()
+                    provider_request_reserved = False
+                raise
             if final_payload.get("stream") and lease_box.get("lease") is not None:
                 # The slot must outlive the handshake: the wrapper releases it
                 # when the real stream ends, errors or is closed.
@@ -5972,9 +6151,36 @@ class OpenAICompatibleLocalClient:
                     model=self.model_name,
                 )
             except Exception as error:
+                from .agent_run_budget import AgentRunBudgetStop, get_agent_run_budget
+
+                if isinstance(error, AgentRunBudgetStop):
+                    raise
+                if provider_request_reserved:
+                    from .agent_run_budget import is_http_429_error
+
+                    run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+                    if run_budget is not None:
+                        if not provider_send_started:
+                            run_budget.abort_provider_request()
+                        elif is_http_429_error(error):
+                            run_budget.record_provider_response({"total_tokens": 0})
+                        else:
+                            run_budget.mark_token_usage_unavailable()
+                    provider_request_reserved = False
+                if frozen_attempt is not None:
+                    failure = classify_frozen_transport_failure(
+                        error, first_request=first_frozen_request and provider_send_started,
+                        proven_single_transport=False,
+                    )
+                    if failure is not None:
+                        raise failure from error
+                    raise
                 if budget_exhausted_after_429(error, prior_429):
                     raise prior_429 from None
-                if not (governed and should_retry_429(error, physical, governor_id, checkpoint)):
+                retry = governed and should_retry_429(
+                    error, physical, governor_id, checkpoint
+                )
+                if not retry:
                     raise
                 prior_429 = error
 
@@ -6532,6 +6738,13 @@ class OpenAICompatibleLocalClient:
                 if budget is not None:
                     budget.checkpoint()
                 if isinstance(exc, LocalToolSelectionError):
+                    raise
+                from .frozen_candidate_transport import current_frozen_transport
+                from ..services.agent_route_fallback_policy import RoutePreflightFailure
+
+                if current_frozen_transport() is not None and isinstance(
+                    exc, (APIError, RoutePreflightFailure)
+                ):
                     raise
                 self._validate_required_tool_contract(api_kwargs, required_tool_schema)
                 if _is_context_overflow_error(exc) and "tools" in api_kwargs:
@@ -8242,6 +8455,15 @@ class OpenAICompatibleLocalClient:
         except Exception as exc:
             self._project_request_usage_to_agent_run()
             self._record_generation_failure(exc)
+            # Preserve classified failures and unclassified SDK errors for the
+            # frozen controller. Ordinary turns keep their error response.
+            from .frozen_candidate_transport import current_frozen_transport
+            from ..services.agent_route_fallback_policy import RoutePreflightFailure
+
+            if current_frozen_transport() is not None and isinstance(
+                exc, (APIError, RoutePreflightFailure)
+            ):
+                raise
             if isinstance(exc, ModelOutputIncompleteError) and exc.request_type == "review":
                 # An incomplete verifier sample cannot authorize another tool
                 # turn. Keep the work receipt intact and surface this separate
@@ -8373,7 +8595,7 @@ class OpenAICompatibleLocalClient:
         self._last_generation_metrics = None
         config = getattr(self, "config", None)
         output_limit = config.get("runtime.target_max_output_tokens", 1024) if config else 1024
-        output_limit = min(1024, max(1, int(output_limit or 1024)))
+        output_limit = min(4096, max(1, int(output_limit or 1024)))
         context_budget = self._context_budget(output_limit)
         messages = [
             {
@@ -8567,6 +8789,11 @@ class OpenAICompatibleLocalClient:
             self._record_request_usage(stream_usage)
         else:
             self._mark_request_usage_unknown()
+        from .agent_run_budget import get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        if run_budget is not None:
+            run_budget.record_provider_response(stream_usage or None)
         try:
             if stream_usage and not suppress_automatic_context:
                 persist_usage_sync(
@@ -8623,6 +8850,7 @@ class OpenAICompatibleLocalClient:
         # or yields no chunks.
         self._last_usage = {}
         self._last_usage_records = []
+        self._last_suppressed_stream_usage = {}
         self._last_stream_tool_call_echo_suppressed = False
         stream_usage: Dict[str, Any] = {}
         stream_usage_settled = False
@@ -8640,6 +8868,8 @@ class OpenAICompatibleLocalClient:
             ):
                 if self._last_usage:
                     stream_usage = dict(self._last_usage)
+                if suppress_automatic_context and self._last_suppressed_stream_usage:
+                    stream_usage = dict(self._last_suppressed_stream_usage)
                 full_response += content
                 if not protect_stream_claims:
                     yield content
@@ -8653,6 +8883,8 @@ class OpenAICompatibleLocalClient:
                 # permission-filtered schemas and validates/executes calls.
                 if self._last_usage:
                     stream_usage = dict(self._last_usage)
+                if suppress_automatic_context and self._last_suppressed_stream_usage:
+                    stream_usage = dict(self._last_suppressed_stream_usage)
                 self._settle_stream_usage(
                     stream_usage,
                     suppress_automatic_context=suppress_automatic_context,
@@ -8749,10 +8981,13 @@ class OpenAICompatibleLocalClient:
                 # empty/failed stream.  Persist exactly once for the stream.
                 if self._last_usage:
                     stream_usage = dict(self._last_usage)
+                if suppress_automatic_context and self._last_suppressed_stream_usage:
+                    stream_usage = dict(self._last_suppressed_stream_usage)
                 self._settle_stream_usage(
                     stream_usage,
                     suppress_automatic_context=suppress_automatic_context,
                 )
+            self._last_suppressed_stream_usage = {}
             if not suppress_automatic_context:
                 self.history_manager.add_message("user", user_input)
                 self.history_manager.add_message("assistant", full_response)
@@ -8876,6 +9111,16 @@ class OpenAICompatibleLocalClient:
         return "すみません。ローカルLLMの呼び出しでエラーが発生しました。"
 
     def list_models(self) -> List[Dict[str, Any]]:
+        if getattr(self, "_deepseek_managed_loopback_transport", False):
+            response = self.client.models.list()
+            rows = getattr(response, "data", [])
+            return [
+                item.model_dump(mode="json")
+                if callable(getattr(item, "model_dump", None))
+                else dict(item)
+                for item in rows
+                if isinstance(item, dict) or callable(getattr(item, "model_dump", None))
+            ]
         request = urllib.request.Request(
             f"{self.base_url}/models",
             headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
@@ -9032,6 +9277,13 @@ class OpenAICompatibleLocalClient:
             # Never expose the shared runtime as idle while that thread runs.
             self._local_runtime_consumer_lease_release_requested = True
             return
+        if getattr(self, "_deepseek_managed_loopback_transport", False):
+            try:
+                self.client.close()
+            except Exception:
+                logger.warning(
+                    "[OpenAICompatibleLocalClient] Managed loopback transport close failed"
+                )
         self._release_managed_local_generation_lease(all=True)
         self._release_managed_local_runtime_consumer_lease(all=True)
         logger.info("[OpenAICompatibleLocalClient] cleanup complete")

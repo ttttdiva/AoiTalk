@@ -24,6 +24,7 @@ class AgentDelegation(Base):
     parent_delegation_id = Column(UUID(as_uuid=True), ForeignKey("agent_delegations.id", ondelete="RESTRICT"), nullable=True)
     linked_work_item_id = Column(UUID(as_uuid=True), ForeignKey("agent_work_items.id", ondelete="RESTRICT"), nullable=True)
     linked_work_binding = Column(JSON, nullable=False, default=dict)
+    source_actor_json = Column(JSON, nullable=True)
     title = Column(String(160), nullable=False)
     work_role = Column(String(32), nullable=False)
     instruction_ciphertext = Column(Text, nullable=False)
@@ -62,6 +63,11 @@ class AgentDelegation(Base):
     def to_safe_dict(self):
         fields = ("id", "delegator_agent_id", "delegator_revision_id", "worker_agent_id", "worker_revision_id", "reviewer_agent_id", "reviewer_revision_id", "project_id", "persona_id", "parent_delegation_id", "linked_work_item_id", "created_by")
         result = {key: str(getattr(self, key)) if getattr(self, key) is not None else None for key in fields}
+        source_fields = ("version", "source_run_id", "source_work_item_id", "source_session_id",
+                         "source_agent_id", "source_revision_id", "inherited_user_id")
+        source = self.source_actor_json
+        result["source_actor"] = ({key: source[key] for key in source_fields if key in source}
+                                  if isinstance(source, dict) else None)
         result.update(title=self.title, work_role=self.work_role, round=self.round,
                       content_hash=self.content_hash,
                       cancelled_at=self.cancelled_at.isoformat() if self.cancelled_at else None,

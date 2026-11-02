@@ -34,6 +34,27 @@ BASE_CAPABILITIES = frozenset(
 DISCOVERY_CAPABILITY = "existing-target-discovery-v1"
 MAX_STDIN_BYTES = 65536
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_STDERR_DIAGNOSTIC_BYTES = 8192
+
+
+def safe_stderr_summary(raw: bytes) -> str:
+    """Classify bounded helper stderr without retaining or returning its text."""
+    if not isinstance(raw, bytes) or not raw:
+        return "empty"
+    text = raw[:MAX_STDERR_DIAGNOSTIC_BYTES].decode("utf-8", "ignore").casefold()
+    if "connection refused" in text:
+        return "connection_refused"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "origin" in text and any(term in text for term in ("403", "forbidden", "denied", "not allowed")):
+        return "websocket_origin_rejected"
+    if "websocket" in text and any(term in text for term in ("handshake", "upgrade", "status")):
+        return "websocket_handshake_failed"
+    if "permission" in text or "access denied" in text:
+        return "permission_denied"
+    if "invalid_cdp_endpoint" in text or "invalid cdp endpoint" in text:
+        return "endpoint_invalid"
+    return "nonempty_unclassified"
 
 
 def _unique_object(pairs):
@@ -127,6 +148,11 @@ class OwnedHelperRuntime:
         self._active_process = None
         self._active_threads: list[threading.Thread] = []
         self._pending_io = []
+        self._last_command_diagnostic = {
+            "exit_code": None,
+            "response_code": None,
+            "stderr_summary": "not_run",
+        }
         self.config_path = self.state_directory / "agent-browser.json"
         inherited = (
             os.environ if inherited_environment is None else inherited_environment
@@ -238,6 +264,10 @@ class OwnedHelperRuntime:
     @property
     def discover_existing(self) -> bool:
         return self._discover_existing
+
+    @property
+    def last_command_diagnostic(self) -> dict:
+        return dict(self._last_command_diagnostic)
 
     @property
     def epoch(self) -> str:
@@ -559,6 +589,7 @@ class OwnedHelperRuntime:
             ) from None
         self._active_process = process
         output = bytearray()
+        stderr_sample = bytearray()
         overflow, io_error = threading.Event(), threading.Event()
         counter_lock = threading.Lock()
         total = 0
@@ -580,6 +611,9 @@ class OwnedHelperRuntime:
                             return
                         if capture:
                             output.extend(chunk)
+                        elif len(stderr_sample) < MAX_STDERR_DIAGNOSTIC_BYTES:
+                            remaining = MAX_STDERR_DIAGNOSTIC_BYTES - len(stderr_sample)
+                            stderr_sample.extend(chunk[:remaining])
             except Exception:
                 io_error.set()
 
@@ -605,6 +639,7 @@ class OwnedHelperRuntime:
         ]
         self._active_threads = workers
         failure = None
+        exit_code = None
         deadline = time.monotonic() + timeout_seconds
         try:
             for worker in workers:
@@ -629,8 +664,18 @@ class OwnedHelperRuntime:
                     break
                 time.sleep(0.01)
             if failure:
+                self._last_command_diagnostic = {
+                    "exit_code": exit_code if type(exit_code) is int else None,
+                    "response_code": None,
+                    "stderr_summary": safe_stderr_summary(bytes(stderr_sample)),
+                }
                 self._terminate()
                 raise AgentBrowserRuntimeError(failure, outcome_unknown=True)
+            self._last_command_diagnostic = {
+                "exit_code": exit_code if type(exit_code) is int else None,
+                "response_code": None,
+                "stderr_summary": safe_stderr_summary(bytes(stderr_sample)),
+            }
             try:
                 result = json.loads(
                     output.decode("utf-8"),
@@ -665,6 +710,17 @@ class OwnedHelperRuntime:
                 raise AgentBrowserRuntimeError(
                     "agent_browser_json_invalid", outcome_unknown=True
                 ) from None
+            response_code = result.get("code")
+            if response_code is not None:
+                if response_code in {
+                    "unavailable", "invalid_endpoint", "invalid_arguments",
+                    "connection_blocked", "connection_required", "target_unavailable",
+                    "EXACT_TARGET_REQUIRED", "STALE_REF", "STRICT_REF_REQUIRED",
+                    "DIALOG_BLOCKED", "FOCUS_CHANGED", "tab_gone", "rebind_pending",
+                }:
+                    self._last_command_diagnostic["response_code"] = response_code
+                else:
+                    self._last_command_diagnostic["response_code"] = "unrecognized"
             if result.get("code") == "outcome_unknown":
                 self._terminate()
             return result

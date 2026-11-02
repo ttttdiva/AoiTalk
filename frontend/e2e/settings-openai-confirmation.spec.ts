@@ -2,19 +2,12 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { addAuthCookie, E2E_USER_ID, mockAuthenticatedApis } from "./support/auth";
 
-type Reference = "openai_api_key" | "free-team:openai-complimentary";
-
 async function mockConfirmationApis(page: Page, options: { otherOwner?: boolean } = {}) {
   const main = { provider: "gemini", model: "fixture-base" };
-  const team = { schema_version: 3, delegation_enabled: false, teams: [], execution_profiles: [] };
-  const profile = { enabled: true, main_pool_id: "coordinator", max_fallbacks: 2, pools: {}, llm_profiles: {} };
-  const before = structuredClone({ main, team, profile });
-  const credentials = [
-    { reference: "openai_api_key", configured: true, fingerprint: "a".repeat(64),
-      project_id: "", sdk_organization_id: "", base_url: "https://api.openai.com/v1" },
-    { reference: "free-team:openai-complimentary", configured: true, fingerprint: "b".repeat(64),
-      project_id: "fixture-project", sdk_organization_id: "", base_url: "https://api.openai.com/v1" },
-  ];
+  const profile = { enabled: true, main_pool_id: "coordinator", max_fallbacks: 2, pools: {} };
+  const before = structuredClone({ main, profile });
+  const credentials = [{ reference: "openai_api_key", configured: true, fingerprint: "a".repeat(64),
+    project_id: "", sdk_organization_id: "", base_url: "https://api.openai.com/v1" }];
   let record: Record<string, unknown> = {};
   let scope = "org-fixture";
   let tier = "tier_1_2";
@@ -49,7 +42,7 @@ async function mockConfirmationApis(page: Page, options: { otherOwner?: boolean 
           actor_user_id: E2E_USER_ID, recorded_at: "2026-10-07T12:00:00Z",
           source_kind: "owner_declaration", source_reference: body.source_reference,
           eligible: true, enrolled: true, organization_id: scope, usage_tier: tier,
-          credential_reference: body.credential_reference as Reference, revoked_at: null };
+          credential_reference: body.credential_reference as string, revoked_at: null };
         await route.fulfill({ json: response() });
       } else if (method === "DELETE") {
         record = { ...record, revoked_at: "2026-10-07T12:05:00Z" };
@@ -67,9 +60,7 @@ async function mockConfirmationApis(page: Page, options: { otherOwner?: boolean 
           models: [{ id: main.model, label: "Fixture Base" }] }],
       } });
     } else if (path === "/settings") {
-      await route.fulfill({ json: { settings: { agent_team: team } } });
-    } else if (path === "/agent-team/config") {
-      await route.fulfill({ json: { agent_team: team } });
+      await route.fulfill({ json: { settings: {} } });
     } else if (path === "/free-team/settings") {
       await route.fulfill({ json: { profile, credentials: [], candidates: [] } });
     } else if (path === "/free-team/usage") {
@@ -81,7 +72,7 @@ async function mockConfirmationApis(page: Page, options: { otherOwner?: boolean 
       await route.fallback();
     }
   });
-  return { reads, writes, before, current: () => ({ main, team, profile }),
+  return { reads, writes, before, current: () => ({ main, profile }),
     rejectNextPut: (status: number) => { nextPutStatus = status; } };
 }
 
@@ -108,7 +99,7 @@ test.describe("既存OpenAI無料枠の本人確認記録", () => {
     await mockAuthenticatedApis(page);
   });
 
-  test("Mainを保ちLaunch枠を記録し、再読込・422復帰・Teamキー参照復元・失効ができる", async ({ page }) => {
+  test("Mainを保ち通常キーでLaunch枠を記録し、再読込・422復帰・失効ができる", async ({ page }) => {
     const fixture = await mockConfirmationApis(page);
     await page.goto("/settings");
     const section = await models(page);
@@ -119,7 +110,7 @@ test.describe("既存OpenAI無料枠の本人確認記録", () => {
     expect(fixture.reads).not.toContain("/free-team/openai-confirmation");
     await initialPanel.getByRole("button", { name: "確認済み無料枠の記録", exact: true }).click();
     await expect(initialPanel).toContainText("Providerの自動attestationではありません");
-    await initialPanel.getByRole("combobox").nth(1).click();
+    await initialPanel.getByRole("combobox").first().click();
     await page.getByRole("option", { name: "Sol 1M / Luna 10M token/日", exact: true }).click();
     await initialPanel.getByLabel("本人申告の出典メモ").fill("本人確認済みLaunch 1M/10Mの記録");
     await initialPanel.getByRole("button", { name: "確認済みの無料枠を記録", exact: true }).click();
@@ -132,9 +123,9 @@ test.describe("既存OpenAI無料枠の本人確認記録", () => {
     } });
 
     await page.reload();
-    let { dialog, panel } = await openRecord(page);
-    await expect(panel.getByRole("combobox").first()).toContainText("現在のOpenAIキー");
-    await expect(panel.getByRole("combobox").nth(1)).toContainText("1M / Luna 10M");
+    const { dialog, panel } = await openRecord(page);
+    await expect(panel).toContainText("通常のOpenAIキー（共有client）");
+    await expect(panel.getByRole("combobox").first()).toContainText("1M / Luna 10M");
     await expect(panel.getByLabel("本人申告の出典メモ")).toHaveValue("本人確認済みLaunch 1M/10Mの記録");
     await expect(panel).toContainText(`操作actor: ${E2E_USER_ID}`);
     await expect(panel).toContainText("owner_declaration");
@@ -145,21 +136,10 @@ test.describe("既存OpenAI無料枠の本人確認記録", () => {
     await panel.getByRole("button", { name: "確認済みの無料枠を記録", exact: true }).click();
     await expect(panel).toContainText("本人申告の確認記録を保存しました");
 
-    await panel.getByRole("combobox").first().click();
-    await page.getByRole("option", { name: "既存無料Teamキー", exact: true }).click();
-    await panel.getByRole("button", { name: "確認済みの無料枠を記録", exact: true }).click();
-    await expect(panel).toContainText("本人申告の確認記録を保存しました");
-    expect(fixture.writes.at(-1)?.body).toMatchObject({
-      credential_reference: "free-team:openai-complimentary", fingerprint: "b".repeat(64),
-      expected_record_id: "fixture-record-2",
-    });
-    await page.reload();
-    ({ dialog, panel } = await openRecord(page));
-    await expect(panel.getByRole("combobox").first()).toContainText("既存無料Teamキー");
     await panel.getByRole("button", { name: "記録を失効", exact: true }).click();
     await expect(panel).toContainText("確認記録を失効させました");
     await expect(dialog).toContainText("確認記録が失効済みです");
-    expect(fixture.writes.at(-1)).toEqual({ path: "/free-team/openai-confirmation", method: "DELETE", body: { expected_record_id: "fixture-record-3" } });
+    expect(fixture.writes.at(-1)).toEqual({ path: "/free-team/openai-confirmation", method: "DELETE", body: { expected_record_id: "fixture-record-2" } });
     await page.keyboard.press("Escape");
     const reloadedSection = page.locator('[data-settings-surface="language-models"]');
     const routing = reloadedSection.getByRole("tab", { name: /Routing/ });
@@ -168,7 +148,7 @@ test.describe("既存OpenAI無料枠の本人確認記録", () => {
     await reloadedSection.getByRole("tab", { name: /Base Model/ }).click();
     await expect(reloadedSection.getByRole("combobox", { name: "LLMプロバイダー" })).toContainText("Gemini");
     await expect(reloadedSection.getByRole("combobox", { name: "LLMモデル" })).toContainText("Fixture Base");
-    expect(fixture.writes).toHaveLength(5);
+    expect(fixture.writes).toHaveLength(4);
     expect(fixture.writes.every(({ path }) => path === "/free-team/openai-confirmation")).toBe(true);
     expect(fixture.current()).toEqual(fixture.before);
   });

@@ -2,6 +2,8 @@ import type { components, paths } from "@/lib/api-types.gen";
 
 export type PersonalDraft = components["schemas"]["PersonalDraftView"];
 export type PersonalDraftPage = components["schemas"]["PersonalDraftPage"];
+export type PersonalDraftEvidencePage = components["schemas"]["PersonalDraftEvidencePage"];
+export type PersonalDraftEvidenceCreate = components["schemas"]["DraftEvidenceCreate"];
 type Decision = components["schemas"]["PersonalDraftDecision"];
 type Accepted = components["schemas"]["PersonalDraftAcceptanceResponse"];
 type Discarded = paths["/api/personal-drafts/{draft_id}/discard"]["post"]["responses"][200]["content"]["application/json"] & {
@@ -54,6 +56,16 @@ export function draftWrite(draft: PersonalDraft, operation: DraftOperation): Dra
 }
 
 export const personalDraftApi = {
+  evidence: async (): Promise<PersonalDraftEvidencePage> => {
+    const page = await draftFetch<PersonalDraftEvidencePage>("/evidence?limit=100");
+    if (!page || !Array.isArray(page.items) || page.items.length > 100) {
+      throw new Error("保存済みの根拠を取得できませんでした");
+    }
+    return page;
+  },
+  saveEvidence: (body: PersonalDraftEvidenceCreate) => draftFetch<{ evidence_ref: string }>("/evidence", {
+    method: "POST", body: JSON.stringify(body),
+  }),
   list: async (cursor?: string): Promise<PersonalDraftPage> => {
     const query = new URLSearchParams({ limit: String(DRAFT_LIST_LIMIT) });
     if (cursor) query.set("cursor", cursor);

@@ -79,18 +79,19 @@ export const ChatHeaderStatus = React.memo(function ChatHeaderStatus({
         <View style={styles.selectors}>
           <View style={styles.selector}>
             <ScopeSwitcher variant="inline" projectNameOnly projects={projects}
+              compact
               projectId={currentProjectId} onSelectProject={onChangeProject}
               allLabel="プロジェクト未選択"
               accessibilityLabel="プロジェクトを選択"
               disabled={rootLocked || diagnostics.runState !== "idle" || pendingCount > 0} />
           </View>
           <View style={styles.selector}>
-            <CharacterSelector session={session} runState={diagnostics.runState}
+            <CharacterSelector compact session={session} runState={diagnostics.runState}
               onChange={onChangeCharacter}
               locked={rootLocked} />
           </View>
           <View style={styles.selector}>
-            <AgentSelector session={session} agents={agents} loading={agentCatalogLoading}
+            <AgentSelector compact session={session} agents={agents} loading={agentCatalogLoading}
               runState={diagnostics.runState} pendingCount={pendingCount}
               onChange={onChangeAgent ?? (async () => undefined)}
               bindingLocked={rootLocked}
@@ -107,8 +108,8 @@ export const ChatHeaderStatus = React.memo(function ChatHeaderStatus({
 const styles = StyleSheet.create({
   header: { width: "100%", minWidth: 0, backgroundColor: "#1e1e2e" },
   contentScroll: { flexGrow: 0, flexShrink: 1 },
-  row: { width: "100%", minWidth: 0, alignItems: "stretch", gap: 4 },
-  navigation: { width: "100%", minWidth: 0, minHeight: 52, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingRight: 4 },
+  row: { width: "100%", minWidth: 0, alignItems: "stretch", gap: 2 },
+  navigation: { width: "100%", minWidth: 0, minHeight: 44, maxHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingRight: 4 },
   icon: { width: 44, height: 44, minWidth: 44, minHeight: 44, margin: 0 },
   selectors: {
     width: "100%",
@@ -117,7 +118,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     alignItems: "flex-start",
-    gap: 4,
+    gap: 2,
   },
   selector: { flexGrow: 1, flexShrink: 1, flexBasis: 90, minWidth: 0, maxWidth: "100%", minHeight: 44 },
   actions: { flexDirection: "row", alignItems: "center", flexShrink: 0, minWidth: 0, minHeight: 44 },

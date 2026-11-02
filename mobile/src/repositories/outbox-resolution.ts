@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, or } from 'drizzle-orm';
+import { and, count, eq, inArray, isNotNull, isNull, or } from 'drizzle-orm';
 
 import { getDb, schema } from '../db/client';
 import {
@@ -2109,3 +2109,28 @@ export const readOutboxResolutionRecord = defaultFacade.readOutboxResolutionReco
 export const listOutboxResolutionHistory = defaultFacade.listOutboxResolutionHistory;
 export const getOutboxResolutionExport = defaultFacade.getOutboxResolutionExport;
 export const assertOutboxResolutionContext = defaultFacade.assertOutboxResolutionContext;
+
+/** Read only the draft count for an already verified auth/server/credential
+ * identity. This query does not initialize or migrate the journal table. */
+export async function getOutboxResolutionDraftCount(context: ResolutionContext): Promise<number | null> {
+  if (!context.authScope.trim() || !context.serverFingerprint.trim()
+    || !context.credentialIdentityRevision.trim()) return null;
+  const current = await captureContextSafe(context.authScope);
+  if (!current || current.authScope !== context.authScope
+    || current.serverFingerprint !== context.serverFingerprint
+    || current.credentialIdentityRevision !== context.credentialIdentityRevision) return null;
+  try {
+    const rows = await getDb().select({ value: count() }).from(schema.outboxResolutionRecords).where(and(
+      eq(schema.outboxResolutionRecords.authScope, context.authScope),
+      eq(schema.outboxResolutionRecords.serverFingerprint, context.serverFingerprint),
+      eq(schema.outboxResolutionRecords.credentialIdentityRevision, context.credentialIdentityRevision),
+      isNotNull(schema.outboxResolutionRecords.draftJson),
+    ));
+    if (await contextChanged(context)) return null;
+    const value = Number(rows[0]?.value);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  } catch {
+    // A missing/unreadable journal remains UNKNOWN; diagnostics never create it.
+    return null;
+  }
+}

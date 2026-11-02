@@ -47,6 +47,10 @@ async def read_docs_projection(
     depth: int,
     page_chars: int,
     wire_view: bool = False,
+    personal_scope: bool = False,
+    scope_anchor_ids: tuple[UUID, ...] | None = None,
+    scope_canonical_seed_ids: tuple[UUID, ...] = (),
+    scope_related_seed_ids: tuple[UUID, ...] = (),
 ) -> dict[str, Any]:
     """Read one bounded document, record or outline projection page."""
 
@@ -64,6 +68,10 @@ async def read_docs_projection(
         include_manifest=False,
         record_only=view == "record",
         outline_only=view == "outline",
+        personal_scope=personal_scope,
+        scope_anchor_ids=scope_anchor_ids,
+        scope_canonical_seed_ids=scope_canonical_seed_ids,
+        scope_related_seed_ids=scope_related_seed_ids,
     )
     if wire_view:
         result["view"] = view
@@ -82,6 +90,10 @@ async def read_docs_edit_page(
     depth: int,
     page_chars: int,
     mutation_binding: str,
+    scope_anchor_ids: tuple[UUID, ...] | None = None,
+    personal_scope: bool = False,
+    scope_canonical_seed_ids: tuple[UUID, ...] = (),
+    scope_related_seed_ids: tuple[UUID, ...] = (),
 ) -> dict[str, Any]:
     """Read/replay one edit page, keeping session and write bindings distinct."""
 
@@ -93,6 +105,8 @@ async def read_docs_edit_page(
         page_chars=page_chars,
         turn_project_id=turn_project_id,
         allowed_node_ids=allowed_node_ids,
+        scope_anchor_ids=scope_anchor_ids,
+        personal_scope=personal_scope,
         context_binding=mutation_binding,
     )
     return await DocsEditReadSessionService(session).read_page(
@@ -106,6 +120,10 @@ async def read_docs_edit_page(
         cursor=cursor,
         scope_binding=session_binding,
         mutation_binding=mutation_binding,
+        personal_scope=personal_scope,
+        scope_anchor_ids=scope_anchor_ids,
+        scope_canonical_seed_ids=scope_canonical_seed_ids,
+        scope_related_seed_ids=scope_related_seed_ids,
     )
 
 

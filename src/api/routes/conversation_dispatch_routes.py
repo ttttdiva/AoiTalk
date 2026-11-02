@@ -27,7 +27,10 @@ from ...services.agent_run_service import (
 from ...services.agent_root_lifecycle import AgentRootLifecycleError
 from ...services.mention_resolver import normalize_mentions
 from ...services.chat_execution_adapter import resolve_canonical_session_agent_id
-from ..router_helpers import cookie_auth_dependency
+from ..router_helpers import (
+    cookie_auth_dependency,
+    conversation_restart_admission_dependency,
+)
 from .payloads import (
     ConversationDispatchRequest,
     UserMessage,
@@ -375,13 +378,19 @@ async def inherit_command_capabilities_from_edit_source(
 def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer") -> None:
     """dispatch / generation stop / generation steer ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
+    require_conversation_admission = conversation_restart_admission_dependency(
+        server, require_auth
+    )
 
-    @app.post("/api/conversations/{session_id}/dispatch")
+    @app.post(
+        "/api/conversations/{session_id}/dispatch",
+        responses={409: {"description": "Conversation restart admission is closed"}},
+    )
     async def dispatch_conversation_message(
         session_id: str,
         payload: ConversationDispatchRequest,
         request: Request,
-        _: None = Depends(require_auth),
+        _: None = Depends(require_conversation_admission),
     ):
         """Queue a user message for async conversation processing."""
         message = (payload.message or "").strip()
@@ -475,6 +484,16 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
         )
         if canonical_conversation is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        remember_background = getattr(
+            server, "_remember_background_worker_session", None
+        )
+        if callable(remember_background):
+            # This row is the canonical persisted source; it also rebuilds the
+            # in-process registry for an existing worker session after restart.
+            remember_background(
+                canonical_conversation.id,
+                canonical_conversation.context,
+            )
         if getattr(canonical_conversation, "id", None) in (None, ""):
             # Lightweight compatibility repositories may expose only the
             # Project/App projection.  They cannot identify a private root;
@@ -987,10 +1006,6 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
             bool(payload.client_message_id)
             or callable(getattr(agent_run_service, "create_server_dispatch_turn", None))
         )
-        if payload.execution_profile_id is not None and not atomic_dispatch:
-            # Only the atomic Run admission pins a validated selection; a
-            # legacy path must never silently drop an explicit runtime.
-            raise HTTPException(status_code=422, detail="agent_execution_profile_unavailable")
         if atomic_dispatch:
             message_metadata["client_message_id"] = payload.client_message_id
         if payload.attachments:
@@ -1157,13 +1172,6 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     "expected_agent_id": (
                         expected_agent_id if expected_agent_provided else "__omitted__"
                     ),
-                    # Only an explicit runtime selection joins the identity;
-                    # omitted/null keeps the historical fingerprint material.
-                    **(
-                        {"execution_profile_id": payload.execution_profile_id}
-                        if payload.execution_profile_id is not None
-                        else {}
-                    ),
                 }
             )
             try:
@@ -1193,8 +1201,6 @@ def register_conversation_dispatch_routes(app: FastAPI, server: "WebChatServer")
                     "expected_agent_id": expected_agent_id,
                     "expected_agent_provided": expected_agent_provided,
                 }
-                if payload.execution_profile_id is not None:
-                    dispatch_kwargs["execution_profile_id"] = payload.execution_profile_id
                 if payload.client_message_id:
                     dispatch_result = await agent_run_service.create_or_get_dispatch_turn(
                         client_message_id=payload.client_message_id,

@@ -6,9 +6,11 @@ terminal_mode.py から挙動不変で切り出した AgentRun 関連ヘルパ�
 イベント移設時の互換性を保ちつつ、完了判定では成功したmutation実績も扱う。
 """
 
+import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import re
 import time
 from datetime import datetime
@@ -38,19 +40,46 @@ from ...services.agent_run_service import (
     sanitize_stream_display_payload,
     sanitize_tool_audit_payload,
 )
-from ...services.agent_team_service import config_get
-from ...services.agent_team_v3 import (
-    AGENT_TEAM_SUBAGENT_CATALOG,
-    agent_team_v3_teams,
-    agent_team_v3_subagents,
-    resolve_agent_team_v3_route,
-)
 from ...services.turn_context import get_turn_context
-from ...tools.core import safe_argument_rejection
+from ...tools.core import safe_argument_rejection, safe_authority_denial
+from ...tools.agent_dialogue import AGENT_WORK_TOOL_SAFE_ERROR_CODES
 
 
 _SEARCH_TOOL_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'、。]+")
+AGENT_RUN_START_TIMEOUT_SECONDS = 30.0
+logger = logging.getLogger(__name__)
+
+
+class AgentRunStartUpdateError(RuntimeError):
+    """Run 開始更新の期限切れ・未保存・失敗を固定理由で表す。"""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 _DOCS_SEARCH_HIT_RE = re.compile(r"^\s*([0-9a-fA-F]{8,36})\s*\|", re.MULTILINE)
+_SAFE_TOOL_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,63}\Z")
+_SAFE_TOOL_ERROR_CODES = frozenset(
+    {
+        "tool_execution_failed",
+        "tool_policy_denied",
+        "agent_authority_denied",
+        "tool_argument_invalid",
+        "tool_argument_unknown",
+        "tool_argument_conflict",
+        "tool_argument_missing",
+        "tool_not_found",
+        "unknown_tool",
+        "circuit_open",
+        "not_executed",
+        "command_failed",
+        "command_unclassified_failure",
+        "invalid_json",
+        "read_path_not_found",
+        "unexpected_task_mutation",
+        "duplicate_search_required",
+    }
+)
+_SAFE_AGENT_WORK_ERROR_CODES = AGENT_WORK_TOOL_SAFE_ERROR_CODES
 _SEARCH_URL_LIMIT = 20
 _MUTATION_TOOL_NAMES = (
     PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES
@@ -167,7 +196,15 @@ def _extract_search_tool_urls(output_text: str) -> list[str]:
 
 
 def _config_text(config: Any, key: str, default: str = "") -> str:
-    return str(config_get(config, key, default) or "").strip()
+    value: Any = config
+    for part in key.split("."):
+        if isinstance(value, Mapping):
+            value = value.get(part, default)
+        else:
+            getter = getattr(value, "get", None)
+            value = getter(key, default) if callable(getter) else default
+            break
+    return str(value or "").strip()
 
 
 def _main_agent_run_provider(config: Any) -> str:
@@ -186,49 +223,6 @@ def _main_agent_run_model(config: Any, provider: str) -> str:
     return ""
 
 
-def _agent_run_subagent_context(
-    config: Any,
-    subagent_id: str,
-    *,
-    team_id: str | None = None,
-) -> dict[str, Any]:
-    provider = ""
-    model = ""
-    subagent = next(
-        (
-            item
-            for item in agent_team_v3_subagents(config)
-            if str(item.get("subagent_id") or "") == str(subagent_id)
-        ),
-        None,
-    )
-    route = resolve_agent_team_v3_route(config, subagent_id) or {}
-    if route:
-        provider = str(route.get("provider") or "").strip()
-        model = str(route.get("model") or "").strip()
-    if not provider:
-        provider = _main_agent_run_provider(config)
-    if not model:
-        model = _main_agent_run_model(config, provider)
-    return {
-        "actor_type": "agent_team",
-        "actor_key": subagent_id,
-        "actor_label": str(
-            (subagent or {}).get("name")
-            or AGENT_TEAM_SUBAGENT_CATALOG.get(subagent_id, {}).get("name")
-            or subagent_id
-        ),
-        "team_id": team_id or None,
-        "subagent_id": subagent_id,
-        "llm_profile_id": None,
-        "execution_profile_id": str(route.get("execution_profile_id") or "") or None,
-        "provider": provider,
-        "model": model,
-        "route_source": str(route.get("route_source") or "main_inherit").strip()
-        or "main_inherit",
-    }
-
-
 def _agent_run_tool_context(config: Any, data: dict[str, Any]) -> dict[str, str]:
     tool_result = data.get("tool_result")
     tool_name = str(data.get("tool") or data.get("tool_name") or "").strip()
@@ -238,58 +232,34 @@ def _agent_run_tool_context(config: Any, data: dict[str, Any]) -> dict[str, str]
         return {}
 
     if tool_name == "agent_team_delegate":
-        tool_args = (
-            data.get("tool_args") if isinstance(data.get("tool_args"), dict) else {}
-        )
-        requested_team = str(tool_args.get("team") or "").strip()
-        configured_team = next(
-            (
-                item
-                for item in agent_team_v3_teams(config)
-                if str(item.get("team_id") or "") == requested_team
-                or str(item.get("name") or "").casefold() == requested_team.casefold()
-            ),
-            None,
-        )
-        requested_team_id = str(
-            (configured_team or {}).get("team_id") or requested_team
+        # Retired Team events are historical projections only. Read actor and
+        # route metadata already present in the event payload; never resolve
+        # a current Team/Subagent route from App Config.
+        tool_args = data.get("tool_args") if isinstance(data.get("tool_args"), dict) else {}
+        tool_result = data.get("tool_result") if isinstance(data.get("tool_result"), dict) else {}
+        requested_id = str(
+            tool_args.get("subagent")
+            or tool_result.get("subagent_id")
+            or data.get("subagent_id")
+            or ""
         ).strip()
-        requested_id = str(tool_args.get("subagent") or "").strip()
-        subagent = next(
-            (
-                item
-                for item in agent_team_v3_subagents(config, include_disabled=False)
-                if str(item.get("subagent_id") or "") == requested_id
-                or str(item.get("name") or "").casefold() == requested_id.casefold()
-            ),
-            None,
-        )
-        if not subagent:
+        if not requested_id:
             return {}
-        subagent_id = str(subagent.get("subagent_id") or requested_id).strip()
-        if configured_team and subagent_id not in {
-            str(item).strip() for item in (configured_team.get("subagent_ids") or [])
-        }:
-            return {}
-        route = resolve_agent_team_v3_route(config, subagent_id) or {}
-        provider = str(route.get("provider") or "").strip()
-        provider = provider or _main_agent_run_provider(config)
-        model = str(route.get("model") or "").strip()
-        model = model or _main_agent_run_model(config, provider)
-        label = str(subagent.get("name") or AGENT_TEAM_SUBAGENT_CATALOG.get(subagent_id, {}).get("name") or subagent_id)
         return {
             "actor_type": "agent_team",
-            "actor_key": subagent_id,
-            "actor_label": label,
-            "team_id": requested_team_id or None,
-            "provider": provider,
-            "model": model,
-            "subagent_id": subagent_id,
-            "llm_profile_id": None,
-        "execution_profile_id": str(route.get("execution_profile_id") or "") or None,
-            "mode": str(route.get("effort") or route.get("reasoning_effort") or "").strip(),
-            "route_source": str(route.get("route_source") or "main_inherit").strip()
-            or "main_inherit",
+            "actor_key": requested_id,
+            "actor_label": str(
+                tool_result.get("actor_label")
+                or data.get("actor_label")
+                or requested_id
+            ),
+            "team_id": str(tool_args.get("team") or data.get("team_id") or "").strip() or None,
+            "provider": str(tool_result.get("provider") or data.get("provider") or "").strip(),
+            "model": str(tool_result.get("model") or data.get("model") or "").strip(),
+            "subagent_id": requested_id,
+            "route_source": str(
+                tool_result.get("route_source") or data.get("route_source") or "historical"
+            ).strip() or "historical",
         }
 
     integration_key = _SHARED_INTEGRATION_TOOLS.get(tool_name)
@@ -423,10 +393,14 @@ async def _peek_client_agent_run_state(
     if not isinstance(raw_usage, dict):
         return tool_calls, None, str(state.get("failure") or "")
     dialogue_usage = getattr(client, "_agent_dialogue_usage", None)
-    if isinstance(dialogue_usage, dict):
+    if (
+        isinstance(dialogue_usage, dict)
+        and getattr(client, "_agent_dialogue_budget_scope", None) is not None
+    ):
         # A native completed-state snapshot may have been published before a
-        # nested specialist finished.  The shared dialogue ledger is the
-        # current canonical cumulative receipt for this parent turn.
+        # nested specialist finished.  Only the scoped dialogue budget ledger
+        # is a canonical cumulative replacement; a provider-local projection
+        # without that scope may describe only the latest generation batch.
         raw_usage = {**raw_usage, **dialogue_usage}
     usage: dict[str, Any] = {}
     for key in (
@@ -448,7 +422,7 @@ async def _peek_client_agent_run_state(
         usage["output_includes_reasoning"] = raw_usage[
             "output_includes_reasoning"
         ]
-    if raw_usage.get("total_tokens_source") in {"reported", "derived"}:
+    if raw_usage.get("total_tokens_source") in {"reported", "derived", "mixed"}:
         usage["total_tokens_source"] = raw_usage["total_tokens_source"]
     if usage:
         reasoning_is_separate = not bool(
@@ -633,9 +607,18 @@ def _client_agent_run_usage(client) -> dict[str, Any] | None:
         metadata = getter() or {}
         if not isinstance(metadata, dict):
             return None
-        raw_usage = getattr(client, "_agent_dialogue_usage", None)
-        if not isinstance(raw_usage, dict):
+        dialogue_usage = getattr(client, "_agent_dialogue_usage", None)
+        budget_scope = getattr(client, "_agent_dialogue_budget_scope", None)
+        if isinstance(dialogue_usage, dict) and budget_scope is not None:
+            raw_usage = dialogue_usage
+        else:
             raw_usage = metadata.get("agent_run_usage")
+        if not isinstance(raw_usage, dict) or not raw_usage:
+            cumulative_usage = getattr(client, "_agent_run_usage", None)
+            if isinstance(cumulative_usage, dict) and cumulative_usage:
+                raw_usage = cumulative_usage
+        if not isinstance(raw_usage, dict) or not raw_usage:
+            raw_usage = dialogue_usage
         if not isinstance(raw_usage, dict):
             return None
 
@@ -659,7 +642,7 @@ def _client_agent_run_usage(client) -> dict[str, Any] | None:
             usage["output_includes_reasoning"] = raw_usage[
                 "output_includes_reasoning"
             ]
-        if raw_usage.get("total_tokens_source") in {"reported", "derived"}:
+        if raw_usage.get("total_tokens_source") in {"reported", "derived", "mixed"}:
             usage["total_tokens_source"] = raw_usage["total_tokens_source"]
         if not usage:
             return None
@@ -821,6 +804,8 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         default=None,
     )
     normalized_tool_call_id = str(tool_call_id or "").strip() or None
+    tool_name = str(value("tool", "name", default="") or "")
+    normalized_tool_name = tool_name.rsplit(".", 1)[-1].casefold()
     metadata = value("metadata", "result_metadata", "meta", default={})
     if not isinstance(metadata, dict):
         metadata = {}
@@ -829,6 +814,7 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
     # A similarly named caller metadata field is not provenance. The typed
     # framework field below is the only source allowed into the receipt.
     metadata.pop("policy_denial", None)
+    metadata.pop("error_code", None)
     # Execution provenance is framework-owned and must survive the
     # compatibility record projection. Keep it in bounded metadata so the
     # durable AgentRun row can distinguish an actual provider execution from
@@ -853,19 +839,131 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
     ):
         metadata["argument_rejection"] = rejection
         metadata.setdefault("error_code", rejection["code"])
+    metadata.pop("authority_denial", None)
+    authority_denial = safe_authority_denial(
+        value("authority_denial", default=None)
+    )
+    if (
+        authority_denial
+        and value("executed", default=None) is False
+        and value("synthetic", default=False) is not True
+        and not successful
+    ):
+        metadata["authority_denial"] = authority_denial
+        metadata.setdefault("error_code", "agent_authority_denied")
+    metadata.pop("budget_exceeded", None)
+    metadata.pop("run_budget_failure", None)
+    safe_budget_receipt: dict[str, Any] | None = None
+    safe_budget_field: str | None = None
+    safe_budget_code: str | None = None
+    for budget_field in ("budget_exceeded", "run_budget_failure"):
+        raw_budget_failure = value(budget_field, default=None)
+        if not isinstance(raw_budget_failure, Mapping):
+            continue
+        from ...llm.agent_run_budget import safe_budget_failure_payload
+        from ...llm.agent_run_budget import AgentRunBudgetFailure
+
+        code = str(raw_budget_failure.get("code") or "")
+        kind = str(raw_budget_failure.get("kind") or "")
+        valid_overage = code in {
+            "run_budget_exceeded:tokens",
+            "run_budget_exceeded:tool_calls",
+        } and kind in {"tokens", "tool_calls"} and budget_field == "budget_exceeded"
+        valid_unavailable = (
+            code == "run_budget_usage_unavailable:tokens"
+            and kind == "usage_unavailable"
+            and budget_field == "run_budget_failure"
+        )
+        if valid_overage or valid_unavailable:
+            try:
+                receipt = AgentRunBudgetFailure(
+                    code=code,
+                    kind=kind,
+                    measured_tokens=(
+                        int(raw_budget_failure["measured_tokens"])
+                        if raw_budget_failure.get("measured_tokens") is not None
+                        else None
+                    ),
+                    token_limit=int(raw_budget_failure.get("token_limit") or 1),
+                    request_count=int(raw_budget_failure.get("request_count") or 0),
+                    tool_call_count=int(raw_budget_failure.get("tool_call_count") or 0),
+                    tool_call_limit=int(raw_budget_failure.get("tool_call_limit") or 1),
+                    token_usage_state=str(
+                        raw_budget_failure.get("token_usage_state") or "unknown"
+                    ),
+                )
+                safe_budget = safe_budget_failure_payload(receipt)
+            except (TypeError, ValueError, OverflowError):
+                safe_budget = None
+            if (
+                safe_budget is not None
+                and value("executed", default=None) is False
+                and value("synthetic", default=False) is True
+                and not successful
+            ):
+                metadata[budget_field] = safe_budget
+                metadata["error_code"] = code
+                safe_budget_receipt = safe_budget
+                safe_budget_field = budget_field
+                safe_budget_code = code
     denial = value("policy_denial", default=None)
     if isinstance(denial, Mapping):
         denial_code = str(denial.get("code") or "").strip()
         if re.fullmatch(r"[a-z][a-z0-9_]{2,63}", denial_code):
             metadata.setdefault("policy_denial", {"code": denial_code})
+    if not successful:
+        raw_error_code = value("error_code", default=None)
+        if raw_error_code is None and isinstance(result_object, Mapping):
+            raw_error_code = result_object.get("error_code")
+        candidate_code = (
+            str(raw_error_code or "").strip()
+            if isinstance(raw_error_code, str)
+            else ""
+        )
+        safe_code = ""
+        if normalized_tool_name == "delegate_plan":
+            from ...services.delegation_failure_projection import KNOWN_DELEGATION_ERRORS, project_delegate_failure
+            projected = project_delegate_failure(result)
+            projected_code = projected.removeprefix("Error: ")
+            if projected_code in KNOWN_DELEGATION_ERRORS:
+                safe_code = projected_code
+        elif (
+            normalized_tool_name
+            in {
+                "answer_agent_work_question",
+                "resume_agent_work",
+                "escalate_agent_work_question",
+                "stop_agent_work",
+                "send_agent_work_message",
+            }
+            and candidate_code in _SAFE_AGENT_WORK_ERROR_CODES
+        ):
+            safe_code = candidate_code
+        elif (
+            _SAFE_TOOL_ERROR_CODE_RE.fullmatch(candidate_code)
+            and candidate_code in _SAFE_TOOL_ERROR_CODES
+        ):
+            safe_code = candidate_code
+        # Typed schema/authority/budget evidence above already set a more
+        # specific fixed code. Caller metadata is discarded before this point.
+        if not metadata.get("error_code"):
+            metadata["error_code"] = safe_code or "tool_execution_failed"
+    else:
+        metadata.pop("error_code", None)
     if error:
         metadata.setdefault("error", error)
     if blocked_reason:
         metadata.setdefault("blocked_reason", blocked_reason)
 
+    if normalized_tool_name == "delegate_plan" and not successful:
+        from ...services.delegation_failure_projection import project_delegate_failure
+        result = project_delegate_failure(result)
+        error = None
+        metadata.pop("error", None)
+
     safe_payload = sanitize_tool_audit_payload(
         {
-            "tool": str(value("tool", "name", default="") or ""),
+            "tool": tool_name,
             "arguments": dict(arguments),
             "result": result,
             "successful": bool(successful),
@@ -889,6 +987,20 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         safe_result = ""
     else:
         safe_result = str(safe_result)
+    safe_metadata = sanitize_tool_audit_payload(metadata)
+    if (
+        safe_budget_receipt is not None
+        and safe_budget_field is not None
+        and safe_budget_code is not None
+    ):
+        # This receipt is framework-authored and rebuilt from integer fields
+        # plus exact codes above. Restore it after generic secret redaction,
+        # whose vocabulary can conservatively redact safe states such as
+        # "known"/"unknown".
+        safe_metadata[safe_budget_field] = safe_budget_receipt
+        safe_metadata["error_code"] = safe_budget_code
+        safe_metadata["executed"] = False
+        safe_metadata["synthetic"] = True
     payload: dict[str, Any] = {
         "tool": str(safe_payload.get("tool") or value("tool", "name", default="") or ""),
         "arguments": safe_arguments,
@@ -896,7 +1008,7 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         "successful": bool(successful),
         "error": safe_payload.get("error"),
         "blocked_reason": safe_payload.get("blocked_reason"),
-        "metadata": sanitize_tool_audit_payload(metadata),
+        "metadata": safe_metadata,
         "tool_call_id": str(safe_payload.get("tool_call_id") or normalized_tool_call_id or "") or None,
         "already_recorded": bool(
             value("tool_result_already_recorded", "already_recorded", default=False)
@@ -1411,6 +1523,81 @@ def _agent_run_completion_result(
     return result_payload
 
 
+def _append_budget_receipt(
+    tool_calls: list[Any],
+    *,
+    run_id: str,
+) -> tuple[dict[str, Any] | None, Any | None]:
+    """Attach one safe budget record and return usage/failure projections."""
+
+    from ...llm.agent_run_budget import (
+        peek_agent_run_budget,
+        safe_budget_failure_payload,
+    )
+
+    ledger = peek_agent_run_budget(run_id)
+    if ledger is None:
+        return None, None
+    usage_state = ledger.usage_state()
+    failure = ledger.failure
+    safe_failure = safe_budget_failure_payload(failure)
+    def _already_has_budget_receipt(call: Any) -> bool:
+        metadata = (
+            call.get("metadata")
+            if isinstance(call, Mapping)
+            else getattr(call, "metadata", None)
+        )
+        return isinstance(metadata, Mapping) and (
+            isinstance(metadata.get("budget_exceeded"), Mapping)
+            or isinstance(metadata.get("run_budget_failure"), Mapping)
+        )
+
+    if safe_failure is not None and not any(
+        _already_has_budget_receipt(call) for call in tool_calls
+    ):
+        code = str(safe_failure["code"])
+        usage_unavailable = safe_failure.get("kind") == "usage_unavailable"
+        failure_field = "run_budget_failure" if usage_unavailable else "budget_exceeded"
+        tool_name = (
+            "run_budget_usage_unavailable"
+            if usage_unavailable
+            else "run_budget_exceeded"
+        )
+        receipt_id = (
+            "run_budget_usage_unavailable_tokens"
+            if usage_unavailable
+            else f"run_budget_exceeded_{safe_failure['kind']}"
+        )
+        tool_calls.append(
+            {
+                "tool": tool_name,
+                "arguments": {},
+                "result": json.dumps(
+                    {
+                        "success": False,
+                        "error_code": code,
+                        failure_field: safe_failure,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "successful": False,
+                "error": code,
+                "tool_call_id": receipt_id,
+                "executed": False,
+                "synthetic": True,
+                failure_field: safe_failure,
+                "metadata": {
+                    "error_code": code,
+                    failure_field: safe_failure,
+                    "executed": False,
+                    "synthetic": True,
+                },
+            }
+        )
+    return usage_state, failure
+
+
 def _should_fail_agent_run_completion(
     *,
     user_input: str,
@@ -1570,59 +1757,95 @@ class AgentRunEventEmitter:
 
     @staticmethod
     def _model_context(client) -> dict[str, Any]:
-        provider = None
-        route_source = "main_inherit"
-        backend = getattr(client, "cli_backend", None)
-        if backend and hasattr(backend, "get_provider_name"):
-            try:
-                provider = backend.get_provider_name()
-            except Exception:
-                provider = None
-        provider = provider or getattr(client, "provider", None)
-        provider = provider or getattr(client, "provider_label", None)
-        model = getattr(backend, "_model", None) if backend else None
-        model = (
-            model
-            or getattr(client, "model_name", None)
-            or getattr(client, "model", None)
-        )
-        # Chat Agent turns carry an immutable route projection on their
-        # request-scoped client.  Prefer it for run start metadata so the
-        # durable audit cannot report the process-wide Character/Main route.
+        def projected_route(provider, model, route_source):
+            clean_provider = str(provider or "").strip().lower()
+            clean_model = str(model or "").strip()
+            if clean_model.casefold() == "default":
+                clean_model = ""
+            clean_source = str(route_source or "").strip()
+            resolved = bool(clean_provider and clean_model)
+            if not resolved:
+                clean_provider = None
+                clean_model = None
+                clean_source = "pending"
+            route = {
+                "provider": clean_provider,
+                "model": clean_model,
+                "route_source": clean_source,
+                "resolution": "resolved" if resolved else "pending",
+            }
+            return {
+                "provider": route["provider"],
+                "model": route["model"],
+                "route_source": route["route_source"],
+                "route": route,
+                "route_resolution": route["resolution"],
+                # Run-start route selection is not evidence that a provider
+                # request was attempted.  Never turn missing observation into
+                # an attempt count of zero or a claim that no external call ran.
+                "provider_attempt_state": "unknown",
+            }
+
+        # Agent and Team turns already carry their request-scoped route.  Keep
+        # the provider, model, and source together rather than filling missing
+        # fields from the long-lived chat client's Main defaults.
         agent_route = getattr(client, "_agent_route", None)
         if isinstance(agent_route, dict):
-            provider = agent_route.get("provider") or provider
-            model = agent_route.get("model") or model
             route_source = (
                 str(agent_route.get("route_source") or "agent_revision").strip()
                 or "agent_revision"
             )
-        if str(model or "").strip().lower() == "default":
-            model = None
-        # The generation client already records the additive effective-route
-        # projection.  Reuse it for AgentRun start metadata instead of reading
-        # provider-specific defaults a second time.
+            return projected_route(
+                agent_route.get("provider"),
+                agent_route.get("model"),
+                route_source,
+            )
+
+        # A client-owned non-Main route (for example a fixed deployment or
+        # Team route) remains authoritative.  The request-scoped session Main
+        # projection is considered below as one indivisible provider/model/
+        # source tuple.
+        generation_metadata = {}
         try:
             metadata_getter = getattr(client, "get_generation_metadata", None)
             generation_metadata = metadata_getter() if callable(metadata_getter) else {}
-            route = (
-                generation_metadata.get("route")
-                if isinstance(generation_metadata, dict)
-                else None
-            )
-            if isinstance(route, dict):
-                route_source = str(route.get("route_source") or route_source).strip() or route_source
-                provider = provider or route.get("provider")
-                model = model or route.get("model")
+            if not isinstance(generation_metadata, dict):
+                generation_metadata = {}
         except Exception:
-            # Route metadata is diagnostics-only; a malformed getter must not
-            # prevent an otherwise valid AgentRun from starting.
-            pass
-        return {
-            "provider": str(provider) if provider else None,
-            "model": str(model) if model else None,
-            "route_source": route_source,
-        }
+            generation_metadata = {}
+
+        route = (
+            generation_metadata.get("route")
+            if isinstance(generation_metadata.get("route"), dict)
+            else None
+        )
+        route_source = (
+            str(route.get("route_source") or "").strip()
+            if isinstance(route, dict)
+            else ""
+        )
+        implicit_main_sources = {"", "main_inherit", "runtime_main", "pending"}
+        if isinstance(route, dict) and route_source not in implicit_main_sources:
+            return projected_route(
+                route.get("provider"), route.get("model"), route_source
+            )
+
+        # A selected response model is request-scoped and explicit even before
+        # the session generation wrapper has projected its final route.
+        response_model = getattr(client, "current_response_model", None)
+        if isinstance(response_model, dict):
+            response_provider = str(response_model.get("provider") or "").strip()
+            response_name = str(response_model.get("model") or "").strip()
+            if response_provider and response_name:
+                return projected_route(
+                    response_provider, response_name, "response_model"
+                )
+
+        # get_generation_metadata may still expose the process-wide OpenRouter
+        # defaults here: terminal/voice mode publishes the current request's
+        # session route only after the request target has been materialized.
+        # Mark this as pending instead of creating a mixed or misleading route.
+        return projected_route(None, None, "pending")
 
     # payload の text 本文をそのまま AgentRunEvent.message へ写すストリームイベント。
     # タイムラインが message を本文として表示するため、message 未設定でも本文を残す。
@@ -1837,26 +2060,49 @@ class AgentRunEventEmitter:
             self._already_recorded_tool_ids.add(tool_call_id)
 
     async def mark_running(self, client) -> None:
-        if not self._agent_run_service:
+        if not self._agent_run_service or not self._agent_run_id:
+            # Run を持たない呼出は従来どおり開始更新をしない。
             return
         model_context = self._model_context(client)
         try:
-            await self._agent_run_service.mark_running(
-                self._agent_run_id,
-                message="Assistant generation started",
-                metadata={
-                    "session_id": self._session_id,
-                    "project_id": self._project_id,
-                    "generation_profile": self._generation_profile,
-                    "include_project_context": self._include_project_context,
-                    "command_capabilities": list(self._command_capabilities),
-                    "route_source": model_context["route_source"],
-                },
-                provider=model_context["provider"],
-                model=model_context["model"],
+            persisted = await asyncio.wait_for(
+                self._agent_run_service.mark_running(
+                    self._agent_run_id,
+                    message="Assistant generation started",
+                    metadata={
+                        "session_id": self._session_id,
+                        "project_id": self._project_id,
+                        "generation_profile": self._generation_profile,
+                        "include_project_context": self._include_project_context,
+                        "command_capabilities": list(self._command_capabilities),
+                        "route_source": model_context["route_source"],
+                        "route": model_context["route"],
+                        "route_resolution": model_context["route_resolution"],
+                        "provider_attempt_state": model_context[
+                            "provider_attempt_state"
+                        ],
+                    },
+                    provider=model_context["provider"],
+                    model=model_context["model"],
+                ),
+                timeout=AGENT_RUN_START_TIMEOUT_SECONDS,
             )
+            if persisted is None:
+                raise RuntimeError("agent_run_start_update_not_persisted")
         except Exception as exc:
-            print(f"[{self._log_prefix}] AgentRun start update failed: {exc}")
+            reason = (
+                "agent_run_start_update_timed_out"
+                if isinstance(exc, asyncio.TimeoutError)
+                else "agent_run_start_update_failed"
+            )
+            # 原因例外の本文は DB 値を含みうるため、固定理由と例外型だけを残す。
+            logger.error(
+                "AgentRun start update failed: run=%s reason=%s error_type=%s",
+                self._agent_run_id,
+                reason,
+                type(exc).__name__,
+            )
+            raise AgentRunStartUpdateError(reason) from exc
 
     async def authoritative_mutation_completion(self, client=None) -> dict[str, Any] | None:
         """Return this run's proven mutation result, if one exists.
@@ -1911,13 +2157,20 @@ class AgentRunEventEmitter:
         )
         if not self._agent_run_service:
             await _discard_client_generation_run(client, self._agent_run_id)
+            from ...llm.agent_run_budget import discard_agent_run_budget
+
+            discard_agent_run_budget(self._agent_run_id)
             self.finished = True
             return
         try:
-            tool_calls = (
+            tool_calls = list((
                 run_state[0]
                 if run_state is not None
                 else _client_tool_calls(client)
+            ) or [])
+            budget_usage, budget_failure = _append_budget_receipt(
+                tool_calls,
+                run_id=self._agent_run_id,
             )
             await self._persist_tool_calls(tool_calls)
 
@@ -1944,6 +2197,18 @@ class AgentRunEventEmitter:
             context_manifest_ref = _client_context_manifest_ref(client)
             if context_manifest_ref:
                 result_payload["context_manifest"] = context_manifest_ref
+            if budget_usage is not None:
+                result_payload["run_budget"] = budget_usage
+            if budget_failure is not None:
+                from ...llm.agent_run_budget import safe_budget_failure_payload
+
+                safe_budget = safe_budget_failure_payload(budget_failure)
+                if safe_budget is not None:
+                    result_payload[
+                        "run_budget_failure"
+                        if safe_budget.get("kind") == "usage_unavailable"
+                        else "budget_exceeded"
+                    ] = safe_budget
             usage = (
                 run_state[1]
                 if run_state is not None
@@ -1994,6 +2259,10 @@ class AgentRunEventEmitter:
                 )
             if mutation_evidence is not None:
                 failure_message = None
+            if budget_failure is not None:
+                # A budget stop is always a failed Run, even when the latest
+                # assistant text or a prior mutation otherwise looks complete.
+                failure_message = budget_failure.code
             if self.assistant_persistence_failure:
                 # The reply exists only in the stream; the conversation lost
                 # it.  Record the run as failed with the durable reason.
@@ -2030,9 +2299,18 @@ class AgentRunEventEmitter:
                 )
             if terminal_result is None:
                 raise RuntimeError("AgentRun terminal state was not persisted")
+            terminal_status = (
+                str(terminal_result.get("status") or "").casefold()
+                if isinstance(terminal_result, Mapping)
+                else ""
+            )
+            if terminal_status in {"succeeded", "failed", "cancelled"}:
+                from ...llm.agent_run_budget import discard_agent_run_budget
+
+                discard_agent_run_budget(self._agent_run_id)
+            self.finished = True
             if run_state is not None:
                 await _ack_client_agent_run_state(client, self._agent_run_id)
-            self.finished = True
         except Exception as exc:
             print(f"[{self._log_prefix}] AgentRun completion update failed: {exc}")
 
@@ -2050,13 +2328,20 @@ class AgentRunEventEmitter:
         run_state = await _peek_client_agent_run_state(client, self._agent_run_id)
         if not self._agent_run_service:
             await _discard_client_generation_run(client, self._agent_run_id)
+            from ...llm.agent_run_budget import discard_agent_run_budget
+
+            discard_agent_run_budget(self._agent_run_id)
             self.finished = True
             return
         try:
-            tool_calls = (
+            tool_calls = list((
                 run_state[0]
                 if run_state is not None
                 else _client_tool_calls(client)
+            ) or [])
+            budget_usage, budget_failure = _append_budget_receipt(
+                tool_calls,
+                run_id=self._agent_run_id,
             )
             await self._persist_tool_calls(tool_calls)
 
@@ -2083,6 +2368,18 @@ class AgentRunEventEmitter:
             context_manifest_ref = _client_context_manifest_ref(client)
             if context_manifest_ref:
                 result["context_manifest"] = context_manifest_ref
+            if budget_usage is not None:
+                result["run_budget"] = budget_usage
+            if budget_failure is not None:
+                from ...llm.agent_run_budget import safe_budget_failure_payload
+
+                safe_budget = safe_budget_failure_payload(budget_failure)
+                if safe_budget is not None:
+                    result[
+                        "run_budget_failure"
+                        if safe_budget.get("kind") == "usage_unavailable"
+                        else "budget_exceeded"
+                    ] = safe_budget
             usage = (
                 run_state[1]
                 if run_state is not None
@@ -2106,18 +2403,25 @@ class AgentRunEventEmitter:
                 failure_kwargs["metadata"] = failure_metadata
             if safe_preprovider_proof is not None:
                 failure_kwargs["preprovider_proof"] = provider_failure_proof
-            safe_status = (
-                status
-                if status in {"failed", "cancelled", "awaiting_approval"}
-                else "failed"
+            budget_overage = (
+                budget_failure is not None
+                and budget_failure.kind in {"tokens", "tool_calls"}
             )
+            if budget_overage:
+                safe_status = "failed"
+            elif status in {"failed", "cancelled", "awaiting_approval"}:
+                safe_status = status
+            else:
+                safe_status = "failed"
             terminal_result = await self._agent_run_service.fail_run(
                 self._agent_run_id,
                 (
                     error_text
                     if safe_preprovider_proof is not None
                     else (
-                        run_state[2]
+                        budget_failure.code
+                        if budget_overage
+                        else run_state[2]
                         if run_state is not None and run_state[2]
                         else error_text
                     )
@@ -2127,10 +2431,19 @@ class AgentRunEventEmitter:
             )
             if terminal_result is None:
                 raise RuntimeError("AgentRun failure state was not persisted")
+            terminal_status = (
+                str(terminal_result.get("status") or "").casefold()
+                if isinstance(terminal_result, Mapping)
+                else ""
+            )
+            if terminal_status in {"succeeded", "failed", "cancelled"}:
+                from ...llm.agent_run_budget import discard_agent_run_budget
+
+                discard_agent_run_budget(self._agent_run_id)
+            self.finished = True
             if run_state is not None:
                 await _ack_client_agent_run_state(client, self._agent_run_id)
             else:
                 await _discard_client_generation_run(client, self._agent_run_id)
-            self.finished = True
         except Exception as exc:
             print(f"[{self._log_prefix}] AgentRun failure update failed: {exc}")

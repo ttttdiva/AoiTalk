@@ -173,7 +173,7 @@ class I18nManager:
         """
         self.current_language = language
         
-    def get(self, key: str, **kwargs) -> str:
+    def get(self, key: str, /, **kwargs) -> str:
         """翻訳されたテキストを取得
         
         Args:
@@ -203,7 +203,7 @@ class I18nManager:
                 
         return text
         
-    def get_error_message(self, error_key: str, **kwargs) -> str:
+    def get_error_message(self, error_key: str, /, **kwargs) -> str:
         """エラーメッセージを取得
         
         Args:
@@ -269,7 +269,7 @@ _i18n_manager = I18nManager()
 
 
 # 便利関数
-def _(key: str, **kwargs) -> str:
+def _(key: str, /, **kwargs) -> str:
     """翻訳を取得する便利関数
     
     Args:
@@ -300,7 +300,7 @@ def get_language() -> Language:
     return _i18n_manager.current_language
 
 
-def get_error_message(error_key: str, **kwargs) -> str:
+def get_error_message(error_key: str, /, **kwargs) -> str:
     """エラーメッセージを取得
     
     Args:

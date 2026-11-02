@@ -10,6 +10,9 @@ from .field_crypto import _is_sensitive_key
 
 _CONFIGURED_SUFFIX = "_configured"
 _MUSE_REMOTE_TARGET_SETTING_KEY = "remote_targets.muse"
+CLI_TRUSTED_WINDOWS_AGENT_IDS_SETTING_KEY = (
+    "cli_development_sessions.trusted_windows.allowed_agent_ids"
+)
 _SECRET_LEAF_NAMES = frozenset(
     {
         "api_key",
@@ -67,7 +70,13 @@ def is_admin_only_setting_key(key: str) -> bool:
         ".api_key"
     ):
         return True
-    return normalized in {"mage_vl.api_key", "browser_agent"}
+    return normalized in {
+        "mage_vl.api_key",
+        "browser_agent",
+        "dots_dialogue.enabled",
+        CLI_TRUSTED_WINDOWS_AGENT_IDS_SETTING_KEY,
+        "muse_chat.native_link",
+    }
 
 
 def _configured_flag_name(field_name: str) -> str:

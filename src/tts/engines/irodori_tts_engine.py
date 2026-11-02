@@ -9,9 +9,12 @@ caches the loaded runtime for later requests.
 
 import asyncio
 import io
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
+
+from src.runtime_release_contract import is_runtime_release_active
 
 from ..irodori_config import IRODORI_TTS_CHECKPOINT, resolve_irodori_checkpoint
 
@@ -61,7 +64,14 @@ class IrodoriTTSEngine:
             }
         )
         self.codec_repo = str(codec_repo or self.DEFAULT_CODEC_REPO).strip()
-        self.refs_dir = self._resolve_path(refs_dir or "config/irodori_refs")
+        runtime_refs = (
+            os.environ.get("AOITALK_IRODORI_REFS_DIR", "")
+            if is_runtime_release_active(self.repo_root)
+            else ""
+        )
+        self.refs_dir = self._resolve_path(
+            refs_dir or runtime_refs or "config/irodori_refs"
+        )
         self.use_gpu = bool(use_gpu)
         self.model_device = self._normalize_device(model_device)
         self.codec_device = self._normalize_device(codec_device)

@@ -27,6 +27,8 @@ export default function OperationsScreen() {
       title="Operations"
       right={
         <View style={styles.headerActions}>
+          <Button compact accessibilityLabel="Agent一覧を開く" onPress={() => router.push("/operations/agents")}>Agent</Button>
+          <Button compact accessibilityLabel="Team一覧を開く" onPress={() => router.push("/operations/team-graphs")}>Team</Button>
           <ScopeSwitcher variant="inline" projectNameOnly accessibilityLabel="Operationsの範囲を変更" />
         </View>
       }

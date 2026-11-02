@@ -19,6 +19,7 @@ interface ProjectContextValue {
   selectedSpace: Space | null;
   selectedProjectId: string | null;
   selectedProject: Project | null;
+  scopeHydrated: boolean;
   setSelectedSpaceId: (id: string) => void;
   setSelectedProjectId: (id: string | null) => void;
   refreshProjects: (options?: RefreshProjectsOptions) => Promise<void>;
@@ -64,6 +65,7 @@ export function useProject(): ProjectContextValue {
   const projects = useProjectStore((s) => s.projects);
   const selectedSpaceId = useProjectStore((s) => s.selectedSpaceId);
   const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
+  const scopeHydrated = useProjectStore((s) => s.scopeHydrated);
   const setSelectedSpaceId = useProjectStore((s) => s.setSelectedSpaceId);
   const setSelectedProjectId = useProjectStore((s) => s.setSelectedProjectId);
   const refreshProjects = useProjectStore((s) => s.refreshProjects);
@@ -81,6 +83,7 @@ export function useProject(): ProjectContextValue {
     selectedSpace,
     selectedProjectId,
     selectedProject,
+    scopeHydrated,
     setSelectedSpaceId,
     setSelectedProjectId,
     refreshProjects,

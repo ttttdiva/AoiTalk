@@ -25,6 +25,7 @@ import {
 } from "../db/sqlite-writer";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import {
+  getConfiguredApiServerFingerprint,
   isApiConnectionError,
   isApiHttpError,
   isApiTimeoutError,
@@ -59,6 +60,27 @@ const AUTO_CLOSE_ON_DUE_METADATA_KEY = "mobile_auto_close_on_due";
 type DbTaskWithAutoClose = DbTask & {
   autoCloseOnDue?: boolean | null;
 };
+type ApiTaskTag = NonNullable<ApiTask["tags"]>[number];
+
+function safeTaskTagName(tag: ApiTaskTag): ApiTaskTag {
+  const name = tag.name.trim();
+  return { ...tag, name: name === tag.id ? "" : tag.name };
+}
+
+function normalizeTaskTagList(value: unknown): ApiTaskTag[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (tag): tag is ApiTaskTag =>
+        Boolean(
+          tag &&
+            typeof tag === "object" &&
+            typeof (tag as Record<string, unknown>).id === "string" &&
+            typeof (tag as Record<string, unknown>).name === "string",
+        ),
+    )
+    .map(safeTaskTagName);
+}
 
 type TaskTombstoneLedgerContext = {
   storageKey: string;
@@ -226,6 +248,13 @@ function metadataWithAutoClose(
 // のいずれかに限定する。スコープ単位で最終フル取得時刻を保持する。
 const FULL_FETCH_THROTTLE_MS = 60_000;
 const lastFullFetchAt = new Map<string, number>();
+const taskListRefreshesInFlight = new Map<string, Promise<void>>();
+export type TaskListRefreshEvent = {
+  authScope: string | null | undefined;
+};
+const taskListRefreshListeners = new Set<
+  (event: TaskListRefreshEvent) => void
+>();
 
 /**
  * フル取得を実行すべきか判定する純粋関数。
@@ -249,6 +278,108 @@ export function shouldRunFullFetch(
 /** テスト用: スコープ別の最終フル取得時刻をクリアする。 */
 export function resetTaskFullFetchThrottle(): void {
   lastFullFetchAt.clear();
+}
+
+function notifyTaskListRefresh(authScope: string | null | undefined): void {
+  for (const listener of taskListRefreshListeners) {
+    try {
+      listener({ authScope });
+    } catch {
+      // A screen subscriber must not turn a committed cache refresh into a
+      // failed repository request.
+    }
+  }
+}
+
+type TaskListIdentity = {
+  authScope: string | null | undefined;
+  serverFingerprint: string;
+};
+
+async function readTaskListIdentity(): Promise<TaskListIdentity> {
+  const token = await getToken();
+  const resolvedAuthScope = authScopeForToken(token);
+  const authScope = resolvedAuthScope ?? (token ? `legacy-token:${token}` : null);
+  let serverFingerprint: string;
+  try {
+    serverFingerprint = await getConfiguredApiServerFingerprint();
+  } catch (error) {
+    // Lightweight repository doubles sometimes provide only getToken. The
+    // production auth module always has getTokenAuthScope, so a real storage
+    // or server-configuration failure remains fail-closed.
+    if (typeof getTokenAuthScope === "function") throw error;
+    serverFingerprint = "legacy-server-identity-unavailable";
+  }
+  return { authScope, serverFingerprint };
+}
+
+function sameTaskListIdentity(
+  left: TaskListIdentity,
+  right: TaskListIdentity,
+): boolean {
+  return left.authScope === right.authScope
+    && left.serverFingerprint === right.serverFingerprint;
+}
+
+function taskListRefreshKey(
+  scopeKey: string,
+  identity: TaskListIdentity,
+): string {
+  return JSON.stringify([
+    identity.authScope ?? null,
+    identity.serverFingerprint,
+    scopeKey,
+  ]);
+}
+
+function scheduleBackgroundTaskListRefresh(
+  key: string,
+  identity: TaskListIdentity,
+  localIsEmpty: boolean,
+  force: boolean,
+  refresh: () => Promise<unknown>,
+): Promise<void> | null {
+  const inFlight = taskListRefreshesInFlight.get(key);
+  if (inFlight) return inFlight;
+  if (!shouldRunFullFetch(
+      lastFullFetchAt.get(key),
+      Date.now(),
+      localIsEmpty,
+      force,
+    )) return null;
+
+  const flight = Promise.resolve()
+    .then(async () => {
+      if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) {
+        throw new TaskListScopeChangedError();
+      }
+      if (!(await canUseServer())) return;
+      if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) {
+        throw new TaskListScopeChangedError();
+      }
+      if (
+        !shouldRunFullFetch(
+          lastFullFetchAt.get(key),
+          Date.now(),
+          localIsEmpty,
+          force,
+        )
+      ) return;
+      await refresh();
+      if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) {
+        throw new TaskListScopeChangedError();
+      }
+      lastFullFetchAt.set(key, Date.now());
+    })
+    .finally(() => {
+      taskListRefreshesInFlight.delete(key);
+    });
+  taskListRefreshesInFlight.set(key, flight);
+  // Default list reads are intentionally local-first. The promise remains
+  // available to an explicit refresh caller, while background failures are
+  // observed here and cannot become unhandled rejections.
+  void flight.catch(() => undefined);
+  return flight;
 }
 
 function taskMetadataWithCachedTags(
@@ -282,7 +413,7 @@ function taskMetadataWithCachedTags(
     : cachedTaskTags(existingMetadata);
   return {
     ...withAutoClose,
-    [CACHED_TAGS_KEY]: Array.isArray(cachedTags) ? cachedTags : [],
+    [CACHED_TAGS_KEY]: normalizeTaskTagList(cachedTags),
   };
 }
 
@@ -290,16 +421,8 @@ function cachedTaskTags(metadata: unknown): ApiTask["tags"] {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     return [];
   }
-  const tags = (metadata as Record<string, unknown>)[CACHED_TAGS_KEY];
-  if (!Array.isArray(tags)) return [];
-  return tags.filter(
-    (tag): tag is NonNullable<ApiTask["tags"]>[number] =>
-      Boolean(
-        tag &&
-          typeof tag === "object" &&
-          typeof (tag as Record<string, unknown>).id === "string" &&
-          typeof (tag as Record<string, unknown>).name === "string",
-      ),
+  return normalizeTaskTagList(
+    (metadata as Record<string, unknown>)[CACHED_TAGS_KEY],
   );
 }
 
@@ -703,7 +826,7 @@ type TaskListScope = { projectId?: string | null; spaceId?: string | null };
 
 class TaskListScopeChangedError extends Error {
   constructor() {
-    super("認証状態が変更されたためタスク一覧の適用を中止しました");
+    super("認証状態が変更されたかサーバー設定が切り替わったためタスク一覧の適用を中止しました");
     this.name = "TaskListScopeChangedError";
   }
 }
@@ -750,11 +873,21 @@ async function pendingTaskIds(authScope: string | null | undefined): Promise<Set
     .map((row) => row.entityId));
 }
 
-async function captureTaskListSnapshot(scope: TaskListScope) {
-  const authScope = authScopeForToken(await getToken());
-  const pending = await pendingTaskIds(authScope);
+async function captureTaskListSnapshot(
+  scope: TaskListScope,
+  expectedIdentity?: TaskListIdentity,
+) {
+  const identity = await readTaskListIdentity();
+  if (expectedIdentity && !sameTaskListIdentity(identity, expectedIdentity)) {
+    throw new TaskListScopeChangedError();
+  }
+  const pending = await pendingTaskIds(identity.authScope);
   const rows = await readCanonicalTaskRows(scope);
-  return { authScope, pending, rows: new Map(rows.map((row) => [row.id, row])) };
+  return {
+    ...identity,
+    pending,
+    rows: new Map(rows.map((row) => [row.id, row])),
+  };
 }
 
 type TaskListSnapshot = Awaited<ReturnType<typeof captureTaskListSnapshot>>;
@@ -765,7 +898,7 @@ async function applyCanonicalTaskList(
   snapshot: TaskListSnapshot,
 ): Promise<void> {
   await runForegroundSqliteWrite(async (writer) => {
-    if (authScopeForToken(await getToken()) !== snapshot.authScope) {
+    if (!sameTaskListIdentity(await readTaskListIdentity(), snapshot)) {
       throw new TaskListScopeChangedError();
     }
     const ledgerKey = await prepareTaskTombstoneLedgerKey();
@@ -1247,6 +1380,91 @@ export function createSqliteTaskDetailCache(deps?: {
 
 const taskDetailSnapshotStore = createSqliteTaskDetailCache();
 
+type TaskTagCatalogPayload = {
+  version: 1;
+  projectId: string;
+  tags: Tag[];
+};
+
+function taskTagCatalogKey(
+  projectId: string,
+  identity: TaskListIdentity,
+): string {
+  return `task-tag-catalog:v1:${JSON.stringify([
+    identity.authScope ?? null,
+    identity.serverFingerprint,
+    projectId,
+  ])}`;
+}
+
+function normalizeProjectTaskTagCatalog(
+  value: unknown,
+  projectId: string,
+): Tag[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const tags: Tag[] = [];
+  for (const item of value) {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      typeof (item as Record<string, unknown>).id !== "string" ||
+      typeof (item as Record<string, unknown>).name !== "string" ||
+      (item as Record<string, unknown>).project_id !== projectId
+    ) {
+      return undefined;
+    }
+    tags.push(safeTaskTagName(item as ApiTaskTag));
+  }
+  return tags;
+}
+
+function readTaskTagCatalogForIdentity(
+  projectId: string,
+  identity: TaskListIdentity,
+): Tag[] | undefined {
+  const hit = taskDetailSnapshotStore.read(taskTagCatalogKey(projectId, identity));
+  if (!hit || !hit.payload || typeof hit.payload !== "object") return undefined;
+  const payload = hit.payload as Partial<TaskTagCatalogPayload>;
+  if (payload.version !== 1 || payload.projectId !== projectId) return undefined;
+  return normalizeProjectTaskTagCatalog(payload.tags, projectId);
+}
+
+/** Apply the project catalogue to the Task's existing membership IDs only. */
+export function mergeTaskTagsWithCatalog(
+  task: ApiTask,
+  catalog: Tag[] | undefined,
+): ApiTask {
+  if (!catalog || !Array.isArray(task.tags)) return task;
+  const catalogById = new Map(catalog.map((tag) => [tag.id, tag]));
+  return {
+    ...task,
+    tags: task.tags.map(
+      (tag) =>
+        catalogById.get(tag.id) ?? {
+          id: tag.id,
+          project_id: task.project_id,
+          name: "",
+        },
+    ),
+  };
+}
+
+async function mergeTaskWithSavedTagCatalog(task: ApiTask): Promise<ApiTask> {
+  let identity: TaskListIdentity;
+  try {
+    identity = await readTaskListIdentity();
+  } catch {
+    return task;
+  }
+  const catalog = readTaskTagCatalogForIdentity(task.project_id, identity);
+  try {
+    if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) return task;
+  } catch {
+    return task;
+  }
+  return mergeTaskTagsWithCatalog(task, catalog);
+}
+
 export function taskSnapshotKey(taskId: string): string {
   return `task:${taskId}`;
 }
@@ -1295,7 +1513,14 @@ export function mergeTaskSnapshotAggregates(
   local: ApiTask,
   snapshot: ApiTask | undefined,
 ): ApiTask {
-  if (!snapshot) return local;
+  if (!snapshot) {
+    const hasLegacyIdName = (local.tags ?? []).some(
+      (tag) => tag.name.trim() === tag.id,
+    );
+    return hasLegacyIdName
+      ? { ...local, tags: normalizeTaskTagList(local.tags) }
+      : local;
+  }
   const localAssignees = Array.isArray(local.assignees) ? local.assignees : [];
   const snapshotAssignees = Array.isArray(snapshot.assignees)
     ? snapshot.assignees
@@ -1314,6 +1539,23 @@ export function mergeTaskSnapshotAggregates(
   const snapshotTagsComplete =
     snapshot.tags_complete === true ||
     (snapshot.tags_complete === undefined && snapshotTags.length > 0);
+  const normalizedLocalTags = normalizeTaskTagList(localTags);
+  const normalizedSnapshotTags = normalizeTaskTagList(snapshotTags);
+  const snapshotTagsById = new Map(
+    normalizedSnapshotTags
+      .filter((tag) => tag.name.trim() && tag.name.trim() !== tag.id)
+      .map((tag) => [tag.id, tag]),
+  );
+  const localTagsWithCachedNames = normalizedLocalTags.map((tag) => {
+    if (tag.name.trim() && tag.name.trim() !== tag.id) return tag;
+    const cached = snapshotTagsById.get(tag.id);
+    return cached ? { ...tag, name: cached.name } : tag;
+  });
+  const tags = localTagsComplete
+    ? localTagsWithCachedNames
+    : snapshotTagsComplete
+      ? normalizedSnapshotTags
+      : localTagsWithCachedNames;
   return {
     ...local,
     comments: local.comments ?? snapshot.comments,
@@ -1328,11 +1570,7 @@ export function mergeTaskSnapshotAggregates(
       localAssigneesComplete || snapshotAssigneesComplete
         ? true
         : local.assignees_complete ?? snapshot.assignees_complete,
-    tags: localTagsComplete
-      ? localTags
-      : snapshotTagsComplete
-        ? snapshotTags
-        : localTags,
+    tags,
     tags_complete:
       localTagsComplete || snapshotTagsComplete
         ? true
@@ -1367,9 +1605,15 @@ export function mergeTaskUpdateAggregates(
     next = { ...next, assignees, assignees_complete: true };
   }
   if (Array.isArray(data.tag_ids)) {
-    const previousById = new Map(
-      (snapshot?.tags ?? []).map((tag) => [tag.id, tag]),
-    );
+    const previousById = new Map<string, Tag>();
+    for (const tag of normalizeTaskTagList([
+      ...(merged.tags ?? []),
+      ...(snapshot?.tags ?? []),
+    ])) {
+      if (tag.name.trim() && tag.name.trim() !== tag.id && !previousById.has(tag.id)) {
+        previousById.set(tag.id, tag);
+      }
+    }
     const tags = data.tag_ids
       .filter((value): value is string => typeof value === "string")
       .filter((value, index, values) => values.indexOf(value) === index)
@@ -1377,15 +1621,59 @@ export function mergeTaskUpdateAggregates(
         previousById.get(tagId) ?? {
           id: tagId,
           project_id: local.project_id,
-          name: tagId,
+          name: "",
         },
-      );
+      ).map(safeTaskTagName);
     next = { ...next, tags, tags_complete: true };
   }
   return next;
 }
 
 export const tasksRepo = {
+  /** Read the saved full project tag catalogue without waiting for the server. */
+  async readTagCatalog(projectId: string): Promise<Tag[] | undefined> {
+    let identity: TaskListIdentity;
+    try {
+      identity = await readTaskListIdentity();
+    } catch {
+      return undefined;
+    }
+    const catalog = readTaskTagCatalogForIdentity(projectId, identity);
+    try {
+      return sameTaskListIdentity(await readTaskListIdentity(), identity)
+        ? catalog
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** Fetch and persist a canonical catalogue only while its auth/server scope is current. */
+  async listTags(projectId: string): Promise<Tag[]> {
+    let identity: TaskListIdentity | undefined;
+    try {
+      identity = await readTaskListIdentity();
+    } catch {
+      // The API may still be usable, but without a stable scope its result is
+      // never persisted to the local catalogue.
+    }
+    const remoteTags = await taskApi.listTags(projectId);
+    const catalog = normalizeProjectTaskTagCatalog(remoteTags, projectId);
+    if (!identity || !catalog) return remoteTags;
+
+    const currentIdentity = await readTaskListIdentity();
+    if (!sameTaskListIdentity(currentIdentity, identity)) {
+      throw new TaskListScopeChangedError();
+    }
+    taskDetailSnapshotStore.write(taskTagCatalogKey(projectId, identity), {
+      version: 1,
+      projectId,
+      tags: catalog,
+    } satisfies TaskTagCatalogPayload);
+    notifyTaskListRefresh(identity.authScope);
+    return catalog;
+  },
+
   /** List from local cache only. */
   async listLocal(projectId?: string | null): Promise<ApiTask[]> {
     const authScope = authScopeForToken(await getToken());
@@ -1428,7 +1716,10 @@ export const tasksRepo = {
             ),
           )
           .orderBy(desc(schema.tasks.updatedAt));
-    return rows
+    if (authScopeForToken(await getToken()) !== authScope) {
+      throw new TaskListScopeChangedError();
+    }
+    const tasks = rows
       .filter((row) => isParticipatingProject({
         owner_id: row.projectOwnerId,
         slug: row.projectSlug ?? "",
@@ -1468,6 +1759,36 @@ export const tasksRepo = {
         );
         return createdOrder !== 0 ? createdOrder : a.id.localeCompare(b.id);
       });
+    let identity: TaskListIdentity;
+    try {
+      identity = await readTaskListIdentity();
+    } catch {
+      return tasks;
+    }
+    if (
+      typeof getTokenAuthScope === "function" &&
+      identity.authScope !== authScope
+    ) {
+      throw new TaskListScopeChangedError();
+    }
+    const projectIds = [...new Set(tasks.map((task) => task.project_id))];
+    const catalogs = new Map<string, Tag[]>();
+    for (const taskProjectId of projectIds) {
+      const catalog = readTaskTagCatalogForIdentity(taskProjectId, identity);
+      if (catalog !== undefined) catalogs.set(taskProjectId, catalog);
+    }
+    let currentIdentity: TaskListIdentity;
+    try {
+      currentIdentity = await readTaskListIdentity();
+    } catch {
+      return tasks;
+    }
+    if (!sameTaskListIdentity(currentIdentity, identity)) {
+      throw new TaskListScopeChangedError();
+    }
+    return tasks.map((task) =>
+      mergeTaskTagsWithCatalog(task, catalogs.get(task.project_id)),
+    );
   },
 
   /**
@@ -1479,35 +1800,56 @@ export const tasksRepo = {
     options?: { force?: boolean },
   ): Promise<ApiTask[]> {
     const local = await this.listLocal(projectId);
-    if (await canUseServer()) {
-      const key = `project:${projectId ?? "all"}`;
-      if (
-        shouldRunFullFetch(
-          lastFullFetchAt.get(key),
-          Date.now(),
+    const force = options?.force ?? false;
+    if (force && !(await canUseServer())) return local;
+    if (force) {
+      try {
+        const identity = await readTaskListIdentity();
+        const key = taskListRefreshKey(
+          `project:${projectId ?? "all"}`,
+          identity,
+        );
+        const flight = scheduleBackgroundTaskListRefresh(
+          key,
+          identity,
           local.length === 0,
-          options?.force ?? false,
-        )
-      ) {
-        try {
-          await this.refresh(projectId);
-          lastFullFetchAt.set(key, Date.now());
-          // サーバー応答の配列順ではなく、必ずローカルの正規化済み順を返す。
-          // 供給元によって並びが変わると、リロードのたびに表示順が入れ替わる。
-          return this.listLocal(projectId);
-        } catch (error) {
-          if (error instanceof TaskListScopeChangedError) throw error;
-          if (local.length === 0) {
-            throw error;
-          }
-          return local;
+          true,
+          () => this.refresh(projectId, identity),
+        );
+        if (!flight) return local;
+        await flight;
+        const refreshed = await this.listLocal(projectId);
+        if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) {
+          throw new TaskListScopeChangedError();
         }
+        return refreshed;
+      } catch (error) {
+        if (error instanceof TaskListScopeChangedError) throw error;
+        if (local.length === 0) throw error;
+        return local;
       }
     }
+    void readTaskListIdentity()
+      .then(async (identity) => {
+        if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) return;
+        const key = taskListRefreshKey(
+          `project:${projectId ?? "all"}`,
+          identity,
+        );
+        scheduleBackgroundTaskListRefresh(
+          key,
+          identity,
+          local.length === 0,
+          false,
+          () => this.refresh(projectId, identity),
+        );
+      })
+      .catch(() => undefined);
     return local;
   },
 
   async listLocalBySpace(spaceId: string): Promise<ApiTask[]> {
+    const authScope = authScopeForToken(await getToken());
     const all = await this.listLocal(null);
     const db = getDb();
     const projects = await db
@@ -1519,6 +1861,9 @@ export const tasksRepo = {
           isNull(schema.projects.deletedAt),
         ),
       );
+    if (authScopeForToken(await getToken()) !== authScope) {
+      throw new TaskListScopeChangedError();
+    }
     const projectIds = new Set(projects.map((project) => project.id));
     return all.filter((task) => projectIds.has(task.project_id));
   },
@@ -1534,48 +1879,97 @@ export const tasksRepo = {
     const local = scope.space_id
       ? await this.listLocalBySpace(scope.space_id)
       : await this.listLocal(null);
-    if (await canUseServer()) {
-      const key = `scope:${scope.space_id ?? "all"}`;
-      if (
-        shouldRunFullFetch(
-          lastFullFetchAt.get(key),
-          Date.now(),
-          local.length === 0,
-          options?.force ?? false,
-        )
-      ) {
-        try {
+    const force = options?.force ?? false;
+    if (force && !(await canUseServer())) return local;
+    if (force) {
+      try {
+        const identity = await readTaskListIdentity();
+        const key = taskListRefreshKey(
+          `scope:${scope.space_id ?? "all"}`,
+          identity,
+        );
+        const refresh = async () => {
           const reconciliationScope = { spaceId: scope.space_id };
-          const snapshot = await captureTaskListSnapshot(reconciliationScope);
+          const snapshot = await captureTaskListSnapshot(
+            reconciliationScope,
+            identity,
+          );
           const list = await taskApi.listTasksByScope({
             ...(scope.space_id ? { space_id: scope.space_id } : {}),
           });
           await applyCanonicalTaskList(list, reconciliationScope, snapshot);
-          lastFullFetchAt.set(key, Date.now());
-          // list（サーバー応答順）ではなくローカルの正規化済み順を返す。
-          return scope.space_id
-            ? this.listLocalBySpace(scope.space_id)
-            : this.listLocal(null);
-        } catch (error) {
-          if (error instanceof TaskListScopeChangedError) throw error;
-          if (local.length === 0) {
-            throw error;
-          }
-          return local;
+          notifyTaskListRefresh(snapshot.authScope);
+        };
+        const flight = scheduleBackgroundTaskListRefresh(
+          key,
+          identity,
+          local.length === 0,
+          true,
+          refresh,
+        );
+        if (!flight) return local;
+        await flight;
+        const refreshed = scope.space_id
+          ? this.listLocalBySpace(scope.space_id)
+          : this.listLocal(null);
+        const value = await refreshed;
+        if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) {
+          throw new TaskListScopeChangedError();
         }
+        return value;
+      } catch (error) {
+        if (error instanceof TaskListScopeChangedError) throw error;
+        if (local.length === 0) throw error;
+        return local;
       }
     }
+    void readTaskListIdentity()
+      .then(async (identity) => {
+        if (!sameTaskListIdentity(await readTaskListIdentity(), identity)) return;
+        const key = taskListRefreshKey(
+          `scope:${scope.space_id ?? "all"}`,
+          identity,
+        );
+        scheduleBackgroundTaskListRefresh(
+          key,
+          identity,
+          local.length === 0,
+          false,
+          async () => {
+            const reconciliationScope = { spaceId: scope.space_id };
+            const snapshot = await captureTaskListSnapshot(
+              reconciliationScope,
+              identity,
+            );
+            const list = await taskApi.listTasksByScope({
+              ...(scope.space_id ? { space_id: scope.space_id } : {}),
+            });
+            await applyCanonicalTaskList(list, reconciliationScope, snapshot);
+            notifyTaskListRefresh(snapshot.authScope);
+          },
+        );
+      })
+      .catch(() => undefined);
     return local;
   },
 
+  subscribeListRefresh(listener: (event: TaskListRefreshEvent) => void): () => void {
+    taskListRefreshListeners.add(listener);
+    return () => taskListRefreshListeners.delete(listener);
+  },
+
   /** Fetch from server and upsert into SQLite. */
-  async refresh(projectId?: string | null): Promise<ApiTask[]> {
+  async refresh(
+    projectId?: string | null,
+    expectedIdentity?: TaskListIdentity,
+  ): Promise<ApiTask[]> {
     const scope = { projectId };
-    const snapshot = await captureTaskListSnapshot(scope);
+    const snapshot = await captureTaskListSnapshot(scope, expectedIdentity);
     const list = projectId
       ? await taskApi.listTasks(projectId)
       : await taskApi.listAllTasks();
     await applyCanonicalTaskList(list, scope, snapshot);
+    notifyTaskListRefresh(snapshot.authScope);
     return list;
   },
 
@@ -1597,20 +1991,23 @@ export const tasksRepo = {
           isNotNull(schema.projects.id),
         ),
       );
-    return rows[0]
-      ? toApiShape(
-          rows[0].task,
-          rows[0].projectName,
-          extractProjectColor(rows[0].projectMetadata),
-        )
-      : null;
+    if (!rows[0]) return null;
+    const local = toApiShape(
+      rows[0].task,
+      rows[0].projectName,
+      extractProjectColor(rows[0].projectMetadata),
+    );
+    return mergeTaskWithSavedTagCatalog(local);
   },
 
   async get(taskId: string): Promise<ApiTask | null> {
     const local = await this.getLocal(taskId);
     if (await canUseServer()) {
       try {
-        const remote = await taskApi.getTask(taskId);
+        const response = await taskApi.getTask(taskId);
+        const remote = Array.isArray(response.tags)
+          ? { ...response, tags: normalizeTaskTagList(response.tags) }
+          : response;
         await applyRemoteTasks([remote]);
         // 詳細レスポンス全体をスナップショットへ保存し、オフライン補完に使う。
         writeTaskSnapshot(remote);

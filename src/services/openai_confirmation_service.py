@@ -15,11 +15,10 @@ from sqlalchemy import select
 
 from ..app_config_store import GLOBAL_CONFIG_KEY
 from ..memory.models import AppConfigSetting
-from ..memory.models.free_team import FreeTeamCredentialProfile
 from ..security.field_crypto import decrypt_json_secret_leaves, encrypt_json_secret_leaves
 
 SCHEMA = "owner_confirmation_v1"
-REFERENCES = ("openai_api_key", "free-team:openai-complimentary")
+REFERENCES = ("openai_api_key",)
 
 
 class ConfirmationError(Exception):
@@ -49,25 +48,42 @@ async def config_row(session, *, lock: bool = False):
     return row, stored, current
 
 
-async def credential_identity(session, config: dict, reference: str, *, lock: bool = False) -> dict:
-    from .free_team_service import config_get, _credential_api_key
+async def credential_identity(
+    session,
+    config: dict,
+    reference: str = "openai_api_key",
+    *,
+    lock: bool = False,
+    actual_identity: dict | None = None,
+) -> dict:
+    from .free_team_service import config_get
     if reference not in REFERENCES:
         raise ConfirmationError("credential_reference_unsupported", 422)
-    if reference == "openai_api_key":
-        key = config_get(config, reference, "") or os.getenv("OPENAI_API_KEY", "")
-        endpoint = config_get(config, "openai.base_url", "") or config_get(config, "openai_base_url", "") or os.getenv("OPENAI_BASE_URL", "")
+    if actual_identity is not None:
+        key_hash = str(actual_identity.get("api_key_sha256") or "")
+        project_id = str(actual_identity.get("project_id") or "")
+        organization_id = str(actual_identity.get("organization_id") or "")
+        endpoint = str(actual_identity.get("base_url") or "")
     else:
-        query = select(FreeTeamCredentialProfile).where(FreeTeamCredentialProfile.id == "openai-complimentary")
-        if lock:
-            query = query.with_for_update()
-        profile = (await session.execute(query)).scalar_one_or_none()
-        key = _credential_api_key(profile) if profile is not None else ""
-        endpoint = profile.base_url if profile is not None else ""
-    return {"credential_reference": reference,
-        "api_key_sha256": hashlib.sha256(key.encode()).hexdigest() if isinstance(key, str) and key else "",
-        "sdk_project_id": os.getenv("OPENAI_PROJECT_ID", ""),
-        "sdk_organization_id": os.getenv("OPENAI_ORG_ID", ""),
-        "base_url": str(endpoint or "https://api.openai.com/v1").rstrip("/")}
+        key = config_get(config, "openai_api_key", "") or os.getenv("OPENAI_API_KEY", "")
+        endpoint = (
+            config_get(config, "openai.base_url", "")
+            or config_get(config, "openai_base_url", "")
+            or os.getenv("OPENAI_BASE_URL", "")
+            or "https://api.openai.com/v1"
+        )
+        key_hash = hashlib.sha256(key.encode()).hexdigest() if isinstance(key, str) and key else ""
+        # The standard SDK client reads these two values from the same process
+        # environment; no Free Team-specific credential source is consulted.
+        project_id = os.getenv("OPENAI_PROJECT_ID", "")
+        organization_id = os.getenv("OPENAI_ORG_ID", "")
+    return {
+        "credential_reference": reference,
+        "api_key_sha256": key_hash,
+        "sdk_project_id": project_id,
+        "sdk_organization_id": organization_id,
+        "base_url": str(endpoint or "").rstrip("/"),
+    }
 
 
 def require_owner(receipt: dict, actor_id: str) -> None:
@@ -76,7 +92,9 @@ def require_owner(receipt: dict, actor_id: str) -> None:
         raise ConfirmationError("confirmation_owner_mismatch", 403)
 
 
-async def binding_stop_reason(session, config: dict) -> str:
+async def binding_stop_reason(
+    session, config: dict, *, actual_identity: dict | None = None
+) -> str:
     from .free_team_service import config_get
     receipt = config_get(config, "openai.complimentary_verification", {})
     if not isinstance(receipt, dict) or receipt.get("schema") != SCHEMA:
@@ -89,17 +107,42 @@ async def binding_stop_reason(session, config: dict) -> str:
     binding = bindings[0]
     if not isinstance(binding, dict):
         return "credential_project_unverified"
-    if binding.get("credential_reference") not in REFERENCES:
+    if binding.get("credential_reference") != "openai_api_key":
         return "credential_project_unverified"
-    current = await credential_identity(session, config, binding["credential_reference"])
+    current = await credential_identity(
+        session,
+        config,
+        "openai_api_key",
+        actual_identity=actual_identity,
+    )
+    if actual_identity is not None:
+        configured = await credential_identity(session, config, "openai_api_key")
+        if any(
+            configured.get(key) != current.get(key)
+            for key in (
+                "api_key_sha256",
+                "sdk_project_id",
+                "sdk_organization_id",
+                "base_url",
+            )
+        ):
+            return "confirmation_credential_changed"
     if not current["api_key_sha256"] or any(binding.get(key) != value for key, value in current.items()):
         return "confirmation_credential_changed"
+    if binding.get("organization_id") != config_get(
+        config, "openai.billing_scope_id", ""
+    ):
+        return "billing_scope_unverified"
     return ""
 
 
-async def authoritative_config(session) -> dict:
+async def authoritative_config(
+    session, *, actual_identity: dict | None = None
+) -> dict:
     _, _, current = await config_row(session, lock=True)
-    reason = await binding_stop_reason(session, current)
+    reason = await binding_stop_reason(
+        session, current, actual_identity=actual_identity
+    )
     if reason:
         raise ConfirmationError(reason)
     return current
@@ -122,8 +165,15 @@ async def context(session, actor_id: str) -> dict:
     # Only the owning human-admin route receives declaration/actor metadata.
     public = {key: receipt.get(key) for key in ("record_id", "owner_user_id", "actor_user_id", "recorded_at",
         "source_kind", "source_reference", "eligible", "enrolled", "organization_id", "usage_tier", "revoked_at")}
-    public["credential_reference"] = next((binding.get("credential_reference") for binding in receipt.get("credentials", [])
-        if isinstance(binding, dict)), None)
+    public["credential_reference"] = next(
+        (
+            "openai_api_key"
+            for binding in receipt.get("credentials", [])
+            if isinstance(binding, dict)
+            and binding.get("credential_reference") == "openai_api_key"
+        ),
+        None,
+    )
     return {"credentials": credentials, "record": public, "stop_reason": reason,
         "billing_scope_id": config_get(current, "openai.billing_scope_id", ""),
         "usage_tier": config_get(current, "openai.usage_tier", "tier_1_2"),
@@ -139,7 +189,9 @@ async def save(session, actor_id: str, payload: dict) -> dict:
     require_owner(previous, actor_id)
     if previous.get("record_id") != payload.get("expected_record_id"):
         raise ConfirmationError("confirmation_record_changed")
-    identity = await credential_identity(session, current, payload["credential_reference"], lock=True)
+    identity = await credential_identity(
+        session, current, "openai_api_key", lock=True
+    )
     if not identity["api_key_sha256"]:
         raise ConfirmationError("credential_not_configured", 422)
     if identity["api_key_sha256"] != payload["fingerprint"]:

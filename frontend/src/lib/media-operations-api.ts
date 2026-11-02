@@ -25,6 +25,9 @@ export type MediaPersonaRevision = Schemas["PersonaRevisionResponse"];
 export type MediaPersona = Schemas["PersonaSummaryResponse"];
 export type MediaPersonaDetail = Schemas["PersonaDetailResponse"];
 export type MediaPersonaIntake = Schemas["PersonaIntakeResponse"];
+export type MediaStockItem = Schemas["StockItemResponse"];
+export type MediaStockAction = Schemas["StockAdoptionRequest"]["action"];
+export type MediaStockDecision = Schemas["ContentItemStockDecisionResponse"];
 export type StoredArtifactPersonaResourceProvenance = {
   type: "stored_artifact";
   artifact_id: string;
@@ -338,6 +341,31 @@ function encodeId(id: string): string {
 }
 
 export const mediaOperationsApi = {
+  async listStockItems(): Promise<MediaStockItem[]> {
+    return request<MediaStockItem[]>("/operations/media/stock?limit=500");
+  },
+
+  async changeStockAdoption(
+    contentItemId: string,
+    action: MediaStockAction,
+    expectedContentItemHash: string,
+    expectedVersion: number,
+    idempotencyKey: string,
+  ): Promise<MediaStockDecision> {
+    return request<MediaStockDecision>(
+      `/operations/media/content-items/${encodeId(contentItemId)}/stock-adoption`,
+      {
+        method: "POST",
+        ...jsonBody({
+          action,
+          expected_content_item_hash: expectedContentItemHash,
+          expected_version: expectedVersion,
+        }),
+      },
+      idempotencyKey,
+    );
+  },
+
   async listCostEntries(personaRef: string, projectId?: string | null, offset = 0): Promise<MediaCostEntry[]> {
     const query = new URLSearchParams({ persona_ref: personaRef, limit: "100", offset: String(offset) });
     if (projectId) query.set("project_id", projectId);

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import stat
 import sys
 import threading
@@ -133,7 +134,14 @@ def _normalise_ids(values: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _workspace_root(config: Any) -> Path:
+def _workspace_root(config: Any, *, create: bool = False) -> Path:
+    """Resolve the configured root without creating it.
+
+    Scope factories may explicitly materialise the private/scratch namespace
+    they own.  Configuration lookup and path resolution must remain read-only,
+    so callers that only inspect a configured root never create ``workspaces``.
+    """
+
     value = _first_config(
         config,
         (
@@ -160,8 +168,14 @@ def _workspace_root(config: Any) -> Path:
     except (OSError, ValueError, RuntimeError) as exc:
         raise HarnessExecutionScopeServiceError("trusted workspace root cannot be canonicalized") from exc
     if not root.exists():
-        with suppress(OSError):
+        if not create:
+            return root
+        try:
             root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HarnessExecutionScopeServiceError(
+                "trusted workspace root could not be created"
+            ) from exc
     if not root.exists() or not root.is_dir():
         raise HarnessExecutionScopeServiceError("trusted workspace root is not a directory")
     # Never permit the deployment workspace itself to be an escaping link.
@@ -513,6 +527,7 @@ def build_current_turn_enterprise_scope(
     project_context: Mapping[str, Any] | None = None,
     run_id: str | None = None,
     audit_id: str | None = None,
+    scratch_name: str | None = None,
     external_grant_resolver: ExternalReadGrantResolver | Callable[..., Iterable[Any]] | None = None,
 ) -> HarnessExecutionScope:
     """Build the current Enterprise turn's trusted execution capability.
@@ -581,7 +596,10 @@ def build_current_turn_enterprise_scope(
         server_context.get("organization_id", server_context.get("org_id")),
         "organization_id",
     )
-    workspace = _workspace_root(config)
+    # Issuing a current-turn mutable scope is the explicit write boundary.  The
+    # resolver above remains side-effect free for callers that only inspect the
+    # configured location.
+    workspace = _workspace_root(config, create=True)
     protected_roots = _protected_roots(config, workspace)
     user_root = _canonicalise(workspace / "_users" / f"user_{user_id}")
     lexical_user_root = workspace / "_users" / f"user_{user_id}"
@@ -603,17 +621,30 @@ def build_current_turn_enterprise_scope(
             "private user namespace changed to a link/reparse point"
         )
 
-    scratch_values = _first_config(
-        config,
-        (
-            "harness_execution.scratch_roots",
-            "harness.execution.scratch_roots",
-            "agent_harness.execution.scratch_roots",
-        ),
-        (),
-    )
-    if not scratch_values:
-        scratch_values = (user_root / ".harness_scratch",)
+    if scratch_name is not None:
+        if (
+            not isinstance(scratch_name, str)
+            or not scratch_name
+            or scratch_name in {".", ".."}
+            or Path(scratch_name).name != scratch_name
+            or any(separator in scratch_name for separator in ("/", "\\"))
+        ):
+            raise HarnessExecutionScopeServiceError("scratch_name must be one safe directory name")
+        # Per-command callers must not reuse a shared configured scratch root.
+        # They pass a run-unique name and receive ownership tracking below.
+        scratch_values = (user_root / scratch_name,)
+    else:
+        scratch_values = _first_config(
+            config,
+            (
+                "harness_execution.scratch_roots",
+                "harness.execution.scratch_roots",
+                "agent_harness.execution.scratch_roots",
+            ),
+            (),
+        )
+        if not scratch_values:
+            scratch_values = (user_root / ".harness_scratch",)
     raw_scratch_values = (
         (scratch_values,)
         if isinstance(scratch_values, (str, os.PathLike))
@@ -627,12 +658,16 @@ def build_current_turn_enterprise_scope(
             raise HarnessExecutionScopeServiceError(
                 "scratch root contains a symbolic link/reparse point"
             )
-    scratch = _canonical_roots(scratch_values, base=user_root, label="scratch_roots", require_existing=False)
+    scratch = _canonical_roots(
+        scratch_values,
+        base=user_root,
+        label="scratch_roots",
+        require_existing=False,
+    )
+    created_scratch: list[tuple[Path, tuple[int, int]]] = []
     for root in scratch:
         if not _is_within(root, user_root) or _is_protected(root, protected_roots):
             raise HarnessExecutionScopeServiceError("scratch root must remain inside the private workspace")
-        with suppress(OSError):
-            root.mkdir(parents=True, exist_ok=True)
         if _path_has_any_link_or_reparse(Path(os.path.abspath(root))):
             raise HarnessExecutionScopeServiceError(
                 "scratch root changed to a symbolic link/reparse point"
@@ -713,27 +748,70 @@ def build_current_turn_enterprise_scope(
         or uuid.uuid4().hex
     )
     selected_audit_id = _clean_id(audit_id, "audit_id") or f"turn:{selected_run_id}"
+    # Delay materialisation until all identity, Project, grant, network, and
+    # capability validation above has succeeded.  This keeps a rejected scope
+    # request from creating a scratch root that no caller can release.
+    for root in scratch:
+        existed = os.path.lexists(root)
+        if existed:
+            if not root.is_dir():
+                for path, identity in created_scratch:
+                    _remove_created_scratch_dir(path, identity)
+                raise HarnessExecutionScopeServiceError("scratch root is not a directory")
+        else:
+            try:
+                # ``exist_ok=False`` prevents a concurrent owner from being
+                # mistaken for this turn's scratch root.
+                root.mkdir(parents=True, exist_ok=False)
+            except OSError as exc:
+                for path, identity in created_scratch:
+                    _remove_created_scratch_dir(path, identity)
+                raise HarnessExecutionScopeServiceError(
+                    "scratch root could not be created"
+                ) from exc
+            identity = _directory_identity(root)
+            if identity is None:
+                for path, prior_identity in created_scratch:
+                    _remove_created_scratch_dir(path, prior_identity)
+                raise HarnessExecutionScopeServiceError(
+                    "created scratch root has no stable directory identity"
+                )
+            created_scratch.append((root, identity))
+        if _path_has_any_link_or_reparse(Path(os.path.abspath(root))):
+            for path, identity in created_scratch:
+                _remove_created_scratch_dir(path, identity)
+            raise HarnessExecutionScopeServiceError(
+                "scratch root changed to a symbolic link/reparse point"
+            )
     root_identity = "user:" + hashlib.sha256((user_id + "|" + _path_key(user_root)).encode("utf-8", "surrogatepass")).hexdigest()[:32]
-    return HarnessExecutionScope._issue(
-        user_id=user_id,
-        organization_id=organization_id,
-        project_ids=project_ids,
-        app_ids=app_ids,
-        read_roots=tuple(dict.fromkeys(read_roots)),
-        write_roots=(user_root, *scratch),
-        delete_roots=(user_root, *scratch),
-        command_roots=(user_root, *scratch),
-        scratch_roots=scratch,
-        external_read_grants=grants,
-        network_capability=network_capability,
-        network_allowlist=network_allowlist,
-        environment_capability_ids=env_ids,
-        secret_capability_ids=secret_ids,
-        resource_limits=_limits(config),
-        run_id=selected_run_id,
-        audit_id=selected_audit_id,
-        root_identity=root_identity,
-    )
+    try:
+        scope = HarnessExecutionScope._issue(
+            user_id=user_id,
+            organization_id=organization_id,
+            project_ids=project_ids,
+            app_ids=app_ids,
+            read_roots=tuple(dict.fromkeys(read_roots)),
+            write_roots=(user_root, *scratch),
+            delete_roots=(user_root, *scratch),
+            command_roots=(user_root, *scratch),
+            scratch_roots=scratch,
+            external_read_grants=grants,
+            network_capability=network_capability,
+            network_allowlist=network_allowlist,
+            environment_capability_ids=env_ids,
+            secret_capability_ids=secret_ids,
+            resource_limits=_limits(config),
+            run_id=selected_run_id,
+            audit_id=selected_audit_id,
+            root_identity=root_identity,
+        )
+    except BaseException:
+        for path, identity in created_scratch:
+            _remove_created_scratch_dir(path, identity)
+        raise
+    if scratch_name is not None:
+        _remember_created_scratch_roots(str(scope.run_id), created_scratch)
+    return scope
 
 
 def _build_managed_harness_scope(
@@ -798,13 +876,42 @@ def _build_managed_harness_scope(
         raise HarnessExecutionScopeServiceError(
             "autonomous harness checkout cannot be the shared workspace root"
         )
+    if (
+        not isinstance(scratch_name, str)
+        or not scratch_name
+        or scratch_name in {".", ".."}
+        or Path(scratch_name).name != scratch_name
+        or any(separator in scratch_name for separator in ("/", "\\"))
+    ):
+        raise HarnessExecutionScopeServiceError("autonomous harness scratch name is invalid")
+
     scratch = workspace / scratch_name
     # Record whether this issuance creates the scratch directory, so only a
-    # directory this run made itself is ever removed when the run ends.
+    # directory this run made itself is ever removed when the run ends.  A
+    # collision discovered during mkdir is treated as an unknown owner and is
+    # preserved.
     scratch_created = not os.path.lexists(scratch)
-    scratch.mkdir(parents=True, exist_ok=True)
-    created_identity = _directory_identity(scratch) if scratch_created else None
+    created_identity: tuple[int, int] | None = None
     try:
+        try:
+            if scratch_created:
+                # A concurrent creator must cause a collision, not become an
+                # implicit owner of the path we observed as missing.
+                scratch.mkdir(parents=True, exist_ok=False)
+            elif not scratch.is_dir():
+                raise HarnessExecutionScopeServiceError(
+                    "autonomous harness scratch is not a directory"
+                )
+        except BaseException:
+            # If another process won a race after our lexists check, do not
+            # infer ownership from the path and never remove it here.
+            raise
+        if scratch_created:
+            created_identity = _directory_identity(scratch)
+            if created_identity is None:
+                raise HarnessExecutionScopeServiceError(
+                    "autonomous harness scratch could not be assigned an identity"
+                )
         if _path_has_any_link_or_reparse(Path(os.path.abspath(scratch))):
             raise HarnessExecutionScopeServiceError(
                 "autonomous harness scratch contains a symbolic link/reparse point"
@@ -843,14 +950,13 @@ def _build_managed_harness_scope(
     except BaseException:
         # A failed issuance never leaves behind a scratch directory it created.
         if created_identity is not None:
-            _remove_empty_created_dir(Path(scratch), created_identity)
+            _remove_created_scratch_dir(Path(scratch), created_identity)
         raise
     if created_identity is not None:
-        with _CREATED_SCRATCH_LOCK:
-            _CREATED_SCRATCH_ROOTS[(str(scope.run_id), _path_key(scratch))] = (
-                scratch,
-                created_identity,
-            )
+        _remember_created_scratch_roots(
+            str(scope.run_id),
+            ((scratch, created_identity),),
+        )
     return scope
 
 
@@ -858,6 +964,18 @@ def _build_managed_harness_scope(
 # (run_id, path key) with the directory identity observed right after creation.
 _CREATED_SCRATCH_ROOTS: dict[tuple[str, str], tuple[Path, tuple[int, int]]] = {}
 _CREATED_SCRATCH_LOCK = threading.Lock()
+
+
+def _remember_created_scratch_roots(
+    run_id: str,
+    roots: Iterable[tuple[Path, tuple[int, int]]],
+) -> None:
+    with _CREATED_SCRATCH_LOCK:
+        for path, identity in roots:
+            _CREATED_SCRATCH_ROOTS[(str(run_id), _path_key(path))] = (
+                path,
+                identity,
+            )
 
 
 def _directory_identity(path: Path) -> tuple[int, int] | None:
@@ -870,29 +988,74 @@ def _directory_identity(path: Path) -> tuple[int, int] | None:
     return (int(info.st_dev), int(info.st_ino))
 
 
-def _remove_empty_created_dir(path: Path, identity: tuple[int, int]) -> bool:
-    """``rmdir`` the directory only if it is still the one created and empty."""
+def _tree_has_link_or_reparse(path: Path) -> bool:
+    """Inspect a scratch tree without following links or reparse points."""
+
+    pending = [Path(path)]
+    while pending:
+        current = pending.pop()
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or bool(
+            getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            return True
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            return True
+        for entry in entries:
+            child = Path(entry.path)
+            try:
+                child_info = entry.stat(follow_symlinks=False)
+            except OSError:
+                return True
+            if stat.S_ISLNK(child_info.st_mode) or bool(
+                getattr(child_info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            ):
+                return True
+            if stat.S_ISDIR(child_info.st_mode):
+                pending.append(child)
+    return False
+
+
+def _remove_created_scratch_dir(path: Path, identity: tuple[int, int]) -> bool:
+    """Remove one exact run-created scratch tree after a safe preflight.
+
+    The root identity is checked before and after the recursive preflight.  A
+    reparse point anywhere below the root makes the whole tree ineligible so
+    cleanup never follows or removes an alias.  The caller's registry remains
+    the ownership proof; this function never infers ownership from a path.
+    """
 
     if _directory_identity(path) != identity:
         return False
-    if _path_has_any_link_or_reparse(Path(os.path.abspath(path))):
+    if _tree_has_link_or_reparse(path):
+        return False
+    if _directory_identity(path) != identity:
         return False
     try:
-        os.rmdir(path)
+        shutil.rmtree(path)
     except OSError:
-        # Non-empty (or concurrently used) directories are kept.
+        # Concurrent use, permissions, or a race with a replacement keeps the
+        # exact scratch root available for owner recovery.
         return False
-    return True
+    return not os.path.lexists(path)
 
 
 def release_created_scratch_roots(scope: Any) -> tuple[Path, ...]:
-    """Remove the empty scratch directories that this run's scope created.
+    """Remove the exact scratch trees that this run's scope created.
 
     Only a directory recorded at creation by this issuance is a candidate. A
-    directory that existed before, has content, was replaced by another
-    directory/link, or belongs to another run is never removed.  ``os.rmdir``
-    itself refuses a non-empty directory, so content written concurrently is
-    kept.  Returns the removed paths.
+    directory that existed before, was replaced by another directory/link,
+    contains a reparse point, or belongs to another run is never removed.
+    Returns the removed paths.
     """
 
     if scope is None:
@@ -906,7 +1069,7 @@ def release_created_scratch_roots(scope: Any) -> tuple[Path, ...]:
         if entry is None:
             continue
         path, identity = entry
-        if _remove_empty_created_dir(path, identity):
+        if _remove_created_scratch_dir(path, identity):
             removed.append(path)
     return tuple(removed)
 

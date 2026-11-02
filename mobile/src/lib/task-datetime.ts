@@ -8,6 +8,26 @@ export function isTaskDateOnlyInput(value: string | null | undefined): boolean {
   return typeof value === "string" && DATE_ONLY_PATTERN.test(value.trim());
 }
 
+export function inferTaskAllDay(
+  explicitAllDay: boolean,
+  startAt: string | null | undefined,
+  endAt: string | null | undefined,
+): boolean {
+  if (explicitAllDay) return true;
+  const providedValues = [startAt, endAt].filter(
+    (value): value is string => typeof value === "string" && value.trim() !== "",
+  );
+  return (
+    providedValues.length > 0 && providedValues.every(isTaskDateOnlyInput)
+  );
+}
+
+export function taskAllDayFromStoredRecord(
+  allDay: boolean | null | undefined,
+): boolean {
+  return Boolean(allDay);
+}
+
 /**
  * サーバーの `created_at` / `updated_at` と同じ表記（TZ指定なしのUTC）を返す。
  *
@@ -43,4 +63,28 @@ export function toTaskWallClockIso(
   )}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
     date.getSeconds(),
   )}`;
+}
+
+export function buildTaskSchedulePayload(
+  explicitAllDay: boolean,
+  startAt: string | null | undefined,
+  endAt: string | null | undefined,
+): { start_at: string | null; end_at: string | null; all_day: boolean } {
+  return {
+    start_at: toTaskWallClockIso(startAt),
+    end_at: toTaskWallClockIso(endAt),
+    all_day: inferTaskAllDay(explicitAllDay, startAt, endAt),
+  };
+}
+
+export function buildStoredTaskSchedulePayload(
+  allDay: boolean | null | undefined,
+  startAt: string | null | undefined,
+  endAt: string | null | undefined,
+): { start_at: string | null; end_at: string | null; all_day: boolean } {
+  return buildTaskSchedulePayload(
+    taskAllDayFromStoredRecord(allDay),
+    startAt,
+    endAt,
+  );
 }

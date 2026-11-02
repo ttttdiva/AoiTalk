@@ -8,8 +8,11 @@ describe("Operations entry compatibility", () => {
       expect(operationsSectionFromQuery(new URLSearchParams({ [key]: "fixture" }))).toBe("overview");
     }
     expect(operationsSectionFromQuery(new URLSearchParams("tab=studio&graph_work=fixture"))).toBe("studio");
-    for (const tab of ["overview", "agents", "work", "activity", "connections", "opportunities", "actions", "personas"] as const) {
+    for (const tab of ["overview", "agents", "work", "activity", "connections", "opportunities", "actions"] as const) {
       expect(operationsSectionFromQuery(new URLSearchParams({ tab }))).toBe(tab);
     }
+    // Persona settings belong to one persona; without it the persona list opens.
+    expect(operationsSectionFromQuery(new URLSearchParams({ tab: "personas", persona: "p" }))).toBe("personas");
+    expect(operationsSectionFromQuery(new URLSearchParams({ tab: "personas" }))).toBe("studio");
   });
 });

@@ -967,6 +967,11 @@ class SGLangClient:
         gateway = self._sync_privacy_gateway(
             suppress_automatic_context=suppress_automatic_context,
         )
+        from .agent_run_budget import AgentRunBudgetStop, get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        provider_send_started = False
+        provider_request_reserved = False
         descriptor = EgressDescriptor(
             action="model.generate",
             transport="sglang.chat.completions",
@@ -977,23 +982,59 @@ class SGLangClient:
         )
 
         def sender(final_payload: Any) -> Any:
+            nonlocal provider_send_started, provider_request_reserved
             if not isinstance(final_payload, dict):
                 raise PrivacyError("SGLang outbound payload is malformed")
             self._last_privacy_payload = dict(final_payload)
+            from .agent_run_budget import AgentRunBudgetStop, get_agent_run_budget
+
+            run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+            if run_budget is not None and not run_budget.begin_provider_request():
+                failure = run_budget.failure
+                if failure is not None:
+                    raise AgentRunBudgetStop(failure)
+            provider_send_started = False
+            provider_request_reserved = run_budget is not None
             from .generation_budget import record_bounded_model_request
             budget = record_bounded_model_request(final_payload)
             client = self.client.with_options(max_retries=0) if budget else self.client
-            return client.chat.completions.create(**final_payload)
+            provider_send_started = True
+            try:
+                return client.chat.completions.create(**final_payload)
+            except Exception as error:
+                from .agent_run_budget import is_http_429_error
 
-        response = gateway.execute_sync(
-            request_payload,
-            provider="sglang",
-            descriptor=descriptor,
-            sender=sender,
-            base_url=self.base_url,
-            source_kind="model_request",
-            model=self.model_name,
-        )
+                if run_budget is not None:
+                    if is_http_429_error(error):
+                        run_budget.record_provider_response({"total_tokens": 0})
+                    else:
+                        run_budget.mark_token_usage_unavailable()
+                    provider_request_reserved = False
+                raise
+
+        try:
+            response = gateway.execute_sync(
+                request_payload,
+                provider="sglang",
+                descriptor=descriptor,
+                sender=sender,
+                base_url=self.base_url,
+                source_kind="model_request",
+                model=self.model_name,
+            )
+        except AgentRunBudgetStop:
+            raise
+        except Exception as error:
+            if provider_request_reserved and run_budget is not None:
+                from .agent_run_budget import is_http_429_error
+
+                if not provider_send_started:
+                    run_budget.abort_provider_request()
+                elif is_http_429_error(error):
+                    run_budget.record_provider_response({"total_tokens": 0})
+                else:
+                    run_budget.mark_token_usage_unavailable()
+            raise
         # A Help stream is intentionally ephemeral.  Avoid recording its
         # request into the reused client's ordinary context manifest after the
         # outer TurnContext has already been reset.
@@ -1119,15 +1160,20 @@ class SGLangClient:
     ) -> dict[str, Any]:
         """Capture and persist one direct SGLang response."""
 
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            self._capture_usage(response)
-            return {}
-
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         previous_usage = dict(getattr(self, "_last_usage", {}) or {})
         usage = self._capture_usage(response)
+        from .agent_run_budget import get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        if run_budget is not None:
+            run_budget.record_provider_response(usage or None)
+        if suppress_automatic_context:
+            return {}
         if (
-            not bool(getattr(get_turn_context(), "suppress_automatic_context", False))
-            and not usage
+            not usage
             and previous_usage
         ):
             self._last_usage = previous_usage
@@ -1155,6 +1201,11 @@ class SGLangClient:
                 captured_usage,
                 budget.get("server_rate_card"),
             ) or captured_usage
+        from .agent_run_budget import get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        if run_budget is not None:
+            run_budget.record_provider_response(captured_usage or None)
         ledger.record_usage(
             captured_usage,
             usage_key=ledger.next_provider_usage_key("provider"),
@@ -2900,13 +2951,15 @@ class SGLangClient:
                     full_response += content
                     yielded_content = True
                     yield content
-                captured_usage = (
-                    {}
-                    if suppress_automatic_context
-                    else self._capture_usage(chunk)
-                )
+                captured_usage = self._capture_usage(chunk)
                 if captured_usage:
                     stream_usage = captured_usage
+
+            from .agent_run_budget import get_agent_run_budget
+
+            run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+            if run_budget is not None:
+                run_budget.record_provider_response(stream_usage or None)
 
             ledger.record_usage(
                 stream_usage,

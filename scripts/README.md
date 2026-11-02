@@ -1,6 +1,6 @@
 # 開発・運用スクリプト
 
-ここには現在のアプリのセットアップ、検証、配布、再利用可能な保守に必要なCLIを置く。一度限りの修復コード、LLMへの相談文と回答、端末固有のログなどは追跡しない `.local/` に置く。廃止したCLIは専用テスト・参照とともに削除し、互換wrapperとして残さない。
+ここには現在のアプリのセットアップ、検証、配布、再利用可能な保守に必要なCLIを置く。一度限りの修復コード、LLMへの相談文と回答、端末固有のログなどは OS 一時領域の作業専用の所有範囲に置く。廃止したCLIは専用テスト・参照とともに削除し、互換wrapperとして残さない。
 
 | 用途 | 入口 / 参照先 |
 | --- | --- |
@@ -10,7 +10,6 @@
 | Schema整合性 | `check_schema_drift.py`。[スキーマドリフト](../docs/schema_drift_check.md) |
 | API契約 | `generate_openapi.py` → `contracts/openapi/fastapi.json`。[型生成手順](../docs/openapi_typegen.md) |
 | Mobile契約 | `validate_mobile_product_contract.py`。[Mobile Product Contract](../docs/mobile_product_contract.md) |
-| CI参考情報（通常作業での待機不要） | `wait_ci.ps1` は既存の任意ツール。CI完了は待たず、成功を完了条件にしない。検証項目の定義は `.github/workflows/ci.yml` |
 | 手動フル検証 | `run_canonical_verification.ps1`。明示的な手動実行用で、通常作業のターゲット検証と区別する |
 | Enterprise配布 | ルートの `Enterprise.bat` → `build_enterprise_handoff.ps1`。`origin/main` の固定snapshotを使用する。既定のWindows handoff生成はDocker/BuildKit不要で、対象Linux buildは必須。正本は `README.enterprise.md` |
 | ChatGPT Web Director | `chatgpt_web_director.py` / `chatgpt_web_director.ps1`。[利用手順](../docs/chatgpt_web_director.md) |

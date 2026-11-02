@@ -1,8 +1,8 @@
-"""Opt-in Edge-compatible adapter for a manifest-pinned, owned bridge helper.
+"""Safe local browser adapter for the Gateway's bound Playwright broker.
 
-Only this adapter's opaque handles are action authority. The helper remains the
-sole CDP implementation, and the legacy extension is never a fallback. The
-adapter projects safe snapshots; page prose is not a general-purpose DLP layer.
+Only this adapter's opaque handles are action authority. It validates target
+selection and projects bounded accessible snapshots; page prose is not a
+general-purpose DLP layer.
 """
 from __future__ import annotations
 
@@ -41,8 +41,30 @@ _ACTION_ROLES = {
 _ROLE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _REF = re.compile(r"e[1-9][0-9]{0,19}\Z")
 _TARGET = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_BROWSER_OPERATIONS = frozenset({
+    "connect", "health_check", "target_list", "target_select", "target_open",
+    "read", "verify", "navigate", "action", "other",
+})
+_BROWSER_RESPONSE_CODES = frozenset({
+    "unavailable", "invalid_endpoint", "invalid_arguments", "connection_blocked",
+    "connection_required", "target_unavailable", "EXACT_TARGET_REQUIRED", "STALE_REF",
+    "STRICT_REF_REQUIRED", "DIALOG_BLOCKED", "FOCUS_CHANGED", "tab_gone", "rebind_pending",
+    "edge_broker_endpoint_required", "edge_broker_endpoint_invalid",
+    "edge_broker_client_connect_failed", "edge_broker_default_context_unavailable",
+    "edge_broker_client_command_failed", "agent_browser_target_open_failed",
+    "agent_browser_target_open_scope_invalid", "unrecognized",
+    "edge_broker_event_monitor_unavailable", "edge_broker_browser_disconnected",
+    "edge_broker_browser_context_closed", "edge_broker_probe_timeout",
+})
+_CONNECTION_METHODS = {
+    "gateway_browser_bind": "gateway_browser_bind_websocket",
+}
+_UNKNOWN_CONNECTION_METHOD = "unknown"
 _ATTR = re.compile(r"(?:level=[0-9]+|checked=(?:true|false|mixed)|expanded=(?:true|false)|selected|disabled|required|ref=e[1-9][0-9]{0,19})\Z")
 _FACTORY_ERRORS = frozenset({
+    "direct_edge_cdp_forbidden", "edge_broker_endpoint_required", "edge_broker_endpoint_invalid",
+    "edge_broker_client_connect_failed", "edge_broker_default_context_unavailable",
+    "edge_broker_client_command_failed",
     "edge_debugging_endpoint_missing", "edge_debugging_endpoint_unreadable", "edge_active_port_invalid",
     "edge_active_port_link_rejected", "edge_profile_path_invalid", "edge_cdp_endpoint_invalid",
     "edge_local_app_data_unavailable", "edge_channel_invalid", "edge_process_verification_requires_windows",
@@ -55,6 +77,33 @@ _FACTORY_ERRORS = frozenset({
     "agent_browser_cancelled",
 })
 _ZERO_WIDTH = str.maketrans({"\u00a0": " ", **{c: None for c in "\u200b\u200c\u200d\u2060\ufeff"}})
+
+
+def _browser_operation_for_args(args) -> str:
+    """Project helper argv to a fixed operation category without its values."""
+    if not isinstance(args, (tuple, list)) or not args or any(not isinstance(item, str) for item in args):
+        return "other"
+    values = tuple(args)
+    if values[:1] == ("connect",):
+        return "connect"
+    if values == ("health-check",):
+        return "health_check"
+    if values[:1] == ("tab",):
+        if len(values) >= 2 and values[1] == "list":
+            return "target_list"
+        return "target_select"
+    if values[:1] == ("open-target",):
+        return "target_open"
+    if values[:1] in {("navigate",), ("back",)}:
+        return "navigate"
+    if values[:1] in {("verify",), ("resolve_tab",)}:
+        return "verify"
+    if values[:1] in {("snapshot",), ("crowdworks-inspect",), ("observe",)}:
+        return "read"
+    if values[:1] in {("act",), ("click",), ("type",), ("fill",), ("select",),
+                       ("check",), ("uncheck",), ("press",)}:
+        return "action"
+    return "other"
 
 
 @dataclass(frozen=True)
@@ -117,6 +166,7 @@ class AgentBrowserBridge:
         max_output_bytes: int = 1048576, max_refs: int = 4096,
         cancel_event: threading.Event | None = None, default_scope: dict[str, Any] | None = None,
         diagnostic_cache: dict[str, Any] | None = None,
+        on_fault: Callable[[str, str], Any] | None = None,
     ):
         if runtime is None and runtime_factory is None:
             raise EdgeBridgeError("agent_browser_runtime_required")
@@ -151,6 +201,8 @@ class AgentBrowserBridge:
         self._diagnostic_error = ""
         self._last_verified_at = None
         self._diagnostic_cache = diagnostic_cache if diagnostic_cache is not None else {}
+        self._last_transport_diagnostic = {"operation": None, "error_code": None}
+        self._on_fault = on_fault
 
     def diagnostics(self):
         """Cached GUI state: no lock wait, process, filesystem, or CDP request."""
@@ -162,7 +214,15 @@ class AgentBrowserBridge:
                 "selection_required": connected and self._bound_target is None,
                 "cached": True, "last_verified_at": self._last_verified_at,
                 "current_connection_verified": False,
-                "edge_policy": deepcopy(self._diagnostic_cache.get("edge_policy"))}
+                "edge_policy": deepcopy(self._diagnostic_cache.get("edge_policy")),
+                "browser_operation": self._last_transport_diagnostic["operation"],
+                "browser_error_code": self._last_transport_diagnostic["error_code"],
+                "connection_method": self._connection_method()}
+
+    def _connection_method(self):
+        endpoint = getattr(self._runtime, "endpoint", None)
+        source = getattr(endpoint, "source", None)
+        return _CONNECTION_METHODS.get(source, _UNKNOWN_CONNECTION_METHOD)
 
     def available(self) -> bool:
         """Cached health only: hello/heartbeat cannot spawn or connect anything."""
@@ -197,6 +257,51 @@ class AgentBrowserBridge:
         except Exception:
             return False
 
+    def wait_quiescent(self, timeout_seconds=0.0) -> bool:
+        """Prove the current runtime has no still-running command after timeout."""
+        runtime = self._runtime
+        if runtime is None:
+            return True
+        wait = getattr(runtime, "wait_quiescent", None)
+        if not callable(wait):
+            return False
+        try:
+            return wait(timeout_seconds) is True
+        except Exception:
+            return False
+
+    def transport_disconnected(self) -> bool:
+        """Expose only whether the current broker transport latched a disconnect."""
+        runtime = self._runtime
+        return getattr(runtime, "connection_lost", False) is True
+
+    def probe_transport(self, *, timeout_seconds: float = 2.0) -> bool | None:
+        """Round-trip a fixed browser-version request without reading page content."""
+        if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
+                or not 0.05 <= timeout_seconds <= 5.0):
+            return False
+        with self._lock:
+            if (self._closed or self._faulted or self._cancelled() or not self._connected
+                    or self.transport_disconnected()):
+                return False
+            try:
+                result = self._read(("health-check",), timeout_seconds=float(timeout_seconds))
+            except EdgeBridgeError as exc:
+                if str(exc) == "agent_browser_probe_timeout":
+                    return None
+                return False
+            return result.get("reachable") is True
+
+    def abort_pending_health_check(self) -> bool:
+        """Stop only a stuck Browser.bind version probe after repeated failures."""
+        abort = getattr(self._runtime, "abort_pending_health_check", None)
+        if not callable(abort):
+            return False
+        try:
+            return abort() is True
+        except Exception:
+            return False
+
     async def request(self, command: str, **params: Any) -> dict[str, Any]:
         try:
             return await asyncio.to_thread(self._request, command, params)
@@ -210,7 +315,7 @@ class AgentBrowserBridge:
 
     def local_setup(self, command: str, params: dict[str, Any]) -> dict[str, Any]:
         """Local GUI-only projection; never reachable through the WSS entry."""
-        if command not in {"discover_targets", "select_target"}:
+        if command not in {"discover_targets", "select_target", "open_target"}:
             raise EdgeBridgeError("agent_browser_setup_invalid")
         return self._request(command, params, _local_setup=True)
 
@@ -222,9 +327,10 @@ class AgentBrowserBridge:
                 if self._run_id is not None and params.get("run_id", self._run_id) != self._run_id:
                     raise EdgeBridgeError("agent_browser_run_mismatch")
                 return self._end_run()
-            if command not in GENERAL_BROWSER_COMMANDS | {"discover_targets", "select_target"}:
+            local_commands = {"discover_targets", "select_target", "open_target"}
+            if command not in GENERAL_BROWSER_COMMANDS | local_commands:
                 raise EdgeBridgeError("agent_browser_command_unsupported")
-            if command in {"discover_targets", "select_target"} and not _local_setup:
+            if command in local_commands and not _local_setup:
                 raise EdgeBridgeError("agent_browser_local_setup_required")
             if self._closed or self._cancelled():
                 raise EdgeBridgeError("agent_browser_cancelled")
@@ -233,10 +339,14 @@ class AgentBrowserBridge:
             if self._runtime is not None and self._runtime_session != _runtime_identity(self._runtime):
                 self._fault()
                 raise EdgeBridgeError("agent_browser_epoch_changed")
-            if command in {"discover_targets", "select_target"}:
+            if command in local_commands:
                 if self._running:
                     raise EdgeBridgeError("agent_browser_run_active")
-                return self._discover_targets() if command == "discover_targets" else self._select_target(params)
+                if command == "discover_targets":
+                    return self._discover_targets()
+                if command == "select_target":
+                    return self._select_target(params)
+                return self._open_target(params)
             if command == "resolve_tab":
                 return self._resolve_tab(params)
             if not self._running:
@@ -262,20 +372,53 @@ class AgentBrowserBridge:
                 return self._crowdworks_inspect(target)
             return self._page_action(command, params, handle, target)
 
-    def _fault(self):
+    def _fault(self, *, error_code=None, operation=None):
+        first_fault = not self._faulted and not self._closed
+        runtime_configured = self._runtime is not None or self._factory is not None
         self._faulted = True
         self._available = False
         self._diagnostic_error = "agent_browser_reconnect_required"
         self._invalidate(epoch=True, connection=True)
+        if first_fault and self._on_fault is not None and runtime_configured:
+            response_code = self._last_transport_diagnostic.get("error_code")
+            raw_code = error_code or {
+                "outcome_unknown": "edge_broker_operation_outcome_unknown",
+                "target_unavailable": "agent_browser_target_unavailable",
+                "tab_gone": "agent_browser_target_gone",
+                "rebind_pending": "agent_browser_rebind_pending",
+            }.get(response_code, response_code)
+            code = {
+                "outcome_unknown": "edge_broker_operation_outcome_unknown",
+                "target_unavailable": "agent_browser_target_unavailable",
+                "tab_gone": "agent_browser_target_gone",
+                "rebind_pending": "agent_browser_rebind_pending",
+            }.get(raw_code, raw_code)
+            if code not in {
+                "edge_broker_browser_disconnected", "edge_broker_browser_context_closed",
+                "edge_broker_operation_outcome_unknown", "edge_broker_client_command_failed",
+                "agent_browser_session_faulted", "agent_browser_target_unavailable",
+                "agent_browser_target_gone", "agent_browser_rebind_pending",
+            }:
+                code = "agent_browser_session_faulted"
+            op = operation or self._last_transport_diagnostic.get("operation")
+            if op not in _BROWSER_OPERATIONS:
+                op = "other"
+            try:
+                self._on_fault(code, op)
+            except Exception:
+                # Recovery observation must not destabilize the failed command.
+                pass
         try:
             if self._runtime is not None:
                 self._runtime.stop()
         except Exception:
             pass
 
-    def _runtime_call(self, args, *, private=False):
+    def _runtime_call(self, args, *, private=False, timeout_seconds=None):
         if self._cancelled() or self._closed:
             raise _HelperFailure("agent_browser_cancelled", executed=False)
+        requested_args = tuple(args)
+        operation = _browser_operation_for_args(requested_args)
         epoch = self._epoch
         stdin = None
         if private:
@@ -287,22 +430,36 @@ class AgentBrowserBridge:
                 raise _HelperFailure("agent_browser_input_too_large", executed=False)
             args = ("bridge-command", "--stdin")
         try:
-            response = self._runtime.run(tuple(args), stdin_bytes=stdin, timeout_seconds=self.timeout,
-                                         cancel_event=self, max_output_bytes=self.max_output_bytes)
+            response = self._runtime.run(
+                tuple(args), stdin_bytes=stdin,
+                timeout_seconds=self.timeout if timeout_seconds is None else timeout_seconds,
+                cancel_event=self, max_output_bytes=self.max_output_bytes,
+            )
         except Exception as exc:
+            self._capture_transport_diagnostic(operation)
+            if operation == "health_check" and getattr(exc, "code", None) == "agent_browser_timeout":
+                self._last_transport_diagnostic = {
+                    "operation": "health_check", "error_code": "edge_broker_probe_timeout",
+                }
+                raise _HelperFailure("agent_browser_probe_timeout", executed=False) from None
             # Runtime error strings/tracebacks may contain private input. Never
             # copy them onto the WSS surface, including in exception chaining.
             executed = None if getattr(exc, "outcome_unknown", True) else False
             code = "agent_browser_outcome_unknown" if executed is None else "agent_browser_command_failed"
             if getattr(exc, "code", None) == "agent_browser_output_limit":
                 code = "agent_browser_output_limit"
-            self._fault()
+            self._fault(
+                error_code=("edge_broker_operation_outcome_unknown" if executed is None
+                            else "edge_broker_client_command_failed"),
+                operation=operation,
+            )
             raise _HelperFailure(code, executed=executed) from None
+        self._capture_transport_diagnostic(operation)
         if epoch != self._epoch or self._cancelled() or self._closed:
-            self._fault()
+            self._fault(error_code="edge_broker_operation_outcome_unknown", operation=operation)
             raise _HelperFailure("agent_browser_outcome_unknown")
         if not isinstance(response, dict) or type(response.get("success")) is not bool:
-            self._fault()
+            self._fault(error_code="edge_broker_client_command_failed", operation=operation)
             raise _HelperFailure("agent_browser_response_invalid")
         if response["success"] is False:
             data = response.get("data")
@@ -316,11 +473,35 @@ class AgentBrowserBridge:
                           "EXACT_TARGET_REQUIRED", "target_unavailable", "STRICT_INPUT_UNSUPPORTED",
                           "connection_blocked", "connection_required", "TARGET_SELECTION_REQUIRED",
                           "CROWDWORKS_SCOPE_UNSUPPORTED", "CROWDWORKS_SCOPE_OVERFLOW",
+                          "unavailable", "invalid_endpoint", "invalid_arguments",
+                          "edge_broker_endpoint_required", "edge_broker_endpoint_invalid",
+                          "edge_broker_client_connect_failed", "edge_broker_default_context_unavailable",
+                          "edge_broker_client_command_failed", "edge_broker_event_monitor_unavailable",
+                          "edge_broker_browser_disconnected", "edge_broker_browser_context_closed",
+                          "edge_broker_probe_timeout",
+                          "agent_browser_target_open_failed",
+                          "agent_browser_target_open_scope_invalid",
                           "CROWDWORKS_INSPECTION_UNAVAILABLE"}
             code = code if code in safe_codes else "agent_browser_command_failed"
+            if (operation == "health_check" and code == "edge_broker_probe_timeout"
+                    and executed is False):
+                self._last_transport_diagnostic = {
+                    "operation": "health_check", "error_code": "edge_broker_probe_timeout",
+                }
+                raise _HelperFailure("agent_browser_probe_timeout", executed=False)
             if executed is not False or code in {"rebind_pending", "tab_gone", "target_unavailable",
                                                 "EXACT_TARGET_REQUIRED", "connection_blocked", "connection_required"}:
-                self._fault()
+                mapped = {
+                    "outcome_unknown": "edge_broker_operation_outcome_unknown",
+                    "target_unavailable": "agent_browser_target_unavailable",
+                    "tab_gone": "agent_browser_target_gone",
+                    "rebind_pending": "agent_browser_rebind_pending",
+                }.get(code)
+                self._fault(
+                    error_code=("edge_broker_operation_outcome_unknown" if executed is None
+                                else mapped or "agent_browser_session_faulted"),
+                    operation=operation,
+                )
             raise _HelperFailure(code, executed=executed)
         data = response.get("data")
         if not isinstance(data, dict):
@@ -329,13 +510,30 @@ class AgentBrowserBridge:
         self._last_verified_at = time.time()
         return data
 
+    def _capture_transport_diagnostic(self, operation):
+        raw = getattr(self._runtime, "last_command_diagnostic", None)
+        if callable(raw):
+            try:
+                raw = raw()
+            except Exception:
+                raw = None
+        if not isinstance(raw, dict):
+            raw = {}
+        response_code = raw.get("response_code")
+        if response_code not in _BROWSER_RESPONSE_CODES:
+            response_code = "unrecognized" if response_code else None
+        self._last_transport_diagnostic = {
+            "operation": operation if operation in _BROWSER_OPERATIONS else "other",
+            "error_code": response_code,
+        }
+
     def is_set(self):
-        """Combined cancellation event interface consumed by OwnedHelperRuntime."""
+        """Combined cancellation event interface consumed by the browser transport."""
         return self._cancelled() or self._closed
 
-    def _read(self, args, *, private=False):
+    def _read(self, args, *, private=False, timeout_seconds=None):
         try:
-            return self._runtime_call(args, private=private)
+            return self._runtime_call(args, private=private, timeout_seconds=timeout_seconds)
         except _HelperFailure as exc:
             self._diagnostic_error = _public_error(exc.code)
             raise EdgeBridgeError(_public_error(exc.code)) from None
@@ -440,7 +638,8 @@ class AgentBrowserBridge:
                     for char in title):
                 self._fault()
                 raise EdgeBridgeError("agent_browser_targets_invalid")
-            targets.append({"tab_id": self._handle_for_target(target), "origin": _origin(item.get("origin", "")),
+            targets.append({"tab_id": self._handle_for_target(target), "target_id": target,
+                            "origin": _origin(item.get("origin", "")),
                             "title": title, "type": "page", "selected": item["active"]})
         if self._bound_target is not None and self._bound_target not in seen:
             self._fault()
@@ -449,6 +648,18 @@ class AgentBrowserBridge:
         self._diagnostic_error = "" if targets else "agent_browser_no_targets"
         return {"targets": targets, "selection_required": self._bound_target is None,
                 "available": bool(targets), "error": self._diagnostic_error}
+
+    def _open_target(self, params):
+        allowed = {"https://crowdworks.jp/", "https://www.crowdworks.jp/"}
+        url = params.get("url") if isinstance(params, dict) else None
+        if (not isinstance(params, dict) or set(params) != {"url"}
+                or not isinstance(url, str) or url not in allowed):
+            raise EdgeBridgeError("agent_browser_target_open_scope_invalid")
+        self._connect_initial()
+        self._read(("open-target", url), private=True)
+        # Re-list through the normal discovery projection. The broker runtime
+        # atomically checks for an existing matching page before it opens one.
+        return self._discover_targets()
 
     def _select_target(self, params):
         handle = params.get("tab_id")
@@ -802,6 +1013,17 @@ def _valid_target(value):
 
 def _public_error(code):
     return {"STALE_REF": "edge_stale_element", "STRICT_REF_REQUIRED": "edge_stale_element",
+            "edge_broker_endpoint_required": "edge_broker_endpoint_required",
+            "edge_broker_endpoint_invalid": "edge_broker_endpoint_invalid",
+            "edge_broker_client_connect_failed": "edge_broker_client_connect_failed",
+            "edge_broker_default_context_unavailable": "edge_broker_default_context_unavailable",
+            "edge_broker_client_command_failed": "edge_broker_client_command_failed",
+            "edge_broker_event_monitor_unavailable": "edge_broker_event_monitor_unavailable",
+            "edge_broker_browser_disconnected": "edge_broker_browser_disconnected",
+            "edge_broker_browser_context_closed": "edge_broker_browser_context_closed",
+            "unavailable": "agent_browser_helper_unavailable",
+            "invalid_endpoint": "agent_browser_helper_endpoint_invalid",
+            "invalid_arguments": "agent_browser_helper_arguments_invalid",
             "rebind_pending": "agent_browser_rebind_pending", "tab_gone": "agent_browser_target_gone",
             "DIALOG_BLOCKED": "agent_browser_dialog_blocked",
             "FOCUS_CHANGED": "agent_browser_focus_required",

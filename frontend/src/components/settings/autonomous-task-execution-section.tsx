@@ -198,7 +198,7 @@ export function AutonomousTaskExecutionSection() {
       icon={<Workflow className="size-4" />}
       targetId="autonomous-task-execution"
       summary={<Badge variant={draft.enabled ? "secondary" : "outline"}>{draft.enabled ? "有効" : "無効"}</Badge>}
-      help="Execution Team topologyとは独立して、バックグラウンドタスクの実行方法を管理します。モデル設定は実行方式ごとに保存されます。"
+      help="Agentの職務設定とは独立して、バックグラウンドタスクの実行方法を管理します。モデル設定は実行方式ごとに保存されます。"
     >
       {(message || error) && (
         <p role={error ? "alert" : "status"} className={`rounded border p-2 text-xs ${error ? "border-destructive/40 text-destructive" : "text-muted-foreground"}`}>

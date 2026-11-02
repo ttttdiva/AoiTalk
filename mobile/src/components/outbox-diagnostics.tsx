@@ -2,33 +2,16 @@ import React, {
   useEffect,
   useRef,
   useState,
-  useSyncExternalStore,
 } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { Button, Text } from "react-native-paper";
 import { useAuth } from "../contexts/AuthContext";
 import {
   getOutboxDiagnostics,
   type OutboxDiagnostic,
 } from "../repositories/outbox";
-import {
-  requestOutboxResolutionTarget,
-  confirmOutboxResolutionTarget,
-  inspectOutboxResolution,
-  prepareOutboxResolution,
-  adoptOutboxServer,
-} from "../repositories/outbox-resolution";
-import type {
-  ResolutionField,
-  ResolutionPreview,
-  ResolutionRecordView,
-} from "../repositories/outbox-resolution-types";
+import type { ResolutionField, ResolutionPreview } from "../repositories/outbox-resolution-types";
 import { useSyncStatusStore } from "../stores/sync-status";
-import { exportOutboxResolutionRecord } from "../lib/outbox-resolution-export";
-import {
-  getOutboxResolutionEditorRevision,
-  subscribeOutboxResolutionEditors,
-} from "../lib/outbox-resolution-editor-guard";
 import {
   outboxResolutionDomainKey,
   useOutboxResolutionIdentity,
@@ -37,12 +20,21 @@ import {
 import { isMobileReadOnlyDiagnosticsEnabled } from "../lib/read-only-diagnostics";
 
 const REASONS: Record<OutboxDiagnostic["errorKind"], string> = {
-  missing_entity: "サーバーに対象が見つかりません。端末の更新は保持しています",
-  conflict: "サーバー上の変更と競合しています",
+  missing_entity: "サーバーに対象がありません。端末の内容を記録に残して取り下げます。",
+  conflict: "サーバー版に自動でそろえます。端末の内容は記録に残します。",
   scope: "保存先または権限を確認する必要があります",
   missing_base: "サーバーの更新版を確認する必要があります",
   server_error: "サーバーが操作を受理できませんでした",
   pending: "送信を待っています",
+};
+
+const RETRY_GATE_LABELS: Record<Exclude<OutboxDiagnostic["retryGateReason"], undefined | "unknown">, string> = {
+  retryable_below_limit: "再試行回数の上限内",
+  legacy_conflict_reconciliation: "旧競合の再読取対象",
+  legacy_task_conflict_reconciliation: "旧Task競合の再読取対象",
+  blocked_reason_present: "保存済みの保留理由あり",
+  task_conflict_has_snapshot: "Task競合snapshotの確認待ち",
+  retry_limit_reached: "再試行上限に到達",
 };
 
 const REASON_LABELS: Record<string, string> = {
@@ -109,33 +101,6 @@ function reasonLabel(reason: string | null | undefined): string {
   return REASON_LABELS[reason] ?? "安全のため、この操作は実行できません。元の操作を保持しています。";
 }
 
-function resultReason(result: unknown): string | null {
-  if (!result || typeof result !== "object") return "transaction_failed";
-  const candidate = result as { ok?: unknown; reason?: unknown };
-  return candidate.ok === false && typeof candidate.reason === "string"
-    ? candidate.reason
-    : "transaction_failed";
-}
-
-const CLEAR_RESOLUTION_REASONS = new Set([
-  "context_changed",
-  "auth_scope_changed",
-  "scope_changed",
-  "origin_confirmation_required",
-]);
-
-function shouldClearResolution(reason: unknown): boolean {
-  return typeof reason === "string" && CLEAR_RESOLUTION_REASONS.has(reason);
-}
-
-function isSuccess<T>(result: unknown): result is { ok: true; value: T } {
-  return Boolean(
-    result
-      && typeof result === "object"
-      && (result as { ok?: unknown }).ok === true,
-  );
-}
-
 function finiteString(value: unknown): string | null {
   if (typeof value !== "string" || !value.trim()) return null;
   return value.length <= 256 ? value : `${value.slice(0, 256)}…`;
@@ -200,14 +165,6 @@ function comparisonLabel(comparison: ResolutionField["comparison"]): string {
   return "比較未確認";
 }
 
-function useEditorRevision(): number {
-  return useSyncExternalStore(
-    subscribeOutboxResolutionEditors,
-    getOutboxResolutionEditorRevision,
-    getOutboxResolutionEditorRevision,
-  );
-}
-
 function safeRows(value: unknown): OutboxDiagnostic[] {
   if (!Array.isArray(value)) return [];
   return value.filter((row): row is OutboxDiagnostic => {
@@ -224,7 +181,12 @@ function safeRows(value: unknown): OutboxDiagnostic[] {
       && typeof candidate.retryCount === "number"
       && Number.isFinite(candidate.retryCount)
       && typeof candidate.errorKind === "string"
-      && Object.prototype.hasOwnProperty.call(REASONS, candidate.errorKind);
+      && Object.prototype.hasOwnProperty.call(REASONS, candidate.errorKind)
+      && (candidate.retryEligibility === undefined || ["eligible", "blocked", "unknown"].includes(candidate.retryEligibility))
+      && (candidate.retryGateReason === undefined || candidate.retryGateReason === "unknown"
+        || Object.prototype.hasOwnProperty.call(RETRY_GATE_LABELS, candidate.retryGateReason))
+      && (candidate.schedulerState === undefined
+        || ["trigger_driven", "not_eligible", "unknown"].includes(candidate.schedulerState));
   }).map((row) => ({
     opId: row.opId,
     tableName: row.tableName,
@@ -237,6 +199,10 @@ function safeRows(value: unknown): OutboxDiagnostic[] {
     hasConflictSnapshot: row.hasConflictSnapshot === true,
     blockedReason: null,
     errorKind: row.errorKind,
+    retryEligibility: row.retryEligibility ?? "unknown",
+    retryGateReason: row.retryGateReason ?? "unknown",
+    schedulerState: row.schedulerState ?? "unknown",
+    nextAttemptAt: null,
   }));
 }
 
@@ -348,280 +314,6 @@ export function ResolutionPreviewDetails({
   </View>;
 }
 
-type ResolutionCardProps = {
-  row: OutboxDiagnostic;
-  authScope: string;
-  resolutionIdentityKey?: string;
-};
-
-type ResolutionTargetRequestView = {
-  confirmation: object;
-  targetLabel: string;
-  operationOrigin: string;
-  serverHost?: string | null;
-  host?: string | null;
-  serverPort?: number | string | null;
-  port?: number | string | null;
-};
-
-/** A single explicit compare / prepare / adopt flow shared by Task and Docs. */
-export function OutboxResolution({ row, authScope, resolutionIdentityKey }: ResolutionCardProps) {
-  const identity = `${resolutionIdentityKey ?? authScope}|${row.opId}|${row.tableName}|${row.entityId}`;
-  const currentIdentity = useRef(identity);
-  currentIdentity.current = identity;
-  const editorRevision = useEditorRevision();
-  const dataKey = `${identity}|editor:${editorRevision}`;
-  const generation = useRef(0);
-  const mountedRef = useRef(true);
-  const busyRef = useRef(false);
-  const [busy, setBusy] = useState(false);
-  const [preview, setPreview] = useState<ResolutionPreview | null>(null);
-  const [record, setRecord] = useState<ResolutionRecordView | null>(null);
-  const [dataIdentity, setDataIdentity] = useState<string | null>(null);
-  const [targetRequest, setTargetRequest] = useState<ResolutionTargetRequestView | null>(null);
-  const [capability, setCapability] = useState<object | null>(null);
-  const [confirmAdopt, setConfirmAdopt] = useState(false);
-  const [status, setStatus] = useState<"saved" | "adopted" | "exported" | "shared" | "cancelled" | null>(null);
-  const [errorReason, setErrorReason] = useState<string | null>(null);
-
-  const clearResolutionState = () => {
-    setPreview(null);
-    setRecord(null);
-    setDataIdentity(null);
-    setTargetRequest(null);
-    setCapability(null);
-    setConfirmAdopt(false);
-    setStatus(null);
-  };
-
-  useEffect(() => {
-    mountedRef.current = true;
-    generation.current += 1;
-    busyRef.current = false;
-    setBusy(false);
-    setPreview(null);
-    setRecord(null);
-    setDataIdentity(null);
-    setTargetRequest(null);
-    setCapability(null);
-    setConfirmAdopt(false);
-    setStatus(null);
-    setErrorReason(null);
-    return () => {
-      mountedRef.current = false;
-      generation.current += 1;
-    };
-  }, [identity, editorRevision]);
-
-  const supported = row.tableName === "tasks" || row.tableName.startsWith("knowledge_");
-  const run = async <T,>(
-    operation: (isCurrent: () => boolean) => Promise<T>,
-    onSuccess: (value: T) => void,
-  ) => {
-    if (!mountedRef.current || currentIdentity.current !== identity || busyRef.current) return;
-    busyRef.current = true;
-    const request = ++generation.current;
-    const requestRevision = editorRevision;
-    const active = () => currentIdentity.current === identity
-      && mountedRef.current
-      && generation.current === request
-      && getOutboxResolutionEditorRevision() === requestRevision;
-    setBusy(true);
-    setErrorReason(null);
-    try {
-      const value = await operation(active);
-      if (active()) onSuccess(value);
-    } catch {
-      if (active()) setErrorReason("transaction_failed");
-    } finally {
-      if (active()) {
-        busyRef.current = false;
-        setBusy(false);
-      }
-    }
-  };
-
-  const requestTarget = () => {
-    void run(
-      () => requestOutboxResolutionTarget(row.opId, authScope),
-      (result: unknown) => {
-        if (isSuccess<ResolutionTargetRequestView>(result)) {
-          setTargetRequest(result.value);
-          setErrorReason(null);
-        } else {
-          if (shouldClearResolution(resultReason(result))) clearResolutionState();
-          setErrorReason(resultReason(result));
-        }
-      },
-    );
-  };
-
-  const confirmTarget = () => {
-    const pending = targetRequest;
-    if (!pending) return;
-    void run(
-      async (isCurrent) => {
-        const confirmed = await confirmOutboxResolutionTarget(pending.confirmation);
-        if (!isSuccess<object>(confirmed)) return confirmed;
-        // The target confirmation is a capability boundary. If the card was
-        // blurred, unmounted, or moved to another owner while it awaited the
-        // confirmation, do not start the live GET at all.
-        if (!isCurrent()) return { ok: false, reason: "context_changed" };
-        const inspected = await inspectOutboxResolution(row.opId, authScope, confirmed.value);
-        if (!isCurrent()) return { ok: false, reason: "context_changed" };
-        if (!isSuccess<ResolutionPreview>(inspected)) return inspected;
-        return { ok: true, value: { preview: inspected.value, capability: confirmed.value } };
-      },
-      (result: unknown) => {
-        setTargetRequest(null);
-        if (isSuccess<{ preview: ResolutionPreview; capability: object }>(result)) {
-          setCapability(result.value.capability);
-          setPreview(result.value.preview);
-          setDataIdentity(dataKey);
-          setRecord(null);
-        } else {
-          setPreview(null);
-          if (shouldClearResolution(resultReason(result))) clearResolutionState();
-          setErrorReason(resultReason(result));
-        }
-      },
-    );
-  };
-
-  const prepare = () => {
-    const visiblePreview = dataIdentity === dataKey ? preview : null;
-    if (!visiblePreview || !visiblePreview.view.canPrepare) return;
-    void run(
-      () => prepareOutboxResolution(visiblePreview),
-      (result: unknown) => {
-        if (isSuccess<ResolutionRecordView>(result)) {
-          setRecord(result.value);
-          setDataIdentity(dataKey);
-          setStatus("saved");
-        } else {
-          if (shouldClearResolution(resultReason(result))) clearResolutionState();
-          setErrorReason(resultReason(result));
-        }
-      },
-    );
-  };
-
-  const exportOriginal = () => {
-    const visibleRecord = dataIdentity === dataKey ? record : null;
-    if (!visibleRecord) return;
-    void run(
-      () => exportOutboxResolutionRecord(visibleRecord.item.id, authScope, visibleRecord.item.revision),
-      (result: unknown) => {
-        if (isSuccess<{ status: string }>(result)) {
-          const exportStatus = result.value.status;
-          setStatus(exportStatus === "shared" || exportStatus === "cancelled" ? exportStatus : "exported");
-        } else {
-          if (shouldClearResolution(resultReason(result))) clearResolutionState();
-          setErrorReason(resultReason(result));
-        }
-      },
-    );
-  };
-
-  const adopt = () => {
-    const visibleRecord = dataIdentity === dataKey ? record : null;
-    if (!visibleRecord || !visibleRecord.view.canAdopt) return;
-    setConfirmAdopt(true);
-  };
-
-  const confirmAdoption = () => {
-    const visibleRecord = dataIdentity === dataKey ? record : null;
-    if (!visibleRecord) return;
-    setConfirmAdopt(false);
-    void run(
-      () => adoptOutboxServer(visibleRecord.item.id, authScope, visibleRecord.item.revision, capability ?? undefined),
-      (result: unknown) => {
-        if (isSuccess<ResolutionRecordView>(result)) {
-          setRecord(result.value);
-          setDataIdentity(dataKey);
-          setStatus("adopted");
-        } else {
-          if (shouldClearResolution(resultReason(result))) clearResolutionState();
-          setErrorReason(resultReason(result));
-        }
-      },
-    );
-  };
-
-  const visiblePreview = dataIdentity === dataKey ? preview : null;
-  const visibleRecord = dataIdentity === dataKey ? record : null;
-
-  return <View style={styles.resolution} testID={`outbox-resolution-${row.opId}`}>
-    {supported ? (
-      <Button testID={`outbox-resolution-compare-${row.opId}`} mode="outlined" disabled={busy} loading={busy} onPress={requestTarget}>
-        現在のサーバーと比較
-      </Button>
-    ) : (
-      <Text style={styles.reason}>この操作は解決対象外です。理由を確認できないため、原値を保持しています。</Text>
-    )}
-    {errorReason ? <Text style={styles.reason}>{reasonLabel(errorReason)}</Text> : null}
-    {targetRequest ? <View style={styles.confirmation} testID={`outbox-resolution-target-${row.opId}`}>
-      <Text style={styles.confirmTitle}>比較・解決先の確認</Text>
-      <Text style={styles.bodyText}>操作作成元serverは未記録</Text>
-      <Text style={styles.bodyText}>現在の接続先を比較・解決先として指定</Text>
-      <Text style={styles.metaText}>対象: {finiteString(targetRequest.targetLabel) ?? "未取得"}</Text>
-      <Text style={styles.metaText}>接続先host: {finiteString(targetRequest.serverHost ?? targetRequest.host) ?? "未取得"}</Text>
-      <Text style={styles.metaText}>接続先port: {targetRequest.serverPort ?? targetRequest.port ?? "未取得"}</Text>
-      <View style={styles.confirmActions}>
-        <Pressable accessibilityRole="button" onPress={confirmTarget} disabled={busy} style={styles.nativeButton}>
-          <Text style={styles.nativeButtonText}>この接続先を指定して比較</Text>
-        </Pressable>
-        <Pressable accessibilityRole="button" onPress={() => setTargetRequest(null)} disabled={busy} style={styles.nativeButton}>
-          <Text style={styles.nativeButtonText}>戻る</Text>
-        </Pressable>
-      </View>
-    </View> : null}
-    {visiblePreview ? <>
-      <ResolutionPreviewDetails preview={visiblePreview} fallback={row} />
-      {!visibleRecord ? (
-        <Button
-          mode="outlined"
-          disabled={busy || !visiblePreview.view.canPrepare}
-          loading={busy}
-          onPress={prepare}
-        >
-          原値を保存して保持
-        </Button>
-      ) : null}
-    </> : null}
-    {visibleRecord ? <View style={styles.recordActions}>
-      <Text style={styles.bodyText}>原値を保存しました。送信待ちは保持しています。</Text>
-      <Button mode="outlined" disabled={busy} loading={busy} onPress={exportOriginal}>
-        原値をファイルに保存
-      </Button>
-      <Button
-        mode="outlined"
-        disabled={busy || !visibleRecord.view.canAdopt}
-        loading={busy}
-        onPress={adopt}
-      >
-        現在のサーバー版を採用
-      </Button>
-    </View> : null}
-    {visibleRecord && status === "exported" ? <Text style={styles.success}>原値をファイルに保存しました。</Text> : null}
-    {visibleRecord && status === "shared" ? <Text style={styles.success}>共有画面を開きました。保存先で確認してください。</Text> : null}
-    {visibleRecord && status === "cancelled" ? <Text style={styles.reason}>保存をキャンセルしました。原値は保持しています。</Text> : null}
-    {visibleRecord && status === "adopted" ? <Text style={styles.success}>この1件を採用しました。送信待ちの一覧を手動で再確認してください。</Text> : null}
-    {confirmAdopt && visibleRecord ? <View style={styles.confirmation} testID={`outbox-resolution-confirm-${row.opId}`}>
-      <Text style={styles.confirmTitle}>現在のサーバー版を採用しますか？</Text>
-      <Text style={styles.bodyText}>この1件の端末変更を保全して採用、選択した操作だけ除きます。</Text>
-      <View style={styles.confirmActions}>
-        <Pressable accessibilityRole="button" onPress={confirmAdoption} disabled={busy} style={styles.nativeButton}>
-          <Text style={styles.nativeButtonText}>採用を確認</Text>
-        </Pressable>
-        <Pressable accessibilityRole="button" onPress={() => setConfirmAdopt(false)} disabled={busy} style={styles.nativeButton}>
-          <Text style={styles.nativeButtonText}>戻る</Text>
-        </Pressable>
-      </View>
-    </View> : null}
-  </View>;
-}
-
 export function OutboxDiagnostics({
   resolutionIdentity = undefined,
 }: {
@@ -701,6 +393,18 @@ export function OutboxDiagnostics({
       {displayedRows.map((row) => <View key={row.opId} style={styles.row}>
         <Text style={styles.title}>{areaLabel(row.tableName)}・{ACTION_LABELS[row.action] ?? row.action}</Text>
         <Text style={styles.reason}>{REASONS[row.errorKind]}（再試行{row.retryCount}回）</Text>
+        <Text style={styles.metaText}>
+          sender eligibility: {row.retryEligibility === "eligible" ? "eligible" : row.retryEligibility === "blocked" ? "blocked" : "UNKNOWN"}
+        </Text>
+        <Text style={styles.metaText}>
+          gate: {row.retryGateReason && row.retryGateReason !== "unknown"
+            ? RETRY_GATE_LABELS[row.retryGateReason]
+            : "UNKNOWN"}
+        </Text>
+        <Text style={styles.metaText}>
+          scheduler: {row.schedulerState === "trigger_driven" ? "trigger driven" : row.schedulerState === "not_eligible" ? "sender対象外" : "UNKNOWN"}
+          / 次回時刻: UNKNOWN
+        </Text>
         <Text selectable style={styles.id}>対象ID: {row.entityId}</Text>
         <Text selectable style={styles.id}>操作ID: {row.opId}</Text>
         {row.tableName.startsWith("knowledge_") ? <>
@@ -709,13 +413,6 @@ export function OutboxDiagnostics({
           <Text style={styles.metaText}>base snapshot: {row.hasBaseSnapshot ? "あり" : "なし"}</Text>
           <Text style={styles.metaText}>conflict snapshot: {row.hasConflictSnapshot ? "あり" : "なし"}</Text>
         </> : null}
-        {!readOnlyDiagnostics ? (
-          <OutboxResolution
-            row={row}
-            authScope={scope}
-            resolutionIdentityKey={resolutionIdentityKey ?? undefined}
-          />
-        ) : null}
       </View>)}
       {rows.length > 20 ? <Text style={styles.reason}>保留理由のある操作を優先して20件を表示しています。</Text> : null}
     </> : null}
@@ -725,22 +422,14 @@ export function OutboxDiagnostics({
 const styles = StyleSheet.create({
   container: { marginTop: 8, gap: 8 },
   row: { gap: 3, paddingVertical: 8, borderTopWidth: 1, borderTopColor: "#343149" },
-  resolution: { gap: 6, marginTop: 4 },
   metadata: { gap: 2 },
   detail: { gap: 6 },
   fields: { gap: 6 },
   field: { borderTopWidth: 1, borderTopColor: "#343149", paddingTop: 6, gap: 3 },
-  recordActions: { gap: 6 },
-  confirmation: { gap: 8, padding: 10, borderRadius: 8, backgroundColor: "#26243a" },
-  confirmActions: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
-  nativeButton: { borderWidth: 1, borderColor: "#777294", borderRadius: 6, paddingHorizontal: 12, paddingVertical: 8 },
-  nativeButtonText: { color: "#f0efff", fontSize: 13 },
   title: { color: "#f0efff", fontSize: 13 },
-  confirmTitle: { color: "#f0efff", fontSize: 14, fontWeight: "600" },
   fieldTitle: { color: "#f0efff", fontSize: 13 },
   bodyText: { color: "#cdd6f4", fontSize: 12 },
   reason: { color: "#cdd6f4", fontSize: 12 },
-  success: { color: "#a6e3a1", fontSize: 12 },
   metaText: { color: "#8f8aa8", fontSize: 11 },
   id: { color: "#8f8aa8", fontSize: 10 },
 });

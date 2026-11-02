@@ -721,6 +721,7 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         request_hash_override: str | None = None,
         credential_id: UUID | None = None,
         audit_platform_account: Mapping[str, Any] | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         session = self._resolve(session)
         if actor is None or account_id is None:
@@ -852,7 +853,10 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
                     "result": audit_result,
                 },
             )
-            await self._flush_commit(session)
+            if commit:
+                await self._flush_commit(session)
+            else:
+                await self._flush_only(session)
         except IntegrityError as exc:
             await self._rollback(session)
             raise MediaOperationsConflictError("credential command conflicted with an existing record") from exc
@@ -1047,7 +1051,22 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         new_revision = self._build_platform_revision(account=account, version=int(latest.version) + 1, content=content, created_by=_actor_id(actor), idempotency_key=None)
         session.add(new_revision)
 
-    async def _mutate_state(self, session: Any, actor: Any, account: PlatformAccount, credential: MediaPlatformCredential, *, event_type: str, request_hash: str, key: str, status: str, capabilities: Mapping[str, str] | None = None, encrypted: Any = None, provider_code: str | None = None) -> dict[str, Any]:
+    async def _mutate_state(
+        self,
+        session: Any,
+        actor: Any,
+        account: PlatformAccount,
+        credential: MediaPlatformCredential,
+        *,
+        event_type: str,
+        request_hash: str,
+        key: str,
+        status: str,
+        capabilities: Mapping[str, str] | None = None,
+        encrypted: Any = None,
+        provider_code: str | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
         now = datetime.utcnow()
         credential.revision = int(credential.revision or 1) + 1
         credential.status = status
@@ -1111,10 +1130,24 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
                 "result": self._safe_result(credential, account),
             },
         )
-        await self._flush_commit(session)
+        if commit:
+            await self._flush_commit(session)
+        else:
+            await self._flush_only(session)
         return self._safe_result(credential, account)
 
-    async def rotate_credential(self, session: Any | None = None, actor: Any | None = None, account_id: UUID | str | None = None, *, expected_revision: int, package: bytes | str, connection_type: str, idempotency_key: Any) -> dict[str, Any]:
+    async def rotate_credential(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        account_id: UUID | str | None = None,
+        *,
+        expected_revision: int,
+        package: bytes | str,
+        connection_type: str,
+        idempotency_key: Any,
+        commit: bool = True,
+    ) -> dict[str, Any]:
         session = self._resolve(session)
         if actor is None or account_id is None:
             raise MediaOperationsValidationError("actor and platform_account_id are required")
@@ -1150,9 +1183,19 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         except MediaCredentialCryptoError:
             raise MediaOperationsValidationError("credential package cannot be encrypted") from None
         credential.connection_type = parsed.connection_type
-        return await self._mutate_state(session, actor, account, credential, event_type="rotate", request_hash=request_hash, key=key, status="verification_pending", capabilities={"identity": "unknown", "publish": "unknown", "media": "unknown", "analytics": "unknown"}, encrypted=encrypted)
+        return await self._mutate_state(session, actor, account, credential, event_type="rotate", request_hash=request_hash, key=key, status="verification_pending", capabilities={"identity": "unknown", "publish": "unknown", "media": "unknown", "analytics": "unknown"}, encrypted=encrypted, commit=commit)
 
-    async def verify_credential(self, session: Any | None = None, actor: Any | None = None, account_id: UUID | str | None = None, *, expected_revision: int, idempotency_key: Any, verifier: MediaCredentialProviderVerifier | None = None) -> dict[str, Any]:
+    async def verify_credential(
+        self,
+        session: Any | None = None,
+        actor: Any | None = None,
+        account_id: UUID | str | None = None,
+        *,
+        expected_revision: int,
+        idempotency_key: Any,
+        verifier: MediaCredentialProviderVerifier | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
         session = self._resolve(session)
         if actor is None or account_id is None:
             raise MediaOperationsValidationError("actor and platform_account_id are required")
@@ -1213,7 +1256,7 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
             if int(expected_revision) != int(credential.revision):
                 raise MediaOperationsConflictError("stale media credential revision")
             await self._assert_credential_binding(session, account, credential)
-            return await self._mutate_state(session, actor, account, credential, event_type="verify", request_hash=request_hash, key=key, status="key_unavailable", provider_code="key_unavailable")
+            return await self._mutate_state(session, actor, account, credential, event_type="verify", request_hash=request_hash, key=key, status="key_unavailable", provider_code="key_unavailable", commit=commit)
         except CredentialPackageError as exc:
             account = await self._account(session, actor, account_id, write=True, lock=True)
             credential = await self._credential(session, account.id, lock=True)
@@ -1242,6 +1285,7 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
                 key=key,
                 status="invalid",
                 provider_code=provider_code,
+                commit=commit,
             )
         except MediaCredentialCryptoError:
             account = await self._account(session, actor, account_id, write=True, lock=True)
@@ -1260,7 +1304,7 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
             if int(expected_revision) != int(credential.revision):
                 raise MediaOperationsConflictError("stale media credential revision")
             await self._assert_credential_binding(session, account, credential)
-            return await self._mutate_state(session, actor, account, credential, event_type="verify", request_hash=request_hash, key=key, status="invalid", provider_code="ciphertext_invalid")
+            return await self._mutate_state(session, actor, account, credential, event_type="verify", request_hash=request_hash, key=key, status="invalid", provider_code="ciphertext_invalid", commit=commit)
         try:
             result: CredentialVerificationResult = await (verifier or MediaCredentialProviderVerifier()).verify(package, account_ref=account.account_ref)
         except Exception:
@@ -1313,9 +1357,9 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
         if int(expected_revision) != int(credential.revision):
             raise MediaOperationsConflictError("stale media credential revision")
         await self._assert_credential_binding(session, account, credential)
-        return await self._mutate_state(session, actor, account, credential, event_type="verify", request_hash=request_hash, key=key, status=result.status, capabilities=result_caps, provider_code=safe_provider_code)
+        return await self._mutate_state(session, actor, account, credential, event_type="verify", request_hash=request_hash, key=key, status=result.status, capabilities=result_caps, provider_code=safe_provider_code, commit=commit)
 
-    async def disable_credential(self, session: Any | None = None, actor: Any | None = None, account_id: UUID | str | None = None, *, expected_revision: int, idempotency_key: Any) -> dict[str, Any]:
+    async def disable_credential(self, session: Any | None = None, actor: Any | None = None, account_id: UUID | str | None = None, *, expected_revision: int, idempotency_key: Any, commit: bool = True) -> dict[str, Any]:
         session = self._resolve(session)
         if actor is None or account_id is None:
             raise MediaOperationsValidationError("actor and platform_account_id are required")
@@ -1334,7 +1378,7 @@ class MediaCredentialVaultService(MediaOperationsSetupService):
             return self._audit_result(existing, credential, account)
         if int(expected_revision) != int(credential.revision):
             raise MediaOperationsConflictError("stale media credential revision")
-        return await self._mutate_state(session, actor, account, credential, event_type="disable", request_hash=request_hash, key=key, status="disabled", capabilities={"identity": "unknown", "publish": "unknown", "media": "unknown", "analytics": "unknown"})
+        return await self._mutate_state(session, actor, account, credential, event_type="disable", request_hash=request_hash, key=key, status="disabled", capabilities={"identity": "unknown", "publish": "unknown", "media": "unknown", "analytics": "unknown"}, commit=commit)
 
     async def list_credential_audit(self, session: Any | None = None, actor: Any | None = None, account_id: UUID | str | None = None, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         session = self._resolve(session)

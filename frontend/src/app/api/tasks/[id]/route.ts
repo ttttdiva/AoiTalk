@@ -1,3 +1,4 @@
+import { measureTaskApi } from "@/lib/server/task-api-measure";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import {
@@ -253,7 +254,7 @@ function mapTimeEntry(row: {
   };
 }
 
-export async function GET(
+async function getTask(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
@@ -1889,4 +1890,11 @@ export async function DELETE(
       "content-type": response.headers.get("content-type") ?? "application/json",
     },
   });
+}
+
+export async function GET(
+  request: NextRequest,
+  context: { params: Promise<{ id: string }> },
+) {
+  return measureTaskApi("detail", () => getTask(request, context));
 }

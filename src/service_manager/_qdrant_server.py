@@ -26,6 +26,8 @@ import uuid
 
 import psutil
 
+from ..utils import qdrant_readiness
+
 
 logger = logging.getLogger(__name__)
 _LABEL = "io.aoitalk.qdrant."
@@ -42,6 +44,11 @@ _LIFETIME_RECOVERY_ATTEMPTS = 2
 _LIFETIME_RECOVERY_DELAY_SECONDS = 0.2
 _LIFETIME_RECOVERY_IO_TIMEOUT_SECONDS = 2.0
 _ORPHAN_REMOVAL_TIMEOUT_SECONDS = 5.0
+# Readiness on the DrvFS storage took 17-33 s on 2026-10-30 and grows with the
+# collections; 30 s failed a restart.  The 85 supervisor allows 180 s per start.
+_READINESS_TIMEOUT_SECONDS = 90.0
+# Background start retries; the last delay repeats until AoiTalk stops.
+_RETRY_DELAYS_SECONDS = (10.0, 30.0, 60.0, 120.0, 300.0)
 _ENVIRONMENT = (
     "QDRANT__SERVICE__HOST=0.0.0.0",  # Container only; published host is 127.0.0.1.
     "QDRANT__SERVICE__HTTP_PORT=6333",
@@ -816,7 +823,7 @@ class ManagedQdrant:
         except (QdrantLaunchError, TypeError, AttributeError, ValueError):
             return None
 
-    def start(self, config: object | None, *, is_windows: bool, timeout: float = 30, reserved_ports: set[int] | None = None) -> bool:
+    def start(self, config: object | None, *, is_windows: bool, timeout: float = _READINESS_TIMEOUT_SECONDS, reserved_ports: set[int] | None = None) -> bool:
         with self._lifecycle_lock:
             if self.lifetime_error:
                 raise QdrantLaunchError(self._failure)
@@ -877,6 +884,7 @@ class ManagedQdrant:
                 self.image_id = image_info[0]["Id"]
                 self.plan = plan
                 self._generation += 1
+                generation = self._generation
                 self._supervisor_recovery_used = 0
                 self._ownership_unknown = False
             # Docker name uniqueness is the atomic guard against two app
@@ -904,8 +912,12 @@ class ManagedQdrant:
                 with self._lock:
                     self._container_running = True
                 self._start_lifetime(plan, cid)
-                deadline = time.monotonic() + timeout
+                started = time.monotonic()
+                deadline = started + timeout
                 while time.monotonic() < deadline:
+                    if self._generation != generation:
+                        # stop() was called (AoiTalk is stopping) during the wait.
+                        raise QdrantLaunchError("AoiTalkの停止要求により、Qdrantの起動を中止しました")
                     self._require_lifetime(plan)
                     info = self._inspect(plan, cid)
                     self._assert_owned(info, plan)
@@ -922,6 +934,7 @@ class ManagedQdrant:
                             raise QdrantLaunchError("ready確認後にcontainerが停止しました")
                         self._require_lifetime(plan)
                         _apply_drvfs_optimizer_override(plan)
+                        logger.info("Qdrant ready: %.1fs", time.monotonic() - started)
                         return True
                     time.sleep(0.2)
                 raise QdrantLaunchError(f"Qdrant readiness timeout: {plan.endpoint}。storageを確認してください")
@@ -997,14 +1010,87 @@ class ManagedQdrant:
 _managed_qdrant = ManagedQdrant()
 
 
+_background_lock = threading.Lock()
+_background: dict[str, object] = {"thread": None, "stop": None, "attempts": 0, "error": None, "gave_up": False}
+
+
 def start_managed_qdrant(config: object | None, *, is_windows: bool, reserved_ports: set[int] | None = None) -> bool:
     return _managed_qdrant.start(config, is_windows=is_windows, reserved_ports=reserved_ports)
 
 
+def start_managed_qdrant_background(
+    config: object | None, *, is_windows: bool, reserved_ports: set[int] | None = None
+) -> None:
+    """Start managed Qdrant without holding up AoiTalk, retrying until it is ready.
+
+    FastAPI and Next.js start at once.  Until Qdrant is ready its users report
+    it as preparing (``qdrant_readiness``); a failed start is retried here
+    instead of stopping AoiTalk.  Only a lifetime failure, which needs a new
+    AoiTalk process anyway, ends the retries.
+    """
+    stop = threading.Event()
+    qdrant_readiness.mark_pending()
+
+    def run() -> None:
+        delays = iter(_RETRY_DELAYS_SECONDS)
+        while not stop.is_set():
+            with _background_lock:
+                _background["attempts"] = int(_background["attempts"]) + 1
+            try:
+                _managed_qdrant.start(config, is_windows=is_windows, reserved_ports=reserved_ports)
+            except Exception as exc:
+                fatal = _managed_qdrant.lifetime_error is not None
+                with _background_lock:
+                    _background["error"] = str(exc)[:600] or type(exc).__name__
+                    _background["gave_up"] = fatal
+                if fatal:
+                    logger.error("Qdrantを起動できません。AoiTalkを再起動するまで再試行しません: %s", exc)
+                    return
+                delay = next(delays, _RETRY_DELAYS_SECONDS[-1])
+                logger.warning("Qdrantの起動に失敗しました。%.0f秒後に再試行します: %s", delay, exc)
+                stop.wait(delay)
+                continue
+            if stop.is_set():
+                # AoiTalk began stopping while this start ran.
+                _managed_qdrant.stop()
+                return
+            with _background_lock:
+                _background["error"] = None
+            qdrant_readiness.mark_ready()
+            return
+
+    thread = threading.Thread(target=run, name="managed-qdrant-start", daemon=True)
+    with _background_lock:
+        _background.update(thread=thread, stop=stop, attempts=0, error=None, gave_up=False)
+    thread.start()
+
+
 def stop_managed_qdrant() -> None:
-    _managed_qdrant.stop()
+    with _background_lock:
+        thread, stop = _background["thread"], _background["stop"]
+        _background.update(thread=None, stop=None)
+    if stop is not None:
+        stop.set()
+    try:
+        _managed_qdrant.stop()
+        if thread is not None and thread is not threading.current_thread():
+            # A start that was not interrupted ends within its readiness wait.
+            thread.join(_READINESS_TIMEOUT_SECONDS + 60)
+            _managed_qdrant.stop()
+    finally:
+        qdrant_readiness.mark_idle()
 
 
 def managed_qdrant_status() -> dict[str, object]:
     """Return the process-local Qdrant lifecycle projection without probing."""
-    return _managed_qdrant.status()
+    status = _managed_qdrant.status()
+    with _background_lock:
+        background = dict(_background)
+    if qdrant_readiness.starting() and status.get("mode") != "external":
+        status["mode"] = "local-managed"
+        status["state"] = (
+            "failed" if background["gave_up"] else "retrying" if background["error"] else "starting"
+        )
+        status["error"] = background["error"] or status.get("error")
+        status["attempts"] = background["attempts"]
+    return status

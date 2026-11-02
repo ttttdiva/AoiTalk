@@ -1047,6 +1047,8 @@ class DeepResearchLLMAdapter:
         descriptor: EgressDescriptor,
         sender: Callable[[Any], Any],
         model: str = "",
+        sdk_max_retries: int | None = None,
+        httpx_transport_retries: int | None = None,
     ) -> Any:
         """Route one direct model call through the transaction gateway.
 
@@ -1067,6 +1069,8 @@ class DeepResearchLLMAdapter:
             base_url=base_url,
             source_kind=source_kind,
             model=model,
+            sdk_max_retries=sdk_max_retries,
+            httpx_transport_retries=httpx_transport_retries,
         )
 
     def _apply_deployment_contract(self) -> None:
@@ -1482,7 +1486,16 @@ class DeepResearchLLMAdapter:
             raise RuntimeError("OPENAI_API_KEY is not configured")
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=api_key)
+        # The privacy gateway owns retry policy and the OpenAI quota circuit
+        # must observe the first machine-readable 429 rather than hidden SDK
+        # status-code retries.
+        client = AsyncOpenAI(api_key=api_key, max_retries=0)
+        from .provider_key_attribution_service import (
+            call_with_provider_key_attribution,
+            prepare_provider_key_identity,
+        )
+
+        key_identity = prepare_provider_key_identity(api_key)
         model_name = str(_config_get(self.config, "llm_model", "gpt-4o"))
         started = time.perf_counter()
         request_kwargs = {
@@ -1504,7 +1517,11 @@ class DeepResearchLLMAdapter:
             async def send(final_payload: Any) -> Any:
                 if not isinstance(final_payload, Mapping):
                     raise PrivacyError("deep research OpenAI payload is malformed")
-                return await client.responses.create(**dict(final_payload))
+                return await call_with_provider_key_attribution(
+                    lambda: client.responses.create(**dict(final_payload)),
+                    identity=key_identity,
+                    consumer_id="deep_research:openai",
+                )
 
             response = await self._execute_model_request(
                 request_kwargs,
@@ -1514,6 +1531,8 @@ class DeepResearchLLMAdapter:
                 descriptor=descriptor,
                 sender=send,
                 model=model_name,
+                sdk_max_retries=getattr(client, "max_retries", 0),
+                httpx_transport_retries=0,
             )
             self._record_direct_usage(
                 response,
@@ -1541,7 +1560,11 @@ class DeepResearchLLMAdapter:
     ) -> str:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(base_url=base_url.rstrip("/"), api_key=api_key or "local")
+        client = AsyncOpenAI(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key or "local",
+            max_retries=0,
+        )
         started = time.perf_counter()
         request_kwargs = {
             "model": model,
@@ -1576,6 +1599,14 @@ class DeepResearchLLMAdapter:
                 descriptor=descriptor,
                 sender=send,
                 model=str(model),
+                sdk_max_retries=(
+                    getattr(client, "max_retries", 0)
+                    if provider.strip().lower() == "openai"
+                    else None
+                ),
+                httpx_transport_retries=(
+                    0 if provider.strip().lower() == "openai" else None
+                ),
             )
             self._record_direct_usage(
                 response,

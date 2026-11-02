@@ -1124,7 +1124,6 @@ def _resolve_path_for_user(path: str) -> str:
         # User is logged in: resolve to their personal workspace
         # e.g., "日記フォルダ/2026-01-18.md" -> "user_files/_users/user_{id}/日記フォルダ/2026-01-18.md"
         user_workspace = user_files_root / "_users" / f"user_{user_id}"
-        user_workspace.mkdir(parents=True, exist_ok=True)
         resolved = user_workspace / path
         logger.debug(f"Resolved path '{path}' to user workspace: {resolved}")
         return str(resolved)
@@ -3177,7 +3176,14 @@ def search_files(
                 context_lines=context_lines,
                 max_matches_per_file=max_matches_per_file,
                 fixed_strings=fixed_strings,
-                include_ignored=include_ignored,
+                # Ordinary Enterprise employee reads retain the legacy
+                # visibility contract for the selected workspace, including
+                # dotfiles such as .env.  An explicit coding scope keeps the
+                # conservative ignored/sensitive filtering below.
+                include_ignored=(
+                    include_ignored
+                    or (_enterprise_mode() and not _enterprise_sensitive_filter_active())
+                ),
                 exclude_path=(
                     lambda candidate: bool(
                         _enterprise_sensitive_path_error(str(candidate))

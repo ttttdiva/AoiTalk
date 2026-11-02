@@ -62,6 +62,7 @@ import { useAuth } from "../../../contexts/AuthContext";
 import { useNetworkStore } from "../../../stores/network";
 import { useProject } from "../../../contexts/ProjectContext";
 import { chatApi } from "../../../lib/chat-api";
+import { getConfiguredApiServerFingerprint } from "../../../lib/api-client";
 import { taskApi } from "../../../lib/task-api";
 import { projectApi } from "../../../lib/project-api";
 import { createCurrentCharacterSession } from "../../../features/characters/current-character";
@@ -70,8 +71,9 @@ import {
   buildTaskAgentSessionTitle,
 } from "../../../lib/task-agent";
 import {
-  isTaskDateOnlyInput,
-  toTaskWallClockIso,
+  buildStoredTaskSchedulePayload,
+  buildTaskSchedulePayload,
+  taskAllDayFromStoredRecord,
 } from "../../../lib/task-datetime";
 import { TaskDateField } from "../../../components/task-date-field";
 import {
@@ -195,18 +197,19 @@ function buildTaskSavedDraft(
   task: Task,
   options?: { includeAssignees?: boolean; includeTags?: boolean },
 ): Record<string, unknown> {
-  const startAt = formatTaskDateInput(task.start_at, task.all_day);
-  const endAt = formatTaskDateInput(task.end_at, task.all_day);
+  const taskAllDay = taskAllDayFromStoredRecord(task.all_day);
+  const startAt = formatTaskDateInput(task.start_at, taskAllDay);
+  const endAt = formatTaskDateInput(task.end_at, taskAllDay);
+  const schedule = buildStoredTaskSchedulePayload(
+    task.all_day,
+    startAt,
+    endAt,
+  );
   const draft: Record<string, unknown> = {
     title: task.title.trim(),
     description: task.description?.trim() || null,
     status: task.status,
-    start_at: toTaskWallClockIso(startAt),
-    end_at: toTaskWallClockIso(endAt),
-    all_day:
-      Boolean(task.all_day) ||
-      isTaskDateOnlyInput(startAt) ||
-      isTaskDateOnlyInput(endAt),
+    ...schedule,
     notifications_enabled: task.notifications_enabled ?? true,
     reminder_offsets: task.reminder_offsets ?? [],
     tag_ids: (task.tags ?? []).map((tag) => tag.id),
@@ -226,11 +229,22 @@ export default function TaskDetailScreen() {
   const router = useRouter();
   const navigation = useNavigation();
   const { isAuthenticated, isAnonymous, user } = useAuth();
+  const [apiServerFingerprint, setApiServerFingerprint] = useState<string | null>(null);
+  const [apiServerReady, setApiServerReady] = useState(false);
   const outboxResolutionAuthScope = isAnonymous
     ? null
     : user?.user_id?.trim()
       ? `auth:${user.user_id.trim()}`
       : "metadata-only";
+  const requestedTaskTarget = JSON.stringify([outboxResolutionAuthScope ?? "anonymous", taskId]);
+  const taskTargetContextRef = useRef({ target: requestedTaskTarget, generation: 0 });
+  if (taskTargetContextRef.current.target !== requestedTaskTarget) {
+    taskTargetContextRef.current = {
+      target: requestedTaskTarget,
+      generation: taskTargetContextRef.current.generation + 1,
+    };
+  }
+  const taskTargetKey = JSON.stringify(taskTargetContextRef.current);
   const online = useNetworkStore((state) => state.connected ?? state.online);
   const { projects, refreshProjects } = useProject();
   const [task, setTask] = useState<Task | null>(null);
@@ -257,7 +271,25 @@ export default function TaskDetailScreen() {
   const [allDay, setAllDay] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [reminderOffsets, setReminderOffsets] = useState<number[]>([]);
-  const [availableTags, setAvailableTags] = useState<Tag[]>([]);
+  const [tagCatalogState, setTagCatalogState] = useState<{
+    identity: string;
+    tags: Tag[];
+    known: boolean;
+  } | null>(null);
+  const tagCatalogScope = JSON.stringify([outboxResolutionAuthScope, apiServerFingerprint]);
+  const tagCatalogIdentity = JSON.stringify([tagCatalogScope, task?.project_id ?? null]);
+  const tagMutationIdentity = JSON.stringify([tagCatalogIdentity, taskId]);
+  const tagMutationIdentityRef = useRef(tagMutationIdentity);
+  tagMutationIdentityRef.current = tagMutationIdentity;
+  const tagMutationEpochRef = useRef(0);
+  const tagCatalogScopeRef = useRef(tagCatalogScope);
+  const tagCatalogScopeChanged = tagCatalogScopeRef.current !== tagCatalogScope;
+  const availableTags = apiServerReady && tagCatalogState?.identity === tagCatalogIdentity
+    ? tagCatalogState.tags
+    : [];
+  const tagCatalogKnown = apiServerReady && tagCatalogState?.identity === tagCatalogIdentity
+    ? tagCatalogState.known
+    : false;
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [tagSelectionTouched, setTagSelectionTouched] = useState(false);
   const [availableMembers, setAvailableMembers] = useState<
@@ -267,7 +299,8 @@ export default function TaskDetailScreen() {
   const [assigneeSelectionTouched, setAssigneeSelectionTouched] =
     useState(false);
   const [newTagDraft, setNewTagDraft] = useState("");
-  const [tagBusy, setTagBusy] = useState(false);
+  const [tagBusyIdentity, setTagBusyIdentity] = useState<string | null>(null);
+  const tagBusy = tagBusyIdentity === tagMutationIdentity;
   const [subtaskDraft, setSubtaskDraft] = useState("");
   const [subtaskSaving, setSubtaskSaving] = useState(false);
   const [commentDraft, setCommentDraft] = useState("");
@@ -321,6 +354,9 @@ export default function TaskDetailScreen() {
   const pendingTaskDraftSavesRef = useRef(new Set<Promise<unknown>>());
   const pendingTaskTargetWritesRef = useRef(new Set<Promise<unknown>>());
   const taskDraftDirtyRef = useRef(false);
+  const currentTaskTargetRef = useRef(taskTargetKey);
+  currentTaskTargetRef.current = taskTargetKey;
+  const loadedTaskTargetRef = useRef<string | null>(null);
 
   const trackTaskTargetWrite = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
     const flight = operation();
@@ -359,15 +395,21 @@ export default function TaskDetailScreen() {
     };
   }, []);
 
-  const applyLoadedTask = useCallback((nextTask: Task | null) => {
+  const applyLoadedTask = useCallback((nextTask: Task | null, preserveComposers = false) => {
     setTask(nextTask);
+    if (!preserveComposers) {
+      setSubtaskDraft("");
+      setCommentDraft("");
+      setNewTagDraft("");
+    }
     if (!nextTask) return;
     setTitle(nextTask.title);
     setDescription(nextTask.description || "");
     setStatus(nextTask.status);
-    setStartAt(formatTaskDateInput(nextTask.start_at, nextTask.all_day));
-    setEndAt(formatTaskDateInput(nextTask.end_at, nextTask.all_day));
-    setAllDay(Boolean(nextTask.all_day));
+    const nextAllDay = taskAllDayFromStoredRecord(nextTask.all_day);
+    setStartAt(formatTaskDateInput(nextTask.start_at, nextAllDay));
+    setEndAt(formatTaskDateInput(nextTask.end_at, nextAllDay));
+    setAllDay(nextAllDay);
     setReminderOffsets(nextTask.reminder_offsets ?? []);
     setSelectedTagIds((nextTask.tags ?? []).map((tag) => tag.id));
     setTagSelectionTouched(false);
@@ -378,31 +420,42 @@ export default function TaskDetailScreen() {
     setNotificationsEnabled(nextTask.notifications_enabled ?? true);
     setTitleError(null);
     setSaveError(null);
-    setSubtaskDraft("");
-    setCommentDraft("");
   }, []);
 
   const loadTask = useCallback(async () => {
     if (!taskId) return;
     const requestId = ++loadTaskRequestRef.current;
     const isCurrentRequest = () =>
-      isMountedRef.current && requestId === loadTaskRequestRef.current;
-    userEditedDuringRefreshRef.current = false;
-    setLoading(true);
+      isMountedRef.current && requestId === loadTaskRequestRef.current
+      && currentTaskTargetRef.current === taskTargetKey;
+    const sameTarget = loadedTaskTargetRef.current === taskTargetKey;
+    userEditedDuringRefreshRef.current = sameTarget && taskDraftDirtyRef.current;
+    if (!sameTarget) {
+      cancelPendingDraftFlush();
+      taskDraftDirtyRef.current = false;
+      setAutosaving(false);
+      applyLoadedTask(null);
+    }
+    const applySnapshot = (nextTask: Task | null) => {
+      if (!isCurrentRequest()) return;
+      const preserveComposers = loadedTaskTargetRef.current === taskTargetKey;
+      if (preserveComposers && (taskDraftDirtyRef.current || userEditedDuringRefreshRef.current)) {
+        if (nextTask) setTask(nextTask);
+      } else {
+        applyLoadedTask(nextTask, preserveComposers);
+      }
+      loadedTaskTargetRef.current = taskTargetKey;
+    };
+    setLoading(!sameTarget);
     try {
       const localTask = await tasksRepo.getLocal(taskId);
       if (!isCurrentRequest()) return;
-      applyLoadedTask(localTask);
+      applySnapshot(localTask);
       setRecurrenceRule(localTask?.recurrence_rule ?? null);
       if (localTask) setLoading(false);
 
       const remoteTaskPromise = trackTaskTargetWrite(() => tasksRepo.get(taskId)).then((remoteTask) => {
-        if (!isCurrentRequest()) return;
-        if (userEditedDuringRefreshRef.current) {
-          setTask(remoteTask);
-          return;
-        }
-        applyLoadedTask(remoteTask);
+        applySnapshot(remoteTask);
       });
       const timerPromise = timeEntriesRepo
         .getActive(taskId)
@@ -474,7 +527,7 @@ export default function TaskDetailScreen() {
     } finally {
       if (isCurrentRequest()) setLoading(false);
     }
-  }, [applyLoadedTask, isAuthenticated, online, taskId, trackTaskTargetWrite]);
+  }, [applyLoadedTask, cancelPendingDraftFlush, isAuthenticated, online, taskId, taskTargetKey, trackTaskTargetWrite]);
 
   useEffect(() => {
     void loadTask();
@@ -482,7 +535,29 @@ export default function TaskDetailScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      const focusEpoch = ++tagMutationEpochRef.current;
+      let cancelled = false;
+      setApiServerReady(false);
+      void getConfiguredApiServerFingerprint()
+        .then((fingerprint) => {
+          if (!cancelled && tagMutationEpochRef.current === focusEpoch) {
+            setApiServerFingerprint(fingerprint);
+            setApiServerReady(true);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && tagMutationEpochRef.current === focusEpoch) {
+            setApiServerFingerprint(null);
+            setApiServerReady(true);
+          }
+        });
       void refreshProjects();
+      return () => {
+        cancelled = true;
+        if (tagMutationEpochRef.current === focusEpoch) {
+          tagMutationEpochRef.current += 1;
+        }
+      };
     }, [refreshProjects]),
   );
 
@@ -516,32 +591,41 @@ export default function TaskDetailScreen() {
     };
   }, [online, task?.project_id, taskId]);
 
-  // task.tags はロード毎に新しい配列になり、ローカル→リモート差し替えで
-  // listTags が1表示で多重発火していた。タグidの安定キーへ依存を切り替える。
-  const taskTagSignature = useMemo(
-    () => (task?.tags ?? []).map((tag) => tag.id).join(","),
-    [task?.tags],
-  );
   useEffect(() => {
+    if (!apiServerReady) return;
+    const scopeChanged = tagCatalogScopeRef.current !== tagCatalogScope;
+    tagCatalogScopeRef.current = tagCatalogScope;
     if (!task?.project_id) {
-      setAvailableTags([]);
+      setTagCatalogState({ identity: tagCatalogIdentity, tags: [], known: true });
       return;
     }
     let cancelled = false;
-    const fallbackTags = task.tags ?? [];
-    taskApi
-      .listTags(task.project_id)
-      .then((tags) => {
-        if (cancelled) return;
-        setAvailableTags(tags);
-      })
-      .catch(() => {
-        if (!cancelled) setAvailableTags(fallbackTags);
-      });
+    const fallbackTags = scopeChanged ? [] : task.tags ?? [];
+    setTagCatalogState({
+      identity: tagCatalogIdentity,
+      tags: fallbackTags,
+      known: scopeChanged,
+    });
+    void (async () => {
+      const cachedTags = await tasksRepo.readTagCatalog(task.project_id);
+      if (cancelled) return;
+      if (cachedTags !== undefined) {
+        setTagCatalogState({ identity: tagCatalogIdentity, tags: cachedTags, known: true });
+      }
+      if (!isAuthenticated || !online) return;
+      try {
+        const tags = await tasksRepo.listTags(task.project_id);
+        if (!cancelled) {
+          setTagCatalogState({ identity: tagCatalogIdentity, tags, known: true });
+        }
+      } catch {
+        // Keep the local catalogue (or Task's known labels) when refresh fails.
+      }
+    })();
     return () => {
       cancelled = true;
     };
-  }, [task?.project_id, taskTagSignature]);
+  }, [apiServerReady, isAuthenticated, online, tagCatalogScope, task?.project_id, tagCatalogIdentity]);
 
   useEffect(() => {
     if (!task?.project_id) {
@@ -581,10 +665,7 @@ export default function TaskDetailScreen() {
       title: title.trim(),
       description: description.trim() || null,
       status,
-      start_at: toTaskWallClockIso(startAt),
-      end_at: toTaskWallClockIso(endAt),
-      all_day:
-        allDay || isTaskDateOnlyInput(startAt) || isTaskDateOnlyInput(endAt),
+      ...buildTaskSchedulePayload(allDay, startAt, endAt),
       notifications_enabled: notificationsEnabled,
       reminder_offsets: reminderOffsets,
     };
@@ -668,7 +749,8 @@ export default function TaskDetailScreen() {
     async (options?: { showErrors?: boolean }) => {
       const normalizedTitle = title.trim();
       const showErrors = options?.showErrors ?? false;
-      if (deletingRef.current) return null;
+      if (deletingRef.current || !isMountedRef.current
+        || currentTaskTargetRef.current !== taskTargetKey) return null;
       if (!taskId || !task || !draftPayload) {
         return null;
       }
@@ -693,11 +775,13 @@ export default function TaskDetailScreen() {
       try {
         const previousTask = task;
         const updated = await saveTaskQueueRef.current.enqueue(() => {
-          if (deletingRef.current) {
-            return Promise.reject(new Error("タスク削除中は保存を停止しました"));
+          if (deletingRef.current || !isMountedRef.current
+            || currentTaskTargetRef.current !== taskTargetKey) {
+            return Promise.reject(new Error("対象が変わったため保存を停止しました"));
           }
           return trackTaskTargetWrite(() => tasksRepo.update(taskId, draftPayload));
         });
+        if (!isMountedRef.current || currentTaskTargetRef.current !== taskTargetKey) return null;
         const isLatestSave =
           isMountedRef.current &&
           saveTaskGenerationRef.current === saveGeneration;
@@ -731,12 +815,20 @@ export default function TaskDetailScreen() {
         const selectedTagObjects = selectedTagIds.map((tagId) => {
           const existing = previousTask.tags?.find((tag) => tag.id === tagId);
           const available = availableTags.find((tag) => tag.id === tagId);
+          const namedAvailable =
+            available && available.name.trim() && available.name.trim() !== available.id
+              ? available
+              : null;
+          const namedExisting =
+            existing && existing.name.trim() && existing.name.trim() !== existing.id
+              ? existing
+              : null;
           return (
-            available ??
-            existing ?? {
+            namedAvailable ??
+            namedExisting ?? {
               id: tagId,
               project_id: previousTask.project_id,
-              name: tagId,
+              name: "",
             }
           );
         });
@@ -801,6 +893,7 @@ export default function TaskDetailScreen() {
       } catch (error) {
         if (
           isMountedRef.current &&
+          currentTaskTargetRef.current === taskTargetKey &&
           saveTaskGenerationRef.current === saveGeneration
         ) {
           if (showErrors) {
@@ -817,6 +910,7 @@ export default function TaskDetailScreen() {
       } finally {
         if (
           isMountedRef.current &&
+          currentTaskTargetRef.current === taskTargetKey &&
           saveTaskGenerationRef.current === saveGeneration
         ) {
           setAutosaving(false);
@@ -834,6 +928,7 @@ export default function TaskDetailScreen() {
       status,
       task,
       taskId,
+      taskTargetKey,
       title,
       trackTaskTargetWrite,
     ],
@@ -848,7 +943,8 @@ export default function TaskDetailScreen() {
       pendingTaskDraftSavesRef.current.add(flight);
       void flight.then(
         (result) => {
-          if (result !== null && draftSignatureRef.current === draftSignatureAtStart) {
+          if (result !== null && currentTaskTargetRef.current === taskTargetKey
+            && draftSignatureRef.current === draftSignatureAtStart) {
             taskDraftDirtyRef.current = false;
           }
         },
@@ -859,7 +955,7 @@ export default function TaskDetailScreen() {
         .catch(() => undefined);
       return flight;
     },
-    [performSaveTaskDraft],
+    [performSaveTaskDraft, taskTargetKey],
   );
 
   useEffect(() => {
@@ -1105,7 +1201,10 @@ export default function TaskDetailScreen() {
 
   const handleCreateTag = useCallback(async () => {
     const name = newTagDraft.trim();
-    if (!name || !task?.project_id || tagBusy) return;
+    if (!name || !task?.project_id || !apiServerReady || tagBusy) return;
+    const requestIdentity = tagMutationIdentity;
+    const requestEpoch = tagMutationEpochRef.current;
+    const projectId = task.project_id;
     const existing = availableTags.find(
       (tag) => tag.name.toLowerCase() === name.toLowerCase(),
     );
@@ -1114,21 +1213,39 @@ export default function TaskDetailScreen() {
       setNewTagDraft("");
       return;
     }
-    setTagBusy(true);
+    setTagBusyIdentity(requestIdentity);
     try {
-      const created = await taskApi.createTag(task.project_id, { name });
-      setAvailableTags((prev) => [...prev, created]);
+      const created = await taskApi.createTag(projectId, { name });
+      if (
+        tagMutationIdentityRef.current !== requestIdentity ||
+        tagMutationEpochRef.current !== requestEpoch
+      ) return;
+      setTagCatalogState((previous) => ({
+        identity: tagCatalogIdentity,
+        tags: [
+          ...(previous?.identity === tagCatalogIdentity ? previous.tags : []),
+          created,
+        ],
+        known: true,
+      }));
       setTagSelectionTouched(true);
       setSelectedTagIds((prev) => [...prev, created.id]);
       setNewTagDraft("");
     } catch (error) {
-      setSaveError(
-        error instanceof Error ? error.message : "タグ作成に失敗しました",
-      );
+      if (
+        tagMutationIdentityRef.current === requestIdentity &&
+        tagMutationEpochRef.current === requestEpoch
+      ) {
+        setSaveError(
+          error instanceof Error ? error.message : "タグ作成に失敗しました",
+        );
+      }
     } finally {
-      setTagBusy(false);
+      setTagBusyIdentity((current) =>
+        current === requestIdentity ? null : current,
+      );
     }
-  }, [availableTags, newTagDraft, tagBusy, task?.project_id, toggleTag]);
+  }, [apiServerReady, availableTags, newTagDraft, tagBusy, tagCatalogIdentity, tagMutationIdentity, task?.project_id, toggleTag]);
 
   const saveRecurrence = useCallback(async () => {
     if (!taskId || advancedSaving) return;
@@ -1470,10 +1587,7 @@ export default function TaskDetailScreen() {
       title: normalizedTitle,
       description: description.trim() || null,
       status,
-      start_at: toTaskWallClockIso(startAt),
-      end_at: toTaskWallClockIso(endAt),
-      all_day:
-        allDay || isTaskDateOnlyInput(startAt) || isTaskDateOnlyInput(endAt),
+      ...buildTaskSchedulePayload(allDay, startAt, endAt),
       notifications_enabled: notificationsEnabled,
       reminder_offsets: reminderOffsets,
       tags: availableTags.filter((tag) => selectedTagIds.includes(tag.id)),
@@ -1600,14 +1714,21 @@ export default function TaskDetailScreen() {
   }, [isAuthenticated, loadTask, online, taskId, triagingAgent, trackTaskTargetWrite]);
 
   const comments: TaskComment[] = task?.comments ?? [];
-  const selectedTags = [
-    ...(task?.tags ?? []),
-    ...availableTags.filter((tag) => selectedTagIds.includes(tag.id)),
-  ].filter(
-    (tag, index, all) =>
-      selectedTagIds.includes(tag.id) &&
-      all.findIndex((candidate) => candidate.id === tag.id) === index,
-  );
+  const selectedTags = selectedTagIds.flatMap((tagId) => {
+    // Server tag names supersede cached labels once they arrive. During an
+    // unresolved interval, keep the selection by ID but omit its label.
+    const availableTag = availableTags.find((candidate) => candidate.id === tagId);
+    const cachedTag = task?.tags?.find((candidate) => candidate.id === tagId);
+    const hasDisplayName = (candidate: typeof availableTag) =>
+      Boolean(candidate?.name.trim() && candidate.name.trim() !== candidate.id);
+    const tag = hasDisplayName(availableTag)
+      ? availableTag
+      : apiServerReady && !tagCatalogKnown && !tagCatalogScopeChanged && hasDisplayName(cachedTag)
+        ? cachedTag
+        : null;
+    if (!tag || !tag.name.trim() || tag.name.trim() === tag.id) return [];
+    return [tag];
+  });
   const assigneeLabel =
     selectedAssigneeIds
       .map((id) => {

@@ -97,7 +97,6 @@ export default function ChatScreen() {
   const aoiDots = useContext(AoiDotsContext);
   const chatSurfaceActive = aoiDots?.isOpen !== true;
   const flatListRef = useRef<FlatList<TimelineItem>>(null);
-  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promotedSessionTargetRef = useRef<string | null>(null);
   const voiceSessionAliasesRef = useRef(new Map<string, string>());
   const reduceMotion = useReducedMotion();
@@ -464,22 +463,9 @@ export default function ChatScreen() {
     });
   }, [controller.agentCatalog, controller.session, router, user?.user_id]);
 
-  const scheduleScrollToEnd = useCallback((delay = 48) => {
-    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
-    scrollTimerRef.current = setTimeout(() => {
-      scrollTimerRef.current = null;
-      flatListRef.current?.scrollToEnd({ animated: true });
-    }, delay);
-  }, []);
-
-  useEffect(() => {
-    scheduleScrollToEnd();
-  }, [durableTimeline.length, Boolean(controller.streamContent), scheduleScrollToEnd]);
-
   useEffect(() => {
     const showSubscription = Keyboard.addListener("keyboardDidShow", () => {
       setKeyboardVisible(true);
-      if (!editTargetIdRef.current) scheduleScrollToEnd(64);
     });
     const hideSubscription = Keyboard.addListener("keyboardDidHide", () => {
       setKeyboardVisible(false);
@@ -487,9 +473,8 @@ export default function ChatScreen() {
     return () => {
       showSubscription.remove();
       hideSubscription.remove();
-      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
     };
-  }, [scheduleScrollToEnd]);
+  }, []);
 
   const sendComposerMessage = useCallback(
     (submission: ChatComposerSubmission) => {
@@ -666,6 +651,7 @@ export default function ChatScreen() {
       >
         <ChatTimeline
           listRef={flatListRef}
+          sessionKey={sessionId}
           header={
             <ChatHeaderStatus
               diagnostics={controller.diagnostics}

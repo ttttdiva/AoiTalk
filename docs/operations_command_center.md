@@ -11,7 +11,7 @@ remains read-only and stores no queue, approval or domain state.
 | URL | Surface | Mutating? |
 | --- | --- | --- |
 | `/operations` | Overview / Command Center | No; read-only projection |
-| `/operations?tab=agents` | Agent identity, role revisions, assignments, automation, integration, phone and activity | Dedicated identity/rule/policy/credential/telephony commands; projection remains read-only |
+| `/operations?tab=agents` | Agent identity, role revisions, assignments, automation, integration and activity | Dedicated identity/rule/policy/credential commands; projection remains read-only |
 | `/operations?tab=work` | Generic AgentWorkItems and latest attempts | No |
 | `/operations?tab=activity` | Cross-ledger activity timeline | No |
 | `/operations?tab=personas` | Existing Media Persona/brand surface | Existing domain commands only |

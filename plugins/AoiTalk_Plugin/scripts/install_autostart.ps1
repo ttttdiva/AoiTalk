@@ -9,7 +9,7 @@ $PackageRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot "..\.."))
 $Launcher = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "connect_tunnel.ps1"))
 $PowerShell = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"))
-$TaskName = "AoiTalk Plugin 41"
+$TaskName = "AoiTalk Plugin"
 
 if (-not (Test-Path -LiteralPath (Join-Path $PackageRoot ".env") -PathType Leaf)) {
     throw "Copy .env.example to plugins\AoiTalk_Plugin\.env and configure the issued AoiTalk tunnel first."
@@ -50,7 +50,12 @@ function Test-OwnTask($Task) {
     try { $sameEntry = [IO.Path]::GetFullPath($fileValue).Equals($Launcher, [StringComparison]::OrdinalIgnoreCase) }
     catch { $sameEntry = $false }
     $sameEntry = $sameEntry -and ($argumentValues -icontains "-Watch")
-    return $sameExecutable -and $sameWorkingDirectory -and $sameEntry
+    # The previously installed task used a one-shot run_plugin.bat launcher.
+    # Preserve it during the naming migration; do not treat arbitrary -Command
+    # strings as trusted just because they mention the launcher path.
+    $legacyArguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "& ''{0}''; exit $LASTEXITCODE"' -f (Join-Path $RepoRoot 'run_plugin.bat')
+    $sameLegacyEntry = [string]::Equals($args, $legacyArguments, [StringComparison]::OrdinalIgnoreCase)
+    return $sameExecutable -and $sameWorkingDirectory -and ($sameEntry -or $sameLegacyEntry)
 }
 
 $existing = Get-ExistingTask

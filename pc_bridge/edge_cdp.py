@@ -1,10 +1,8 @@
-"""Read-only Edge CDP endpoint discovery; never enables remote debugging.
+"""Broker endpoint validation for the existing Edge browser.
 
-An endpoint on disk is only a candidate, not evidence of an authenticated CDP
-connection or of Edge process ownership. In particular an HTTP discovery 404
-does not rule out Edge's UI-enabled WebSocket-only debugging endpoint.
-These helpers are used only by the opt-in ``agent_browser`` backend; the
-existing ``extension`` backend remains a separate Native Messaging path.
+This module intentionally never reads DevToolsActivePort and never connects to
+Edge. Existing Edge access is available only through the Gateway's authenticated
+edge_cdp_broker and its Browser.bind Playwright WebSocket.
 """
 from __future__ import annotations
 
@@ -23,6 +21,7 @@ _CHANNEL_FOLDERS = {
     "canary": "Edge SxS",
 }
 _BROWSER_PATH = re.compile(r"/devtools/browser(?:/[A-Za-z0-9][A-Za-z0-9._~-]{0,127})?\Z")
+_BROKER_PATH = re.compile(r"/[A-Fa-f0-9]{32}\Z")
 
 
 class EdgeCdpError(RuntimeError):
@@ -62,6 +61,45 @@ class EdgeCdpDiagnostic:
         }
 
 
+@dataclass(frozen=True)
+class BrokerWebSocketEndpoint:
+    """An ephemeral loopback Playwright endpoint returned by Browser.bind."""
+
+    url: str = field(repr=False)
+    source: str = "gateway_browser_bind"
+
+    def __post_init__(self):
+        object.__setattr__(self, "url", validate_broker_websocket_endpoint(self.url))
+        if self.source != "gateway_browser_bind":
+            raise EdgeCdpError("edge_broker_endpoint_invalid")
+
+
+def validate_broker_websocket_endpoint(value: str) -> str:
+    """Accept only the Gateway broker's ephemeral IPv4 loopback endpoint."""
+    if not isinstance(value, str) or len(value) > 256 or any(ord(char) <= 32 for char in value):
+        raise EdgeCdpError("edge_broker_endpoint_invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise EdgeCdpError("edge_broker_endpoint_invalid") from None
+    if port == 9222:
+        raise EdgeCdpError("direct_edge_cdp_forbidden")
+    if (
+        parsed.scheme != "ws"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or not 1 <= port <= 65_535
+        or parsed.username is not None
+        or parsed.password is not None
+        or not _BROKER_PATH.fullmatch(parsed.path)
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise EdgeCdpError("edge_broker_endpoint_invalid")
+    return urlunsplit(("ws", f"127.0.0.1:{port}", parsed.path, "", ""))
+
+
 def validate_loopback_endpoint(value: str) -> str:
     """Accept only literal loopback browser WebSockets without credentials."""
     if not isinstance(value, str) or len(value) > 512 or any(ord(c) <= 32 for c in value):
@@ -90,51 +128,15 @@ def validate_loopback_endpoint(value: str) -> str:
 def edge_user_data_directory(
     channel: str = "stable", *, environ: Mapping[str, str] | None = None
 ) -> Path:
-    if channel not in _CHANNEL_FOLDERS:
-        raise EdgeCdpError("edge_channel_invalid")
-    local = (os.environ if environ is None else environ).get("LOCALAPPDATA", "")
-    if not local or not Path(local).is_absolute():
-        raise EdgeCdpError("edge_local_app_data_unavailable")
-    return Path(local) / "Microsoft" / _CHANNEL_FOLDERS[channel] / "User Data"
+    del channel, environ
+    raise EdgeCdpError("direct_edge_cdp_forbidden")
 
 
 def read_edge_cdp_endpoint(
     user_data_dir: Path, *, channel: str = "stable"
 ) -> EdgeCdpEndpoint:
-    """Read the browser-owned file once, with a small bounded read, no probes."""
-    directory = Path(user_data_dir)
-    if not directory.is_absolute() or str(directory).startswith(("\\\\", "//")):
-        raise EdgeCdpError("edge_profile_path_invalid")
-    path = directory / "DevToolsActivePort"
-    try:
-        if path.is_symlink():
-            raise EdgeCdpError("edge_active_port_link_rejected")
-        with path.open("rb") as stream:
-            raw = stream.read(MAX_ACTIVE_PORT_BYTES + 1)
-    except FileNotFoundError:
-        raise EdgeCdpError("edge_debugging_endpoint_missing") from None
-    except PermissionError:
-        raise EdgeCdpError("edge_debugging_endpoint_unreadable") from None
-    except OSError:
-        raise EdgeCdpError("edge_debugging_endpoint_unreadable") from None
-    if len(raw) > MAX_ACTIVE_PORT_BYTES:
-        raise EdgeCdpError("edge_active_port_invalid")
-    try:
-        lines = raw.decode("ascii").splitlines()
-    except UnicodeError:
-        raise EdgeCdpError("edge_active_port_invalid") from None
-    if not 1 <= len(lines) <= 2 or not re.fullmatch(r"[0-9]{1,5}", lines[0]):
-        raise EdgeCdpError("edge_active_port_invalid")
-    port = int(lines[0])
-    if not 1 <= port <= 65535:
-        raise EdgeCdpError("edge_active_port_invalid")
-    browser_path = lines[1] if len(lines) == 2 else "/devtools/browser"
-    try:
-        return EdgeCdpEndpoint(
-            f"ws://127.0.0.1:{port}{browser_path}", "active_port", channel
-        )
-    except EdgeCdpError:
-        raise EdgeCdpError("edge_active_port_invalid") from None
+    del user_data_dir, channel
+    raise EdgeCdpError("direct_edge_cdp_forbidden")
 
 
 def diagnose_edge_cdp(
@@ -147,28 +149,6 @@ def diagnose_edge_cdp(
     developer_tools_availability: int | None = None,
     observed_http_status: int | None = None,
 ) -> EdgeCdpDiagnostic:
-    """Describe locally available evidence without networking or settings writes.
-
-Policy and HTTP evidence are optional caller-observed inputs. Unknown policy
-is not represented as permission. No state returned here means 'connected'.
-"""
-    if remote_debugging_allowed is False:
-        return EdgeCdpDiagnostic("blocked", "edge_remote_debugging_policy_blocked")
-    warnings = []
-    if developer_tools_availability == 2:
-        warnings.append("edge_developer_tools_policy_restricted")
-    if observed_http_status == 404:
-        warnings.append("edge_http_discovery_unavailable_websocket_unverified")
-    try:
-        if channel not in _CHANNEL_FOLDERS:
-            raise EdgeCdpError("edge_channel_invalid")
-        if explicit_endpoint is not None:
-            endpoint = EdgeCdpEndpoint(explicit_endpoint, "explicit", channel)
-        else:
-            directory = user_data_dir if user_data_dir is not None else edge_user_data_directory(channel, environ=environ)
-            endpoint = read_edge_cdp_endpoint(directory, channel=channel)
-    except EdgeCdpError as exc:
-        return EdgeCdpDiagnostic("unavailable", str(exc), warnings=tuple(warnings))
-    return EdgeCdpDiagnostic(
-        "endpoint_candidate", "edge_cdp_connection_unverified", endpoint, tuple(warnings)
-    )
+    del user_data_dir, channel, environ, explicit_endpoint, remote_debugging_allowed
+    del developer_tools_availability, observed_http_status
+    return EdgeCdpDiagnostic("blocked", "direct_edge_cdp_forbidden")

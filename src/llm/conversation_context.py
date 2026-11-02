@@ -101,6 +101,20 @@ _EPHEMERAL_HISTORY_CONTEXT_LABELS = (
     "[Current Project Context]",
     "[Current tool hints]",
 )
+_TERMINAL_DIALOGUE_STATES = frozenset(
+    {"succeeded", "failed", "cancelled", "expired"}
+)
+_DIALOGUE_TOOL_NAMES = frozenset(
+    {
+        "ask_agent_work_question",
+        "get_agent_work_status",
+        "send_agent_work_message",
+        "answer_agent_work_question",
+        "escalate_agent_work_question",
+        "stop_agent_work",
+        "resume_agent_work",
+    }
+)
 
 
 def _unwrap_ephemeral_user_prompt(content: Any) -> Any:
@@ -257,7 +271,7 @@ def compact_model_transcript_tool_results(
     local compressor used for new tool payloads.
     """
 
-    copied = [dict(message) for message in model_messages]
+    copied = _compact_terminal_dialogue_calls(model_messages)
     tool_indexes = [
         index
         for index, message in enumerate(copied)
@@ -307,6 +321,149 @@ def compact_model_transcript_tool_results(
         )
 
     return copied
+
+
+def _tool_call_name_and_args(call: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(call, Mapping):
+        return "", {}
+    function = call.get("function")
+    function = function if isinstance(function, Mapping) else call
+    name = str(function.get("name") or "")
+    raw_args = function.get("arguments")
+    if isinstance(raw_args, Mapping):
+        return name, dict(raw_args)
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except (TypeError, ValueError):
+            parsed = None
+        return name, dict(parsed) if isinstance(parsed, Mapping) else {}
+    return name, {}
+
+
+def _terminal_dialogue_status(content: Any) -> str | None:
+    if not isinstance(content, str):
+        return None
+    try:
+        result = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(result, Mapping):
+        return None
+    status = str(result.get("job_status") or result.get("status") or "").casefold()
+    if result.get("terminal") is not True and status not in _TERMINAL_DIALOGUE_STATES:
+        return None
+    return status if status in _TERMINAL_DIALOGUE_STATES else "succeeded"
+
+
+def _compact_terminal_dialogue_calls(
+    model_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove stale tool operations after a terminal status was recorded.
+
+    This shapes only the active prompt copy. The authoritative persisted
+    transcript remains unchanged for replay, deduplication, and audit.
+    """
+
+    tool_results = {
+        str(message.get("tool_call_id") or ""): message.get("content")
+        for message in model_messages
+        if isinstance(message, Mapping) and str(message.get("role") or "") == "tool"
+    }
+    terminal_dialogues: dict[str, tuple[str, str]] = {}
+    for message in model_messages:
+        if not isinstance(message, Mapping) or str(message.get("role") or "") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            name, arguments = _tool_call_name_and_args(call)
+            call_id = (
+                str(call.get("id") or call.get("tool_call_id") or "")
+                if isinstance(call, Mapping)
+                else ""
+            )
+            dialogue_id = str(arguments.get("dialogue_id") or "")
+            state = (
+                _terminal_dialogue_status(tool_results.get(call_id))
+                if name == "get_agent_work_status"
+                else None
+            )
+            if dialogue_id and state:
+                label = {
+                    "succeeded": "完了",
+                    "failed": "失敗終了",
+                    "cancelled": "取消終了",
+                    "expired": "期限切れ終了",
+                }[state]
+                terminal_dialogues[dialogue_id] = (
+                    call_id,
+                    f"委任は{label}です。新しい依頼には新しい委任を作成してください。",
+                )
+    if not terminal_dialogues:
+        return [dict(message) for message in model_messages]
+
+    terminal_ids = set(terminal_dialogues)
+    removed_call_ids: set[str] = set()
+    for message in model_messages:
+        if not isinstance(message, Mapping) or str(message.get("role") or "") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, Mapping):
+                continue
+            name, arguments = _tool_call_name_and_args(call)
+            if (
+                name in _DIALOGUE_TOOL_NAMES
+                and str(arguments.get("dialogue_id") or "") in terminal_ids
+            ):
+                call_id = str(call.get("id") or call.get("tool_call_id") or "")
+                if call_id:
+                    removed_call_ids.add(call_id)
+
+    output: list[dict[str, Any]] = []
+    summarized: set[str] = set()
+    status_call_ids = {
+        dialogue_id: call_id
+        for dialogue_id, (call_id, _summary) in terminal_dialogues.items()
+    }
+    for raw in model_messages:
+        if not isinstance(raw, Mapping):
+            continue
+        message = dict(raw)
+        role = str(message.get("role") or "")
+        if role == "tool":
+            if str(message.get("tool_call_id") or "") in removed_call_ids:
+                continue
+        elif role == "assistant":
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                retained = []
+                call_ids = {
+                    str(call.get("id") or call.get("tool_call_id") or "")
+                    for call in calls
+                    if isinstance(call, Mapping)
+                }
+                for call in calls:
+                    call_id = (
+                        str(call.get("id") or call.get("tool_call_id") or "")
+                        if isinstance(call, Mapping)
+                        else ""
+                    )
+                    if call_id not in removed_call_ids:
+                        retained.append(call)
+                if len(retained) != len(calls):
+                    message["tool_calls"] = retained
+                    if not retained:
+                        message.pop("tool_calls", None)
+                for dialogue_id, status_call_id in status_call_ids.items():
+                    if status_call_id not in call_ids or dialogue_id in summarized:
+                        continue
+                    summary = terminal_dialogues[dialogue_id][1]
+                    existing = str(message.get("content") or "").strip()
+                    message["content"] = f"{existing}\n{summary}".strip()
+                    summarized.add(dialogue_id)
+            if not message.get("tool_calls") and not str(message.get("content") or "").strip():
+                continue
+        output.append(message)
+    return output
 
 
 def tool_names_by_call_id_from_messages(
@@ -755,6 +912,14 @@ def persist_usage_sync(
         agent_run_id = get_current_agent_run_id()
     if not usage:
         return False
+    usage = dict(usage)
+    from ..services.turn_context import get_turn_context
+
+    turn_context = get_turn_context()
+    if not usage.get("quota_reservation_id") and turn_context.quota_reservation_id:
+        usage["quota_reservation_id"] = turn_context.quota_reservation_id
+    if not usage.get("billing_scope_id") and turn_context.billing_scope_id:
+        usage["billing_scope_id"] = turn_context.billing_scope_id
     try:
         from ..services.token_tracking_service import get_token_tracking_service
 
@@ -778,6 +943,7 @@ def persist_usage_sync(
                 model=requested,
                 requested_model=requested,
                 resolved_model=resolved,
+                reported_total_tokens=(usage.get("total_tokens") if provider == "gemini" and usage.get("metrics_source") == "gemini.usage_metadata" else None),
                 provider_reported_cost=usage.get("provider_reported_cost"),
                 provider_reported_cost_details=usage.get(
                     "provider_reported_cost_details"

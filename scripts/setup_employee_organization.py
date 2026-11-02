@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import hashlib
+import os
+import tempfile
 from pathlib import Path
 import sys
 
@@ -18,10 +21,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def crowdworks_manifest(graph, *, config, worker_team_id, worker_profile_id, reviewer_team_id, reviewer_profile_id):
+def _v2_revision(title, responsibility):
+    """Return a new Agent revision payload with only P2/v2 fields."""
+
+    return {
+        "display_name": title,
+        "mission": responsibility,
+        "responsibility_summary": responsibility,
+        "operational_instructions": responsibility,
+        "model_overrides": {},
+        "tool_ids": [],
+        "delegate_policy": {"agents": [], "workers": []},
+        "capability_ceiling": [],
+        "wake_policy": {"mode": "manual"},
+    }
+
+
+def crowdworks_manifest(graph):
     """Reuse CW/Web/App identities; seed only the missing internal positions."""
     from src.services.agent_identity_service import AgentIdentityValidationError
-    from src.services.agent_model_routing import OPERATIONS_WORK_ROLES, known_agent_teams
 
     indexed = {node["agent"]["slug"]: node for node in graph["nodes"] if node["agent"].get("slug")}
     positions = (
@@ -44,8 +62,7 @@ def crowdworks_manifest(graph, *, config, worker_team_id, worker_profile_id, rev
         ("data", "軽作業担当", "data_worker", "権利と許可を確認した資料整理・データ整形を行う。個人経験を偽る回答や規約違反の仕事は引き受けない。"),
         ("review", "品質review担当", "reviewer", "他社員の成果物と記録された検証を独立にreviewし、合否と修正要件を全体統括へ返す。"),
     )
-    teams = known_agent_teams(config)
-    for key, title, role, responsibility in jobs:
+    for key, title, _role, responsibility in jobs:
         slug = "crowdworks-" + {"data": "data-worker", "review": "quality-reviewer"}.get(key, key)
         entry = {"key": key, "slug": slug, "display_name": title, "manager_key": "crowdworks", "job_title": title,
                  "responsibility_summary": responsibility}
@@ -53,67 +70,45 @@ def crowdworks_manifest(graph, *, config, worker_team_id, worker_profile_id, rev
             agent = indexed[slug]["agent"]
             entry.update(agent_id=agent["id"], display_name=agent["display_name"])
         if slug not in indexed:
-            team_id, profile_id = (reviewer_team_id, reviewer_profile_id) if key == "review" else (worker_team_id, worker_profile_id)
-            team = teams.get(team_id)
-            if team is None:
-                raise AgentIdentityValidationError("referenced employee Team is unavailable")
-            allowed = [sid for sid in OPERATIONS_WORK_ROLES[role] if sid in team["subagent_ids"]]
-            if not allowed:
-                raise AgentIdentityValidationError("referenced Team cannot execute the employee role")
-            entry.update(activate=True, revision={"display_name": title, "mission": responsibility,
-                "responsibility_summary": responsibility, "operational_instructions": responsibility,
-                "agent_team_id": team_id, "execution_profile_id": profile_id,
-                "allowed_subagent_ids": allowed, "capability_ceiling": [], "wake_policy": {"mode": "manual"}})
+            entry.update(activate=True, revision=_v2_revision(title, responsibility))
         entries.append(entry)
     return {"employees": entries}
 
 
-def sns_manifest(graph, portfolio, *, actor_user_id, director_agent_id, config,
-                 brand_team_id, brand_profile_id, worker_team_id, worker_profile_id,
-                 reviewer_team_id, reviewer_profile_id):
+def sns_manifest(graph, portfolio, *, actor_user_id, lead_agent_id):
     """Build reporting roles from the canonical owner-bound brand readback.
 
     These bindings are assignment inputs, not new scope grants. The existing
-    MediaDirector is reused; its lifecycle/revision is left to an explicit
+    Existing SNS lead identity is reused; its lifecycle/revision is left to an explicit
     manifest command. No Project/Persona/content/channel is created here.
     """
     from scripts.media_brand_portfolio_setup import verify_readback
     from src.services.agent_identity_service import AgentIdentityValidationError
-    from src.services.agent_model_routing import OPERATIONS_WORK_ROLES, known_agent_teams
 
     verify_readback(portfolio, str(actor_user_id))
     indexed = {node["agent"]["slug"]: node for node in graph["nodes"] if node["agent"].get("slug")}
-    director = next((node["agent"] for node in graph["nodes"] if node["agent"]["id"] == str(director_agent_id)), None)
-    if director is None:
-        raise AgentIdentityValidationError("existing MediaDirector employee is required")
-    teams = known_agent_teams(config)
-    entries = [{"key": "sns-director", "agent_id": director["id"], "display_name": director["display_name"],
+    lead = next((node["agent"] for node in graph["nodes"] if node["agent"]["id"] == str(lead_agent_id)), None)
+    if lead is None:
+        raise AgentIdentityValidationError("existing SNS lead employee is required")
+    entries = [{"key": "sns-lead", "agent_id": lead["id"], "display_name": lead["display_name"],
                 "job_title": "SNS事業統括"}]
     bindings = []
 
-    def position(key, slug, title, role, instruction, team_id, profile_id):
-        entry = {"key": key, "slug": slug, "display_name": title, "manager_key": "sns-director",
+    def position(key, slug, title, _role, instruction):
+        entry = {"key": key, "slug": slug, "display_name": title, "manager_key": "sns-lead",
                  "job_title": title, "responsibility_summary": instruction}
         if slug in indexed:
             agent = indexed[slug]["agent"]
             entry.update(agent_id=agent["id"], display_name=agent["display_name"])
         if slug not in indexed:
-            team = teams.get(team_id)
-            allowed = [sid for sid in OPERATIONS_WORK_ROLES[role] if team and sid in team["subagent_ids"]]
-            if not allowed:
-                raise AgentIdentityValidationError("referenced Team cannot execute the employee role")
-            entry.update(activate=True, revision={"display_name": title, "mission": instruction,
-                "responsibility_summary": instruction, "operational_instructions": instruction,
-                "agent_team_id": team_id, "execution_profile_id": profile_id,
-                "allowed_subagent_ids": allowed, "capability_ceiling": [], "wake_policy": {"mode": "manual"}})
+            entry.update(activate=True, revision=_v2_revision(title, instruction))
         entries.append(entry)
 
     for brand in portfolio["brands"]:
         definition = brand["definition"]
         key = "sns-brand-" + definition["brand_key"]
         position(key, key, definition["display_name"] + " ブランド担当", "planner",
-            "担当ブランドの採用済み設計と提供された根拠に基づき、共有専門社員へ調査・制作・運用・分析を委任し、review結果をSNS事業統括へ返す。公開や外部送信は別の明示承認経路へ引き渡す。",
-            brand_team_id, brand_profile_id)
+            "担当ブランドの採用済み設計と提供された根拠に基づき、共有専門社員へ調査・制作・運用・分析を委任し、review結果をSNS事業統括へ返す。公開や外部送信は別の明示承認経路へ引き渡す。")
         bindings.append({"employee_key": key, "brand_key": definition["brand_key"],
             "project_id": brand["project_id"], "persona_id": brand["persona"]["id"],
             "persona_revision_id": brand["persona"]["current_revision"]["id"],
@@ -125,8 +120,7 @@ def sns_manifest(graph, portfolio, *, actor_user_id, director_agent_id, config,
         ("analysis", "SNS共有分析担当", "researcher", "提供された実測記録を分析し、未実測と実測を区別してブランド担当へ返す。"),
         ("review", "SNS共有品質review担当", "reviewer", "他社員の成果物、原典、QAと記録済み検証を独立reviewし合否を返す。"),
     ):
-        team_id, profile_id = (reviewer_team_id, reviewer_profile_id) if key == "review" else (worker_team_id, worker_profile_id)
-        position("sns-" + key, "sns-shared-" + key, title, role, instruction, team_id, profile_id)
+        position("sns-" + key, "sns-shared-" + key, title, role, instruction)
     return {"manifest": {"employees": entries}, "bindings": bindings,
             "headquarters_project_id": portfolio["headquarters_project_id"],
             "source_sha256": portfolio["source"]["sha256"]}
@@ -136,10 +130,8 @@ async def run(args):
     from src.api.agent_delegation_routes import OrganizationSetupRequest
     from src.app_config_store import load_app_config_snapshot_sync
     from src.memory.database import get_database_manager
-    from src.services.agent_delegation_service import AgentDelegationService
     from src.services.agent_organization_service import AgentOrganizationService
 
-    AgentDelegationService.require_enabled()
     manager = get_database_manager()
     try:
         # A preview must not upgrade/stamp/seed the database or write config defaults.
@@ -150,16 +142,10 @@ async def run(args):
         graph = await service.graph(actor_user_id=args.actor_user_id)
         bindings = None
         if args.crowdworks:
-            values = (args.worker_team_id, args.worker_profile_id, args.reviewer_team_id, args.reviewer_profile_id)
-            if not all(values):
-                raise ValueError("CrowdWorks recipe requires explicit existing Team/Profile IDs for worker and reviewer")
-            manifest = crowdworks_manifest(graph, config=config, worker_team_id=values[0], worker_profile_id=values[1],
-                reviewer_team_id=values[2], reviewer_profile_id=values[3])
+            manifest = crowdworks_manifest(graph, config=config)
         elif args.sns:
-            values = (args.director_agent_id, args.brand_team_id, args.brand_profile_id,
-                args.worker_team_id, args.worker_profile_id, args.reviewer_team_id, args.reviewer_profile_id)
-            if not all(values):
-                raise ValueError("SNS recipe requires an existing MediaDirector and explicit existing Team/Profile IDs")
+            if not args.lead_agent_id:
+                raise ValueError("SNS recipe requires an existing lead employee")
             from src.services.media_brand_portfolio_service import MediaBrandPortfolioService
             session = await service.identity._session()
             try:
@@ -167,9 +153,8 @@ async def run(args):
                     {"id": args.actor_user_id, "role": "admin", "actor_type": "human"})
             finally:
                 await session.close()
-            plan = sns_manifest(graph, portfolio, actor_user_id=args.actor_user_id, director_agent_id=values[0],
-                config=config, brand_team_id=values[1], brand_profile_id=values[2], worker_team_id=values[3],
-                worker_profile_id=values[4], reviewer_team_id=values[5], reviewer_profile_id=values[6])
+            plan = sns_manifest(graph, portfolio, actor_user_id=args.actor_user_id, lead_agent_id=args.lead_agent_id,
+                config=config)
             manifest, bindings = plan["manifest"], plan["bindings"]
         else:
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
@@ -187,6 +172,7 @@ async def run(args):
             destination = preview_output_path(args.output)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(encoded, encoding="utf-8")
+            print(destination, file=sys.stderr)
         else:
             print(encoded, end="")
     finally:
@@ -213,12 +199,27 @@ def verify_existing_database(manager, *, read_only):
 
 
 def preview_output_path(path):
-    """Export only inside this repository's scratch area, including symlink checks."""
-    destination = Path(path).resolve()
-    scratch = ROOT / ".local"
-    if not scratch.resolve().is_relative_to(ROOT) or not destination.is_relative_to(scratch.resolve()):
-        raise ValueError("preview --output must be inside this repository's .local directory")
-    return destination
+    """Resolve preview exports within this checkout's external temporary scope."""
+    root = ROOT.resolve()
+    temp = Path(os.path.abspath(tempfile.gettempdir()))
+    resolved_temp = temp.resolve()
+    if temp.is_relative_to(root) or resolved_temp.is_relative_to(root):
+        raise ValueError("preview --output requires an OS temp directory outside the repository")
+    checkout_key = os.path.normcase(str(root)).encode("utf-8")
+    scope = temp / ("aoitalk-employee-preview-" + hashlib.sha256(checkout_key).hexdigest()[:16])
+    resolved_scope = scope.resolve()
+    if resolved_scope.is_relative_to(root) or resolved_scope != resolved_temp / scope.name:
+        raise ValueError("preview --output requires an external OS temp scope")
+    requested = Path(path)
+    if not requested.is_absolute() and requested.parts and requested.parts[0].lower() == ".local":
+        raise ValueError("preview --output no longer accepts .local; use a filename")
+    destination = Path(os.path.abspath(requested if requested.is_absolute() else scope / requested))
+    resolved = destination.resolve()
+    if (destination == scope or not destination.is_relative_to(scope)
+            or resolved == resolved_scope or not resolved.is_relative_to(resolved_scope)
+            or resolved.is_relative_to(root)):
+        raise ValueError("preview --output must be inside this checkout's OS temp scope")
+    return resolved
 
 
 def main(argv=None):
@@ -228,15 +229,9 @@ def main(argv=None):
     source.add_argument("--crowdworks", action="store_true")
     source.add_argument("--sns", action="store_true")
     parser.add_argument("--actor-user-id", required=True, help="Existing authenticated administrator User UUID")
-    parser.add_argument("--director-agent-id")
-    parser.add_argument("--brand-team-id")
-    parser.add_argument("--brand-profile-id")
-    parser.add_argument("--worker-team-id")
-    parser.add_argument("--worker-profile-id")
-    parser.add_argument("--reviewer-team-id")
-    parser.add_argument("--reviewer-profile-id")
+    parser.add_argument("--lead-agent-id")
     parser.add_argument("--apply", action="store_true", help="Apply explicit manifest; default only previews it")
-    parser.add_argument("--output", type=Path, help="Write preview JSON in UTF-8 inside this repository's .local directory")
+    parser.add_argument("--output", type=Path, help="Write preview JSON in UTF-8 in this checkout's OS temp scope; use a filename")
     args = parser.parse_args(argv)
     if args.output:
         if args.apply:

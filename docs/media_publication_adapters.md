@@ -39,7 +39,12 @@ Xのcreate応答が不明でpost IDを保存できなかった場合、timeline/
 | `POST .../{id}/oauth/start` | `media_platform_oauth_start` | `{expected_account_revision:1, expected_credential_revision:0}` → official authorization_url、10分のexpires_at、exact project/account |
 | `POST /api/operations/media/oauth/callback` | `media_platform_oauth_callback` | `{state, code}` または `{state, error}` → connected/connection_failed/consent_deniedとsafe credential DTO |
 
+OAuth metadataの`configured`はbrand Projectごとのclient ID・client secret・HTTPS callback設定だけを表す。停止中accountと`bridge_manual` bindingは別の`blockers`で返し、前者はclient設定不足として表示しない。manual Bridgeの本人確認はOAuth grantの権限を持たないため、metadataと`start`の両方で`oauth_manual_bridge_identity_only`として拒否する。
+
 callbackは同じ認証human/owner/Project/account revision/credential revision/configだけが一度消費できる。codeはbody上限16 KiB、token responseは64 KiB。実providerのidentity一致と付与scopeだけを既存暗号化vaultへ保存する。scopeが返らないtokenはidentityだけverifiedになり、publish/media権限を推測しない。state/PKCE verifier/config pinは別AADの暗号文で保持する。YouTube channel IDはcase-sensitiveで比較する。
+callbackはvaultのcredential追加／rotation、provider identityの検証、OAuth requestのcompleted更新を同じDB transactionでcommitする。検証・監査保存に失敗した場合はそのtransactionをrollbackし、既存credential/bindingは維持したままrequestをfailedとして記録する。commit応答が不明な場合は新しいtransactionでrequestとsafe credential状態を照合し、commit済みなら接続成功へ収束する。状態を照合できない場合は503を返し、requestをfailedへ誤更新しない。provider denial・期限切れではcredentialを変更しない。
+
+Operations UIでは`verification_started_at`をpending状態の更新時刻として表示し、Provider identity receiptとは扱わない。`verified`を本人確認済みと表示する条件は、OAuth credential、`identity_match`、identity capability `available`、`last_verified_at`が揃う場合に限る。cookie binding保存は本人確認成功を意味しない。
 
 設定はserver secret管理から `AOITALK_MEDIA_OAUTH_CONFIG_JSON` に供給し、brand Project UUID → `x`/`youtube` → `client_id`, `client_secret`, `redirect_uri` の順に指定する。共有default fallbackやCalendar client/scopesの流用はしない。redirect URIは登録済みHTTPSの専用UI callback（query/fragmentなし）。設定値をfrontend/DB平文/debug logへ送らない。
 

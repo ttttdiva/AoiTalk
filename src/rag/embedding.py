@@ -33,6 +33,11 @@ from .index_io import run_index_io
 
 logger = logging.getLogger(__name__)
 
+# Repository boundary, fixed from the real module path at import time.
+# Lifecycle tests replace __file__ to locate a fake worker script; they
+# replace this constant explicitly when they need a fake repository.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # A stopped worker cannot use these scratch directories anymore. If Windows
 # briefly refuses a delete (for example, a scanner still holds a file handle),
 # defer that cleanup and keep GPU release tied to process absence.
@@ -113,6 +118,7 @@ class EmbeddingGemma2Embedding:
         self._active_operation = None
         self._releasing = False
         self._idle_timer = None
+        self._resident = False
         self._idle_generation = 0
         self._last_used_at = None
         self._last_release_reason = None
@@ -160,6 +166,12 @@ class EmbeddingGemma2Embedding:
             raise RuntimeError(
                 "Embedding worker environment missing; run scripts/setup_embeddinggemma2_worker.py"
             )
+        # Scratch must live in the OS temp area, never inside the repo.
+        # Fail closed if that area itself was configured into the repo.
+        repo_root = Path(_REPO_ROOT).resolve()
+        system_temp = Path(tempfile.gettempdir()).resolve()
+        if system_temp == repo_root or repo_root in system_temp.parents:
+            raise RuntimeError("embedding_worker_temp_inside_repo")
         logs = Path("logs")
         logs.mkdir(parents=True, exist_ok=True)
         self._log = (logs / "embeddinggemma2-worker.log").open("ab")
@@ -168,9 +180,9 @@ class EmbeddingGemma2Embedding:
             k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME"}
         }
         env["PYTHONIOENCODING"] = "utf-8"
-        scratch = Path(__file__).resolve().parents[2] / ".local"
-        scratch.mkdir(parents=True, exist_ok=True)
-        self._temporary = tempfile.TemporaryDirectory(prefix="eg2-worker-", dir=scratch)
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix="eg2-worker-", dir=system_temp
+        )
         env["AOITALK_EMBEDDING_TMP_DIR"] = self._temporary.name
         script = Path(__file__).with_name("embedding_worker.py")
         process = subprocess.Popen(
@@ -674,6 +686,8 @@ class EmbeddingGemma2Embedding:
             delay = 0.001
             reason = "disabled"
         else:
+            if self._resident:
+                return
             if self._idle_timeout_seconds <= 0 or self._last_used_at is None:
                 return
             delay = max(0.001, self._idle_timeout_seconds -
@@ -778,6 +792,15 @@ class EmbeddingGemma2Embedding:
         next request lazily starts the exact same model and vector identity.
         """
         return await asyncio.to_thread(self._release_if_idle)
+
+    def apply_resident(self, enabled: bool):
+        """Keep an already loaded worker until disabled, without interrupting work."""
+        with self._admission_lock:
+            if self._closed:
+                return
+            self._resident = enabled
+            self._cancel_idle_timer_locked()
+            self._schedule_idle_timer_locked()
 
     def apply_master_enabled(self, enabled: bool):
         """Apply an explicit master switch; never loads and never cancels work.

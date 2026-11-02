@@ -53,6 +53,7 @@ from ..security.sensitive_files import (
 from ..llm.codex_instruction_review import ReviewedHostInstructions
 from ..llm.codex_task_completion import CodexTaskProtocolError
 from ..utils.subprocess_env import build_aoitalk_subprocess_env
+from src.runtime_release_contract import persistent_path
 
 logger = logging.getLogger(__name__)
 
@@ -1183,6 +1184,35 @@ def _blocking_command_policy_code(
     return None
 
 
+_EXTERNAL_COMMAND_EFFECTS = (
+    ("git_push", re.compile(r"\bgit(?:\s+(?:-[cC]\s+\S+|-\S+))*\s+push\b", re.IGNORECASE)),
+    (
+        "github_pr",
+        re.compile(
+            r"\bgh\s+(?:pr|issue)\s+(?:create|comment|edit|merge|review|close|reopen)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "external_api_write",
+        re.compile(
+            r"\bgh\s+api\b|\bcurl\b[^;&|\n]*"
+            r"(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|--request\s+(?:POST|PUT|PATCH|DELETE)\b"
+            r"|\s(?:-d|--data(?:-raw|-binary)?|-F|--form)\b)",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def external_command_effect(command: str) -> str | None:
+    """Name the external effect of a command (push, PR, API write), if any."""
+    for effect, pattern in _EXTERNAL_COMMAND_EFFECTS:
+        if pattern.search(command or ""):
+            return effect
+    return None
+
+
 def check_command_denial(
     command: str,
     *,
@@ -1392,6 +1422,7 @@ def resolve_task_route(config: Any, spec: LocalAgentTaskSpec) -> dict[str, str]:
         codex_route_efforts = {
             "gpt-5.6-sol": frozenset({"high"}),
             "gpt-6.1-sol": frozenset({"high"}),
+            "gpt-6-luna": frozenset({"xhigh"}),
         }
         allowed_efforts = codex_route_efforts.get(model)
         if allowed_efforts is None:
@@ -1473,6 +1504,8 @@ class TaskRunContext:
         "commands_failed": 0, "blocked_calls": 0, "files_written": 0,
     })
     stop_reason: str | None = None
+    # How many times an AoiTalk shutdown preempted this task (resume hint).
+    preempted_count: int = 0
     touched_files: set[str] = field(default_factory=set)
     created_files: set[str] = field(default_factory=set)
     background_jobs: set[str] = field(default_factory=set)
@@ -1489,6 +1522,7 @@ class TaskRunContext:
     # Internal-only additions, never accepted from model/request JSON.
     extra_tools: tuple[Any, ...] = ()
     agent_system_prompt: str = ""
+    agent_instruction: str = ""
     execution_checkpoint: Callable[[], None] | None = None
     verified_tool_results: int = 0
     unfinished_background_jobs: int = 0
@@ -1890,8 +1924,18 @@ class ToolGuard:
         return self._mutation_call(original, kwargs, "delete")
 
     # -- commands --------------------------------------------------------
-    def _call_execute_command(self, original, kwargs):
+    def _call_execute_command(self, original, kwargs, *, _section_open=False):
         command = str(kwargs.get("command") or "")
+        effect = None if _section_open else external_command_effect(command)
+        if effect:
+            # A push, PR change or external API write must not be interrupted
+            # by a shutdown; it runs in the foreground inside the section.
+            from .work_preemption import non_preemptible
+
+            with non_preemptible(effect):
+                return self._call_execute_command(
+                    original, {**kwargs, "run_in_background": False}, _section_open=True
+                )
         cwd_raw = kwargs.get("working_directory") or "."
         decision = self.scope.check_command_cwd(cwd_raw)
         if not decision.allowed:
@@ -2475,6 +2519,13 @@ def build_system_prompt(spec: LocalAgentTaskSpec) -> str:
     return "\n".join(rules)
 
 
+RESUMED_AFTER_RESTART_NOTE = (
+    "Resumed: AoiTalk restarted while this task was running. The workspace already "
+    "holds that attempt's changes; inspect them and continue toward the goal instead "
+    "of starting over or redoing finished steps."
+)
+
+
 def build_user_prompt(spec: LocalAgentTaskSpec, baseline: Mapping[str, Any]) -> str:
     parts = [f"Goal:\n{spec.goal}"]
     if spec.constraints:
@@ -2537,6 +2588,19 @@ def parse_report(text: str) -> Optional[dict[str, Any]]:
         "files_changed": files,
         "notes": str(found.get("notes") or "")[:2000],
     }
+
+
+def _native_worker_definitions_valid(definitions: Any) -> bool:
+    """Check the fixed worker's metadata and pinned revision without authority calls."""
+    from ..llm.tool_policy import agent_revision_tool_id_permits
+
+    expected = {**dict.fromkeys(_READ_TOOLS, "workspace_read"),
+                **dict.fromkeys(_MUTATION_TOOLS, "workspace_write"),
+                **dict.fromkeys(_COMMAND_TOOLS, "command_execute")}
+    owners = {item.name: item.owner for item in definitions}
+    return (len(definitions) == len(expected) and set(owners) == set(expected)
+            and all(owners.get(name) == family for name, family in expected.items())
+            and all(agent_revision_tool_id_permits(item.name, item) is not False for item in definitions))
 
 
 class LocalAgentTaskRunner:
@@ -2654,6 +2718,7 @@ class LocalAgentTaskRunner:
         _instruction_review_boot_id: str | None = None,
         extra_tools: Sequence[Any] = (),
         agent_system_prompt: str = "",
+        agent_instruction: str = "",
         execution_checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Run one task synchronously with the same durable-task runtime.
@@ -2712,6 +2777,7 @@ class LocalAgentTaskRunner:
             provider_usage_recorder=provider_usage_recorder,
             extra_tools=tuple(extra_tools),
             agent_system_prompt=str(agent_system_prompt),
+            agent_instruction=str(agent_instruction),
             execution_checkpoint=execution_checkpoint,
             # Trusted internal callers may bind a deployment-issued host
             # instruction receipt to this inline run.  Public task requests
@@ -2819,12 +2885,18 @@ class LocalAgentTaskRunner:
             generation_policy_for_profile(GenerationProfile.AUTONOMOUS_WORK)
         )
         try:
-            backend = self._create_backend(ctx)
-            with contextlib.ExitStack() as stack:
-                if trusted_scope is not None:
-                    stack.enter_context(harness_execution_scope_context(trusted_scope))
-                stack.enter_context(run_scope_context(scope))
-                outcome = self._loop(ctx, backend, registry, baseline)
+            from .codex_development_runtime import _NATIVE_CODE_WORKER_STAGE_INSTRUCTION
+
+            if (ctx.agent_system_prompt == _NATIVE_CODE_WORKER_STAGE_INSTRUCTION
+                    and not _native_worker_definitions_valid(registry.get_all())):
+                outcome = {"contract_error": True}
+            else:
+                backend = self._create_backend(ctx)
+                with contextlib.ExitStack() as stack:
+                    if trusted_scope is not None:
+                        stack.enter_context(harness_execution_scope_context(trusted_scope))
+                    stack.enter_context(run_scope_context(scope))
+                    outcome = self._loop(ctx, backend, registry, baseline)
         except _TaskStop as stop:
             outcome = {"stop": stop.reason}
         except Exception as exc:  # provider / runtime failure
@@ -2872,15 +2944,44 @@ class LocalAgentTaskRunner:
         from ..tools.adapters import OpenAIAPIAdapter
 
         spec = ctx.spec
+        # The deployment-owned worker stage follows the frozen Agent context;
+        # Agent role prose cannot replace this phase's host responsibilities.
         messages = [
             {"role": "system", "content": with_common_harness_instructions(
-                "\n\n".join(part for part in (ctx.agent_system_prompt, build_system_prompt(spec)) if part))},
-            {"role": "user", "content": build_user_prompt(spec, baseline)},
+                "\n\n".join(part for part in (ctx.agent_instruction, ctx.agent_system_prompt, build_system_prompt(spec)) if part))},
+            {"role": "user", "content": build_user_prompt(spec, baseline) + (
+                "\n\n" + RESUMED_AFTER_RESTART_NOTE if getattr(ctx, "preempted_count", 0) else ""
+            )},
         ]
-        tools = OpenAIAPIAdapter.convert_all(registry.get_all())
+        definitions = registry.get_all()
+        tools = OpenAIAPIAdapter.convert_all(definitions)
         if ctx.agent_system_prompt:
             ctx.update({"execution_state": "loading_model", "current_step": "loading_model"})
         request = backend.build_request(messages, tools)
+        from .codex_development_runtime import _NATIVE_CODE_WORKER_STAGE_INSTRUCTION
+
+        if ctx.agent_system_prompt == _NATIVE_CODE_WORKER_STAGE_INSTRUCTION:
+            owners = {item.name: item.owner for item in definitions}
+            request_tools = request.get("tools")
+            request_tools = request_tools if isinstance(request_tools, list) else []
+            declared = [item["function"]["name"] for item in request_tools
+                        if isinstance(item, dict) and isinstance(item.get("function"), dict)
+                        and isinstance(item["function"].get("name"), str)]
+            expected = {**dict.fromkeys(_READ_TOOLS, "workspace_read"),
+                        **dict.fromkeys(_MUTATION_TOOLS, "workspace_write"),
+                        **dict.fromkeys(_COMMAND_TOOLS, "command_execute")}
+            valid = (len(request_tools) == len(expected) and len(declared) == len(expected)
+                     and set(declared) == set(expected)
+                     and _native_worker_definitions_valid(definitions))
+            ctx.emit("native_request_contract", {
+                "stage": "code_worker", "version": 1,
+                "declared_tool_count": min(len(request_tools), 256),
+                "declared_tools": sorted(name for name in declared if name in expected),
+                "owner_families": sorted({owners[name] for name in declared if name in expected
+                                          and owners.get(name) == expected[name]}),
+            })
+            if not valid:
+                return {"contract_error": True}
         describe = getattr(backend, "describe", None)
         if callable(describe):
             with contextlib.suppress(Exception):
@@ -2957,6 +3058,8 @@ class LocalAgentTaskRunner:
                 "no_progress": f"{ctx.limits.failure_streak_limit} consecutive tool failures",
                 "cancelled": "cancel requested",
             }.get(reason, reason)
+        elif outcome.get("contract_error"):
+            status, reason, detail = "failed", "native_worker_tool_contract_missing", "Required native worker tool contract is missing"
         elif "error" in outcome:
             status, reason = "failed", "llm_or_runtime_error"
             detail = ctx.redactor.text(f"{type(outcome['error']).__name__}: {outcome['error']}", 500)
@@ -3051,6 +3154,9 @@ class LocalAgentTaskManager:
 
     HEARTBEAT_SEC = 10.0
     CANCEL_JOIN_TIMEOUT_SEC = 10.0
+    # A task stopped by more restarts than this fails instead of looping.
+    MAX_PREEMPTIONS = 20
+    DRAIN_RETRY_SEC = 5.0
 
     def __init__(
         self,
@@ -3065,7 +3171,9 @@ class LocalAgentTaskManager:
     ):
         self.config = config
         self.limits = limits or LocalAgentTaskLimits.from_config(config)
-        storage = _cfg(config, "local_agent_tasks.storage_dir", "") or str(_REPO_ROOT / "data" / "local_agent_tasks")
+        storage = _cfg(config, "local_agent_tasks.storage_dir", "") or str(
+            persistent_path("data/local_agent_tasks", _REPO_ROOT)
+        )
         self.store = store or LocalAgentTaskStore(Path(storage))
         self.runner = runner or LocalAgentTaskRunner(config)
         self.allowed_roots = list(allowed_roots) if allowed_roots is not None else default_allowed_roots(config)
@@ -3120,12 +3228,29 @@ class LocalAgentTaskManager:
         with self._lock:
             self._threads = [thread for thread in self._threads if thread.is_alive()]
 
+    def _requeue_preempted(self, record: dict[str, Any]) -> bool:
+        """Put a task stopped by an AoiTalk shutdown back in the queue."""
+        preempted = int(record.get("preempted_count") or 0) + 1
+        if preempted > self.MAX_PREEMPTIONS:
+            return False
+        record.update(status="queued", cancel_reason=None, preempted_count=preempted,
+                      current_step="queued", latest_activity="preempted by AoiTalk restart",
+                      updated_at=_now())
+        self.store.save(record)
+        self.store.append_event(record["task_id"], {"ts": _now(), "type": "status", "status": "queued",
+                                                    "reason": "preempted_by_shutdown"})
+        return True
+
     def _recover(self) -> None:
         for record in self.store.list():
             if record.get("executor") == "aoitalk_agent":
                 continue
             status = record.get("status")
-            if status == "running" or (status == "queued" and record.get("cancel_requested")):
+            if (status == "running" and record.get("cancel_reason") == "aoitalk_shutdown"
+                    and not record.get("cancel_requested") and self._requeue_preempted(record)):
+                # The shutdown stopped it before its thread could requeue it.
+                self._queue.put(record["task_id"])
+            elif status == "running" or (status == "queued" and record.get("cancel_requested")):
                 record.update(status="failed" if status == "running" else "cancelled",
                               failure_reason="interrupted_by_restart" if status == "running" else "cancelled",
                               failure_detail="AoiTalk restarted while the task was running" if status == "running" else None,
@@ -3164,6 +3289,10 @@ class LocalAgentTaskManager:
 
     def submit(self, payload: Mapping[str, Any], *, owner: str, idempotency_key: str | None = None
                ) -> tuple[dict[str, Any], bool]:
+        from .restart_drain import is_restart_draining
+
+        if is_restart_draining():
+            raise LocalAgentTaskError("restart_pending", "AoiTalkの再起動待ちのため、新しいタスクを受け付けていません", 503)
         spec = validate_task_request(payload, allowed_roots=self.allowed_roots, limits=self.limits)
         if spec.agent_id is not None:
             raise LocalAgentTaskError("canonical_runtime_unavailable", "Agent requests require common AgentWork admission", 409)
@@ -3461,6 +3590,16 @@ class LocalAgentTaskManager:
                     done.set()
 
     def _execute(self, task_id: str) -> None:
+        from .restart_drain import is_restart_draining
+
+        if is_restart_draining():
+            # Do not start new work during a restart reservation; the task stays
+            # queued (and is recovered after the restart, or retried here if the
+            # reservation is withdrawn).
+            retry = threading.Timer(self.DRAIN_RETRY_SEC, self._queue.put, args=(task_id,))
+            retry.daemon = True
+            retry.start()
+            return
         with self._lock:
             record = self.store.load(task_id)
             if record.get("status") != "queued" or record.get("executor") == "aoitalk_agent":
@@ -3506,6 +3645,7 @@ class LocalAgentTaskManager:
         ctx = TaskRunContext(task_id=task_id, spec=spec, limits=self.limits, cancel_event=cancel_event,
                              emit=emit, update=update, redactor=redactor, user_id=record.get("owner"))
         ctx.codex_profile_receipt = record.get("codex_profile_binding")
+        ctx.preempted_count = int(record.get("preempted_count") or 0)
         if record.get("instruction_review") is not None:
             from ..llm.codex_instruction_review import ReviewedHostInstructions
             ctx.instruction_review = ReviewedHostInstructions(
@@ -3537,6 +3677,16 @@ class LocalAgentTaskManager:
                            "failure_detail": redactor.text(type(exc).__name__, 200)}
             current = self.store.load(task_id)
             if current.get("cancel_reason") == "aoitalk_shutdown" and outcome.get("status") == "cancelled":
+                # Preemptible: resume after the restart from the workspace as it is.
+                with self._lock:
+                    current = self.store.load(task_id)
+                    current["changed_files"] = sorted(
+                        set(current.get("changed_files") or []) | set(outcome.get("changed_files") or [])
+                    )
+                    current["counters"] = dict(ctx.counters)
+                    requeued = self._requeue_preempted(current)
+                if requeued:
+                    return
                 outcome = {**outcome, "status": "failed", "failure_reason": "interrupted_by_shutdown"}
             final = {
                 "status": outcome.get("status", "failed"),
@@ -3545,7 +3695,10 @@ class LocalAgentTaskManager:
                 "completion_summary": outcome.get("completion_summary"),
                 "summary_text": outcome.get("summary_text"),
                 "result": outcome.get("result"),
-                "changed_files": outcome.get("changed_files") or [],
+                "changed_files": sorted(
+                    set(outcome.get("changed_files") or [])
+                    | (set(current.get("changed_files") or []) if ctx.preempted_count else set())
+                ),
                 "counters": dict(ctx.counters),
                 "finished_at": _now(),
                 "current_step": "finished",

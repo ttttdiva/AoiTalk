@@ -171,91 +171,9 @@ def cleanup(bridge, runtimes, identities, work, *, inspector_factory, pid_exists
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live", action="store_true", help="authorize one Windows connection diagnostic")
-    parser.add_argument("--bundle-dir", type=Path, required=True)
-    parser.add_argument("--input", type=Path, required=True,
-                        help="Local JSON: endpoint, channel, optional already-selected target_id; never copied to output")
-    args = parser.parse_args(argv)
-    if not args.live or os.name != "nt":
-        parser.error("requires explicit --live on Windows")
-    sys.path.insert(0, str(ROOT))
-    from pc_bridge import browser_backend
-    from pc_bridge.agent_browser_runtime import OwnedHelperRuntime
-    from pc_bridge.windows_edge_identity import EdgeEndpointIdentityVerifier, WindowsEdgeInspector
-    import psutil
-
-    output = ROOT / ".local" / ("bridge-connect-diagnostic-" + uuid4().hex)
-    output.mkdir(parents=True, exist_ok=False)
-    work = output / "state"
-    report = {"mode": "source_api_pinned_helper", "stages": [], "success": False}
-
-    def record(row):
-        if row is not None:
-            report["stages"].append(row)
-        temporary = output / "report.new"
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(report, stream, indent=2, allow_nan=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(output / "report.json")
-
-    bridge = None
-    runtimes, identities = [], []
-    original_data_dir = browser_backend.data_dir
-
-    class RecordingVerifier(EdgeEndpointIdentityVerifier):
-        def capture(self, endpoint):
-            identity = super().capture(endpoint)
-            identities.append((self, endpoint, identity))
-            return identity
-
-    try:
-        with args.input.open("rb") as stream:
-            raw = stream.read(4097)
-        settings = json.loads(raw, object_pairs_hook=unique_object) if len(raw) <= 4096 else None
-        if (not isinstance(settings, dict) or not {"endpoint", "channel"} <= set(settings)
-                or set(settings) - {"endpoint", "channel", "target_id"}
-                or any(not isinstance(value, str) or not value for value in settings.values())):
-            raise ValueError("diagnostic_input_invalid")
-        work.mkdir()
-        # This isolated process uses scratch only, never saved registration settings.
-        browser_backend.data_dir = lambda: work
-
-        def factory(**kwargs):
-            kwargs["state_directory"] = work / kwargs["session_id"]
-            report["discover_existing"] = kwargs["discover_existing"] is True
-            report["explicit_target"] = kwargs["attach_target"] is not None
-            record(None)
-            runtime = OwnedHelperRuntime(**kwargs)
-            runtimes.append(runtime)
-            return RecordingRuntime(runtime, record)
-
-        bridge = browser_backend.create_browser_backend(
-            {"browser_backend": "agent_browser", "agent_browser": settings},
-            bundle_directory=args.bundle_dir.resolve(), require_pinned=True, runtime_factory=factory,
-            edge_identity_verifier=RecordingVerifier(),
-        )
-        if "target_id" in settings:
-            asyncio.run(bridge.request("resolve_tab", tab_id=None, url="", run_id="connect-diagnostic"))
-        else:
-            bridge.local_setup("discover_targets", {})
-        report["success"] = True
-    except BaseException as exc:
-        report.update(success=False, code=safe_error(exc))
-    finally:
-        browser_backend.data_dir = original_data_dir
-        report["cleanup"] = cleanup(bridge, runtimes, identities, work,
-                                    inspector_factory=WindowsEdgeInspector, pid_exists=psutil.pid_exists)
-        report["connection_succeeded"] = report["success"]
-        report["success"] = report["success"] and all(value is True for value in report["cleanup"].values())
-        try:
-            record(None)
-        except Exception:
-            report.update(success=False, evidence_saved=False)
-        print(json.dumps(report, ensure_ascii=True, allow_nan=False))
-    return 0 if report["success"] else 1
+    del argv
+    print(json.dumps({"success": False, "code": "direct_edge_cdp_forbidden"}, ensure_ascii=True))
+    return 1
 
 
 if __name__ == "__main__":

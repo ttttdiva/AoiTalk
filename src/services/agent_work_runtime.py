@@ -53,11 +53,14 @@ from ..memory.models import (
     AgentWorkItem,
     ConversationSession,
     ExternalAction,
+    ExternalConnection,
     User,
 )
 from ..memory.project_repository import ProjectRepository
 
 from ..memory.models.agent_work import is_execution_control_value
+from .restart_drain import is_restart_draining
+from . import work_preemption
 from .provider_failure_metadata import USAGE_COUNTER_KEYS, safe_usage_snapshot, terminal_failure_event_fields
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,23 @@ INTERACTIVE_HISTORY_FENCE_SCHEMA = "aoitalk.interactive_history_fence/v1"
 INTERACTIVE_HISTORY_FENCE_ACK = "provider_outcome_unknown_no_replay"
 _HISTORY_FENCE_ORIGIN_CODES = frozenset({"max_attempts_exhausted", "interactive_lease_expired"})
 _HISTORY_FENCE_EVENT = "work.history_fenced"
+
+
+def _discard_run_budget_after_terminalization(
+    run_id: str,
+    terminal_run: Any,
+) -> None:
+    if not isinstance(terminal_run, Mapping) or terminal_run.get("status") not in {
+        "succeeded",
+        "failed",
+        "cancelled",
+    }:
+        return
+    from ..llm.agent_run_budget import discard_agent_run_budget
+
+    discard_agent_run_budget(run_id)
+
+
 _CANONICAL_RESOURCE_KEY = re.compile(
     r"^(?:project:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|workspace:[0-9a-f]{64})$",
     re.IGNORECASE,
@@ -166,6 +186,16 @@ def _datetime(value: Any) -> datetime | None:
         return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
     except (TypeError, ValueError):
         return None
+
+
+def _preempted_count(row: Any) -> int:
+    metadata = getattr(row, "metadata_json", None)
+    if not isinstance(metadata, Mapping):
+        return 0
+    try:
+        return max(0, int(metadata.get("preempted_count") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _safe_json(value: Any, *, depth: int = 0) -> Any:
@@ -470,6 +500,30 @@ class ExecutionOutcome:
         return cls(classification="permanent", error_message=str(value))
 
 
+@dataclass(frozen=True)
+class PreRunWorkDeferral:
+    """Requeue a source before provider execution or adapter side effects.
+
+    A source can return this from ``WorkSource.refresh`` before adapter entry.
+    A narrowly scoped API task adapter can also return it when its typed
+    provider contract proves it stopped before sending. Some tasks already
+    own a queued AgentRun, and the adapter case has a running but unsent Run;
+    the coordinator retains that exact Run and restores the attempt. An
+    adapter may set ``allow_running_run`` only for a Free Team operator route
+    pinned by the AgentRevision and only when the provider request did not start.
+    """
+
+    outcome: ExecutionOutcome
+    deadline_extension_seconds: float = 0.0
+    allow_running_run: bool = False
+
+    def __post_init__(self) -> None:
+        if self.outcome.normalized_classification() != "transient":
+            raise ValueError("pre-run deferral outcome must be transient")
+        if self.outcome.retry_after_seconds is None:
+            raise ValueError("pre-run deferral requires retry_after_seconds")
+
+
 class InteractiveAdmissionError(RuntimeError):
     """A trusted live-chat work item could not be admitted."""
 
@@ -481,9 +535,16 @@ class InteractiveAdmissionError(RuntimeError):
 class InteractiveHistoryFenceError(RuntimeError):
     """A history-only acknowledgment could not be proven safe."""
 
-    def __init__(self, code: str, http_status: int) -> None:
+    def __init__(
+        self,
+        code: str,
+        http_status: int,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         self.code = code
         self.http_status = http_status
+        self.details = _safe_json(details or {})
         super().__init__(code)
 
 
@@ -630,6 +691,7 @@ class AgentWorkCoordinator:
         self.enabled = Features.autonomous_agent_runtime() and enabled is not False
         self.sources: dict[str, WorkSource] = {}
         self.adapters: dict[str, ExecutionAdapter] = {}
+        self._poll_callbacks: dict[str, Callable[[], Any]] = {}
         self._poll_task: asyncio.Task[Any] | None = None
         self._dispatch_lock = asyncio.Lock()
         self._execution_tasks: dict[asyncio.Task[Any], WorkClaim] = {}
@@ -694,6 +756,38 @@ class AgentWorkCoordinator:
             self.adapters[key] = adapter
         return adapter
 
+    def register_poll_callback(
+        self, key: str, callback: Callable[[], Any]
+    ) -> None:
+        """Register a small in-process hook that runs before each AgentWork poll.
+
+        Callbacks may enqueue work through an existing service boundary. They
+        never own a second scheduler loop, and failures do not stop normal
+        AgentWork discovery or dispatch.
+        """
+
+        normalized = _string(key, limit=120)
+        if not normalized or not callable(callback):
+            raise ValueError("poll callback requires a key and callable")
+        self._poll_callbacks[normalized] = callback
+
+    def unregister_poll_callback(self, key: str) -> bool:
+        """Remove one lifespan-owned pre-poll hook."""
+
+        normalized = _string(key, limit=120)
+        if not normalized:
+            return False
+        return self._poll_callbacks.pop(normalized, None) is not None
+
+    async def _run_poll_callbacks(self) -> None:
+        for key, callback in tuple(self._poll_callbacks.items()):
+            try:
+                await _maybe_await(callback())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("AgentWork pre-poll callback failed: key=%s", key)
+
     async def discover_and_materialize(
         self,
         *,
@@ -702,7 +796,12 @@ class AgentWorkCoordinator:
         space_id: Any | None = None,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Discover candidates and durably dedupe them by source identity."""
+        """Discover and dedupe atomically per source.
+
+        Each completed source is committed before the next source starts.
+        A later failure rolls back only its own source; earlier progress stays
+        durable and a later discovery deduplicates already-materialized work.
+        """
 
         if not self._runtime_enabled():
             return []
@@ -731,7 +830,7 @@ class AgentWorkCoordinator:
                     row = await self._materialize_one(session, candidate)
                     if row is not None:
                         materialized.append(row.to_safe_dict() if hasattr(row, "to_safe_dict") else row)
-            await session.commit()
+                await session.commit()
             return materialized
         except Exception:
             await self._rollback(session)
@@ -781,7 +880,38 @@ class AgentWorkCoordinator:
             raw.pop("required_capabilities_json", None)
             raw.pop("budget_reservation_json", None)
             candidate = WorkCandidate(**{key: value for key, value in raw.items() if key in allowed})
+        # This namespace is server-owned metadata, not an authorization proof.
+        # Reject values the existing bounded serializer would alter.
+        if candidate.source_type == "media.generation.plan" and "team_media_origin" in candidate.metadata:
+            origin = candidate.metadata["team_media_origin"]
+            if not isinstance(origin, Mapping) or _safe_json(origin, depth=1) != origin:
+                raise ValueError("invalid team_media_origin metadata")
         normalized = candidate.normalized()
+        if (candidate.source_type == "media.generation.plan" and "team_media_origin" in candidate.metadata
+                and normalized.metadata.get("team_media_origin") != candidate.metadata["team_media_origin"]):
+            raise ValueError("invalid team_media_origin metadata")
+
+        def check_media_origin(row: AgentWorkItem) -> None:
+            if normalized.source_type != "media.generation.plan":
+                return
+            existing = row.metadata_json if isinstance(row.metadata_json, Mapping) else {}
+            incoming = normalized.metadata
+            had_origin = "team_media_origin" in existing
+            has_origin = "team_media_origin" in incoming
+            if has_origin and (not had_origin or incoming["team_media_origin"] != existing["team_media_origin"]):
+                raise ValueError("team_media_origin conflict")
+            if had_origin:
+                for name in ("root_work_item_id", "parent_work_item_id", "causation_id"):
+                    value = getattr(normalized, name)
+                    old = getattr(row, name)
+                    comparable = _as_uuid(value) if name != "causation_id" else value
+                    if value is not None and old != comparable:
+                        raise ValueError(f"team_media_origin {name} conflict")
+                # Zero is the WorkCandidate/normal discovery default, not an
+                # instruction to reset the persisted depth.
+                if normalized.causal_depth and normalized.causal_depth != row.causal_depth:
+                    raise ValueError("team_media_origin causal_depth conflict")
+
         for field_name in (
             "space_id", "project_id", "task_id", "persona_id", "app_id",
             "conversation_session_id",
@@ -834,6 +964,7 @@ class AgentWorkCoordinator:
             )
             fingerprint_row = fingerprint_result.scalars().first()
             if fingerprint_row is not None:
+                check_media_origin(fingerprint_row)
                 return fingerprint_row
         values = {
             "source_type": normalized.source_type,
@@ -875,10 +1006,22 @@ class AgentWorkCoordinator:
             # Keep one active execution per canonical source/intent while a
             # newer source revision is discovered; the next discovery after
             # settlement will materialize the new revision safely.
+            check_media_origin(active_row)
             return active_row
         existing_result = await session.execute(select(AgentWorkItem).where(*[getattr(AgentWorkItem, key) == value for key, value in values.items()]))
         row = existing_result.scalars().first()
         if row is not None:
+            check_media_origin(row)
+            if row.state not in WORK_TERMINAL_STATES and (
+                _as_uuid(row.assigned_agent_id) != _as_uuid(normalized.assigned_agent_id)
+                or _as_uuid(row.agent_revision_id) != _as_uuid(normalized.agent_revision_id)
+            ):
+                # An unfinished WorkItem is already bound to its admitted
+                # Agent/revision. Discovery may see a newer selection after a
+                # revision migration, but that must not rewrite this attempt's
+                # identity or payload in place; a new source identity gets a
+                # new WorkItem on the new revision.
+                return row
             existing_metadata = (
                 row.metadata_json if isinstance(row.metadata_json, Mapping) else {}
             )
@@ -899,10 +1042,14 @@ class AgentWorkCoordinator:
                 # Serialize source metadata refresh with domain reservations.
                 await session.execute(update(AgentWorkItem).where(AgentWorkItem.id==row.id).values(updated_at=AgentWorkItem.updated_at))
                 await session.refresh(row)
+                check_media_origin(row)
+            existing_metadata = row.metadata_json if isinstance(row.metadata_json, Mapping) else {}
+            origin_bound = normalized.source_type == "media.generation.plan" and "team_media_origin" in existing_metadata
             # Refresh mutable scheduling metadata, but never resurrect terminal
             # work or overwrite an active lease from a discovery replay.
             if row.state not in WORK_TERMINAL_STATES | WORK_ACTIVE_STATES | {"blocked"}:
-                row.source_revision = normalized.source_revision
+                if not origin_bound:
+                    row.source_revision = normalized.source_revision
                 row.not_before = normalized.not_before
                 row.deadline = normalized.deadline
                 row.priority = normalized.priority
@@ -913,6 +1060,8 @@ class AgentWorkCoordinator:
                 metadata.pop("media_generation_costs", None)
                 if "media_generation_costs" in (row.metadata_json or {}):
                     metadata = {"media_generation_costs":row.metadata_json["media_generation_costs"], **metadata}
+                if origin_bound:
+                    metadata["team_media_origin"] = existing_metadata["team_media_origin"]
                 row.metadata_json = metadata
                 row.domain = normalized.domain
                 row.space_id = _as_uuid(normalized.space_id)
@@ -922,11 +1071,12 @@ class AgentWorkCoordinator:
                 row.app_id = _as_uuid(normalized.app_id)
                 if hasattr(row, "conversation_session_id"):
                     row.conversation_session_id = _as_uuid(normalized.conversation_session_id)
-                if "media_generation_costs" not in metadata:
+                if not origin_bound and "media_generation_costs" not in metadata:
                     row.assigned_agent_id = _as_uuid(normalized.assigned_agent_id)
                     row.agent_revision_id = _as_uuid(normalized.agent_revision_id)
                 row.execution_adapter = normalized.execution_adapter
-                row.max_attempts = normalized.max_attempts
+                if not origin_bound:
+                    row.max_attempts = normalized.max_attempts
                 row.concurrency_key = normalized.concurrency_key
                 row.mutation_fingerprint = normalized.mutation_fingerprint
                 row.updated_at = self._now()
@@ -984,6 +1134,8 @@ class AgentWorkCoordinator:
             else:
                 await self._rollback(session)
             winner = (await session.execute(select(AgentWorkItem).where(*[getattr(AgentWorkItem, key) == value for key, value in values.items()]))).scalars().first()
+            if winner is not None:
+                check_media_origin(winner)
             return winner
         else:
             if nested is not None:
@@ -1053,7 +1205,8 @@ class AgentWorkCoordinator:
         return claims[0] if claims else None
 
     async def claim_many(self, limit: int, *, source_type: str | None = None) -> list[WorkClaim]:
-        if not self._runtime_enabled():
+        # A restart reservation stops new claims; pending work resumes after it.
+        if not self._runtime_enabled() or is_restart_draining():
             return []
         count = max(1, min(int(limit or 1), 32 if self.max_concurrency is None else self.max_concurrency))
         source_key = _string(source_type, limit=80) if source_type else None
@@ -1097,9 +1250,14 @@ class AgentWorkCoordinator:
                     error_code="deadline_expired",
                     error_message="work item deadline has expired",
                 )
+            retired_pair = and_(
+                AgentWorkItem.source_type == "marketplace_crowdworks",
+                AgentWorkItem.execution_adapter == "crowdworks_workflow",
+            )
             eligible = or_(
                 and_(AgentWorkItem.state == "pending", or_(AgentWorkItem.not_before.is_(None), AgentWorkItem.not_before <= now)),
                 and_(AgentWorkItem.state == "retry_wait", or_(AgentWorkItem.not_before.is_(None), AgentWorkItem.not_before <= now)),
+                and_(retired_pair, AgentWorkItem.state.in_(("pending", "retry_wait"))),
             )
             claim_conditions = [eligible, or_(AgentWorkItem.deadline.is_(None), AgentWorkItem.deadline > now)]
             # Interactive chat is admitted and driven by the live transport.
@@ -1141,6 +1299,7 @@ class AgentWorkCoordinator:
                 # Exclude busy resources before LIMIT so a queued sibling on
                 # one resource does not strand independent work in a free slot.
                 claim_conditions.append(or_(
+                    retired_pair,
                     AgentWorkItem.concurrency_key.is_(None),
                     AgentWorkItem.concurrency_key.not_in(active_keys),
                 ))
@@ -1161,7 +1320,8 @@ class AgentWorkCoordinator:
             rows = [
                 row
                 for row in rows
-                if str(row.execution_adapter or "default") in self.adapters
+                if (row.source_type == "marketplace_crowdworks" and row.execution_adapter == "crowdworks_workflow")
+                or str(row.execution_adapter or "default") in self.adapters
                 or "default" in self.adapters
                 or (not self.adapters and not self.sources)
             ]
@@ -1171,12 +1331,13 @@ class AgentWorkCoordinator:
                     break
                 attempts = int(row.attempt_count or 0)
                 max_attempts = max(1, min(int(row.max_attempts or self.max_attempts), MAX_ATTEMPTS))
-                if attempts >= max_attempts:
+                retired_crowdworks = row.source_type == "marketplace_crowdworks" and row.execution_adapter == "crowdworks_workflow"
+                if not retired_crowdworks and attempts - _preempted_count(row) >= max_attempts:
                     await self._transition_locked(session, row, "dead_letter", token=None, error_code="max_attempts_exhausted", error_message="maximum attempts exhausted")
                     continue
                 concurrency_key = str(row.concurrency_key or "").strip()
                 await self._lock_concurrency_key(session, concurrency_key)
-                if concurrency_key:
+                if concurrency_key and not retired_crowdworks:
                     current_key = await session.execute(
                         select(func.count(AgentWorkItem.id)).where(
                             AgentWorkItem.state.in_(tuple(WORK_ACTIVE_STATES)),
@@ -1185,14 +1346,14 @@ class AgentWorkCoordinator:
                     )
                     if int(current_key.scalar_one() if hasattr(current_key, "scalar_one") else current_key.scalar() or 0) > 0:
                         continue
-                if concurrency_key and concurrency_key in active_keys:
+                if not retired_crowdworks and concurrency_key and concurrency_key in active_keys:
                     continue
-                if not await self._agent_capacity_available(session, row):
+                if not retired_crowdworks and not await self._agent_capacity_available(session, row):
                     continue
-                if not await self._interactive_session_available(session, row):
+                if not retired_crowdworks and not await self._interactive_session_available(session, row):
                     continue
                 budget = row.budget_reservation_json if isinstance(row.budget_reservation_json, Mapping) else {}
-                if budget and (
+                if not retired_crowdworks and budget and (
                     (budget.get("exhausted") is True)
                     or (budget.get("remaining") is not None and _number(budget.get("remaining")) <= 0)
                     or (budget.get("remaining_units") is not None and _number(budget.get("remaining_units")) <= 0)
@@ -1200,7 +1361,7 @@ class AgentWorkCoordinator:
                     await self._transition_locked(session, row, "blocked", token=None, error_code="budget_exhausted", error_message="budget reservation exhausted")
                     continue
                 budget = dict(budget)
-                if budget and not (budget.get("awaiting_approval") is True and budget.get("settled_state") == "awaiting_approval"):
+                if not retired_crowdworks and budget and not (budget.get("awaiting_approval") is True and budget.get("settled_state") == "awaiting_approval"):
                     reservation = self._reserve_budget(budget)
                     if reservation is None:
                         await self._transition_locked(session, row, "blocked", token=None, error_code="budget_exhausted", error_message="budget reservation exhausted")
@@ -1211,7 +1372,7 @@ class AgentWorkCoordinator:
                     .where(
                         AgentWorkItem.id == row.id,
                         AgentWorkItem.state.in_(("pending", "retry_wait")),
-                        or_(AgentWorkItem.not_before.is_(None), AgentWorkItem.not_before <= now),
+                        or_(retired_pair, AgentWorkItem.not_before.is_(None), AgentWorkItem.not_before <= now),
                     )
                     .values(
                         state="claimed",
@@ -1759,7 +1920,7 @@ class AgentWorkCoordinator:
                 stale.lease_expires_at = None
                 stale.heartbeat_at = now
                 stale.updated_at = now
-                await self._append_event_in_session(
+                recovery_event = await self._append_event_in_session(
                     session,
                     stale,
                     event_type=f"work.{stale.state}",
@@ -1770,6 +1931,11 @@ class AgentWorkCoordinator:
                     safe_error_code=str(stale.safe_error_code),
                     payload={"recovered_after_restart": True, "transport": True},
                 )
+                # This same transaction can immediately claim the recovered
+                # row and append another event.  The production session has
+                # autoflush disabled, so make this event visible to the next
+                # sequence query without flushing unrelated pending objects.
+                await session.flush([recovery_event])
             # A transport handoff is not autonomous Agent execution.  Keep
             # resource exclusion, but do not call _active_count or
             # _agent_capacity_available (assigned_agent_id is NULL by
@@ -1815,7 +1981,7 @@ class AgentWorkCoordinator:
                 token = uuid.uuid4().hex
                 attempts = int(row.attempt_count or 0)
                 max_attempts = max(1, min(int(row.max_attempts or self.max_attempts), MAX_ATTEMPTS))
-                if attempts >= max_attempts:
+                if attempts - _preempted_count(row) >= max_attempts:
                     await self._transition_locked(
                         session,
                         row,
@@ -2655,11 +2821,19 @@ class AgentWorkCoordinator:
         # coordinator still owns that session until the local claim drains.
         wanted = str(_as_uuid(session_id))
         for claim in self._local_active_claims().values():
-            if claim.work_item_id != str(row.id) and claim.conversation_session_id and str(_as_uuid(claim.conversation_session_id)) == wanted:
+            if (
+                claim.execution_adapter in {"interactive_chat", "cli_session_turn"}
+                and claim.work_item_id != str(row.id)
+                and claim.conversation_session_id
+                and str(_as_uuid(claim.conversation_session_id)) == wanted
+            ):
                 return False
         conditions = [
             AgentWorkItem.state.in_(tuple(WORK_ACTIVE_STATES)),
             AgentWorkItem.id != row.id,
+            AgentWorkItem.execution_adapter.in_(
+                ("interactive_chat", "cli_session_turn")
+            ),
         ]
         if hasattr(AgentWorkItem, "conversation_session_id"):
             conditions.append(AgentWorkItem.conversation_session_id == _as_uuid(session_id))
@@ -2884,8 +3058,20 @@ class AgentWorkCoordinator:
         def unknown() -> None:
             raise InteractiveHistoryFenceError("history_fence_transport_unknown", 409)
 
-        def pending() -> None:
-            raise InteractiveHistoryFenceError("history_fence_child_pending", 409)
+        def pending(*, delivery_blockers: Sequence[Mapping[str, Any]] = ()) -> None:
+            blockers = [
+                {
+                    "id": str(blocker.get("id") or "")[:64],
+                    "kind": str(blocker.get("kind") or "unknown")[:32],
+                    "state": str(blocker.get("state") or "unknown")[:32],
+                }
+                for blocker in list(delivery_blockers)[:50]
+            ]
+            raise InteractiveHistoryFenceError(
+                "history_fence_child_pending",
+                409,
+                details={"delivery_blockers": blockers} if blockers else {},
+            )
 
         async def owned_session(identity: Any) -> None:
             row = await session.get(ConversationSession, _as_uuid(identity)) if _as_uuid(identity) else None
@@ -2970,10 +3156,18 @@ class AgentWorkCoordinator:
                 ):
                     unknown()
         child_pending = False
+        delivery_blockers: list[dict[str, str]] = []
         for delivery in deliveries:
             if delivery.state not in {"cancelled", "failed", "expired", "acked"}:
                 if delivery.state in {"pending", "available", "leased", "delivered"}:
                     child_pending = True
+                    delivery_blockers.append(
+                        {
+                            "id": str(delivery.id),
+                            "kind": str(delivery.kind or "unknown"),
+                            "state": str(delivery.state),
+                        }
+                    )
                 else:
                     unknown()
             for prefix in ("source", "receiver"):
@@ -3053,7 +3247,7 @@ class AgentWorkCoordinator:
                 else:
                     unknown()
         if child_pending:
-            pending()
+            pending(delivery_blockers=delivery_blockers)
         result = {
             name: [{"id": str(row.id), "state": str(getattr(row, "state", getattr(row, "status", "")))} for row in values]
             for name, values in (
@@ -3574,6 +3768,10 @@ class AgentWorkCoordinator:
         normalized = self._coerce_claim(claim)
         result = ExecutionOutcome.from_value(outcome)
         classification = result.normalized_classification()
+        preempted = (
+            classification == "transient"
+            and result.error_code == work_preemption.PREEMPTED_ERROR_CODE
+        )
         if not self._runtime_enabled() and not (_interactive and self.interactive_enabled):
             return {
                 "work_item_id": normalized.work_item_id,
@@ -3623,7 +3821,13 @@ class AgentWorkCoordinator:
             if classification == "succeeded":
                 state = "succeeded"
             elif classification == "transient":
-                state = "retry_wait" if int(row.attempt_count or 0) < int(row.max_attempts or self.max_attempts) else "dead_letter"
+                state = (
+                    "retry_wait"
+                    if preempted
+                    or int(row.attempt_count or 0) - _preempted_count(row)
+                    < int(row.max_attempts or self.max_attempts)
+                    else "dead_letter"
+                )
             elif classification == "permanent":
                 state = "failed"
             elif classification == "blocked":
@@ -3635,7 +3839,7 @@ class AgentWorkCoordinator:
             else:
                 state = "cancelled"
             if state == "retry_wait":
-                delay = self._retry_delay(normalized, result)
+                delay = 0 if preempted else self._retry_delay(normalized, result)
                 row.not_before = now + timedelta(seconds=delay)
                 row.next_attempt_at = row.not_before
             else:
@@ -3683,6 +3887,14 @@ class AgentWorkCoordinator:
                     if safe_status:
                         metadata["domain_status"] = safe_status
                 row.metadata_json = _safe_json(metadata or {})
+            if preempted:
+                metadata = (
+                    dict(row.metadata_json)
+                    if isinstance(row.metadata_json, Mapping)
+                    else {}
+                )
+                metadata["preempted_count"] = _preempted_count(row) + 1
+                row.metadata_json = _safe_json(metadata)
             if state in WORK_TERMINAL_STATES or state in {"blocked", "uncertain", "awaiting_approval"}:
                 row.completed_at = now
             if state == "cancelled":
@@ -4673,7 +4885,19 @@ class AgentWorkCoordinator:
                     str(row.source_type or "") == "chat_turn"
                     or str(row.execution_adapter or "") == "interactive_chat"
                 )
-                if interactive_source:
+                run_succeeded = False
+                if interactive_source and stale_run_id:
+                    stale_run = await session.get(AgentRun, stale_run_id)
+                    run_succeeded = (
+                        str(getattr(stale_run, "status", "") or "") == "succeeded"
+                    )
+                if run_succeeded:
+                    # The turn finished and only its Work settlement was lost.
+                    state = "succeeded"
+                    row.outcome_classification = "succeeded"
+                    row.completed_at = now
+                    recovered += 1
+                elif interactive_source:
                     state = "uncertain"
                     row.not_before = None
                     row.next_attempt_at = None
@@ -4696,7 +4920,9 @@ class AgentWorkCoordinator:
                 if isinstance(row.budget_reservation_json, Mapping) and row.budget_reservation_json:
                     row.budget_reservation_json = self._settle_budget(
                         dict(row.budget_reservation_json),
-                        ExecutionOutcome(classification="transient"),
+                        ExecutionOutcome(
+                            classification="succeeded" if run_succeeded else "transient"
+                        ),
                         state=state,
                     )
                 row.heartbeat_at = now
@@ -4705,13 +4931,15 @@ class AgentWorkCoordinator:
                 # regardless of the attempt ceiling. Keep that fence distinct
                 # from both exhausted retries and proven restart reconciliation.
                 row.safe_error_code = (
-                    "interactive_lease_expired"
+                    None
+                    if run_succeeded
+                    else "interactive_lease_expired"
                     if interactive_source
                     else "stale_lease_recovered"
                     if state == "retry_wait"
                     else "max_attempts_exhausted"
                 )
-                if stale_run_id:
+                if stale_run_id and not run_succeeded:
                     stale_run_ids.append(str(stale_run_id))
                 await self._append_event_in_session(session, row, event_type=f"work.{state}", actor_kind="service", actor_id=self.worker_id, agent_run_id=stale_run_id, from_state=previous_state, to_state=state, safe_error_code=row.safe_error_code, payload={"recovered_after_restart": True, "error_code": row.safe_error_code})
             await session.commit()
@@ -4776,7 +5004,7 @@ class AgentWorkCoordinator:
                 state = str(item.state or "")
                 try:
                     if state == "succeeded":
-                        await service.complete_run(
+                        terminal_run = await service.complete_run(
                             str(run.id),
                             result=item.result_summary_json
                             if isinstance(item.result_summary_json, dict)
@@ -4788,14 +5016,10 @@ class AgentWorkCoordinator:
                             },
                         )
                     else:
-                        await service.fail_run(
+                        terminal_run = await service.fail_run(
                             str(run.id),
                             item.safe_error_code or "work_item_terminal",
-                            status=(
-                                "awaiting_approval"
-                                if state == "awaiting_approval"
-                                else "failed"
-                            ),
+                            status=state if state in {"cancelled", "awaiting_approval"} else "failed",
                             metadata={
                                 "work_item_id": str(item.id),
                                 "classification": item.outcome_classification
@@ -4803,6 +5027,10 @@ class AgentWorkCoordinator:
                                 "reconciled_from_work_item": True,
                             },
                         )
+                    _discard_run_budget_after_terminalization(
+                        str(run.id),
+                        terminal_run,
+                    )
                     repaired += 1
                 except Exception:
                     logger.warning(
@@ -4825,11 +5053,62 @@ class AgentWorkCoordinator:
             if row is None:
                 await session.rollback()
                 return None
+            work_binding_context: dict[str, Any] | None = None
+            if (
+                claim.source_type == "marketplace_crowdworks_agent_scan"
+                and claim.intent_key == "marketplace.crowdworks.agent_scan"
+                and claim.execution_adapter == "crowdworks_agent_scan"
+            ):
+                # This source may project an owner,
+                # ConversationSession, and immutable binding into a Run.
+                work_binding_context = await self._work_binding_context(
+                    session, row, claim
+                )
+            elif claim.source_type == "employee_delegation" and claim.execution_adapter == "employee_delegation":
+                from .agent_delegation_service import AgentDelegationService
+                from .conversation_agent_service import ConversationAgentService
+
+                await ConversationAgentService(self._db_manager, config=self.config).prepare_delegation_work_session_binding(
+                    db_session=session, work_item=claim,
+                    delegation_service=AgentDelegationService(self._db_manager, config=self.config),
+                )
+                work_binding_context = await self._work_binding_context(session, row, claim)
             # Reuse an existing run for an idempotent execute_once replay.
             existing_id = getattr(row, "active_agent_run_id", None)
             if existing_id and str(row.state or "") in {"claimed", "running"}:
                 existing = await session.get(AgentRun, existing_id)
                 if existing is not None and str(existing.status or "") not in {"succeeded", "failed", "cancelled"}:
+                    if work_binding_context is not None:
+                        expected_binding = work_binding_context["agent_binding"]
+                        existing_metadata = (
+                            existing.run_metadata
+                            if isinstance(existing.run_metadata, Mapping)
+                            else {}
+                        )
+                        existing_binding = existing_metadata.get("agent_binding")
+                        if (
+                            str(existing.user_id or "")
+                            != work_binding_context["owner_user_id"]
+                            or _as_uuid(existing.session_id)
+                            != _as_uuid(
+                                work_binding_context["conversation_session_id"]
+                            )
+                            or _as_uuid(existing.project_id)
+                            != _as_uuid(work_binding_context["project_id"])
+                            or _as_uuid(existing.agent_id)
+                            != _as_uuid(expected_binding["agent_id"])
+                            or _as_uuid(existing.agent_revision_id)
+                            != _as_uuid(expected_binding["agent_revision_id"])
+                            or not isinstance(existing_binding, Mapping)
+                            or str(existing_binding.get("binding_id") or "")
+                            != str(expected_binding["binding_id"])
+                            or str(existing_binding.get("snapshot_hash") or "")
+                            != str(expected_binding["snapshot_hash"])
+                        ):
+                            await session.rollback()
+                            raise ValueError(
+                                "CrowdWorks existing AgentRun binding does not match"
+                            )
                     await session.commit()
                     return existing.to_dict()
             agent_run_service = None
@@ -4894,19 +5173,26 @@ class AgentWorkCoordinator:
             await session.commit()
         finally:
             await self._close(session)
-        execution_manifest = previous_manifest or {
-            "schema_version": 2,
-            "agent_id": claim.assigned_agent_id,
-            "agent_revision_id": claim.agent_revision_id,
-            "capabilities": list(claim.required_capabilities),
-            "project_id": claim.project_id,
-            "task_id": claim.task_id,
-            "work_item_id": claim.work_item_id,
-            "source": claim.source_type,
-            "team_id": pins.agent_team_id if route_snapshot is not None else None,
-            "execution_profile_id": pins.execution_profile_id if route_snapshot is not None else None,
-            "route_snapshot": route_snapshot,
-        }
+        execution_manifest = previous_manifest
+        if execution_manifest is None:
+            execution_manifest = {
+                "schema_version": 2,
+                "agent_id": claim.assigned_agent_id,
+                "agent_revision_id": claim.agent_revision_id,
+                "capabilities": list(claim.required_capabilities),
+                "project_id": claim.project_id,
+                "task_id": claim.task_id,
+                "work_item_id": claim.work_item_id,
+                "source": claim.source_type,
+                "route_snapshot": route_snapshot,
+            }
+            if route_snapshot is not None:
+                if pins.agent_team_id:
+                    execution_manifest["team_id"] = pins.agent_team_id
+                if pins.execution_profile_id:
+                    execution_manifest["execution_profile_id"] = (
+                        pins.execution_profile_id
+                    )
         kwargs = {
             "agent_id": claim.assigned_agent_id,
             "agent_revision_id": claim.agent_revision_id,
@@ -4922,10 +5208,178 @@ class AgentWorkCoordinator:
             "execution_manifest": execution_manifest,
             "execution_manifest_hash": previous_manifest_hash,
         }
+        if claim.source_type == "employee_delegation" and isinstance(claim.metadata.get("graph_provenance"), Mapping):
+            kwargs["metadata"]["graph_provenance"] = dict(claim.metadata["graph_provenance"])
+        if claim.source_type == "api_agent_task" and previous_row is not None:
+            # API Agent task retries must remain bound to the original private
+            # session, owner, route, and exact task prompt. The initial Run is
+            # the durable source for those admission values; reconstructing a
+            # retry from only the Work identity would create a context-free
+            # Run that cannot satisfy the task's stored execution fence.
+            previous_metadata = (
+                dict(previous_row.run_metadata)
+                if isinstance(previous_row.run_metadata, Mapping)
+                else {}
+            )
+            kwargs.update({
+                "session_id": str(previous_row.session_id) if previous_row.session_id else None,
+                "user_id": str(previous_row.user_id) if previous_row.user_id else None,
+                "objective": str(previous_row.objective or ""),
+                "title": str(previous_row.title or f"{claim.source_type}:{claim.source_id}"),
+                "provider": previous_row.provider,
+                "model": previous_row.model,
+                "acting_subagent_id": previous_row.acting_subagent_id,
+                "metadata": {
+                    **previous_metadata,
+                    "work_item_id": claim.work_item_id,
+                    "attempt": claim.attempt,
+                    "domain": claim.domain,
+                },
+            })
+        if work_binding_context is not None:
+            # Pass the evidence to the canonical AgentRunService transaction;
+            # never mutate a Run after creation or accept an owner from the
+            # request/claim payload.
+            kwargs.update(
+                {
+                    "session_id": work_binding_context["conversation_session_id"],
+                    "user_id": work_binding_context["owner_user_id"],
+                    "metadata": {
+                        **dict(kwargs.get("metadata") or {}),
+                        "owner_user_id": work_binding_context["owner_user_id"],
+                        "conversation_session_id": work_binding_context[
+                            "conversation_session_id"
+                        ],
+                        "agent_binding": dict(
+                            work_binding_context["agent_binding"]
+                        ),
+                    },
+                }
+            )
         # The typed AgentRunService signature is part of the common ledger
         # contract.  An internal TypeError must block this attempt; retrying
         # with fields stripped could orphan the WorkItem/run fence.
         return await agent_run_service.create_run(**kwargs)
+
+    async def _work_binding_context(
+        self,
+        session: Any,
+        row: AgentWorkItem,
+        claim: WorkClaim,
+    ) -> dict[str, Any]:
+        """Read and verify the source-prepared owner/session/binding evidence."""
+
+        metadata = row.metadata_json if isinstance(row.metadata_json, Mapping) else {}
+        declared_owner_id = _as_uuid(metadata.get("owner_user_id"))
+        project_id = _as_uuid(row.project_id)
+        claim_project_id = _as_uuid(claim.project_id)
+        if project_id != claim_project_id:
+            raise ValueError("CrowdWorks Work project does not match its claim")
+        if declared_owner_id is None:
+            raise ValueError("CrowdWorks Work owner context is missing")
+        if (
+            row.source_type != claim.source_type
+            or row.source_id != claim.source_id
+            or row.source_revision != claim.source_revision
+            or row.intent_key != claim.intent_key
+            or row.execution_adapter != claim.execution_adapter
+        ):
+            raise ValueError("CrowdWorks Work source identity changed")
+        if row.assigned_agent_id != _as_uuid(claim.assigned_agent_id):
+            raise ValueError("CrowdWorks Work Agent does not match its claim")
+        if row.agent_revision_id != _as_uuid(claim.agent_revision_id):
+            raise ValueError("CrowdWorks Work AgentRevision does not match its claim")
+
+        if row.source_type == "employee_delegation":
+            from ..memory.models import AgentDelegation
+
+            order = await session.get(AgentDelegation, _as_uuid(row.source_id), with_for_update=True)
+            owner_id = _as_uuid(order.created_by) if order is not None else None
+            if owner_id is None or declared_owner_id != owner_id or order.project_id != project_id:
+                raise ValueError("Delegation owner/project mismatch")
+        else:
+            connection_id = _as_uuid(metadata.get("connection_id"))
+            if connection_id is None or connection_id != _as_uuid(claim.source_id):
+                raise ValueError("CrowdWorks Work connection context is missing")
+            connection = await session.get(
+                ExternalConnection, connection_id, with_for_update=True
+            )
+            if (
+                connection is None
+                or str(getattr(connection, "provider_key", "")).casefold() != "crowdworks"
+                or str(getattr(connection, "auth_status", "")).casefold()
+                not in {"browser_session", "verified"}
+                or getattr(connection, "owner_user_id", None) is None
+            ):
+                raise ValueError("CrowdWorks connection is unavailable")
+            owner_id = _as_uuid(connection.owner_user_id)
+            connection_project_id = _as_uuid(connection.project_id)
+            if (
+                owner_id is None
+                or declared_owner_id != owner_id
+                or connection_project_id != project_id
+            ):
+                raise ValueError("CrowdWorks connection owner/project mismatch")
+
+        session_id = _as_uuid(
+            row.conversation_session_id or metadata.get("conversation_session_id")
+        )
+        binding_metadata = metadata.get("agent_binding")
+        if session_id is None or not isinstance(binding_metadata, Mapping):
+            raise ValueError("CrowdWorks Work session/binding evidence is missing")
+        binding_id = _as_uuid(binding_metadata.get("binding_id"))
+        binding_session_id = _as_uuid(binding_metadata.get("session_id"))
+        binding_agent_id = _as_uuid(binding_metadata.get("agent_id"))
+        binding_revision_id = _as_uuid(binding_metadata.get("agent_revision_id"))
+        binding_hash = str(binding_metadata.get("snapshot_hash") or "")
+        if (
+            binding_id is None
+            or binding_session_id != session_id
+            or binding_agent_id != row.assigned_agent_id
+            or binding_revision_id != row.agent_revision_id
+            or len(binding_hash) != 64
+        ):
+            raise ValueError("CrowdWorks Work binding evidence does not match")
+
+        conversation = await session.get(
+            ConversationSession, session_id, with_for_update=True
+        )
+        if conversation is None or conversation.deleted_at is not None:
+            raise ValueError("CrowdWorks ConversationSession is unavailable")
+        if str(conversation.user_id) != str(owner_id):
+            raise ValueError("CrowdWorks ConversationSession owner mismatch")
+        if _as_uuid(conversation.project_id) != project_id:
+            raise ValueError("CrowdWorks ConversationSession project mismatch")
+        if _as_uuid(conversation.agent_id) != row.assigned_agent_id:
+            raise ValueError("CrowdWorks ConversationSession Agent mismatch")
+
+        from .conversation_agent_service import ConversationAgentService
+
+        binding = await ConversationAgentService(
+            self._db_manager, config=self.config
+        ).resolve_execution_binding_by_id(
+            binding_id=binding_id,
+            session_id=session_id,
+            agent_id=row.assigned_agent_id,
+            agent_revision_id=row.agent_revision_id,
+            db_session=session,
+        )
+        if str(binding.snapshot_hash or "") != binding_hash:
+            raise ValueError("CrowdWorks Agent binding snapshot hash mismatch")
+        return {
+            "owner_user_id": str(owner_id),
+            "conversation_session_id": str(session_id),
+            "project_id": str(project_id) if project_id else None,
+            "agent_binding": {
+                "binding_id": str(binding.binding_id),
+                "session_id": str(binding.session_id),
+                "agent_id": str(binding.agent_id),
+                "agent_revision_id": str(binding.agent_revision_id),
+                "revision_version": int(binding.revision_version),
+                "revision_content_hash": str(binding.revision_content_hash),
+                "snapshot_hash": str(binding.snapshot_hash),
+            },
+        }
 
     def _register_owned_task(
         self,
@@ -5076,15 +5530,28 @@ class AgentWorkCoordinator:
         # prevents a parent task's Run from leaking into provider usage and
         # keeps success/failure/cancellation task-local.
         run_context_token = set_current_agent_run_id(run_id)
+        preemption_tokens = work_preemption.bind_claim(claim, self._stop_event)
         try:
-            return await self._invoke_adapter(
-                adapter,
-                claim,
-                session=session,
-                run_id=run_id,
-                run=run,
-            )
+            if work_preemption.claim_is_preemptible(claim):
+                return await self._invoke_adapter(
+                    adapter,
+                    claim,
+                    session=session,
+                    run_id=run_id,
+                    run=run,
+                )
+            async with work_preemption.non_preemptible(
+                f"kind:{claim.execution_adapter}"
+            ):
+                return await self._invoke_adapter(
+                    adapter,
+                    claim,
+                    session=session,
+                    run_id=run_id,
+                    run=run,
+                )
         finally:
+            work_preemption.unbind_claim(preemption_tokens)
             # Reset before creating the session-close task so it cannot copy
             # the adapter's Run context.  The same applies to any deferred
             # cleanup task created by the coordinator after this returns.
@@ -5261,6 +5728,14 @@ class AgentWorkCoordinator:
         """Own one attempt's session, heartbeat, fencing and settlement independently."""
 
         results: list[dict[str, Any]] = []
+        # Retired queue entries must never reach a fallback/default adapter.
+        # Claim and settle them through the ordinary lease fence so a stale
+        # worker cannot overwrite the retirement or existing terminal history.
+        if claim.source_type == "marketplace_crowdworks" and claim.execution_adapter == "crowdworks_workflow":
+            outcome = ExecutionOutcome(classification="blocked", error_code="crowdworks_workflow_retired", error_message="legacy CrowdWorks workflow has been retired")
+            settled = await self.settle(claim, outcome, source_ok=True)
+            results.append({"claim": claim.to_dict(), "run": None, "outcome": "blocked", "settlement": settled})
+            return results
         adapter = self.adapters.get(claim.execution_adapter) or self.adapters.get("default")
         if adapter is None:
             await self.settle(claim, ExecutionOutcome(classification="permanent", error_code="execution_adapter_unavailable", error_message="execution adapter unavailable"))
@@ -5274,7 +5749,7 @@ class AgentWorkCoordinator:
             await self._settle_claimed_blocked(claim, "agent_revision_missing")
             return results
         try:
-            from .agent_team_v3 import AGENT_TEAM_CAPABILITY_CATALOG
+            from .agent_capabilities import AGENT_CAPABILITY_CATALOG as AGENT_TEAM_CAPABILITY_CATALOG
             unknown_caps = [item for item in claim.required_capabilities if item not in AGENT_TEAM_CAPABILITY_CATALOG]
         except Exception:
             unknown_caps = list(claim.required_capabilities)
@@ -5287,9 +5762,41 @@ class AgentWorkCoordinator:
             return results
         source_session = await self._session()
         try:
-            source_allowed = await self._refresh_source(source_session, claim)
+            if (
+                claim.source_type == "api_agent_task"
+                and claim.execution_adapter == "api_agent_task"
+            ):
+                source_allowed = await self._refresh_source(
+                    source_session, claim, allow_pre_run_deferral=True
+                )
+            else:
+                # Keep the historical WorkSource hook signature unchanged for
+                # domain sources and test adapters that implement it directly.
+                source_allowed = await self._refresh_source(source_session, claim)
         finally:
             await self._close(source_session)
+        if isinstance(source_allowed, PreRunWorkDeferral):
+            outcome = source_allowed.outcome
+            settled = await self._defer_claim_before_run(
+                claim, source_allowed
+            )
+            results.append({
+                "claim": claim.to_dict(),
+                "run": None,
+                "outcome": outcome.normalized_classification(),
+                "settlement": settled,
+            })
+            return results
+        if isinstance(source_allowed, ExecutionOutcome):
+            outcome = source_allowed
+            settled = await self.settle(claim, outcome, source_ok=True)
+            results.append({
+                "claim": claim.to_dict(),
+                "run": None,
+                "outcome": outcome.normalized_classification(),
+                "settlement": settled,
+            })
+            return results
         if source_allowed is False:
             outcome = ExecutionOutcome(classification="blocked", error_code="source_not_executable", error_message="source state changed before execution")
             settled = await self.settle(claim, outcome, source_ok=False)
@@ -5380,6 +5887,7 @@ class AgentWorkCoordinator:
             except Exception:
                 logger.debug("AgentRun running event could not be recorded", exc_info=True)
         adapter_task: asyncio.Task[Any] | None = None
+        adapter_deferral: PreRunWorkDeferral | None = None
         try:
             required = tuple(_string(item, limit=80) for item in adapter.required_capabilities(claim))
             if required and any(item not in set(claim.required_capabilities) for item in required):
@@ -5440,9 +5948,12 @@ class AgentWorkCoordinator:
                             timeout=0.25,
                         )
                         if done:
-                            outcome = ExecutionOutcome.from_value(
-                                adapter_task.result()
-                            )
+                            adapter_result = adapter_task.result()
+                            if isinstance(adapter_result, PreRunWorkDeferral):
+                                adapter_deferral = adapter_result
+                                outcome = adapter_result.outcome
+                            else:
+                                outcome = ExecutionOutcome.from_value(adapter_result)
                             break
                         if lease_failed.is_set():
                             # A lost/disabled lease must stop further
@@ -5472,18 +5983,36 @@ class AgentWorkCoordinator:
         except asyncio.CancelledError:
             if adapter_task is not None and not adapter_task.done():
                 await self._cancel_owned_task(adapter_task)
-            outcome = ExecutionOutcome(
-                classification="uncertain" if run_payload else "transient",
-                error_code="execution_cancelled",
-                error_message=(
-                    "execution outcome is unknown after cancellation"
-                    if run_payload
-                    else "execution cancelled before adapter invocation"
-                ),
-            )
+            if self._stop_event.is_set() and work_preemption.claim_is_preemptible(claim):
+                # Shutdown preemption: requeue without spending the attempt;
+                # the work resumes from its own checkpoint after the restart.
+                outcome = ExecutionOutcome(
+                    classification="transient",
+                    error_code=work_preemption.PREEMPTED_ERROR_CODE,
+                    error_message="work was preempted by an AoiTalk shutdown and requeued",
+                )
+            else:
+                outcome = ExecutionOutcome(
+                    classification="uncertain" if run_payload else "transient",
+                    error_code="execution_cancelled",
+                    error_message=(
+                        "execution outcome is unknown after cancellation"
+                        if run_payload
+                        else "execution cancelled before adapter invocation"
+                    ),
+                )
         except Exception as exc:
             logger.warning("AgentWork adapter failed for %s", claim.work_item_id, exc_info=True)
             outcome = ExecutionOutcome(classification="transient", error_code="adapter_error", error_message=_safe_error(exc))
+        if adapter_deferral is not None:
+            settled = await self._defer_claim_before_run(claim, adapter_deferral)
+            results.append({
+                "claim": claim.to_dict(),
+                "run": run_payload,
+                "outcome": outcome.normalized_classification(),
+                "settlement": settled,
+            })
+            return results
         settled = await self.settle(claim, outcome)
         # A failed token-fenced settlement means this worker no longer
         # owns the work item (another worker may have reclaimed it, or a
@@ -5493,17 +6022,20 @@ class AgentWorkCoordinator:
         # or failure after lease loss.
         settlement_owned = isinstance(settled, Mapping) and settled.get("settled", True) is not False
         if settlement_owned and run_payload and run_payload.get("id"):
+            terminal_run: Mapping[str, Any] | None = None
             try:
                 from .agent_run_service import AgentRunService
                 route_metadata, route_kwargs = _outcome_model_route_audit(outcome)
                 if outcome.normalized_classification() == "succeeded":
-                    await AgentRunService(
+                    terminal_run = await AgentRunService(
                         self._db_manager,
                         config=self.config,
                     ).complete_run(str(run_payload["id"]), result=dict(outcome.result or {}), message=outcome.result_summary, metadata={"work_item_id": claim.work_item_id, "classification": outcome.normalized_classification(), "domain_ref": outcome.domain_ref, "domain_status": outcome.domain_status, **({} if outcome.metadata.get("usage_state") == "known" else {"usage": dict(outcome.usage or {})}), **route_metadata}, **route_kwargs)
                 elif outcome.normalized_classification() in {"permanent", "blocked", "cancelled", "transient", "awaiting_approval", "uncertain"}:
                     classification = outcome.normalized_classification()
-                    await AgentRunService(
+                    if outcome.error_code == work_preemption.PREEMPTED_ERROR_CODE:
+                        classification = "cancelled"
+                    terminal_run = await AgentRunService(
                         self._db_manager,
                         config=self.config,
                     ).fail_run(
@@ -5537,11 +6069,19 @@ class AgentWorkCoordinator:
                         },
                         **route_kwargs,
                     )
+                _discard_run_budget_after_terminalization(
+                    str(run_payload["id"]),
+                    terminal_run,
+                )
             except Exception:
                 logger.debug("AgentRun settlement event could not be recorded", exc_info=True)
-        if settlement_owned and outcome.normalized_classification() in {
-            "succeeded", "permanent", "blocked", "cancelled", "uncertain"
-        }:
+        if settlement_owned and (
+            outcome.normalized_classification() in {
+                "succeeded", "permanent", "blocked", "cancelled", "uncertain"
+            }
+            # A preempted attempt ends here too; its retry is a new attempt.
+            or outcome.error_code == work_preemption.PREEMPTED_ERROR_CODE
+        ):
             try:
                 adapter_close_task = (
                     self._adapter_close_tasks.get(adapter_task)
@@ -5567,6 +6107,34 @@ class AgentWorkCoordinator:
         session = await self._session()
         try:
             now = self._now()
+            if (
+                claim.source_type == "api_agent_task"
+                and claim.execution_adapter == "api_agent_task"
+            ):
+                row = await session.get(
+                    AgentWorkItem, _as_uuid(claim.work_item_id), with_for_update=True
+                )
+                if (
+                    row is None
+                    or row.state not in WORK_ACTIVE_STATES
+                    or row.lease_owner != claim.lease_owner
+                    or row.lease_token != claim.lease_token
+                    or row.lease_expires_at is None
+                    or row.lease_expires_at <= now
+                ):
+                    await session.rollback()
+                    return False
+                metadata = (
+                    dict(row.metadata_json)
+                    if isinstance(row.metadata_json, Mapping)
+                    else {}
+                )
+                metadata["agent_run_id"] = str(run_id)
+                row.active_agent_run_id = _as_uuid(run_id)
+                row.metadata_json = _safe_json(metadata)
+                row.updated_at = now
+                await session.commit()
+                return True
             result = await session.execute(
                 update(AgentWorkItem)
                 .where(
@@ -5670,6 +6238,9 @@ class AgentWorkCoordinator:
                 timeout = self.shutdown_timeout_seconds
             timeout = max(0.0, min(timeout, MAX_SHUTDOWN_TIMEOUT_SECONDS))
         deadline = asyncio.get_running_loop().time() + timeout
+        # A stopping coordinator opens no new section (WorkPreempted); the ones
+        # already open finish before anything is cancelled.
+        await work_preemption.wait_for_sections(timeout)
 
         running = [task for task in self._running_tasks if not task.done()]
         owned = set(running)
@@ -5724,6 +6295,7 @@ class AgentWorkCoordinator:
             if not self._runtime_enabled():
                 return
             try:
+                await self._run_poll_callbacks()
                 await self._dispatch_once(limit=32 if self.max_concurrency is None else self.max_concurrency)
                 if first_poll:
                     logger.info(
@@ -5799,7 +6371,13 @@ class AgentWorkCoordinator:
     record_work_event = record_event
     append_event = record_event
 
-    async def _refresh_source(self, session: Any, claim: WorkClaim) -> bool | None:
+    async def _refresh_source(
+        self,
+        session: Any,
+        claim: WorkClaim,
+        *,
+        allow_pre_run_deferral: bool = False,
+    ) -> bool | None | PreRunWorkDeferral | ExecutionOutcome:
         source = self.sources.get(claim.source_type)
         if source is None or not callable(getattr(source, "refresh", None)):
             # A missing source adapter means current source state cannot be
@@ -5807,12 +6385,165 @@ class AgentWorkCoordinator:
             return False
         try:
             value = await _maybe_await(source.refresh(session, claim))
+            if isinstance(value, PreRunWorkDeferral):
+                return value if allow_pre_run_deferral else True
+            if isinstance(value, ExecutionOutcome):
+                if (
+                    claim.source_type == "api_agent_task"
+                    and claim.execution_adapter == "api_agent_task"
+                ):
+                    return value
+                return bool(value)
             if isinstance(value, Mapping):
                 return bool(value.get("allowed", value.get("refreshed", value.get("ok", False))))
             return bool(value)
         except Exception:
             logger.warning("WorkSource refresh failed for %s", claim.work_item_id, exc_info=True)
             return False
+
+    async def _defer_claim_before_run(
+        self,
+        claim: WorkClaim,
+        deferral: PreRunWorkDeferral,
+    ) -> dict[str, Any]:
+        """Requeue a quota wait only when the current Run is safely reusable.
+
+        A source preflight or a typed Free Team no-send error can reach this
+        path. Preserve only a Run linked to this exact work attempt that is
+        either queued/unstarted, or explicitly permitted by the API task's
+        verified no-send marker. Any mismatch is blocked instead of replayed.
+        """
+
+        from ..memory.models import AgentRun, AgentWorkItem
+
+        outcome = deferral.outcome
+        normalized = self._coerce_claim(claim)
+        try:
+            delay = max(1.0, min(float(outcome.retry_after_seconds or 1.0), 86_400.0))
+            deadline_extension = max(
+                0.0,
+                min(float(deferral.deadline_extension_seconds or 0.0), 86_400.0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            delay, deadline_extension = 1.0, 0.0
+
+        session = await self._session()
+        try:
+            query = await session.execute(
+                select(AgentWorkItem)
+                .where(AgentWorkItem.id == _as_uuid(normalized.work_item_id))
+                .with_for_update()
+            )
+            row = query.scalars().first()
+            now = self._now()
+            safe_to_defer = bool(
+                row is not None
+                and row.state == "running"
+                and row.lease_owner == normalized.lease_owner
+                and row.lease_token == normalized.lease_token
+                and row.lease_expires_at is not None
+                and row.lease_expires_at > now
+                and int(row.attempt_count or 0) == int(normalized.attempt)
+            )
+            if safe_to_defer:
+                if row.active_agent_run_id is None:
+                    existing_run = await session.scalar(
+                        select(AgentRun.id)
+                        .where(
+                            AgentRun.work_item_id == _as_uuid(normalized.work_item_id),
+                            AgentRun.work_item_attempt == int(normalized.attempt),
+                        )
+                        .limit(1)
+                    )
+                    safe_to_defer = existing_run is None
+                else:
+                    queued_run = await session.get(AgentRun, row.active_agent_run_id)
+                    queued_unstarted = bool(
+                        queued_run is not None
+                        and queued_run.work_item_id == row.id
+                        and int(queued_run.work_item_attempt or 0) == int(normalized.attempt)
+                        and str(queued_run.status or "") == "queued"
+                        and queued_run.started_at is None
+                    )
+                    metadata = row.metadata_json if isinstance(row.metadata_json, Mapping) else {}
+                    free_team_route = metadata.get("route")
+                    trusted_running_deferral = bool(
+                        deferral.allow_running_run is True
+                        and normalized.source_type == "api_agent_task"
+                        and normalized.execution_adapter == "api_agent_task"
+                        and metadata.get("tool_free_execution") is True
+                        and isinstance(free_team_route, Mapping)
+                        and str(free_team_route.get("provider") or "").casefold() == "routing-profile"
+                        and str(free_team_route.get("model") or "") == "free-team"
+                        and queued_run is not None
+                        and queued_run.work_item_id == row.id
+                        and int(queued_run.work_item_attempt or 0) == int(normalized.attempt)
+                        and str(queued_run.status or "") == "running"
+                        and queued_run.started_at is not None
+                    )
+                    safe_to_defer = queued_unstarted or trusted_running_deferral
+            if not safe_to_defer:
+                await session.rollback()
+                blocked = ExecutionOutcome(
+                    classification="blocked",
+                    error_code="quota_wait_not_pre_run",
+                    error_message="A quota wait could not be proven to precede AgentRun execution",
+                )
+                return await self.settle(normalized, blocked, source_ok=True)
+
+            assert row is not None
+            previous_state = str(row.state or "running")
+            retry_at = now + timedelta(seconds=delay)
+            row.state = "retry_wait"
+            row.attempt_count = max(0, int(normalized.attempt) - 1)
+            row.outcome_classification = "transient"
+            row.safe_error_code = _safe_error(outcome.error_code) or "source_deferred"
+            row.blocker_code = None
+            row.escalation_reason = _safe_error(outcome.error_message)
+            row.result_summary = _safe_error(outcome.result_summary, limit=2000)
+            row.result_summary_json = _safe_json(outcome.result or {})
+            row.lease_owner = None
+            row.lease_token = None
+            row.lease_expires_at = None
+            row.heartbeat_at = now
+            row.not_before = retry_at
+            row.next_attempt_at = retry_at
+            if row.deadline is not None and deadline_extension:
+                row.deadline = max(
+                    row.deadline,
+                    retry_at + timedelta(seconds=deadline_extension),
+                )
+            row.updated_at = now
+            event_payload = {
+                "pre_run_deferral": True,
+                "retry_after_seconds": delay,
+                **dict(outcome.metadata or {}),
+            }
+            await self._append_event_in_session(
+                session,
+                row,
+                event_type="work.retry_wait",
+                actor_kind="service",
+                actor_id=self.worker_id,
+                from_state=previous_state,
+                to_state="retry_wait",
+                safe_error_code=row.safe_error_code,
+                result_summary=row.result_summary,
+                payload=event_payload,
+            )
+            await session.commit()
+            return {
+                "work_item_id": normalized.work_item_id,
+                "settled": True,
+                "state": "retry_wait",
+                "attempt_count": row.attempt_count,
+                "not_before": retry_at.isoformat(),
+            }
+        except Exception:
+            await self._rollback(session)
+            raise
+        finally:
+            await self._close(session)
 
     async def _authority_allows(self, claim: WorkClaim) -> tuple[bool, str | None]:
         """Resolve every required capability against fresh durable grants."""
@@ -5823,6 +6554,57 @@ class AgentWorkCoordinator:
             from .agent_authority import AgentAuthorityResolver
 
             resolver = AgentAuthorityResolver(self._db_manager, config=self.config)
+            backend_without_tools = False
+            if claim.source_type in {"cli_session_turn", "remote_agent_turn"}:
+                # Only a fully verified Dialogue receiver may use its backend
+                # capability ceiling independently of the Agent tool list.
+                from .agent_dialogue_transport import AgentDialogueTransport
+
+                db = await self._session()
+                try:
+                    delivery = (await db.execute(select(AgentDialogueDelivery).where(
+                        AgentDialogueDelivery.receiver_work_item_id == uuid.UUID(claim.work_item_id),
+                    ))).scalars().first()
+                    if delivery is not None:
+                        dialogue = await db.get(AgentDialogue, delivery.dialogue_id)
+                        transport_work = await db.get(AgentWorkItem, delivery.transport_work_item_id)
+                        source_run = await db.get(AgentRun, delivery.source_run_id)
+                        source_work = await db.get(AgentWorkItem, delivery.source_work_item_id)
+                        from ..memory.models import ConversationMessage
+                        source_message = await db.get(ConversationMessage, delivery.source_message_id)
+                        meta = transport_work.metadata_json if transport_work and isinstance(transport_work.metadata_json, Mapping) else {}
+                        transport = AgentDialogueTransport(self._db_manager)
+                        if (dialogue is None or source_run is None or source_work is None or source_message is None
+                            or str(transport_work.source_id) != str(delivery.id)
+                            or meta.get("binding_hash") != transport._provenance(dialogue, source_run, source_work, source_message)
+                            or not re.fullmatch(r"[0-9a-f]{64}", str(meta.get("provenance_hash") or ""))):
+                            return False, "authority_denied"
+                        work = await transport._validate_prepared_p5_receiver(
+                            db, dialogue, delivery, delivery.receiver_run_id,
+                            delivery.receiver_work_item_id, delivery.receiver_message_id,
+                            provenance_hash=meta["provenance_hash"],
+                        )
+                        backend_without_tools = (
+                            str(work.assigned_agent_id) == str(claim.assigned_agent_id)
+                            and str(work.agent_revision_id) == str(claim.agent_revision_id)
+                            and str(work.source_type) == claim.source_type
+                            and str(work.execution_adapter) == claim.execution_adapter
+                            and tuple(work.required_capabilities_json or ()) == claim.required_capabilities
+                        )
+                        if not backend_without_tools:
+                            return False, "authority_denied"
+                    elif claim.source_type == "remote_agent_turn":
+                        # Use the registered canonical adapter's own session service;
+                        # it revalidates the durable Work, binding and current policy.
+                        from .cli_session_work_adapter import MuseRemoteTurnWorkAdapter
+
+                        adapter = self.adapters.get("remote_agent_turn")
+                        if not isinstance(adapter, MuseRemoteTurnWorkAdapter):
+                            return False, "authority_denied"
+                        await adapter.service._resolve_remote_work_authority(db, claim)
+                        backend_without_tools = True
+                finally:
+                    await db.close()
             requested = list(claim.required_capabilities) or [None]
             for capability in requested:
                 decision = await resolver.resolve(
@@ -5834,6 +6616,7 @@ class AgentWorkCoordinator:
                     required_capability=capability,
                     tool_capabilities=claim.required_capabilities or None,
                     harness_capabilities=claim.required_capabilities or None,
+                    **({"_backend_execution_without_agent_tools": True} if backend_without_tools else {}),
                 )
                 if not decision.allowed:
                     return False, decision.reason or "authority_denied"

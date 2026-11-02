@@ -247,11 +247,28 @@ export type SyncTable =
 
 export interface SyncTablePayload<T = Record<string, unknown>> {
   changes: T[];
-  tombstones: Array<{ id: string; deleted_at?: string | null }>;
+  tombstones: Array<{
+    id: string;
+    deleted_at?: string | null;
+    _sync_fingerprint?: string;
+    _row_version?: string;
+  }>;
   cursor?: string | null;
   /** Receipt of all delivered pages, valid only at the terminal general page. */
   general_digest?: string;
   general_not_modified?: boolean;
+  /** Migration-free row-version receipt shortcut for additive general sync. */
+  general_source_not_modified?: boolean;
+  /** Exact stored-row receipt used by the opt-in message delta protocol. */
+  general_message_sync_digest?: string;
+  general_message_sync_server_time?: string;
+  general_message_sync_not_modified?: boolean;
+  /** Opaque fingerprint for one server message row; never contains its body. */
+  _sync_fingerprint?: string;
+  /** Opt-in row manifest metadata for bounded projection sync. */
+  row_manifest?: Array<[string, string]>;
+  row_manifest_source_digest?: string;
+  _row_version?: string;
   /** サーバー正本の総行数。分割再同期の進捗表示に使う。 */
   authoritative_count?: number;
   authoritative_ids?: string[];
@@ -279,12 +296,29 @@ export interface SyncPullResponse {
   general_watermark?: string | null;
   general_has_more?: boolean;
   general_digest_version?: number;
+  /** Optional source receipts for a fast, unchanged general-sync flight. */
+  general_source_token_version?: number;
+  general_source_receipts?: Record<string, string>;
+  general_source_token_starts?: Record<string, string>;
+  general_source_not_modified?: boolean;
+  /** Terminal receipts can include tables completed on earlier cursor pages. */
+  general_source_terminal_receipts_version?: number;
+  general_message_sync_version?: number;
+  general_row_manifest_version?: number;
   docs_pagination_version?: number;
   docs_scope_digest?: string;
   /** Opaque server snapshot token, stable across all pages in one run. */
   docs_snapshot_token?: string;
   /** Opaque ACL revision, stable across all pages in one run. */
   docs_scope_revision?: string;
+  /** Current per-table digests for project scopes in the root library. */
+  docs_project_digests?: Record<string, Record<string, string>>;
+  /** Current ACL revision for each grouped project scope digest. */
+  docs_project_scope_revisions?: Record<string, string>;
+  /** Compact, opt-in row-set receipts used only by upgraded mobile clients. */
+  docs_fast_digest_stable?: boolean;
+  docs_fast_digests?: Record<string, string>;
+  docs_project_fast_digests?: Record<string, Record<string, string>>;
   /** All Docs workspaces currently visible to this actor. */
   docs_scopes?: DocsSyncScope[];
 }
@@ -322,9 +356,22 @@ export async function pullSync(params: {
   general_pagination?: boolean;
   general_digest_version?: number;
   general_digests?: Record<string, string>;
+  general_source_token_version?: number;
+  general_source_digests?: Record<string, string>;
+  general_source_terminal_receipts?: boolean;
+  general_message_sync_version?: number;
+  general_message_sync_digest?: string;
+  general_message_sync_since?: string;
+  general_message_sync_full?: boolean;
+  general_row_manifest_version?: number;
+  general_row_ids?: Record<string, string[]>;
   general_cursors?: Record<string, string>;
   general_snapshot_token?: string;
   docs_digests?: Record<string, string>;
+  docs_fast_digests?: Record<string, string>;
+  docs_fast_digest_bundle?: string;
+  docs_fast_digest_version?: number;
+  docs_project_fast_baseline?: boolean;
   docs_cursors?: Record<string, string>;
   docs_pagination?: boolean;
   docs_scope_digest?: string;
@@ -334,6 +381,7 @@ export async function pullSync(params: {
   docs_reconcile?: boolean;
   docs_snapshot_token?: string;
   docs_scope_revision?: string;
+  include_docs_project_digests?: boolean;
   /** Caller-owned lifecycle signal; aborting it must not mark the API offline. */
   signal?: AbortSignal;
   /** Logical request ID reused across auth retries for access-log correlation. */
@@ -384,6 +432,33 @@ export async function pullSync(params: {
   if (params.general_digests && Object.keys(params.general_digests).length) {
     search.set('general_digests', JSON.stringify(params.general_digests));
   }
+  if (params.general_source_token_version) {
+    search.set('general_source_token_version', String(params.general_source_token_version));
+  }
+  if (params.general_source_terminal_receipts) {
+    search.set('general_source_terminal_receipts', '1');
+  }
+  if (params.general_source_digests && Object.keys(params.general_source_digests).length) {
+    search.set('general_source_digests', JSON.stringify(params.general_source_digests));
+  }
+  if (params.general_message_sync_version) {
+    search.set('general_message_sync_version', String(params.general_message_sync_version));
+  }
+  if (params.general_message_sync_digest) {
+    search.set('general_message_sync_digest', params.general_message_sync_digest);
+  }
+  if (params.general_message_sync_since) {
+    search.set('general_message_sync_since', params.general_message_sync_since);
+  }
+  if (params.general_message_sync_full) {
+    search.set('general_message_sync_full', '1');
+  }
+  if (params.general_row_manifest_version) {
+    search.set('general_row_manifest_version', String(params.general_row_manifest_version));
+  }
+  if (params.general_row_ids && Object.keys(params.general_row_ids).length) {
+    search.set('general_row_ids', JSON.stringify(params.general_row_ids));
+  }
   const generalCursors = params.general_cursors;
   if (generalCursors && Object.keys(generalCursors).length > 0) {
     search.set('general_cursors', JSON.stringify(generalCursors));
@@ -391,12 +466,20 @@ export async function pullSync(params: {
   if (params.general_snapshot_token) {
     search.set('general_snapshot_token', params.general_snapshot_token);
   }
-  // Docs digest はサーバ現在値と一致すれば全量再送を省ける。保存済み digest だけ
-  // クエリパラメータ（URLエンコードJSON）で送る。RN の fetch は GET に body を
-  // 付けられず、/pull は GET のみ受け付けるため、転送はクエリ経由に統一する。
+  // Docs digest は旧サーバー互換のため引き続き query JSON を受け付ける。
+  // 新しい row-set receipt は一つの bundle にして、scope 数に応じた URL 膨張を防ぐ。
   const digests = params.docs_digests;
   if (digests && Object.keys(digests).length > 0) {
     search.set('docs_digests', JSON.stringify(digests));
+  }
+  if (params.docs_fast_digest_version) {
+    search.set('docs_fast_digest_version', String(params.docs_fast_digest_version));
+  }
+  if (params.docs_fast_digest_bundle) {
+    search.set('docs_fast_digest_bundle', params.docs_fast_digest_bundle);
+  }
+  if (params.docs_fast_digests && Object.keys(params.docs_fast_digests).length) {
+    search.set('docs_fast_digests', JSON.stringify(params.docs_fast_digests));
   }
   const cursors = params.docs_cursors;
   if (cursors && Object.keys(cursors).length > 0) {
@@ -415,6 +498,8 @@ export async function pullSync(params: {
   if (params.docs_scope_revision) {
     search.set('docs_scope_revision', params.docs_scope_revision);
   }
+  if (params.include_docs_project_digests) search.set('include_docs_project_digests', '1');
+  if (params.docs_project_fast_baseline) search.set('docs_project_fast_baseline', '1');
   const suffix = search.toString() ? `?${search.toString()}` : '';
   try {
     const response = await fetchApi<SyncPullResponse>(

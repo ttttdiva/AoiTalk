@@ -1127,7 +1127,7 @@ class ClaudeCLIBackend(CLIBackendBase):
         except (json.JSONDecodeError, TypeError):
             data = None
         if isinstance(data, dict):
-            self.set_last_usage(data.get("usage"))
+            self.set_last_usage(data.get("usage"), usage_key=f"claude:{self._usage_invocation_id}:result")
             if "result" in data:
                 return str(data.get("result") or "")
 
@@ -1141,7 +1141,7 @@ class ClaudeCLIBackend(CLIBackendBase):
                 continue
             if event_type != "result":
                 continue
-            self.set_last_usage(event.get("usage"))
+            self.set_last_usage(event.get("usage"), usage_key=f"claude:{self._usage_invocation_id}:result")
             if "result" in event:
                 result_text = str(event.get("result") or "")
 
@@ -1215,7 +1215,10 @@ class ClaudeCLIBackend(CLIBackendBase):
             self._handle_tool_result_line(event, event_callback)
             return
         if event_type == "result":
-            self.set_last_usage(event.get("usage"))
+            usage_key = f"claude:{self._usage_invocation_id}:result"
+            usage = self.set_last_usage(event.get("usage"), usage_key=usage_key)
+            if usage is not None:
+                event_callback("status_update", {"status": "claude_turn_completed", "usage_key": usage_key, "usage": usage})
             self._flush_pending_assistant_texts(
                 event_callback,
                 final_text=str(event.get("result") or ""),

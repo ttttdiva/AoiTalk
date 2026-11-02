@@ -338,6 +338,14 @@ def run_server_action_supervisor(
             pass
         return 1
     finally:
+        try:
+            final_row = journal.get(run_id)
+            if final_row is not None and final_row.get("status") in {"succeeded", "failed", "cancelled"}:
+                journal.cleanup_run_artifacts(run_id, owner_user_id=final_row.get("owner_user_id"))
+        except Exception:
+            # A changed/reparse/reference-ambiguous tree is intentionally
+            # preserved for the ownership-aware cleanup inventory.
+            pass
         journal.close()
 
 

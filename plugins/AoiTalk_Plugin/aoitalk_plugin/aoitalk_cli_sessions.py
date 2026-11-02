@@ -14,7 +14,7 @@ import unicodedata
 from typing import Annotated, Any, Literal
 
 import httpx
-from pydantic import Field
+from pydantic import Field, StrictBool
 
 from . import aoitalk, aoitalk_auth
 
@@ -850,20 +850,29 @@ async def aoitalk_cli_session_send(
     session_id: SessionId,
     message: Annotated[str, Field(min_length=1, max_length=MAX_MESSAGE_CHARS)],
     idempotency_key: Annotated[str, Field(min_length=1, max_length=128)],
+    muse_tool_loop_opt_in: StrictBool = False,
 ) -> dict[str, Any]:
-    """Submit one raw user message to a durable CLI session using its idempotency key."""
+    """Submit one raw user message; Muse scoped tools require explicit opt-in."""
     state = {"session_id": session_id, "idempotency_key": idempotency_key}
     attempted = False
     try:
+        if type(muse_tool_loop_opt_in) is not bool:
+            raise CliSessionError(
+                "invalid_input", detail="muse_tool_loop_opt_in must be a boolean"
+            )
         sid = _session_id(session_id)
         raw = _bounded_text(message, "message", MAX_MESSAGE_CHARS, allow_newlines=True)
         key = _key(idempotency_key)
+        body: dict[str, Any] = {"message": raw, "idempotency_key": key}
+        # Keep the legacy wire body when opt-in is absent or explicitly false.
+        if muse_tool_loop_opt_in is True:
+            body["muse_tool_loop_opt_in"] = True
 
         async def send(client: CliSessionClient) -> dict[str, Any]:
             nonlocal attempted
             attempted = True
             _, data = await client.call("POST", f"/api/cli-sessions/{sid}/messages",
-                                        json={"message": raw, "idempotency_key": key},
+                                        json=body,
                                         headers={"Idempotency-Key": key})
             return _public_success(data, session_id=sid, idempotency_key=key)
 

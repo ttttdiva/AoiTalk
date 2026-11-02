@@ -29,13 +29,8 @@ from ..memory.models import (
     PersonaOperatorAssignment,
     Project,
 )
-from .agent_team_v3 import (
-    AGENT_TEAM_CAPABILITY_CATALOG,
-    AGENT_TEAM_DEFAULT_TEAMS,
-AGENT_TEAM_SUBAGENT_CATALOG,
-    agent_team_v3_subagents,
-    agent_team_v3_teams,
-)
+from .agent_capabilities import AGENT_CAPABILITY_CATALOG
+from .agent_revision_v2 import revision_tool_ids
 from .project_permissions import normalize_project_member_permissions
 from ..features import Features
 
@@ -119,7 +114,7 @@ def _required_project_permission(capability: str | None) -> str:
 
     normalized = str(capability or "").strip()
     normalized = _AUTHORITY_CAPABILITY_ALIASES.get(normalized, normalized)
-    item = AGENT_TEAM_CAPABILITY_CATALOG.get(normalized) or {}
+    item = AGENT_CAPABILITY_CATALOG.get(normalized) or {}
     return "write" if item.get("access") == "write" else "read"
 
 
@@ -154,7 +149,7 @@ def _scope_capabilities(scope: Any) -> tuple[set[str] | None, bool]:
     if not isinstance(raw, (list, tuple, set, frozenset)):
         return set(), True
     values = {str(item).strip() for item in raw if str(item).strip()}
-    if any(item not in AGENT_TEAM_CAPABILITY_CATALOG for item in values):
+    if any(item not in AGENT_CAPABILITY_CATALOG for item in values):
         return set(), True
     return values, True
 
@@ -171,54 +166,51 @@ class AgentAuthorityResolver:
         value = manager.get_session()
         return await value if inspect.isawaitable(value) else value
 
-    def _teams(self) -> dict[str, dict[str, Any]]:
-        result = {str(key): dict(value) for key, value in AGENT_TEAM_DEFAULT_TEAMS.items()}
-        try:
-            for item in agent_team_v3_teams(self.config):
-                if isinstance(item, Mapping) and item.get("team_id"):
-                    team = dict(item)
-                    result[str(team["team_id"])] = team
-        except Exception:
-            pass
-        return result
+    @staticmethod
+    def _revision_capabilities(_revision: AgentRevision) -> set[str]:
+        """Return the neutral capability definitions available to a revision.
 
-    def _team_capabilities(self, revision: AgentRevision) -> set[str]:
-        teams = self._teams()
-        team = teams.get(str(revision.agent_team_id or ""))
-        if not team or not team.get("enabled", True):
-            return set()
-        subagents = {str(item.get("subagent_id")): item for item in agent_team_v3_subagents(self.config, include_disabled=True) if isinstance(item, Mapping)}
-        if not subagents:
-            subagents = dict(AGENT_TEAM_SUBAGENT_CATALOG)
-        # The employee Team is a code-owned opt-in definition available to
-        # identity revisions even on installations with older saved topology.
-        # An explicit configured override (including disabled) still wins.
-        subagents.setdefault("employee_operator", AGENT_TEAM_SUBAGENT_CATALOG["employee_operator"])
-        # Personal private adapters are likewise a code-owned opt-in built-in.
-        # Only the dedicated manual Team includes this Subagent by default;
-        # an explicit configured entry (including disabled/narrowed caps) wins.
-        subagents.setdefault(
-            "personal_private_adapter",
-            AGENT_TEAM_SUBAGENT_CATALOG["personal_private_adapter"],
-        )
-        result: set[str] = set()
-        allowed_subagents = {
-            str(item).strip()
-            for item in (revision.allowed_subagent_ids or [])
-            if str(item).strip()
+        Team membership and Subagent topology are historical revision fields.
+        The live grant ceiling is the revision's own capability list, which is
+        intersected with this catalog by :meth:`resolve`.
+        """
+
+        return set(AGENT_CAPABILITY_CATALOG)
+
+    @staticmethod
+    def _revision_tool_capabilities(revision: AgentRevision) -> set[str] | None:
+        """Project the exact v2 tool policy to capability families.
+
+        ``None`` keeps concrete tool-group IDs (for example ``browser`` or
+        ``chat_default``) as a presentation narrowing handled by the tool
+        registry. Capability IDs and concrete tools with a known catalog
+        family still narrow authority here, while the revision ceiling below
+        remains the upper bound.
+        """
+
+        ids = revision_tool_ids(revision)
+        if ids is None:
+            return None
+        capabilities = {
+            item for item in ids if item in AGENT_CAPABILITY_CATALOG
         }
-        for subagent_id in team.get("subagent_ids") or []:
-            if str(subagent_id) not in allowed_subagents:
-                continue
-            item = subagents.get(str(subagent_id)) or {}
-            if item.get("enabled") is False:
-                continue
-            result.update(
-                str(capability)
-                for capability in item.get("capability_ids") or []
-                if str(capability) in AGENT_TEAM_CAPABILITY_CATALOG
-            )
-        return result
+        try:
+            from ..llm.tool_policy import agent_capability_ids_for_tool
+
+            for item in ids:
+                capabilities.update(
+                    capability
+                    for capability in agent_capability_ids_for_tool(item)
+                    if capability in AGENT_CAPABILITY_CATALOG
+                )
+        except Exception:
+            # Tool-policy loading is optional for read-only authority checks;
+            # the stored capability ceiling remains authoritative.
+            pass
+        # Empty explicit lists mean no concrete Agent tools. An unrecognised
+        # non-empty group remains a registry-level narrowing, so do not turn
+        # it into a false authority denial here.
+        return capabilities if capabilities or not ids else None
 
     @staticmethod
     def _policy_capabilities(policy: Any, key: str) -> set[str] | None:
@@ -227,12 +219,12 @@ class AgentAuthorityResolver:
         value = policy.get(key)
         if not isinstance(value, (list, tuple, set)):
             return set()
-        if any(str(item).strip() not in AGENT_TEAM_CAPABILITY_CATALOG for item in value):
+        if any(str(item).strip() not in AGENT_CAPABILITY_CATALOG for item in value):
             return set()
         return {
             str(item).strip()
             for item in value
-            if str(item).strip() in AGENT_TEAM_CAPABILITY_CATALOG
+            if str(item).strip() in AGENT_CAPABILITY_CATALOG
         }
 
     @staticmethod
@@ -275,6 +267,7 @@ class AgentAuthorityResolver:
     async def resolve(
         self,
         *,
+        session: Any | None = None,
         agent_id: Any,
         revision_id: Any | None = None,
         project_id: Any | None = None,
@@ -287,6 +280,7 @@ class AgentAuthorityResolver:
         harness_execution_scope: Any | None = None,
         external_action_approved: bool | None = None,
         external_action_policy: Any | None = None,
+        _backend_execution_without_agent_tools: bool = False,
     ) -> AuthorityDecision:
         aid = _parse_uuid(agent_id)
         rid = _parse_uuid(revision_id)
@@ -308,9 +302,11 @@ class AgentAuthorityResolver:
                 return AuthorityDecision(False, agent_id=str(aid), requested_capability=requested, deny_reasons=(reason,))
         if revision_id not in (None, "") and rid is None:
             return AuthorityDecision(False, agent_id=str(aid), requested_capability=requested, deny_reasons=("invalid_revision",))
-        if requested and requested_catalog_capability not in AGENT_TEAM_CAPABILITY_CATALOG:
+        if requested and requested_catalog_capability not in AGENT_CAPABILITY_CATALOG:
             return AuthorityDecision(False, agent_id=str(aid), agent_revision_id=str(rid) if rid else None, requested_capability=requested, deny_reasons=("unknown_capability",))
-        session = await self._session()
+        owns_session = session is None
+        if owns_session:
+            session = await self._session()
         try:
             agent = await session.get(Agent, aid)
             if agent is None:
@@ -338,7 +334,7 @@ class AgentAuthorityResolver:
                     reasons.append("organization_policy_denied")
                 if requested in {"external_action", "external_publish", "media_publish"} and organization.policy_json.get("allow_external_actions") is False:
                     reasons.append("organization_external_actions_denied")
-            if requested in {"external_action_propose", "telephony_control"}:
+            if requested == "external_action_propose":
                 if not (Features.virtual_company() and Features.autonomous_agent_runtime()):
                     reasons.append("employee_runtime_disabled")
                 employee_policy = getattr(organization, "policy_json", None)
@@ -346,22 +342,23 @@ class AgentAuthorityResolver:
                     reasons.append("organization_policy_denied")
                 if not isinstance(employee_policy, Mapping) or employee_policy.get("allow_external_actions") is not True:
                     reasons.append("organization_external_actions_denied")
-                if requested == "telephony_control" and not (Features.voice_input() and Features.tts_output()):
-                    reasons.append("telephony_disabled")
             if revision is not None:
                 revision_caps = {
                     str(item).strip()
                     for item in (revision.capability_ceiling_json or [])
-                    if str(item).strip() in AGENT_TEAM_CAPABILITY_CATALOG
+                    if str(item).strip() in AGENT_CAPABILITY_CATALOG
                 }
-                team_caps = self._team_capabilities(revision)
-                effective = revision_caps & team_caps if revision_caps else set()
+                catalog_caps = self._revision_capabilities(revision)
+                effective = revision_caps & catalog_caps if revision_caps else set()
+                v2_tool_caps = self._revision_tool_capabilities(revision)
+                if v2_tool_caps is not None and not _backend_execution_without_agent_tools:
+                    effective &= v2_tool_caps
                 org_policy = getattr(organization, "policy_json", None) if organization else None
                 org_caps = self._policy_capabilities(org_policy, "allowed_capabilities")
                 if isinstance(org_policy, Mapping) and "allowed_capabilities" in org_policy:
                     raw_org_caps = org_policy.get("allowed_capabilities")
                     if not isinstance(raw_org_caps, (list, tuple, set)) or any(
-                        str(item).strip() not in AGENT_TEAM_CAPABILITY_CATALOG
+                        str(item).strip() not in AGENT_CAPABILITY_CATALOG
                         for item in raw_org_caps
                     ):
                         reasons.append("organization_policy_invalid")
@@ -619,7 +616,7 @@ class AgentAuthorityResolver:
                             str(item).strip()
                             for item in (assignment.capability_ceiling_json or [])
                             if str(item).strip()
-                            in AGENT_TEAM_CAPABILITY_CATALOG
+                            in AGENT_CAPABILITY_CATALOG
                         }
                         if persona_caps:
                             effective &= persona_caps
@@ -652,20 +649,20 @@ class AgentAuthorityResolver:
                     )
             if tool_capabilities is not None:
                 raw_tool = {str(item).strip() for item in tool_capabilities if str(item).strip()}
-                if any(item not in AGENT_TEAM_CAPABILITY_CATALOG for item in raw_tool):
+                if any(item not in AGENT_CAPABILITY_CATALOG for item in raw_tool):
                     reasons.append("invalid_tool_capabilities")
-                effective &= raw_tool & set(AGENT_TEAM_CAPABILITY_CATALOG)
+                effective &= raw_tool & set(AGENT_CAPABILITY_CATALOG)
             if harness_capabilities is not None:
                 raw_harness = {str(item).strip() for item in harness_capabilities if str(item).strip()}
-                if any(item not in AGENT_TEAM_CAPABILITY_CATALOG for item in raw_harness):
+                if any(item not in AGENT_CAPABILITY_CATALOG for item in raw_harness):
                     reasons.append("invalid_harness_capabilities")
-                effective &= raw_harness & set(AGENT_TEAM_CAPABILITY_CATALOG)
+                effective &= raw_harness & set(AGENT_CAPABILITY_CATALOG)
             if external_action_approved is False or (
                 requested in {"external_action", "external_publish", "media_publish"}
                 and external_action_approved is not True
             ):
                 reasons.append("external_action_approval_required")
-            if requested_catalog_capability in AGENT_TEAM_CAPABILITY_CATALOG and AGENT_TEAM_CAPABILITY_CATALOG[requested_catalog_capability].get("access") == "write" and not Features.autonomous_agent_runtime():
+            if requested_catalog_capability in AGENT_CAPABILITY_CATALOG and AGENT_CAPABILITY_CATALOG[requested_catalog_capability].get("access") == "write" and not Features.autonomous_agent_runtime():
                 reasons.append("autonomous_runtime_disabled")
             # Re-evaluate organization scope lists after Persona inference has
             # filled project/space IDs.  The first pass intentionally skips
@@ -686,8 +683,8 @@ class AgentAuthorityResolver:
                     reasons.append(f"organization_{permission_scope}_permission_denied")
             if requested_catalog_capability and requested_catalog_capability not in effective:
                 reasons.append("capability_denied")
-            if requested_catalog_capability in AGENT_TEAM_CAPABILITY_CATALOG:
-                catalog_entry = AGENT_TEAM_CAPABILITY_CATALOG[requested_catalog_capability]
+            if requested_catalog_capability in AGENT_CAPABILITY_CATALOG:
+                catalog_entry = AGENT_CAPABILITY_CATALOG[requested_catalog_capability]
                 if catalog_entry.get("access") == "write" and not Features.autonomous_agent_runtime():
                     reasons.append("autonomous_runtime_disabled")
                 family = str(catalog_entry.get("family") or "")
@@ -710,7 +707,8 @@ class AgentAuthorityResolver:
                 deny_reasons=tuple(dict.fromkeys(reasons)),
             )
         finally:
-            await session.close()
+            if owns_session:
+                await session.close()
 
 
 async def resolve_agent_authority(*args: Any, **kwargs: Any) -> AuthorityDecision:

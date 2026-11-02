@@ -2,7 +2,7 @@
 
 CrowdWorks案件は通常のCrowdWorks担当が探索・採算評価・応募まで担う。
 Web制作・アプリ開発案件は、応募前の実現性評価と受注後の実開発を
-専門Agent（既存 Agent / AgentRevision / Team / Execution Profile）へ割り当てる。
+専門Agentの role route へ割り当てる。
 ここでは分類・社員定義・実行ルート解決・開発環境probeだけを持ち、
 独自のエージェント基盤やschedulerは持たない。
 """
@@ -34,23 +34,14 @@ WORKER_LABELS = {
     "general": "一般作業",
 }
 
-# Capabilities a development AgentWork item declares.  They come from the
-# existing Team capability catalog (App Development Team / code_implementer).
+# Capabilities a development AgentWork item declares.  They are the explicit
+# revision/tool ceiling used by the specialist lane.
 DEVELOPMENT_CAPABILITIES = ("workspace_read", "workspace_write", "command_execute")
 SPECIALIST_CAPABILITY_CEILING = (
     "workspace_read",
     "workspace_write",
     "command_execute",
 )
-SPECIALIST_TEAM_ID = "app_development"
-SPECIALIST_SUBAGENTS = (
-    "code_explorer",
-    "architecture_planner",
-    "code_implementer",
-    "code_reviewer",
-)
-
-
 def normalize_worker_kind(value: Any) -> str:
     kind = str(value or "general").strip().lower().replace("-", "_")
     kind = LEGACY_WORKER_KIND_ALIASES.get(kind, kind)
@@ -162,8 +153,8 @@ def development_harness_settings(
     """Build Agent Harness settings for one client workspace.
 
     The deployment-owned harness settings (binaries, sandbox, stall timeout)
-    are reused.  Only the model selected by the specialist's Execution Profile
-    is layered on top, and repository hooks are dropped because they belong to
+    are reused.  Only the model selected by the specialist's AgentRevision
+    role route is layered on top, and repository hooks are dropped because they belong to
     the AoiTalk worktree lifecycle, not to customer projects.
     """
 
@@ -185,11 +176,11 @@ def development_harness_settings(
         if role == "code_worker" and mode == "mutate":
             plan = DevelopmentRunnerPlan("local_agent_task", provider, codex.model, codex.reasoning_effort, "deployment_codex_native_worker")
         else:
-            plan = DevelopmentRunnerPlan("codex_exec", provider, codex.model, codex.reasoning_effort, "execution_profile")
+            plan = DevelopmentRunnerPlan("codex_exec", provider, codex.model, codex.reasoning_effort, "agent_revision_route")
     elif provider == "claude-cli":
         codex = replace(codex, runner="claude_code")
         claude = replace(claude, model=model or claude.model, reasoning_effort=effort or claude.reasoning_effort)
-        plan = DevelopmentRunnerPlan("claude_code", provider, claude.model, claude.reasoning_effort, "execution_profile")
+        plan = DevelopmentRunnerPlan("claude_code", provider, claude.model, claude.reasoning_effort, "agent_revision_route")
     elif provider in {"openai_compatible_local", "ollama"}:
         # Local OSS routes must use the existing LocalAgentTaskRunner.  Never
         # translate them into the deployment's Codex/Claude CLI runner: that
@@ -200,7 +191,7 @@ def development_harness_settings(
             provider,
             model,
             effort,
-            "execution_profile",
+            "agent_revision_route",
         )
     else:
         from ..agent_model_routing import AgentModelRouteError
@@ -286,8 +277,6 @@ __all__ = [
     "LEGACY_WORKER_KIND_ALIASES",
     "SPECIALISTS",
     "SPECIALIST_CAPABILITY_CEILING",
-    "SPECIALIST_SUBAGENTS",
-    "SPECIALIST_TEAM_ID",
     "SpecialistSpec",
     "WORKER_KINDS",
     "WORKER_LABELS",

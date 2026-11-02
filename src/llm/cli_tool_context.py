@@ -30,7 +30,6 @@ from .tool_policy import (
 ENTRY_TOOL_NAMES: tuple[str, ...] = (
     LOAD_TOOL_PACK_TOOL_NAME,
     "media_assistant",
-    "agent_team_delegate",
     "web_search",
     "bm25_search",
     "search_files",

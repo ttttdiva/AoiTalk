@@ -14,7 +14,7 @@ import yaml
 
 DEFAULT_CONFIG_YAML = r"""
 default_character: シビュラ
-app_config_schema_version: 2
+app_config_schema_version: 3
 llm_model: gpt-5.6-luna
 llm_provider: openai
 llm_provider_visibility:
@@ -29,6 +29,11 @@ openai:
   prompt_cache_retention: ''
   data_sharing_incentive_enabled: false
   usage_tier: tier_1_2
+  usage_api:
+    refresh_seconds: 180
+    unavailable_margin_ratio: 0.15
+  provider_circuit:
+    probe_interval_minutes: 15
   billing_scope_id: ''
 sglang:
   auto_start: true
@@ -299,6 +304,9 @@ model_routing:
     image_mode: auto
     video_mode: auto
   overrides: {}
+model_roles:
+  version: 0
+  roles: {}
 mage_vl:
   enabled: true
   managed: true
@@ -316,168 +324,14 @@ mage_vl:
   num_frames: 32
   max_pixels: 150000
   max_new_tokens: 256
-agent_team:
-  schema_version: 3
-  orchestration_mode: standard
-  delegation_enabled: false
-  teams:
-    general:
-      team_id: general
-      name: General
-      description: AoiTalkの通常利用を担う常用Team。
-      enabled: true
-      sort_order: 10
-      activation:
-        mode: always
-        contexts: []
-      subagent_ids:
-      - general_worker
-      - general_researcher
-      - docs_operator
-      - project_operator
-      - workspace_operator
-      execution_profiles: {}
-    app_development:
-      team_id: app_development
-      name: App Development
-      description: アプリ開発の探索、設計、実装、レビュー。
-      enabled: true
-      sort_order: 20
-      activation:
-        mode: contextual
-        contexts:
-        - app_development
-      subagent_ids:
-      - code_explorer
-      - architecture_planner
-      - code_implementer
-      - code_reviewer
-      - employee_operator
-      execution_profiles: {}
-  subagents:
-    general_worker:
-      subagent_id: general_worker
-      name: 汎用作業
-      description: 特定分野へ固定しない一般作業。比較、整理、要約、補助調査、小規模なファイル作業等。
-      instructions: 特定分野へ固定せず、比較、整理、要約、補助調査、小規模なファイル作業等を行う。CLI Agentを選択した場合はnative toolsを利用可能。
-      enabled: true
-      capability_ids: [workspace_read, workspace_write, repo_map, aoi_tools]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: write
-      allow_cli_native_tools: true
-    general_researcher:
-      subagent_id: general_researcher
-      name: 汎用調査
-      description: Web・Workspace を直接調査し、Docs/Project は専用 operator へ委譲する横断調査。
-      instructions: Web検索とWorkspace/repo mapのread-only調査を行う。DocsやProject/Tasksの詳細は docs_operator / project_operator への委譲を前提とし、自分で high-level Docs/Project tools を直接使わない。根拠を添えて報告する。
-      enabled: true
-      capability_ids: [workspace_read, repo_map, web_read, aoi_tools]
-      scalable: true
-      default_instances: 1
-      max_instances: 6
-      max_workspace_access: read
-      allow_cli_native_tools: true
-    docs_operator:
-      subagent_id: docs_operator
-      name: Docs操作
-      description: Docsノードの検索、読み取り、整理、再構成、更新。
-      instructions: AoiTalk high-level Docs toolsのみ使用する。AoiTalk DBを直接触らせない。canonical nodeを確認し、曖昧な対象を推測して更新せず、書き込み前に対象を確認する。
-      enabled: true
-      capability_ids: [docs_read, docs_write]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: none
-      allow_cli_native_tools: false
-    project_operator:
-      subagent_id: project_operator
-      name: 案件・タスク操作
-      description: Projects、Tasks、Calendar、WBS、Record Tables、課題・案件情報などProject管理系AoiTalk dataを扱う。
-      instructions: Projects、Tasks、Calendar、WBS、Record Tables、課題管理、案件情報等をAoiTalk high-level tools経由で確認・更新する。タスクを新規作成する前に対象Projectの既存タスクをsearch_task_candidates（必要ならsearch付き）で確認し、詳細が必要な候補だけget_taskで開く。parent_task_id階層を尊重する。明確な既存root/containerが同じ成果を包含する場合はそのsubtaskにし、適切なrootがなければ同一目的を1つのrootと実行可能なsubtasksにまとめる。独立成果だけを別rootにする。タイトルの曖昧な類似だけで統合せず、横断的な関連や依存をparent/child containmentと混同せず、重複containerを作らない。Project更新はmanaged AoiTalk toolsで行い、filesystem/native writeは使わない。
-      enabled: true
-      capability_ids: [project_read, project_write, aoi_tools]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: read
-      allow_cli_native_tools: false
-    workspace_operator:
-      subagent_id: workspace_operator
-      name: Workspace操作
-      description: Workspaces、ファイラー上のファイル認識、ファイル検索、ファイル読込、ファイル操作、整理、必要な変更を行う。
-      instructions: 割り当てられたWorkspaceのファイル認識、検索、読込、複数ファイル操作、整理、必要な変更を行う。CLI providerの場合はnative filesystem/search/edit/shell等を利用可能。
-      enabled: true
-      capability_ids: [workspace_read, workspace_write, repo_map, command_execute, aoi_tools]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: write
-      allow_cli_native_tools: true
-    code_explorer:
-      subagent_id: code_explorer
-      name: コード調査
-      description: コードベース、依存関係、データフロー、既存実装等を調査するread-only Subagent。
-      instructions: コードベース、依存関係、データフロー、既存実装を調査し、ファイルを変更しない。
-      enabled: true
-      capability_ids: [workspace_read, repo_map]
-      scalable: true
-      default_instances: 1
-      max_instances: 6
-      max_workspace_access: read
-      allow_cli_native_tools: true
-    architecture_planner:
-      subagent_id: architecture_planner
-      name: 設計
-      description: 実装方針、責務境界、影響範囲等を整理するread-only Subagent。
-      instructions: 実装方針、責務境界、影響範囲等を整理し、実装計画を提案する。
-      enabled: true
-      capability_ids: [workspace_read, repo_map]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: read
-      allow_cli_native_tools: true
-    code_implementer:
-      subagent_id: code_implementer
-      name: 実装
-      description: 実際にWorkspaceで変更を行うSubagent。
-      instructions: 割り当てられた変更をWorkspace sandboxで実装する。API providerではAoiTalk Workspace mutation tools、CLI providerではCLI native filesystem/search/shell/edit/test/build等を利用する。
-      enabled: true
-      capability_ids: [workspace_read, workspace_write, repo_map, command_execute, aoi_tools]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: write
-      allow_cli_native_tools: true
-    code_reviewer:
-      subagent_id: code_reviewer
-      name: コードレビュー
-      description: diff、コード、関連状態をread-onlyでレビューする。
-      instructions: diff、コード、関連状態をread-onlyでレビューし、実行可能な指摘だけを報告する。存在することと毎回自動起動することは別である。
-      enabled: true
-      capability_ids: [workspace_read, repo_map]
-      scalable: true
-      default_instances: 1
-      max_instances: 4
-      max_workspace_access: read
-      allow_cli_native_tools: true
-    employee_operator:
-      subagent_id: employee_operator
-      name: 社員業務
-      description: 管理者が設定した自動化と電話受付を担当する。
-      instructions: 承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。
-      enabled: true
-      capability_ids: [external_action_propose, telephony_control]
-      scalable: false
-      default_instances: 1
-      max_instances: 1
-      max_workspace_access: none
-      allow_cli_native_tools: false
 integrations:
   spotify:
     enabled: false
+crowdworks:
+  evaluation_fallback:
+    # Retry only quota-budget denials from the pinned sol evaluation route.
+    enabled: true
+    model: gpt-5.6-luna
 external_model_privacy:
   # Personal installations preserve the historical direct transport path.
   # Enterprise overlays may override this to protected without changing the
@@ -498,12 +352,20 @@ external_model_privacy:
   raw_media_policy: block
   cache_enabled: true
 
+browser:
+  # local: the dedicated Edge profile managed by this server (default).
+  # bridge: a PC Bridge on another PC (optional, see pc_bridge.remote_enabled).
+  backend: local
+
 browser_agent:
   enabled: true
   jev_enabled: true
   dedicated_enabled: false
   max_steps: 24
   timeout_seconds: 300
+
+pc_bridge:
+  remote_enabled: false
 
 cloud_advisor:
   # New capability is opt-in. Existing Personal/Enterprise behavior is
@@ -525,7 +387,6 @@ routing_profiles:
     display_name: 無料Team
     enabled: true
     main_pool_id: coordinator
-    agent_team_enabled: true
     max_fallbacks: 6
 search:
   provider: openai
@@ -636,6 +497,9 @@ voice_sessions:
     segment_max_chars: 180
     segment_max_wait_ms: 450
     queue_depth: 2
+live_voice:
+  openai_realtime:
+    daily_spend_cap_usd: 1.0
 apps:
   enabled: true
   actions:
@@ -643,6 +507,7 @@ apps:
     # server or PC target until an operator has configured and enabled one.
     enabled: false
     execution_targets: {}
+    local_saved_actions: []
   managed_tool_promotion:
     # Agent-generated managed scripts are server-owned and may be promoted to
     # Apps only after independent successful observations.  The runtime
@@ -746,6 +611,10 @@ cli_development_sessions:
     allowed_permission_modes:
     - native_default
 
+# Muse native link remains opt-in until its real-device acceptance is complete.
+muse_chat:
+  native_link: false
+
 decision_layer:
   jev_free_team_routing_enabled: true
   jev_free_team_shadow_mode: false
@@ -761,6 +630,11 @@ agentic_completion:
   autonomous_work_max_rounds: 120
   review_max_rounds: 2
   project_progress_max_rounds: 120
+runtime:
+  # One typed Agent chat_turn keeps a shared request/tool budget across its
+  # generation, review, and continuation callbacks.
+  agent_run_max_total_tokens: 200000
+  agent_run_max_tool_calls: 24
 mcp_enabled: false
 mcp:
   servers:
@@ -1122,6 +996,17 @@ mobile_ui:
 def load_default_config() -> Dict[str, Any]:
     sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", DEFAULT_CONFIG_YAML)
     config = yaml.safe_load(sanitized) or {}
+    # P5 no longer seeds the retired Team/Director/Subagent envelope or
+    # Execution Profiles.  Existing persisted values are archived by
+    # ``app_config_store`` before these branches are removed.
+    config.pop("agent_team", None)
+    config.pop("execution_profiles", None)
+    routing_profiles = config.get("routing_profiles")
+    free_team = routing_profiles.get("free-team") if isinstance(routing_profiles, dict) else None
+    if isinstance(free_team, dict):
+        free_team.pop("agent_team_enabled", None)
+        free_team.pop("llm_profiles", None)
+    config["app_config_schema_version"] = 3
     # User/Project Files semantic index (search.files_index).  The canonical
     # default lives beside its validator; existing DB rows receive the new
     # branch through the store's missing-key default fill without touching
@@ -1131,21 +1016,6 @@ def load_default_config() -> Dict[str, Any]:
     search_defaults = config.setdefault("search", {})
     if isinstance(search_defaults, dict):
         search_defaults.setdefault("files_index", default_files_index_settings())
-    # Keep the built-in Team Execution Profile catalog in the canonical Agent
-    # Team seed.  The same additive helper is applied during App Config
-    # migration for existing v3 rows, so fresh and saved configurations share
-    # identical IDs/routes without allowing later deletions to be resurrected.
-    try:
-        from .services.agent_team_v3 import seed_agent_team_execution_profile_presets
-
-        agent_team = config.get("agent_team")
-        if isinstance(agent_team, dict):
-            config["agent_team"] = seed_agent_team_execution_profile_presets(agent_team)
-    except Exception:
-        # Defaults must remain loadable during minimal bootstrap/import checks;
-        # App Config migration will retry canonical seeding once services are
-        # available.
-        pass
     # Keep the persisted seed profile-independent while projecting the
     # Enterprise default to protected transport at bootstrap.  Existing DB
     # values (including an explicit Personal ``direct`` choice) are handled

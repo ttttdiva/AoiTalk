@@ -5,7 +5,7 @@ import React, {
   useMemo,
   useRef,
 } from "react";
-import { Animated, FlatList, View } from "react-native";
+import { Animated, FlatList, Pressable, View } from "react-native";
 import { Button, Chip, ProgressBar, Surface, Text } from "react-native-paper";
 import type { AgentRun, ConversationMessage } from "../../../types/api";
 import { findAddedTimelineItemIds, timelineItemIds } from "../animations";
@@ -17,6 +17,7 @@ import { StreamingMessageRow } from "./StreamingMessageRow";
 import { chatScreenStyles as styles } from "./chat-screen.styles";
 import { useChatWaveTouchGuard } from "./chat-wave-touch-context";
 import type { OperationsWorkReference } from "../../../lib/operations-api";
+import { useChatTimelineFollow } from "./useChatTimelineFollow";
 
 const noop = () => undefined;
 const noopMessage = (_message: ConversationMessage) => undefined;
@@ -33,6 +34,24 @@ const EmptyTimeline = React.memo(function EmptyTimeline() {
 function timelineItemKey(item: TimelineItem): string {
   return item.id;
 }
+
+export const ChatTimelineJumpToLatest = React.memo(function ChatTimelineJumpToLatest({
+  onPress,
+}: {
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      testID="chat-timeline-jump-to-latest"
+      accessibilityRole="button"
+      accessibilityLabel="一番下へ移動。最新のメッセージを表示"
+      onPress={onPress}
+      style={({ pressed }) => [styles.jumpToLatest, pressed && styles.jumpToLatestPressed]}
+    >
+      <Text style={styles.jumpToLatestText}>↓ 最新へ</Text>
+    </Pressable>
+  );
+});
 
 const TimelineItemTransition = React.memo(function TimelineItemTransition({
   animate,
@@ -195,6 +214,7 @@ export type ChatTimelineProps = {
   onMessageRender?: (messageId: string) => void;
   listRef?: React.RefObject<FlatList<TimelineItem> | null>;
   header?: React.ReactElement | null;
+  sessionKey?: string;
 };
 
 export const ChatTimeline = React.memo(function ChatTimeline({
@@ -230,8 +250,18 @@ export const ChatTimeline = React.memo(function ChatTimeline({
   onMessageRender,
   listRef,
   header = null,
+  sessionKey = "",
 }: ChatTimelineProps) {
   conversationPerformanceDiagnostics.recordRender("ChatTimeline");
+  const internalListRef = useRef<FlatList<TimelineItem> | null>(null);
+  const timelineListRef = listRef ?? internalListRef;
+  const follow = useChatTimelineFollow({
+    listRef: timelineListRef,
+    sessionKey,
+    itemCount: items.length,
+    streamContent,
+    reduceMotion,
+  });
   const previousIdsRef = useRef<Set<string> | null>(null);
   const addedIds = useMemo(
     () => findAddedTimelineItemIds(previousIdsRef.current, items),
@@ -253,16 +283,16 @@ export const ChatTimeline = React.memo(function ChatTimeline({
       const index = items.findIndex(
         (item) => item.type === "message" && item.message.id === messageId,
       );
-      if (index < 0 || !listRef?.current) return null;
+      if (index < 0 || !timelineListRef.current) return null;
       return setTimeout(() => {
-        listRef.current?.scrollToIndex({
+        timelineListRef.current?.scrollToIndex({
           index,
           animated: true,
           viewPosition,
         });
       }, 64);
     },
-    [items, listRef],
+    [items, timelineListRef],
   );
   const scrollMessageIntoView = useCallback(
     (messageId: string) => {
@@ -382,27 +412,36 @@ export const ChatTimeline = React.memo(function ChatTimeline({
   );
 
   return (
-    <FlatList
-      testID="chat-timeline"
-      ref={listRef}
-      data={items}
-      keyExtractor={timelineItemKey}
-      renderItem={renderItem}
-      keyboardShouldPersistTaps="handled"
-      keyboardDismissMode="interactive"
-      contentContainerStyle={styles.messageList}
-      ListHeaderComponent={header}
-      ListHeaderComponentStyle={header ? styles.timelineHeader : undefined}
-      ListEmptyComponent={EmptyTimeline}
-      ListFooterComponent={footer}
-      onScrollBeginDrag={onDismissMessageActions}
-      onTouchStart={onDismissMessageActions}
-      onScrollToIndexFailed={({ index, averageItemLength }) => {
-        listRef?.current?.scrollToOffset({
-          animated: true,
-          offset: Math.max(0, averageItemLength * Math.max(0, index - 1)),
-        });
-      }}
-    />
+    <View style={styles.timelineContainer}>
+      <FlatList
+        testID="chat-timeline"
+        ref={timelineListRef}
+        data={items}
+        keyExtractor={timelineItemKey}
+        renderItem={renderItem}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="interactive"
+        contentContainerStyle={styles.messageList}
+        ListHeaderComponent={header}
+        ListHeaderComponentStyle={header ? styles.timelineHeader : undefined}
+        ListEmptyComponent={EmptyTimeline}
+        ListFooterComponent={footer}
+        onScroll={follow.onScroll}
+        onLayout={follow.onLayout}
+        onContentSizeChange={follow.onContentSizeChange}
+        scrollEventThrottle={16}
+        onScrollBeginDrag={onDismissMessageActions}
+        onTouchStart={onDismissMessageActions}
+        onScrollToIndexFailed={({ index, averageItemLength }) => {
+          timelineListRef.current?.scrollToOffset({
+            animated: true,
+            offset: Math.max(0, averageItemLength * Math.max(0, index - 1)),
+          });
+        }}
+      />
+      {follow.showJumpToLatest ? (
+        <ChatTimelineJumpToLatest onPress={follow.scrollToLatest} />
+      ) : null}
+    </View>
   );
 });

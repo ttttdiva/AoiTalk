@@ -11,9 +11,19 @@ import re
 from dotenv import load_dotenv
 
 from ..security.secret_env import load_secret_environment
+from src.runtime_release_contract import is_runtime_release_active
 
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+_source_root = Path(__file__).resolve().parents[2]
+_runtime_config_root = (
+    os.environ.get("AOITALK_RUNTIME_CONFIG_ROOT", "").strip()
+    if is_runtime_release_active(_source_root)
+    else ""
+)
+_dotenv_root = Path(_runtime_config_root) if _runtime_config_root else _source_root
+if _runtime_config_root and not _dotenv_root.is_absolute():
+    raise ValueError("AOITALK_RUNTIME_CONFIG_ROOT must be absolute")
+load_dotenv(_dotenv_root / ".env")
 load_secret_environment()
 
 

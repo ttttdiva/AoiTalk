@@ -14,7 +14,7 @@ import { useNetworkStore } from "../stores/network";
 import { runSync } from "../sync/engine";
 
 const OUTBOX_LABELS: Record<OutboxSyncState, string> = {
-  empty: "なし", pending: "未送信の更新あり", retrying: "再試行待ち", failed: "確認が必要な更新あり",
+  empty: "なし", pending: "未送信の更新あり", retrying: "再試行待ち", failed: "送信できない更新あり",
 };
 const STATUS_LABELS: Record<SyncStatus, string> = {
   idle: "待機中", pending: "送信待ち", syncing: "同期中", success: "完了", partial: "一部失敗", error: "失敗",
@@ -27,6 +27,7 @@ const STAGE_LABELS: Record<SyncStage, string> = {
   "pending-clips": "保留中のクリップ",
   "clip-targets": "クリップ対象",
   profiles: "プロファイル",
+  finalizing: "完了処理",
 };
 const DOCS_SCOPE_LABELS: Record<SyncDocsScope, string> = {
   personal: "個人",
@@ -40,8 +41,8 @@ const OUTCOME_LABELS: Record<SyncOutcome, string> = {
   aborted: "中断",
 };
 const REASONS: Record<OutboxDiagnostic["errorKind"], string> = {
-  conflict: "サーバー上の変更と競合しています。採用する変更の確認が必要です。",
-  missing_entity: "サーバーに対象が見つかりません。端末の更新は保持しています。",
+  conflict: "サーバー版に自動でそろえます。端末の内容は記録に残します。",
+  missing_entity: "サーバーに対象がありません。端末の内容を記録に残して取り下げます。",
   scope: "保存先または権限を確認してください。",
   missing_base: "サーバーの更新版を確認する必要があります。",
   server_error: "サーバーが操作を受理できませんでした。",

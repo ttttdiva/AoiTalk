@@ -9,28 +9,103 @@ final delivery is always a human action.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
 
-from ...memory.models import AgentRun, AgentRevision
+from ...memory.models import AgentRun, AgentRevision, AgentWorkItem
 from ...memory.models.operations import EngagementOpportunity, ExternalAction
 from ..agent_model_routing import AgentModelRouteError, load_pinned_agent_pins
 from ..agent_work_runtime import ExecutionOutcome, WorkCandidate
-from .client_development import CrowdWorksDevelopmentAdapter, development_candidate
+from .client_development import (
+    CrowdWorksDevelopmentAdapter, development_candidate, development_source_revision,
+)
 from .crowdworks_specialists import (
     DEVELOPMENT_WORKER_KINDS,
     GENERAL_WORKER_KINDS,
     is_development_kind,
     normalize_worker_kind,
 )
-from .crowdworks_workflow import CrowdWorksWorkflowService
+from .crowdworks_execution import CrowdWorksExecutionService
 
 
 # ``code`` remains registered only so work items materialized before the
 # specialist split can still settle through the development lane.
 WORKER_KINDS = GENERAL_WORKER_KINDS
+
+
+async def _accepted_development_recovery(session, opportunity, kind, *, claim_work_id=None):
+    """Validate the latest explicit retry against its original terminal attempt."""
+    metadata = dict(opportunity.metadata_json or {})
+    epoch = metadata.get("development_recovery_revision")
+    receipts = metadata.get("development_recovery_receipts")
+    development = metadata.get("development")
+    if (type(epoch) is not int or epoch < 1 or not isinstance(receipts, list)
+        or not isinstance(development, dict)
+        or development.get("worker_kind") not in (None, "", kind)):
+        return False
+    if development.get("status") == "uncertain":
+        return False
+    if claim_work_id is None and development.get("status") != "retry_requested":
+        return False
+    if claim_work_id is not None and development.get("work_item_id") not in (None, "", str(claim_work_id)):
+        return False
+    matching = [r for r in receipts if isinstance(r, dict) and type(r.get("revision")) is int and r["revision"] == epoch]
+    if len(matching) != 1:
+        return False
+    receipt = matching[0]
+    request = receipt.get("request")
+    previous = receipt.get("previous_development")
+    if (not receipt.get("idempotency_key") or not isinstance(request, dict)
+        or not isinstance(previous, dict) or previous.get("status") == "uncertain"):
+        return False
+    try:
+        work_id = UUID(str(request.get("work_item_id")))
+        run_id = UUID(str(request.get("run_id")))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    work = await session.get(AgentWorkItem, work_id)
+    run = await session.get(AgentRun, run_id)
+    if work is None or run is None:
+        return False
+    if (work.source_type != "marketplace_crowdworks_fulfillment"
+        or work.source_id != str(opportunity.id) or work.project_id != opportunity.project_id
+        or work.intent_key != f"marketplace.crowdworks.develop:{kind}"
+        or work.execution_adapter != f"crowdworks_development_{kind}"
+        or (work.metadata_json or {}).get("worker_kind") != kind
+        or run.work_item_id != work.id or run.project_id != opportunity.project_id
+        or (run.user_id is not None and str(run.user_id) != str(opportunity.owner_user_id))
+        or run.agent_id != work.assigned_agent_id or run.agent_revision_id != work.agent_revision_id
+        or work.state not in {"failed", "cancelled", "blocked", "dead_letter"}
+        or run.status not in {"failed", "cancelled", "blocked"}
+        or receipt.get("work_state") != work.state or receipt.get("run_status") != run.status
+        or any(getattr(work, f) is not None for f in ("lease_owner", "lease_token", "lease_expires_at", "active_agent_run_id"))):
+        return False
+    old_opportunity = SimpleNamespace(
+        source_snapshot_hash=opportunity.source_snapshot_hash,
+        metadata_json={**metadata, "development_recovery_revision": epoch - 1},
+    )
+    if work.source_revision != development_source_revision(old_opportunity, kind, agent_revision_id=str(work.agent_revision_id)):
+        return False
+    for field, expected in (("opportunity_id", str(opportunity.id)), ("project_id", str(opportunity.project_id or "")),
+                            ("work_item_id", str(work.id)), ("agent_run_id", str(run.id)),
+                            ("source_revision", work.source_revision), ("worker_kind", kind)):
+        if previous.get(field) not in (None, "") and str(previous[field]) != expected:
+            return False
+    latest = await session.scalar(select(AgentRun).where(AgentRun.work_item_id == work.id)
+        .order_by(AgentRun.work_item_attempt.desc(), AgentRun.created_at.desc(), AgentRun.id.desc()).limit(1))
+    if latest is None or latest.id != run.id:
+        return False
+    others = (await session.scalars(select(AgentWorkItem).where(
+        AgentWorkItem.source_type == work.source_type, AgentWorkItem.source_id == work.source_id,
+        AgentWorkItem.intent_key == work.intent_key, AgentWorkItem.id != work.id))).all()
+    return not any(item.created_at > work.created_at or item.state in {
+        "pending", "claimed", "running", "retry_wait", "uncertain", "awaiting_approval"
+    } or any(getattr(item, f) is not None for f in (
+        "lease_owner", "lease_token", "lease_expires_at", "active_agent_run_id"
+    )) for item in others if str(item.id) != str(claim_work_id or ""))
 
 
 class CrowdWorksFulfillmentWorkSource:
@@ -58,10 +133,13 @@ class CrowdWorksFulfillmentWorkSource:
                 .order_by(ExternalAction.created_at.desc())
                 .limit(1)
             )
-            if action is None:
-                continue
             metadata = dict(opportunity.metadata_json or {})
             kind = normalize_worker_kind(metadata.get("worker_kind"))
+            if action is None and not (
+                is_development_kind(kind)
+                and await _accepted_development_recovery(session, opportunity, kind)
+            ):
+                continue
             if is_development_kind(kind):
                 candidate = await development_candidate(
                     session, opportunity, kind, source_type=self.source_type
@@ -123,6 +201,16 @@ class CrowdWorksFulfillmentWorkSource:
         if opportunity.status != "contract_accepted":
             return False
         if is_development_kind(kind):
+            action = await session.scalar(select(ExternalAction.id).where(
+                ExternalAction.opportunity_id == opportunity.id,
+                ExternalAction.action_type == "engagement.submit_application",
+                ExternalAction.status == "succeeded",
+                ExternalAction.origin_agent_id.is_not(None),
+            ).limit(1))
+            if action is None and not await _accepted_development_recovery(
+                session, opportunity, kind, claim_work_id=work_item_id,
+            ):
+                return False
             return claim.intent_key in {
                 f"marketplace.crowdworks.develop:{kind}",
                 "marketplace.crowdworks.fulfill:code",
@@ -163,7 +251,7 @@ class CrowdWorksFulfillmentAdapter:
         except AgentModelRouteError as exc:
             return ExecutionOutcome(classification="blocked", error_code=exc.code, domain_ref=str(opportunity.id))
         owner_user_id = str(opportunity.owner_user_id)
-        service = CrowdWorksWorkflowService(config=self.config)
+        service = CrowdWorksExecutionService(config=self.config)
         metadata = dict(opportunity.metadata_json or {})
         selected_kind = normalize_worker_kind(metadata.get("worker_kind") or self.worker_kind)
         try:
@@ -173,13 +261,10 @@ class CrowdWorksFulfillmentAdapter:
                 opportunity_id=opportunity.id,
                 worker_kind=selected_kind,
                 pins=pins,
+                work_item_id=str(getattr(claim, "work_item_id", "") or "") or None,
             )
-            metadata = dict(opportunity.metadata_json or {})
-            metadata["review_work_item_id"] = str(getattr(claim, "work_item_id", "") or "") or None
-            opportunity.metadata_json = metadata
-            await session.commit()
         except AgentModelRouteError as exc:
-            # Invalid Team/Profile/Subagent configuration: retrying cannot fix
+            # Invalid AgentRevision role route: retrying cannot fix
             # it and falling back to Base Model is forbidden.
             return ExecutionOutcome(classification="blocked", error_code=exc.code, domain_ref=str(opportunity.id))
         except Exception as exc:

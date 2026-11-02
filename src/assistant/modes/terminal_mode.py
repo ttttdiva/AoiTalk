@@ -76,7 +76,6 @@ from ...services.agent_run_service import (
     reset_current_agent_run_id,
     set_current_agent_run_id,
 )
-from ...services.agent_team_service import agent_team_orchestration_mode
 from ...services.outbound_privacy_service import OutboundPrivacyGateway
 from ...services.semantic_citation import safe_verified_media_read_url
 from ...services.turn_context import (
@@ -94,6 +93,95 @@ logger = logging.getLogger(__name__)
 _NATIVE_AGENT_CLI_PROVIDERS = frozenset(
     {"claude-cli", "codex-cli", "grok-cli", "antigravity-cli"}
 )
+
+
+def _dialogue_run_needs_human_continuation_target(
+    dialogue_role: str, dialogue_metadata: Mapping[str, Any]
+) -> bool:
+    """Only the Root Run that relays a Human answer carries a continuation target.
+
+    The Run that receives the Worker's result (``delivery_kind="response"``)
+    inherits ``source_human_answered`` from the Dialogue but has no target, so
+    requiring one rejected it and left the Dialogue without its receipt.
+    """
+
+    return (
+        dialogue_role == "root"
+        and dialogue_metadata.get("source_human_answered") is True
+        and not dialogue_metadata.get("delivery_kind")
+    )
+
+
+def _dialogue_control_turn_note(dialogue_metadata: Mapping[str, Any]) -> str:
+    """Tell the Root that an owner control already reached the Worker.
+
+    ``apply_agent_dialogue_control`` delivers the owner's instruction to the
+    Worker itself; without this the Root sends the same instruction again.
+    """
+
+    if (
+        dialogue_metadata.get("root_control_turn") is not True
+        or dialogue_metadata.get("resume_answer") is True
+    ):
+        return ""
+    return (
+        "[AgentDialogue control]\n"
+        f"Dialogue {dialogue_metadata.get('dialogue_id')}: this instruction has already "
+        "been delivered to the Worker. Do not call send_agent_work_message, delegate or "
+        "any other tool for it. Reply in one short sentence that the Worker is handling "
+        "it and end this turn; the Worker's result will arrive as a separate delivery."
+    )
+
+
+def _dialogue_worker_turn_note(
+    dialogue_metadata: Mapping[str, Any], verified_refs: Mapping[str, Any] | None = None
+) -> str:
+    """State the Worker's own role; a delegated brief often talks about "the Worker"."""
+
+    refs = verified_refs if isinstance(verified_refs, Mapping) else {}
+    graph = refs.get("team_graph_compiled")
+    if isinstance(graph, Mapping):
+        leader = graph.get("leader")
+        if (
+            refs.get("receiver_role") == "worker"
+            and isinstance(leader, Mapping)
+            and str(leader.get("agent_id") or "") == str(refs.get("receiver_agent_id") or "")
+            and str(leader.get("revision_id") or "") == str(refs.get("receiver_agent_revision_id") or "")
+        ):
+            constraints = {key: graph.get(key) for key in ("roster", "allowed_pairs", "edges", "external_handoffs")}
+            kind = refs.get("team_graph_execution_kind")
+            if kind is None:
+                kind = "generic"
+            if kind in ("generic", "software_code"):
+                coordination = "Use the advertised delegate_plan tool and its actual schema to coordinate the fixed Graph roster and constraints below."
+            elif kind in ("media_image", "media_video"):
+                coordination = "Use the advertised delegate_media tool and its actual schema to coordinate the fixed Graph roster and constraints below."
+            else:
+                coordination = f"Report the unsupported Graph execution kind {kind!r} to the Root; do not delegate."
+            return (
+                "[AgentDialogue Graph leader]\n"
+                f"You are the Graph leader of Dialogue {dialogue_metadata.get('dialogue_id')}. "
+                f"{coordination} "
+                "Do not infer a tool from the purpose or substitute another tool. The server "
+                "checks current authority and eligibility for each delegation. After a "
+                "delegation is accepted, end this model turn with a short started acknowledgement; "
+                "background work continues and a verified host return will resume you. Do not "
+                "sleep, busy-poll, loop on status, or claim completion while children are running. "
+                "Return the finished result to the Root. If you cannot continue without an answer, "
+                "call ask_agent_work_question once using its actual schema only if it is advertised "
+                "and authorized; otherwise do not call or retry it, but "
+                "report the needed answer to the Root as data. Do not invent a tool, "
+                "control, or grant.\n"
+                + json.dumps(constraints, ensure_ascii=False)
+            )
+    return (
+        "[AgentDialogue worker]\n"
+        f"You are the Worker of Dialogue {dialogue_metadata.get('dialogue_id')}. Do the "
+        "requested work yourself and give the finished result as your final message; no "
+        "other Worker will do it and there is nothing to wait for. If you cannot continue "
+        "without an answer, call ask_agent_work_question once; this turn then ends and "
+        "the answer arrives as a new message."
+    )
 
 
 def _request_owned_agent_provider_stop(provider: Any) -> Any:
@@ -600,6 +688,7 @@ async def _append_completed_media_read_tool_results(
 # 維持するため、ここで再 export する。
 from .agent_run_events import (  # noqa: F401
     AgentRunEventEmitter,
+    AgentRunStartUpdateError,
     AGENT_RUN_DELEGATION_TOOL_SUBAGENTS,
     _DOCS_SEARCH_HIT_RE,
     _PROVIDER_MODEL_KEYS,
@@ -1036,13 +1125,22 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         *,
         agent_execution: Any | None = None,
     ) -> asyncio.Lock:
-        if agent_execution is None:
+        # Session-backed ordinary Chat also runs through a request-local
+        # session client (including the P4 Aoi revision overlay).  Keeping
+        # those turns on the legacy process-wide lock lets one long tool loop
+        # hold every conversation behind it.  Only calls without a durable
+        # conversation identity still need the compatibility lock.
+        key = str(session_id or "__default__").strip()
+        if not key or key == "__default__":
             return self._chat_turn_lock
-        key = str(session_id or "__default__").strip() or "__default__"
-        lock = self._chat_turn_locks.get(key)
+        locks = getattr(self, "_chat_turn_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._chat_turn_locks = locks
+        lock = locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._chat_turn_locks[key] = lock
+            locks[key] = lock
         return lock
 
     def _get_chat_turn_persistence(self, llm_client=None) -> ChatTurnPersistence:
@@ -1747,6 +1845,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
         persisted_agent_run = None
         dialogue_metadata: dict[str, Any] = {}
         dialogue_continuation_target: AgentDialogueContinuationTarget | None = None
+        dialogue_control_note = ""
         initial_root_binding_failure_code = None
         setup_cleanup_done = False
         response_model_cache_use = None
@@ -1818,7 +1917,9 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     raw_setup_code = str(
                         getattr(error, "code", "") or ""
                     ).strip().casefold()
-                    if raw_setup_code.startswith("agent_route_"):
+                    if raw_setup_code.startswith("agent_run_scope_"):
+                        setup_error_code = raw_setup_code
+                    elif raw_setup_code.startswith("agent_route_"):
                         setup_error_code = raw_setup_code
                     elif raw_setup_code.startswith("interactive_admission_"):
                         setup_error_code = raw_setup_code
@@ -1835,6 +1936,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             if isinstance(error, asyncio.CancelledError)
                             else setup_error_code or "Agent setup failed"
                         ),
+                        error_code=setup_error_code or None,
                     )
                     if inspect.isawaitable(result):
                         await _await_setup_cleanup(result)
@@ -1904,6 +2006,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             try:
                 from ...services.chat_execution_adapter import (
                     build_agent_chat_turn_client,
+                    persist_interactive_native_run_route,
                     preflight_chat_agent_native_provider,
                     refresh_initial_aoidots_root_proof,
                     resolve_chat_agent_execution,
@@ -1944,10 +2047,13 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     dialogue_role = str(
                         dialogue_metadata.get("role") or ""
                     ).strip().casefold()
-                    root_human_answer = (
-                        dialogue_role == "root"
-                        and dialogue_metadata.get("source_human_answered") is True
+                    root_human_answer = _dialogue_run_needs_human_continuation_target(
+                        dialogue_role, dialogue_metadata
                     )
+                    if dialogue_role == "root":
+                        dialogue_control_note = _dialogue_control_turn_note(
+                            dialogue_metadata
+                        )
                     dialogue_continuation_target = (
                         AgentDialogueContinuationTarget.from_mapping(
                             dialogue_metadata.get("continuation_target")
@@ -1972,6 +2078,12 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             dialogue_id=str(dialogue_metadata.get("dialogue_id")),
                         )
                     )
+                    if dialogue_role == "worker":
+                        # This marker was built by the server from the locked
+                        # Dialogue and its verified authorization at handoff.
+                        dialogue_control_note = _dialogue_worker_turn_note(
+                            dialogue_metadata, dialogue_metadata
+                        )
                     dialogue_metadata = {
                         **dialogue_metadata,
                         "source_human": human_anchor.get("refs"),
@@ -2027,6 +2139,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         run=persisted_agent_run,
                         config=getattr(self, "config", None),
                         run_id=str(agent_run_id),
+                        session_route_override=response_model,
                         dialogue_role=(
                             str(dialogue_metadata.get("role") or "").strip().casefold()
                             or None
@@ -2098,6 +2211,11 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             route_provider,
                             allow_host_probe=native_preflight_host_allowed,
                         )
+                        await persist_interactive_native_run_route(
+                            agent_run_service_for_binding,
+                            str(agent_run_id),
+                            agent_execution,
+                        )
                         issued_agent_scope = await issue_interactive_agent_run_scope(
                             run_id=str(agent_run_id),
                             work_item_id=str(
@@ -2155,7 +2273,9 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             session_id=str(session_id),
                             agent_id=str(agent_execution.agent_id),
                             provider_id=route_provider,
-                            model_id=route_model,
+                            # A remote route such as muse-remote has no model id;
+                            # the workspace only needs a stable label for it.
+                            model_id=route_model or route_provider,
                             run_id=str(agent_run_id),
                             owner_id=str(
                                 (persisted_agent_run or {}).get("user_id")
@@ -2208,6 +2328,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             run=persisted_agent_run,
                             config=getattr(self, "config", None),
                             run_id=str(agent_run_id),
+                            session_route_override=response_model,
                             workspace=agent_dialogue_workspace,
                             dialogue_role=(
                                 str(dialogue_metadata.get("role") or "").strip().casefold()
@@ -2256,7 +2377,9 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             agent_dialogue_workspace.project_id
                         )
                     try:
-                        llm_client = await asyncio.to_thread(
+                        from ...services.scoped_agent_work_turn import build_chat_client_with_frozen_preflight
+
+                        llm_client = await build_chat_client_with_frozen_preflight(
                             build_agent_chat_turn_client,
                             source_client,
                             getattr(self, "config", None),
@@ -2334,6 +2457,22 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     .startswith("agent_dialogue_budget_")
                     else ""
                 )
+                scope_error_code = (
+                    str(getattr(exc, "code", "") or "").strip().casefold()
+                    if str(getattr(exc, "code", "") or "")
+                    .strip()
+                    .casefold()
+                    .startswith("agent_run_scope_")
+                    else ""
+                )
+                anchor_error_code = ""
+                if isinstance(exc, AgentChatAdmissionError):
+                    code = str(getattr(exc, "code", "") or "").strip().casefold()
+                    if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", code) and (
+                        code.startswith(("dialogue_source_human_", "dialogue_worker_provenance_"))
+                        or code in {"dialogue_worker_run_invalid", "dialogue_worker_run_not_found"}
+                    ):
+                        anchor_error_code = code
                 admission_failure_code = ""
                 if (
                     agent_run_id
@@ -2482,6 +2621,49 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             agent_run_id,
                             exc_info=True,
                         )
+                if agent_run_id and anchor_error_code:
+                    try:
+                        await agent_run_service_for_binding.fail_run(
+                            agent_run_id,
+                            anchor_error_code,
+                            result={
+                                "source": "agent_dialogue_anchor_setup",
+                                "safe_error_code": anchor_error_code,
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to terminalize AgentDialogue anchor setup: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                    try:
+                        await agent_run_service_for_binding.persist_agent_dialogue_failure_message(
+                            agent_run_id,
+                            anchor_error_code,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist AgentDialogue anchor failure receipt: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
+                if agent_run_id and scope_error_code:
+                    try:
+                        await agent_run_service_for_binding.fail_run(
+                            agent_run_id,
+                            scope_error_code,
+                            result={
+                                "source": "interactive_agent_scope_setup",
+                                "safe_error_code": scope_error_code[:96],
+                            },
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to terminalize scope-denied interactive Agent run: %s",
+                            agent_run_id,
+                            exc_info=True,
+                        )
                 raise
         llm_message = build_message_with_attachment_context(
             message,
@@ -2499,6 +2681,8 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                 llm_message,
                 dialogue_continuation_target,
             )
+        if dialogue_control_note:
+            llm_message = f"{llm_message}\n\n{dialogue_control_note}"
         chat_persistence = (
             ChatTurnPersistence(getattr(llm_client, "memory_manager", None))
             if agent_execution is not None
@@ -2630,7 +2814,7 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
 
             agent_tool_scope_token = set_current_agent_tool_scope(
                 agent_execution.binding.capability_ceiling,
-                allowed_subagent_ids=agent_execution.binding.allowed_subagent_ids,
+                tool_ids=agent_execution.binding.tool_ids,
                 revalidate=_revalidate_agent_tool,
             )
             dialogue_id = str(dialogue_metadata.get("dialogue_id") or "").strip()
@@ -2902,6 +3086,31 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
             initial_root_binding_failure_code = (
                 "interactive_admission_human_persistence_unavailable"
             )
+
+        if agent_execution is not None:
+            # Personal deadline draft exposure is attached only after this
+            # turn has the canonical persisted user-message identity. This
+            # common point covers both dispatches with a pre-persisted row and
+            # direct WebSocket turns whose row was just saved above.
+            from ...services.chat_execution_adapter import (
+                activate_personal_deadline_current_turn_tool_after_persist,
+            )
+
+            try:
+                await activate_personal_deadline_current_turn_tool_after_persist(
+                    llm_client,
+                    agent_execution,
+                    config=getattr(self, "config", None),
+                    session_id=str(session_id or ""),
+                    project_id=project_id,
+                )
+            except Exception:
+                # Optional personal tooling must never break ordinary Agent
+                # Chat when the private profile, gate, or DB is unavailable.
+                logger.debug(
+                    "Personal deadline current-turn tool setup was skipped",
+                    exc_info=True,
+                )
 
         pending_titles: list = []
 
@@ -3320,11 +3529,6 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     handler_client_assigned = agent_execution is None
                 turn_user_context_snapshot = None
                 prompt_history: list[dict[str, str]] = []
-                orchestration_mode = (
-                    "standard"
-                    if agent_execution is not None
-                    else agent_team_orchestration_mode(getattr(self, "config", None))
-                )
                 if llm_client:
                     if suppress_automatic_context:
                         # Clear any provider-local history left by a preceding
@@ -3377,10 +3581,35 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             )
                         if turn_response_handler:
                             turn_response_handler.character_name = session_character_name
-                    if (
-                        orchestration_mode != "director"
-                        or suppress_automatic_context
-                    ) and (session_id or suppress_automatic_context):
+                    if agent_execution is not None:
+                        # ``set_character`` rebuilds the provider agent and
+                        # clears its isolated prompt on several adapters. The
+                        # Agent revision text must remain layered with the
+                        # selected Character for this turn.
+                        from ...llm.harness_instructions import (
+                            with_common_harness_instructions,
+                        )
+
+                        isolated_setter = getattr(
+                            llm_client,
+                            "set_isolated_system_prompt",
+                            None,
+                        )
+                        if callable(isolated_setter):
+                            isolated_setter(
+                                with_common_harness_instructions(
+                                    agent_execution.system_prompt
+                                )
+                            )
+                        else:
+                            setter = getattr(llm_client, "set_system_prompt", None)
+                            if callable(setter):
+                                setter(
+                                    with_common_harness_instructions(
+                                        agent_execution.system_prompt
+                                    )
+                                )
+                    if session_id or suppress_automatic_context:
                         chat_persistence.apply_prompt_history_to_client(
                             llm_client,
                             session_id=session_id,
@@ -3453,315 +3682,6 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                         planning_policy=planning_policy,
                     )
                     planning_scope_cm.__enter__()
-
-                if orchestration_mode == "director" and not suppress_automatic_context:
-                    from ...llm.director_controller import DirectorTurnController
-
-                    director_streaming = bool(
-                        self.web_interface
-                        and hasattr(self.web_interface, "broadcast_stream_event")
-                    )
-
-                    async def _director_stream_callback(
-                        event_type: str,
-                        data: dict,
-                    ) -> None:
-                        if not director_streaming:
-                            return
-                        event_data = _enrich_agent_run_event_payload(
-                            getattr(self, "config", None),
-                            dict(data),
-                        )
-                        if session_id:
-                            event_data["session_id"] = session_id
-                        if agent_run_id:
-                            event_data["agent_run_id"] = agent_run_id
-                        safe_event_data = sanitize_stream_display_payload(
-                            event_type,
-                            event_data,
-                        )
-                        try:
-                            result = self.web_interface.broadcast_stream_event(
-                                event_type,
-                                safe_event_data,
-                            )
-                            if inspect.isawaitable(result):
-                                await result
-                        except Exception as exc:
-                            print(
-                                "[TerminalMode] Director進捗イベント送信エラー: "
-                                f"{exc}"
-                            )
-
-                    project_name = str(project_id or "").strip() or "未選択"
-                    director_project_metadata: dict[str, Any] = {}
-                    trusted_parent_context = None
-                    qa_browser_coordinator = None
-                    qa_playwright = None
-                    try:
-                        from ...services.agent_run_scope_service import (
-                            TRUSTED_PARENT_CONTEXT_KEY,
-                            create_parent_run_context_from_config,
-                            resolve_trusted_parent_run_context,
-                        )
-                        from ...services.project_context import get_runtime_project_context
-
-                        runtime_context = get_runtime_project_context()
-                        candidate_context = (
-                            runtime_context
-                            if isinstance(runtime_context, dict)
-                            else director_project_metadata
-                        )
-                        if isinstance(candidate_context, dict):
-                            trusted_parent_context = resolve_trusted_parent_run_context(
-                                candidate_context.get(TRUSTED_PARENT_CONTEXT_KEY),
-                                parent_run_id=agent_run_id,
-                            )
-                    except Exception as exc:
-                        # A malformed/untrusted marker must never widen the
-                        # Director run.  It simply leaves publication/scope
-                        # integration disabled for this legacy turn.
-                        print(
-                            "[TerminalMode] Director parent scope markerを"
-                            f"無視しました: {exc}"
-                        )
-                    if trusted_parent_context is None and agent_run_id:
-                        try:
-                            # The production Director entrypoint may create a
-                            # parent scope only from its dedicated trusted
-                            # setting.  Project ``workspace_root`` and model
-                            # text are intentionally never considered here.
-                            trusted_parent_context = (
-                                create_parent_run_context_from_config(
-                                    getattr(self, "config", None),
-                                    parent_run_id=agent_run_id,
-                                )
-                            )
-                        except Exception as exc:
-                            # An absent/invalid explicit repository setting
-                            # keeps ordinary Director reads available; any
-                            # write-capable worker will fail closed in the
-                            # runtime registry instead of widening scope.
-                            print(
-                                "[TerminalMode] Director親run scope factoryを"
-                                f"利用できません: {exc}"
-                            )
-                    resolver = getattr(llm_client, "_resolve_project_context", None)
-                    if callable(resolver):
-                        try:
-                            resolved_project = resolver()
-                            if inspect.isawaitable(resolved_project):
-                                resolved_project = await resolved_project
-                            if isinstance(resolved_project, dict):
-                                # Director's graph resolver consumes the
-                                # existing project context as read-only data;
-                                # do not infer context from Team IDs.
-                                director_project_metadata = dict(resolved_project)
-                                project_name = str(
-                                    resolved_project.get("name")
-                                    or resolved_project.get("title")
-                                    or resolved_project.get("id")
-                                    or project_name
-                                )
-                                if trusted_parent_context is None:
-                                    trusted_parent_context = resolve_trusted_parent_run_context(
-                                        resolved_project.get(TRUSTED_PARENT_CONTEXT_KEY),
-                                        parent_run_id=agent_run_id,
-                                    )
-                        except Exception as exc:
-                            print(
-                                "[TerminalMode] Director用プロジェクト名の解決を"
-                                f"スキップしました: {exc}"
-                            )
-                    # QA Browser is an explicit parent setting.  It is never
-                    # inferred from Project/model text and is not started for
-                    # ordinary Director conversations.  When enabled, the
-                    # parent owns Playwright/profile/transport and injects
-                    # only the opaque capability facade into the Operator.
-                    try:
-                        config_value = getattr(getattr(self, "config", None), "get", None)
-                        config_obj = getattr(self, "config", None)
-
-                        def _qa_config_value(key: str, default: Any = None) -> Any:
-                            value = None
-                            if callable(config_value):
-                                try:
-                                    value = config_value(key, None)
-                                except TypeError:
-                                    value = config_value(key)
-                            if value is not None:
-                                return value
-                            raw = (
-                                config_obj
-                                if isinstance(config_obj, dict)
-                                else getattr(config_obj, "config", None)
-                            )
-                            current = raw
-                            for part in key.split("."):
-                                if not isinstance(current, dict) or part not in current:
-                                    return default
-                                current = current[part]
-                            return current
-
-                        qa_enabled = _qa_config_value(
-                            "agent_operator.qa_browser_enabled",
-                            False,
-                        )
-                        qa_origins = _qa_config_value(
-                            "agent_operator.qa_allowed_origins",
-                            None,
-                        )
-                        if isinstance(qa_origins, str) and "," in qa_origins:
-                            qa_origins = [
-                                item.strip() for item in qa_origins.split(",") if item.strip()
-                            ]
-                        if (
-                            str(qa_enabled).strip().lower() in {"1", "true", "yes", "on"}
-                            and trusted_parent_context is not None
-                            and qa_origins
-                        ):
-                            from playwright.async_api import async_playwright
-
-                            from ...services.qa_browser_coordinator import (
-                                create_qa_browser_coordinator,
-                            )
-
-                            qa_playwright = await async_playwright().start()
-                            qa_browser_coordinator = (
-                                await create_qa_browser_coordinator(
-                                    allowed_origins=qa_origins,
-                                    trusted_parent_context=trusted_parent_context,
-                                    playwright=qa_playwright,
-                                    role="ui_qa_worker",
-                                )
-                            )
-                    except Exception as exc:
-                        if qa_browser_coordinator is not None:
-                            try:
-                                await qa_browser_coordinator.close(
-                                    "QA Browser setup failed"
-                                )
-                            except Exception:
-                                pass
-                            qa_browser_coordinator = None
-                        if qa_playwright is not None:
-                            try:
-                                await qa_playwright.stop()
-                            except Exception:
-                                pass
-                            qa_playwright = None
-                        print(
-                            "[TerminalMode] QA Browser parent laneを"
-                            f"開始できません: {exc}"
-                        )
-                    try:
-                        controller = DirectorTurnController(
-                            config=getattr(self, "config", {}),
-                            session_id=session_id,
-                            user_id=sender_user_id,
-                            project_id=project_id,
-                            project_name=project_name,
-                            parent_run_id=agent_run_id,
-                            generation_profile=generation_profile,
-                            chat_persistence=chat_persistence,
-                            agent_run_service=agent_run_service,
-                            progress_callback=_director_stream_callback,
-                            session_context={
-                                "session_id": session_id,
-                                "generation_profile": generation_profile,
-                            },
-                            project_metadata=director_project_metadata,
-                            trusted_parent_context=trusted_parent_context,
-                            qa_browser_coordinator=qa_browser_coordinator,
-                            require_parent_scope=True,
-                        )
-                        if director_streaming:
-                            await _director_stream_callback(
-                                "stream_start",
-                                {
-                                    "status": "director",
-                                    "message": "Directorが依頼を確認しています",
-                                },
-                            )
-                        response = await controller.run(
-                            llm_message,
-                            attachments=attachments,
-                            history=prompt_history,
-                        )
-                        safe_response = await persist_assistant_reply(
-                            response,
-                            include_generation_metrics=False,
-                        )
-                        await emitter.complete(response, llm_client)
-                        if director_streaming:
-                            await _director_stream_callback(
-                                "stream_end",
-                                {"content": safe_response},
-                            )
-                        print(f"{self.character_name}: {response}")
-                        if self.web_interface and not director_streaming:
-                            self.web_interface.add_assistant_message(
-                                safe_response,
-                                session_id=session_id,
-                            )
-                        return response
-                    except asyncio.CancelledError:
-                        if director_streaming:
-                            await _director_stream_callback(
-                                "stream_cancelled",
-                                {
-                                    "status": "cancelled",
-                                    "message": "Director処理を停止しました",
-                                },
-                            )
-                        raise
-                    except Exception:
-                        if director_streaming:
-                            await _director_stream_callback(
-                                "stream_end",
-                                {
-                                    "status": "failed",
-                                    "message": "Director処理中にエラーが発生しました",
-                                },
-                            )
-                        raise
-                    finally:
-                        if qa_browser_coordinator is not None:
-                            try:
-                                await qa_browser_coordinator.close(
-                                    "Director parent turn finished"
-                                )
-                            except Exception as exc:
-                                print(
-                                    "[TerminalMode] QA Browser cleanup error: "
-                                    f"{exc}"
-                                )
-                        if qa_playwright is not None:
-                            try:
-                                await qa_playwright.stop()
-                            except Exception as exc:
-                                print(
-                                    "[TerminalMode] QA Browser Playwright cleanup error: "
-                                    f"{exc}"
-                                )
-                        if turn_response_handler:
-                            turn_response_handler.llm_client = original_handler_client
-                        if llm_client:
-                            llm_client.current_session_id = None
-                            llm_client.current_project_id = None
-                            llm_client.generation_policy = generation_policy_for_profile(
-                                None
-                            )
-                            llm_client.current_include_project_context = None
-                            llm_client.current_edit_message_id = None
-                            llm_client.current_response_model = None
-                            llm_client.current_command_capabilities = ()
-                            llm_client.current_tool_required = None
-                            llm_client.external_persistence_enabled = False
-                            restore_turn_user_context_on_client(
-                                llm_client,
-                                turn_user_context_snapshot,
-                            )
 
                 stream_callback = None
                 steering_callback = None
@@ -4952,6 +4872,32 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     provider_failure_proof if typed_provider_failure else None
                 ),
             )
+            if isinstance(e, AgentRunStartUpdateError) and stream_callback is None:
+                # 開始更新は stream callback 準備前に失敗するため、待機中の
+                # Web UI へ固定理由の終端を1回だけ返す。
+                try:
+                    broadcaster = getattr(
+                        self.web_interface,
+                        "broadcast_stream_event",
+                        None,
+                    )
+                    if callable(broadcaster):
+                        stream_end_data = {
+                            "content": safe_error_reply,
+                            "message": safe_error_reply,
+                            "status": "failed",
+                            "agent_run_id": agent_run_id,
+                            "error": e.reason,
+                        }
+                        if session_id:
+                            stream_end_data["session_id"] = session_id
+                        event = broadcaster("stream_end", stream_end_data)
+                        if inspect.isawaitable(event):
+                            await event
+                except Exception:
+                    logger.debug(
+                        "Failed to publish AgentRun start failure stream end"
+                    )
             if self.web_interface:
                 self.web_interface.add_assistant_message(
                     safe_error_reply,
@@ -4998,7 +4944,28 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                             ),
                         )
 
-                    await _await_setup_cleanup(_settle_interactive_work_after_turn())
+                    # A Work row left running after its Run ended blocks this
+                    # conversation and every Dialogue delivery sourced from it,
+                    # so one transient failure must not abandon the settlement.
+                    async def _settle_interactive_work_with_retry() -> None:
+                        for attempt in range(1, 4):
+                            try:
+                                await _settle_interactive_work_after_turn()
+                                return
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                if attempt == 3:
+                                    raise
+                                logger.warning(
+                                    "Retrying interactive Agent work settlement: run=%s attempt=%d",
+                                    agent_run_id,
+                                    attempt,
+                                    exc_info=True,
+                                )
+                                await asyncio.sleep(0.5 * attempt)
+
+                    await _await_setup_cleanup(_settle_interactive_work_with_retry())
                 except Exception:
                     logger.warning(
                         "Failed to settle interactive Agent work: run=%s",
@@ -5094,6 +5061,11 @@ class TerminalMode(TerminalCommandsMixin, BaseAssistant):
                     await human_resource_lease_context.__aexit__(None, None, None)
                 finally:
                     human_resource_lease_context = None
+            finalize_turn_identity = getattr(
+                llm_client, "finalize_turn_identity", None
+            )
+            if callable(finalize_turn_identity):
+                finalize_turn_identity()
 
     async def _cleanup_mode_specific(self):
         """Cleanup terminal mode specific resources"""

@@ -26,6 +26,9 @@ from embedding_text import (
 )
 
 MAX_REQUEST_BYTES = 128 * 1024 * 1024
+# Fixed at import from the real worker path; tests may replace this
+# constant with a fake repository root inside the OS temp area.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 model = None
 model_settings = None
 
@@ -197,13 +200,20 @@ def execute(request):
     inputs = request.get("inputs")
     if not isinstance(inputs, list) or len(inputs) > 32:
         raise ValueError("invalid_embedding_batch")
-    temporary_root = Path(
-        os.environ.get("AOITALK_EMBEDDING_TMP_DIR")
-        or Path(__file__).resolve().parents[2] / ".local/eg2-worker-media"
+    configured_tmp = os.environ.get("AOITALK_EMBEDDING_TMP_DIR")
+    temporary_root = (
+        Path(configured_tmp) if configured_tmp else Path(tempfile.gettempdir())
     )
-    temporary_root.mkdir(parents=True, exist_ok=True)
+    # Resolve before mkdir so a repo-local target (including via symlink)
+    # fails closed without creating .local or any other repo directory;
+    # mkdir and the child directory use this same checked physical path.
+    repo_root = Path(_REPO_ROOT).resolve()
+    resolved_tmp = temporary_root.resolve()
+    if resolved_tmp == repo_root or repo_root in resolved_tmp.parents:
+        raise ValueError("embedding_tmp_dir_inside_repo")
+    resolved_tmp.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
-        prefix="eg2-media-", dir=temporary_root
+        prefix="eg2-media-", dir=resolved_tmp
     ) as directory:
         if op == "validate_query" or mode == "query":
             inputs = [

@@ -83,7 +83,7 @@ async def specialist_agent_binding(
 
     Discovery/assessment may intentionally use the latest active revision.  A
     claimed AgentWork must pass ``agent_revision_id`` so an edited employee
-    cannot silently change the in-flight model/team route.
+    cannot silently change the in-flight role route.
     """
 
     spec = SPECIALISTS.get(normalize_worker_kind(worker_kind))
@@ -128,8 +128,6 @@ async def specialist_agent_binding(
         "agent_revision_id": str(revision.id),
         "display_name": revision.display_name or spec.display_name,
         "state": agent.state,
-        "agent_team_id": revision.agent_team_id,
-        "execution_profile_id": revision.execution_profile_id,
     }
 
 
@@ -232,8 +230,8 @@ async def assess_development_opportunities(
         binding = await specialist_agent_binding(session, kind)
         spec = SPECIALISTS[kind]
         # Bind this assessment to one exact revision, then use the same
-        # planner/Subagent resolver as every other Operations work phase.
-        # Missing/disabled specialists or invalid profiles must not borrow the
+        # planner role route resolver as every other Operations work phase.
+        # Missing/disabled specialists or invalid role routes must not borrow the
         # marketplace policy, active chat route or global cloud model.
         try:
             if binding is None or binding.get("state") != "active":

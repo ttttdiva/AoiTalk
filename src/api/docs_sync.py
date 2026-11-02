@@ -14,14 +14,18 @@ import json
 import logging
 import math
 import re
-from datetime import date, datetime, timezone
+from time import perf_counter
+from types import SimpleNamespace
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
-from sqlalchemy import and_, case, false, or_, select, text
+from sqlalchemy import String, and_, case, cast, false, func, literal, or_, select, text, union
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ..memory.models import (
     KnowledgeEdge,
@@ -111,6 +115,57 @@ def _docs_digest(items: list[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
+def _docs_digest_joined(joined: Optional[str]) -> str:
+    """Hash SQL-ordered digest material with the existing v2 wire algorithm."""
+
+    return hashlib.sha256((joined or "").encode("utf-8")).hexdigest()
+
+
+def _pg_docs_digest_material(signature: Any) -> Any:
+    """Build the same sorted/newline-joined material as ``_docs_digest``.
+
+    UTF-8 byte ordering under PostgreSQL's C collation matches Python's
+    lexicographic ordering for the valid UTF-8 strings used by Docs digests.
+    Keeping the final SHA-256 in Python preserves the existing digest contract.
+    """
+
+    return func.string_agg(
+        signature,
+        aggregate_order_by(literal("\n"), signature.collate("C")),
+    )
+
+
+def _pg_docs_datetime_iso(value: Any) -> Any:
+    """Match ``datetime.isoformat()`` without materializing timestamp rows."""
+
+    formatted = func.to_char(value, 'YYYY-MM-DD"T"HH24:MI:SS.US')
+    return func.coalesce(
+        func.regexp_replace(formatted, r"\.0+$", ""),
+        literal("none"),
+    )
+
+
+def _pg_docs_float_repr(value: Any) -> Any:
+    """Match Python ``repr(float)`` for PostgreSQL float columns."""
+
+    raw = cast(value, String)
+    special = case(
+        (value.is_(None), literal("None")),
+        (raw == "NaN", literal("nan")),
+        (raw == "Infinity", literal("inf")),
+        (raw == "-Infinity", literal("-inf")),
+        else_=raw,
+    )
+    return case(
+        (
+            and_(raw.not_in(("NaN", "Infinity", "-Infinity")),
+                 ~raw.like("%.%"), ~func.lower(raw).like("%e%")),
+            raw + literal(".0"),
+        ),
+        else_=special,
+    )
+
+
 def _effective_force_full(
     force_full: bool,
     client_digest: Optional[str],
@@ -135,6 +190,1002 @@ def _effective_force_full(
         and client_digest is not None
         and client_digest != current_digest
     )
+
+
+DOCS_NODE_DELTA_OVERLAP = timedelta(minutes=5)
+
+
+def _docs_delta_since(since: datetime) -> datetime:
+    """Return a replay-safe lower bound for a Docs node delta.
+
+    Mobile persists a wall-clock watermark after a successful pull.  A small
+    overlap covers clock precision/transaction ordering differences between
+    the client and PostgreSQL.  Upserts are idempotent, so replaying this
+    bounded window is safe and prevents a commit which landed just after the
+    previous request from being skipped.
+    """
+
+    return since - DOCS_NODE_DELTA_OVERLAP
+
+
+def _session_dialect_name(session: AsyncSession) -> str | None:
+    """Return the bound dialect without making a connection or leaking config."""
+
+    try:
+        return str(session.get_bind().dialect.name).lower()
+    except Exception:  # noqa: BLE001 - lightweight test doubles are unbound
+        return None
+
+
+async def _read_docs_digest(
+    session: AsyncSession,
+    statement: Any,
+    signature_for,
+    encode,
+) -> tuple[str, int, list[Any] | None]:
+    """Read a table digest without returning every row to Python on PostgreSQL."""
+
+    if _session_dialect_name(session) == "postgresql":
+        source = statement.subquery()
+        signature = signature_for(source.c)
+        row = (
+            await session.execute(
+                select(
+                    func.count().label("row_count"),
+                    _pg_docs_digest_material(signature).label("digest_material"),
+                ).select_from(source)
+            )
+        ).one()
+        return (
+            _docs_digest_joined(row.digest_material),
+            int(row.row_count or 0),
+            None,
+        )
+    rows = (await session.execute(statement)).all()
+    return _docs_digest([encode(row) for row in rows]), len(rows), rows
+
+
+def _aggregate_digest_value(value: Any) -> str:
+    """Normalize a PostgreSQL aggregate value into the opaque digest input."""
+
+    if value is None:
+        return "none"
+    return str(value)
+
+
+def _knowledge_nodes_aggregate_statement(
+    docs_library_id: UUID,
+    project_access: Any,
+    root_rank: Any,
+    *,
+    group_by_project: bool = False,
+):
+    """Build the one-row PostgreSQL fingerprint query for visible Docs nodes.
+
+    ``hashtextextended`` is PostgreSQL's native text hash and keeps the large
+    node set in the database.  Two independently seeded sums plus count and
+    min/max bounds make ordinary additions, updates, moves and deletes alter
+    the opaque token without transferring 150k ORM rows to Python.  The
+    aggregate is a change detector, not an authorization primitive: the
+    authoritative ACL revision is still checked by ``sync_routes``.
+    """
+
+    content_text = func.concat_ws(
+        ":",
+        KnowledgeNode.id,
+        KnowledgeNode.updated_at,
+        KnowledgeNode.is_explicit_blank,
+    )
+    shape_text = func.concat_ws(
+        ":",
+        KnowledgeNode.id,
+        KnowledgeNode.parent_id,
+        KnowledgeNode.root_page_id,
+        KnowledgeNode.project_id,
+        KnowledgeNode.created_by,
+        KnowledgeNode.archived_at,
+        root_rank,
+    )
+    aggregate_columns = (
+        func.count(KnowledgeNode.id).label("node_count"),
+        # PostgreSQL has no min/max aggregate for UUID; cast to its canonical
+        # textual representation so additions/deletions still shift bounds.
+        func.min(cast(KnowledgeNode.id, String)).label("min_id"),
+        func.max(cast(KnowledgeNode.id, String)).label("max_id"),
+        func.min(KnowledgeNode.updated_at).label("min_updated_at"),
+        func.max(KnowledgeNode.updated_at).label("max_updated_at"),
+        func.sum(func.hashtextextended(content_text, 0)).label("content_hash_a"),
+        func.sum(func.hashtextextended(content_text, 1)).label("content_hash_b"),
+        func.sum(func.hashtextextended(shape_text, 0)).label("shape_hash_a"),
+        func.sum(func.hashtextextended(shape_text, 1)).label("shape_hash_b"),
+    )
+    if group_by_project:
+        return select(
+            KnowledgeNode.project_id.label("scope_project_id"),
+            *aggregate_columns,
+        ).where(
+            KnowledgeNode.docs_library_id == docs_library_id,
+            project_access,
+        ).group_by(KnowledgeNode.project_id)
+    return select(*aggregate_columns).where(
+        KnowledgeNode.docs_library_id == docs_library_id,
+        project_access,
+    )
+
+
+def _knowledge_nodes_aggregate_digests(row: Any) -> tuple[str, str, int]:
+    """Convert the aggregate row into stable content/shape tokens."""
+
+    values = {
+        key: getattr(row, key, None)
+        for key in (
+            "node_count",
+            "min_id",
+            "max_id",
+            "min_updated_at",
+            "max_updated_at",
+            "content_hash_a",
+            "content_hash_b",
+            "shape_hash_a",
+            "shape_hash_b",
+        )
+    }
+    # SQLAlchemy Row supports attribute access.  Keep tuple-style support for
+    # narrow in-process doubles used by protocol tests.
+    if values["node_count"] is None and isinstance(row, (tuple, list)):
+        keys = list(values)
+        values = dict(zip(keys, row, strict=False))
+    count = int(values["node_count"] or 0)
+    content = _docs_digest(
+        [
+            "knowledge_nodes:aggregate:v1",
+            *(_aggregate_digest_value(values[key]) for key in (
+                "node_count",
+                "min_id",
+                "max_id",
+                "min_updated_at",
+                "max_updated_at",
+                "content_hash_a",
+                "content_hash_b",
+            )),
+        ]
+    )
+    shape = _docs_digest(
+        [
+            "knowledge_nodes:shape-aggregate:v1",
+            *(_aggregate_digest_value(values[key]) for key in (
+                "node_count",
+                "min_id",
+                "max_id",
+                "shape_hash_a",
+                "shape_hash_b",
+            )),
+        ]
+    )
+    return content, shape, count
+
+
+async def pull_docs_project_scope_digests(
+    session: AsyncSession,
+    *,
+    docs_library_id: UUID,
+    project_ids: list[UUID],
+    user_id: UUID,
+    library_owner_id: UUID | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Calculate all project-scope Docs table digests in a fixed query set.
+
+    This is used only by an opted-in root pull.  Project rows are grouped by
+    their canonical project discriminator so a user with many projects does
+    not repeat each table digest query once per scope.  The material encoding
+    below mirrors ``pull_docs_table`` so the returned tokens can be compared
+    directly with each v2 scope's saved authoritative digests.
+    """
+    scope_ids = sorted(set(project_ids), key=str)
+    if not scope_ids:
+        return {}
+    project_access = docs_readable_node_predicate(
+        KnowledgeNode,
+        docs_library_id=docs_library_id,
+        user_id=user_id,
+        library_owner_id=library_owner_id,
+    )
+    project_access = and_(
+        project_access,
+        KnowledgeNode.project_id.in_(scope_ids),
+        docs_node_renderable_predicate(KnowledgeNode),
+    )
+    visible_node_ids = select(KnowledgeNode.id).where(
+        KnowledgeNode.docs_library_id == docs_library_id,
+        project_access,
+    )
+    visible_tag_ids = select(KnowledgeNodeSupertag.supertag_id).where(
+        KnowledgeNodeSupertag.node_id.in_(visible_node_ids)
+    )
+    visible_field_ids = select(KnowledgeFieldValue.field_id).where(
+        KnowledgeFieldValue.node_id.in_(visible_node_ids)
+    )
+    materials: dict[str, dict[str, list[str]]] = {
+        str(project_id): {} for project_id in scope_ids
+    }
+    aggregated_digests: dict[str, dict[str, str]] = {}
+
+    async def digest_project_rows(table: str, statement: Any, signature_for) -> bool:
+        if _session_dialect_name(session) != "postgresql":
+            return False
+        started_at = perf_counter()
+        source = statement.subquery()
+        signature = signature_for(source.c)
+        result = await session.execute(
+            select(
+                source.c.scope_project_id.label("scope_project_id"),
+                func.count().label("row_count"),
+                _pg_docs_digest_material(signature).label("digest_material"),
+            )
+            .select_from(source)
+            .group_by(source.c.scope_project_id)
+        )
+        rows = result.all()
+        row_count = 0
+        for row in rows:
+            project_key = str(row.scope_project_id)
+            aggregated_digests.setdefault(project_key, {})[table] = (
+                _docs_digest_joined(row.digest_material)
+            )
+            row_count += int(row.row_count or 0)
+        if diagnostics is not None:
+            diagnostics.setdefault("tables", {})[table] = {
+                "elapsed_ms": round((perf_counter() - started_at) * 1000, 1),
+                "rows": row_count,
+                "scopes": len(rows),
+                "sql_aggregated": True,
+            }
+        return True
+
+    def add_rows(table: str, rows: list[Any], encode) -> None:
+        for row in rows:
+            project_key = str(row[0])
+            bucket = materials.get(project_key)
+            if bucket is not None:
+                bucket.setdefault(table, []).append(encode(row[1:]))
+
+    mobile_node_type = or_(
+        KnowledgeNode.node_type.is_(None),
+        KnowledgeNode.node_type.notin_(("search", "day", "system")),
+    )
+    visible_root = and_(
+        KnowledgeNode.parent_id.is_(None),
+        KnowledgeNode.archived_at.is_(None),
+        mobile_node_type,
+    )
+    root_rank = case(
+        (visible_root, 0),
+        (KnowledgeNode.parent_id.is_(None), 1),
+        else_=2,
+    )
+    node_digest_started_at = perf_counter()
+    node_rows = (
+        await session.execute(
+            _knowledge_nodes_aggregate_statement(
+                docs_library_id,
+                project_access,
+                root_rank,
+                group_by_project=True,
+            )
+        )
+    ).all()
+    node_digests: dict[str, str] = {}
+    for row in node_rows:
+        project_key = str(row.scope_project_id)
+        node_digests[project_key] = _knowledge_nodes_aggregate_digests(row)[0]
+    if diagnostics is not None:
+        diagnostics.setdefault("tables", {})["knowledge_nodes"] = {
+            "elapsed_ms": round((perf_counter() - node_digest_started_at) * 1000, 1),
+            "rows": sum(int(row.node_count or 0) for row in node_rows),
+            "scopes": len(node_rows),
+            "sql_aggregated": True,
+        }
+    empty_node_digest = _knowledge_nodes_aggregate_digests(SimpleNamespace(
+        node_count=0,
+        min_id=None,
+        max_id=None,
+        min_updated_at=None,
+        max_updated_at=None,
+        content_hash_a=None,
+        content_hash_b=None,
+        shape_hash_a=None,
+        shape_hash_b=None,
+    ))[0]
+    for project_key, bucket in materials.items():
+        bucket["knowledge_nodes"] = [node_digests.get(project_key, empty_node_digest)]
+
+    tag_node = aliased(KnowledgeNode)
+    tag_stmt = (
+        select(
+            tag_node.project_id.label("scope_project_id"),
+            KnowledgeSupertag.id.label("supertag_id"),
+            KnowledgeSupertag.updated_at.label("updated_at"),
+        )
+        .select_from(KnowledgeSupertag)
+        .join(
+            KnowledgeNodeSupertag,
+            KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
+        )
+        .join(tag_node, tag_node.id == KnowledgeNodeSupertag.node_id)
+        .where(
+            KnowledgeSupertag.docs_library_id == docs_library_id,
+            tag_node.id.in_(visible_node_ids),
+        )
+        .distinct()
+    )
+    if not await digest_project_rows(
+        "knowledge_supertags",
+        tag_stmt,
+        lambda c: cast(c.supertag_id, String) + literal(":")
+        + _pg_docs_datetime_iso(c.updated_at),
+    ):
+        tag_rows = (await session.execute(tag_stmt)).all()
+        add_rows(
+            "knowledge_supertags",
+            tag_rows,
+            lambda row: f"{row[0]}:{_digest_dt(row[1])}",
+        )
+
+    tag_field_node = aliased(KnowledgeNode)
+    field_value_node = aliased(KnowledgeNode)
+    field_from_tags = (
+        select(
+            tag_field_node.project_id.label("scope_project_id"),
+            KnowledgeField.id.label("field_id"),
+            KnowledgeField.updated_at.label("updated_at"),
+        )
+        .select_from(KnowledgeField)
+        .join(
+            KnowledgeNodeSupertag,
+            KnowledgeNodeSupertag.supertag_id == KnowledgeField.supertag_id,
+        )
+        .join(tag_field_node, tag_field_node.id == KnowledgeNodeSupertag.node_id)
+        .where(
+            KnowledgeField.docs_library_id == docs_library_id,
+            tag_field_node.id.in_(visible_node_ids),
+            KnowledgeField.supertag_id.in_(visible_tag_ids),
+        )
+    )
+    field_from_values = (
+        select(
+            field_value_node.project_id.label("scope_project_id"),
+            KnowledgeField.id.label("field_id"),
+            KnowledgeField.updated_at.label("updated_at"),
+        )
+        .select_from(KnowledgeField)
+        .join(
+            KnowledgeFieldValue,
+            KnowledgeFieldValue.field_id == KnowledgeField.id,
+        )
+        .join(field_value_node, field_value_node.id == KnowledgeFieldValue.node_id)
+        .where(
+            KnowledgeField.docs_library_id == docs_library_id,
+            field_value_node.id.in_(visible_node_ids),
+            KnowledgeField.id.in_(visible_field_ids),
+        )
+    )
+    fields_stmt = union(field_from_tags, field_from_values)
+    if not await digest_project_rows(
+        "knowledge_fields",
+        fields_stmt,
+        lambda c: cast(c.field_id, String) + literal(":")
+        + _pg_docs_datetime_iso(c.updated_at),
+    ):
+        field_rows = (await session.execute(fields_stmt)).all()
+        add_rows(
+            "knowledge_fields",
+            field_rows,
+            lambda row: f"{row[0]}:{_digest_dt(row[1])}",
+        )
+
+    value_node = aliased(KnowledgeNode)
+    value_target_node = aliased(KnowledgeNode)
+    values_stmt = (
+            select(
+                value_node.project_id.label("scope_project_id"),
+                KnowledgeFieldValue.node_id.label("node_id"),
+                KnowledgeFieldValue.field_id.label("field_id"),
+                KnowledgeFieldValue.updated_at.label("updated_at"),
+            )
+            .select_from(KnowledgeFieldValue)
+            .join(value_node, value_node.id == KnowledgeFieldValue.node_id)
+            .join(KnowledgeField, KnowledgeField.id == KnowledgeFieldValue.field_id)
+            .outerjoin(value_target_node, value_target_node.id == KnowledgeFieldValue.target_node_id)
+            .where(
+                value_node.id.in_(visible_node_ids),
+                KnowledgeField.docs_library_id == docs_library_id,
+                or_(
+                    KnowledgeFieldValue.target_node_id.is_(None),
+                    and_(
+                        value_target_node.id.in_(visible_node_ids),
+                        value_target_node.project_id == value_node.project_id,
+                    ),
+                ),
+            )
+        )
+    if not await digest_project_rows(
+        "knowledge_field_values",
+        values_stmt,
+        lambda c: cast(c.node_id, String) + literal(":")
+        + cast(c.field_id, String) + literal(":")
+        + _pg_docs_datetime_iso(c.updated_at),
+    ):
+        value_rows = (await session.execute(values_stmt)).all()
+        add_rows(
+            "knowledge_field_values",
+            value_rows,
+            lambda row: f"{row[0]}:{row[1]}:{_digest_dt(row[2])}",
+        )
+
+    relation_node = aliased(KnowledgeNode)
+    node_supertag_stmt = (
+        select(
+            relation_node.project_id.label("scope_project_id"),
+            KnowledgeNodeSupertag.node_id.label("node_id"),
+            KnowledgeNodeSupertag.supertag_id.label("supertag_id"),
+            KnowledgeNodeSupertag.updated_at.label("updated_at"),
+        )
+        .select_from(KnowledgeNodeSupertag)
+        .join(relation_node, relation_node.id == KnowledgeNodeSupertag.node_id)
+        .join(
+            KnowledgeSupertag,
+            KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+        )
+        .where(
+            relation_node.id.in_(visible_node_ids),
+            KnowledgeSupertag.docs_library_id == docs_library_id,
+            KnowledgeNodeSupertag.supertag_id.in_(visible_tag_ids),
+        )
+        .distinct()
+    )
+    if not await digest_project_rows(
+        "knowledge_node_supertags",
+        node_supertag_stmt,
+        lambda c: cast(c.node_id, String) + literal(":")
+        + cast(c.supertag_id, String) + literal(":")
+        + _pg_docs_datetime_iso(c.updated_at),
+    ):
+        node_supertag_rows = (await session.execute(node_supertag_stmt)).all()
+        add_rows(
+            "knowledge_node_supertags",
+            node_supertag_rows,
+            lambda row: f"{row[0]}:{row[1]}:{_digest_dt(row[2])}",
+        )
+
+    supertag_field_node = aliased(KnowledgeNode)
+    supertag_field_stmt = (
+        select(
+            supertag_field_node.project_id.label("scope_project_id"),
+            KnowledgeSupertagField.supertag_id.label("supertag_id"),
+            KnowledgeSupertagField.field_id.label("field_id"),
+            KnowledgeSupertagField.sort_order.label("sort_order"),
+            KnowledgeSupertagField.required.label("required"),
+            KnowledgeSupertagField.show_in_template.label("show_in_template"),
+            KnowledgeSupertagField.optional.label("optional"),
+        )
+        .select_from(KnowledgeSupertagField)
+        .join(
+            KnowledgeSupertag,
+            KnowledgeSupertag.id == KnowledgeSupertagField.supertag_id,
+        )
+        .join(KnowledgeField, KnowledgeField.id == KnowledgeSupertagField.field_id)
+        .join(
+            KnowledgeNodeSupertag,
+            KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
+        )
+        .join(supertag_field_node, supertag_field_node.id == KnowledgeNodeSupertag.node_id)
+        .where(
+            KnowledgeSupertag.docs_library_id == docs_library_id,
+            KnowledgeField.docs_library_id == docs_library_id,
+            supertag_field_node.id.in_(visible_node_ids),
+            KnowledgeSupertagField.supertag_id.in_(visible_tag_ids),
+        )
+        .distinct()
+    )
+    if not await digest_project_rows(
+        "knowledge_supertag_fields",
+        supertag_field_stmt,
+        lambda c: cast(c.supertag_id, String) + literal(":")
+        + cast(c.field_id, String) + literal(":")
+        + _pg_docs_float_repr(c.sort_order) + literal(":")
+        + case((c.required.is_(True), literal("1")), else_=literal("0"))
+        + literal(":")
+        + case((c.show_in_template.is_(True), literal("1")), else_=literal("0"))
+        + literal(":")
+        + case((c.optional.is_(True), literal("1")), else_=literal("0")),
+    ):
+        supertag_field_rows = (await session.execute(supertag_field_stmt)).all()
+        add_rows(
+            "knowledge_supertag_fields",
+            supertag_field_rows,
+            lambda row: (
+                f"{row[0]}:{row[1]}:{row[2]!r}:{int(row[3])}:"
+                f"{int(row[4])}:{int(row[5])}"
+            ),
+        )
+
+    placement_node = aliased(KnowledgeNode)
+    placement_parent = aliased(KnowledgeNode)
+    placement_stmt = (
+        select(
+            placement_node.project_id.label("scope_project_id"),
+            KnowledgeNodePlacement.id.label("placement_id"),
+            KnowledgeNodePlacement.node_id.label("node_id"),
+            KnowledgeNodePlacement.parent_node_id.label("parent_node_id"),
+            KnowledgeNodePlacement.sort_order.label("sort_order"),
+            KnowledgeNodePlacement.collapsed.label("collapsed"),
+        )
+        .select_from(KnowledgeNodePlacement)
+        .join(placement_node, placement_node.id == KnowledgeNodePlacement.node_id)
+        .join(placement_parent, placement_parent.id == KnowledgeNodePlacement.parent_node_id)
+        .where(
+            placement_node.id.in_(visible_node_ids),
+            placement_parent.id.in_(visible_node_ids),
+            placement_node.project_id == placement_parent.project_id,
+        )
+    )
+    if not await digest_project_rows(
+        "knowledge_node_placements",
+        placement_stmt,
+        lambda c: cast(c.placement_id, String) + literal(":")
+        + cast(c.node_id, String) + literal(":")
+        + literal("UUID('") + cast(c.parent_node_id, String) + literal("'):")
+        + cast(func.trunc(c.sort_order), String),
+    ):
+        placement_rows = (await session.execute(placement_stmt)).all()
+        add_rows(
+            "knowledge_node_placements",
+            placement_rows,
+            lambda row: f"{row[0]}:{row[1]}:{row[2]}:{row[3]!r}:{int(row[4])}",
+        )
+
+    edge_source = aliased(KnowledgeNode)
+    edge_target = aliased(KnowledgeNode)
+    edge_stmt = (
+        select(
+            edge_source.project_id.label("scope_project_id"),
+            KnowledgeEdge.id.label("edge_id"),
+            KnowledgeEdge.source_node_id.label("source_node_id"),
+            KnowledgeEdge.target_node_id.label("target_node_id"),
+            KnowledgeEdge.relation_type.label("relation_type"),
+            KnowledgeEdge.confidence.label("confidence"),
+        )
+        .select_from(KnowledgeEdge)
+        .join(edge_source, edge_source.id == KnowledgeEdge.source_node_id)
+        .join(edge_target, edge_target.id == KnowledgeEdge.target_node_id)
+        .where(
+            edge_source.id.in_(visible_node_ids),
+            edge_target.id.in_(visible_node_ids),
+            edge_source.project_id == edge_target.project_id,
+        )
+    )
+    if not await digest_project_rows(
+        "knowledge_edges",
+        edge_stmt,
+        lambda c: cast(c.edge_id, String) + literal(":")
+        + cast(c.source_node_id, String) + literal(":")
+        + cast(c.target_node_id, String) + literal(":")
+        + func.coalesce(c.relation_type, literal("None")) + literal(":")
+        + _pg_docs_float_repr(c.confidence),
+    ):
+        edge_rows = (await session.execute(edge_stmt)).all()
+        add_rows(
+            "knowledge_edges",
+            edge_rows,
+            lambda row: f"{row[0]}:{row[1]}:{row[2]}:{row[3]}:{row[4]!r}",
+        )
+
+    return {
+        project_id: {
+            table: node_digests.get(project_id, empty_node_digest)
+            if table == "knowledge_nodes"
+            else aggregated_digests[project_id][table]
+            if table in aggregated_digests.get(project_id, {})
+            else _docs_digest(values.get(table, []))
+            for table in DOCS_PULL_LIMITS
+        }
+        for project_id, values in materials.items()
+    }
+
+
+def _docs_fast_digest_token(
+    table: str,
+    row_count: int,
+    min_key: str | None,
+    max_key: str | None,
+    hash_a: Any,
+    hash_b: Any,
+) -> str:
+    """Stable O(1)-size receipt for the row set described by one table query."""
+
+    return _docs_digest(
+        [
+            f"docs-row-set:v1:{table}",
+            str(row_count),
+            min_key or "none",
+            max_key or "none",
+            _aggregate_digest_value(hash_a if hash_a is not None else 0),
+            _aggregate_digest_value(hash_b if hash_b is not None else 0),
+        ]
+    )
+
+
+async def pull_docs_scope_fast_digests(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    scope_groups: list[tuple[UUID, UUID | None, list[UUID], bool]],
+) -> dict[tuple[str, str | None], dict[str, dict[str, Any]]]:
+    """Return compact row-set receipts for root/project Docs scopes in one SQL.
+
+    A group is ``(library_id, library_owner_id, project_ids, include_personal)``.
+    All visible node slices are materialized once and the eight table receipts
+    are unioned into one PostgreSQL statement. The existing exact SHA digests
+    remain the fallback used by clients which do not opt into these receipts.
+    """
+
+    from sqlalchemy import union_all
+
+    scope_results: dict[tuple[str, str | None], dict[str, dict[str, Any]]] = {}
+    visible_node_selects = []
+    for group_index, (library_id, library_owner_id, project_ids, include_personal) in enumerate(scope_groups):
+        scope_node = aliased(KnowledgeNode, name=f"docs_fast_scope_node_{group_index}")
+        normalized_ids = sorted(set(project_ids), key=str)
+        selected_projects: list[Any] = []
+        if include_personal:
+            selected_projects.append(scope_node.project_id.is_(None))
+        if normalized_ids:
+            selected_projects.append(scope_node.project_id.in_(normalized_ids))
+        if not selected_projects:
+            continue
+        project_scope = (
+            selected_projects[0]
+            if len(selected_projects) == 1
+            else or_(*selected_projects)
+        )
+        visible_access = and_(
+            docs_readable_node_predicate(
+                scope_node,
+                docs_library_id=library_id,
+                user_id=user_id,
+                library_owner_id=library_owner_id,
+            ),
+            project_scope,
+            docs_node_renderable_predicate(scope_node),
+        )
+        visible_node_selects.append(
+            select(
+                literal(
+                    library_id,
+                    type_=KnowledgeNode.docs_library_id.type,
+                ).label("scope_library_id"),
+                scope_node.project_id.label("scope_project_id"),
+                scope_node.id.label("node_id"),
+            ).where(
+                scope_node.docs_library_id == library_id,
+                visible_access,
+            )
+        )
+        if include_personal:
+            scope_results[(str(library_id), None)] = {}
+        for project_id in normalized_ids:
+            scope_results[(str(library_id), str(project_id))] = {}
+    if not visible_node_selects:
+        return scope_results
+
+    empty_digest = {
+        table: {
+            "digest": _docs_fast_digest_token(table, 0, None, None, 0, 0),
+            "count": 0,
+        }
+        for table in DOCS_PULL_LIMITS
+    }
+    for scope in scope_results.values():
+        scope.update({table: dict(value) for table, value in empty_digest.items()})
+
+    visible_nodes = union_all(*visible_node_selects).cte("docs_fast_visible_nodes")
+    visible_tags = (
+        select(
+            visible_nodes.c.scope_library_id,
+            visible_nodes.c.scope_project_id,
+            KnowledgeNodeSupertag.supertag_id.label("supertag_id"),
+        )
+        .select_from(visible_nodes)
+        .join(
+            KnowledgeNodeSupertag,
+            KnowledgeNodeSupertag.node_id == visible_nodes.c.node_id,
+        )
+        .join(
+            KnowledgeSupertag,
+            and_(
+                KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+                KnowledgeSupertag.docs_library_id == visible_nodes.c.scope_library_id,
+            ),
+        )
+        .distinct()
+        .cte("docs_fast_visible_tags")
+    )
+    fields_from_tags = (
+        select(
+            visible_tags.c.scope_library_id,
+            visible_tags.c.scope_project_id,
+            KnowledgeField.id.label("field_id"),
+        )
+        .select_from(visible_tags)
+        .join(KnowledgeField, KnowledgeField.supertag_id == visible_tags.c.supertag_id)
+        .where(KnowledgeField.docs_library_id == visible_tags.c.scope_library_id)
+    )
+    fields_from_values = (
+        select(
+            visible_nodes.c.scope_library_id,
+            visible_nodes.c.scope_project_id,
+            KnowledgeFieldValue.field_id.label("field_id"),
+        )
+        .select_from(visible_nodes)
+        .join(KnowledgeFieldValue, KnowledgeFieldValue.node_id == visible_nodes.c.node_id)
+        .join(
+            KnowledgeField,
+            and_(
+                KnowledgeField.id == KnowledgeFieldValue.field_id,
+                KnowledgeField.docs_library_id == visible_nodes.c.scope_library_id,
+            ),
+        )
+    )
+    visible_fields = union(fields_from_tags, fields_from_values).cte(
+        "docs_fast_visible_fields"
+    )
+
+    node_rows = (
+        select(
+            visible_nodes.c.scope_library_id,
+            visible_nodes.c.scope_project_id,
+            KnowledgeNode.id.label("entity_id"),
+            KnowledgeNode.updated_at.label("updated_at"),
+            KnowledgeNode.is_explicit_blank.label("is_explicit_blank"),
+            KnowledgeNode.parent_id.label("parent_id"),
+            KnowledgeNode.root_page_id.label("root_page_id"),
+            KnowledgeNode.project_id.label("project_id"),
+            KnowledgeNode.created_by.label("created_by"),
+            KnowledgeNode.archived_at.label("archived_at"),
+            case(
+                (
+                    and_(
+                        KnowledgeNode.parent_id.is_(None),
+                        KnowledgeNode.archived_at.is_(None),
+                        or_(
+                            KnowledgeNode.node_type.is_(None),
+                            KnowledgeNode.node_type.notin_(("search", "day", "system")),
+                        ),
+                    ),
+                    0,
+                ),
+                (KnowledgeNode.parent_id.is_(None), 1),
+                else_=2,
+            ).label("pull_rank"),
+        )
+        .select_from(visible_nodes)
+        .join(
+            KnowledgeNode,
+            and_(
+                KnowledgeNode.id == visible_nodes.c.node_id,
+                KnowledgeNode.docs_library_id == visible_nodes.c.scope_library_id,
+            ),
+        )
+    )
+    tag_rows = (
+        select(
+            visible_tags.c.scope_library_id,
+            visible_tags.c.scope_project_id,
+            KnowledgeSupertag.id.label("entity_id"),
+            KnowledgeSupertag.updated_at.label("updated_at"),
+        )
+        .select_from(visible_tags)
+        .join(KnowledgeSupertag, KnowledgeSupertag.id == visible_tags.c.supertag_id)
+    )
+    field_rows = (
+        select(
+            visible_fields.c.scope_library_id,
+            visible_fields.c.scope_project_id,
+            KnowledgeField.id.label("entity_id"),
+            KnowledgeField.updated_at.label("updated_at"),
+        )
+        .select_from(visible_fields)
+        .join(KnowledgeField, KnowledgeField.id == visible_fields.c.field_id)
+    )
+    value_source_node = visible_nodes.alias("docs_fast_value_source")
+    value_target_node = visible_nodes.alias("docs_fast_value_target")
+    field_value_rows = (
+        select(
+            value_source_node.c.scope_library_id,
+            value_source_node.c.scope_project_id,
+            KnowledgeFieldValue.node_id.label("node_id"),
+            KnowledgeFieldValue.field_id.label("field_id"),
+            KnowledgeFieldValue.updated_at.label("updated_at"),
+        )
+        .select_from(value_source_node)
+        .join(KnowledgeFieldValue, KnowledgeFieldValue.node_id == value_source_node.c.node_id)
+        .join(
+            KnowledgeField,
+            and_(
+                KnowledgeField.id == KnowledgeFieldValue.field_id,
+                KnowledgeField.docs_library_id == value_source_node.c.scope_library_id,
+            ),
+        )
+        .outerjoin(
+            value_target_node,
+            and_(
+                KnowledgeFieldValue.target_node_id
+                == value_target_node.c.node_id,
+                value_source_node.c.scope_library_id
+                == value_target_node.c.scope_library_id,
+                value_source_node.c.scope_project_id.is_not_distinct_from(
+                    value_target_node.c.scope_project_id
+                ),
+            ),
+        )
+        .where(
+            KnowledgeFieldValue.target_node_id.is_(None)
+            | value_target_node.c.node_id.is_not(None)
+        )
+    )
+    node_supertag_rows = (
+        select(
+            visible_nodes.c.scope_library_id,
+            visible_nodes.c.scope_project_id,
+            KnowledgeNodeSupertag.node_id.label("node_id"),
+            KnowledgeNodeSupertag.supertag_id.label("supertag_id"),
+            KnowledgeNodeSupertag.updated_at.label("updated_at"),
+        )
+        .select_from(visible_nodes)
+        .join(KnowledgeNodeSupertag, KnowledgeNodeSupertag.node_id == visible_nodes.c.node_id)
+        .join(
+            KnowledgeSupertag,
+            and_(
+                KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+                KnowledgeSupertag.docs_library_id == visible_nodes.c.scope_library_id,
+            ),
+        )
+    )
+    supertag_field_rows = (
+        select(
+            visible_tags.c.scope_library_id,
+            visible_tags.c.scope_project_id,
+            KnowledgeSupertagField.supertag_id.label("supertag_id"),
+            KnowledgeSupertagField.field_id.label("field_id"),
+            KnowledgeSupertagField.sort_order.label("sort_order"),
+            KnowledgeSupertagField.required.label("required"),
+            KnowledgeSupertagField.show_in_template.label("show_in_template"),
+            KnowledgeSupertagField.optional.label("optional"),
+        )
+        .select_from(visible_tags)
+        .join(
+            KnowledgeSupertagField,
+            KnowledgeSupertagField.supertag_id == visible_tags.c.supertag_id,
+        )
+        .join(KnowledgeField, KnowledgeField.id == KnowledgeSupertagField.field_id)
+        .where(KnowledgeField.docs_library_id == visible_tags.c.scope_library_id)
+        .distinct()
+    )
+    placement_node = visible_nodes.alias("docs_fast_placement_node")
+    placement_parent = visible_nodes.alias("docs_fast_placement_parent")
+    placement_rows = (
+        select(
+            placement_node.c.scope_library_id,
+            placement_node.c.scope_project_id,
+            KnowledgeNodePlacement.id.label("placement_id"),
+            KnowledgeNodePlacement.node_id.label("node_id"),
+            KnowledgeNodePlacement.parent_node_id.label("parent_node_id"),
+            KnowledgeNodePlacement.sort_order.label("sort_order"),
+            KnowledgeNodePlacement.collapsed.label("collapsed"),
+        )
+        .select_from(KnowledgeNodePlacement)
+        .join(
+            placement_node,
+            KnowledgeNodePlacement.node_id == placement_node.c.node_id,
+        )
+        .join(
+            placement_parent,
+            and_(
+                KnowledgeNodePlacement.parent_node_id == placement_parent.c.node_id,
+                placement_node.c.scope_library_id == placement_parent.c.scope_library_id,
+                placement_node.c.scope_project_id.is_not_distinct_from(
+                    placement_parent.c.scope_project_id
+                ),
+            ),
+        )
+    )
+    edge_source = visible_nodes.alias("docs_fast_edge_source")
+    edge_target = visible_nodes.alias("docs_fast_edge_target")
+    edge_rows = (
+        select(
+            edge_source.c.scope_library_id,
+            edge_source.c.scope_project_id,
+            KnowledgeEdge.id.label("edge_id"),
+            KnowledgeEdge.source_node_id.label("source_node_id"),
+            KnowledgeEdge.target_node_id.label("target_node_id"),
+            KnowledgeEdge.relation_type.label("relation_type"),
+            KnowledgeEdge.confidence.label("confidence"),
+        )
+        .select_from(KnowledgeEdge)
+        .join(edge_source, KnowledgeEdge.source_node_id == edge_source.c.node_id)
+        .join(
+            edge_target,
+            and_(
+                KnowledgeEdge.target_node_id == edge_target.c.node_id,
+                edge_source.c.scope_library_id == edge_target.c.scope_library_id,
+                edge_source.c.scope_project_id.is_not_distinct_from(
+                    edge_target.c.scope_project_id
+                ),
+            ),
+        )
+    )
+
+    def aggregate_rows(table: str, source_rows: Any, key_fields: tuple[str, ...], digest_fields: tuple[str, ...]):
+        source = source_rows.subquery()
+        key = cast(
+            func.jsonb_build_array(*(source.c[field] for field in key_fields)),
+            String,
+        )
+        fingerprint = cast(
+            func.jsonb_build_array(*(source.c[field] for field in digest_fields)),
+            String,
+        )
+        return select(
+            source.c.scope_library_id.label("scope_library_id"),
+            source.c.scope_project_id.label("scope_project_id"),
+            literal(table).label("table_name"),
+            func.count().label("row_count"),
+            func.min(key).label("min_key"),
+            func.max(key).label("max_key"),
+            func.sum(func.hashtextextended(fingerprint, 0)).label("hash_a"),
+            func.sum(func.hashtextextended(fingerprint, 1)).label("hash_b"),
+        ).select_from(source).group_by(
+            source.c.scope_library_id, source.c.scope_project_id
+        )
+
+    aggregate_statements = [
+        aggregate_rows(
+            "knowledge_nodes",
+            node_rows,
+            ("entity_id",),
+            ("entity_id", "updated_at", "is_explicit_blank", "parent_id", "root_page_id", "project_id", "created_by", "archived_at", "pull_rank"),
+        ),
+        aggregate_rows("knowledge_supertags", tag_rows, ("entity_id",), ("entity_id", "updated_at")),
+        aggregate_rows("knowledge_node_supertags", node_supertag_rows, ("node_id", "supertag_id"), ("node_id", "supertag_id", "updated_at")),
+        aggregate_rows("knowledge_supertag_fields", supertag_field_rows, ("supertag_id", "field_id"), ("supertag_id", "field_id", "sort_order", "required", "show_in_template", "optional")),
+        aggregate_rows("knowledge_fields", field_rows, ("entity_id",), ("entity_id", "updated_at")),
+        aggregate_rows("knowledge_field_values", field_value_rows, ("node_id", "field_id"), ("node_id", "field_id", "updated_at")),
+        aggregate_rows("knowledge_node_placements", placement_rows, ("placement_id",), ("placement_id", "node_id", "parent_node_id", "sort_order", "collapsed")),
+        aggregate_rows("knowledge_edges", edge_rows, ("edge_id",), ("edge_id", "source_node_id", "target_node_id", "relation_type", "confidence")),
+    ]
+    all_aggregates = union_all(*aggregate_statements).subquery("docs_fast_scope_aggregates")
+    aggregate_rows_result = (
+        await session.execute(select(all_aggregates))
+    ).all()
+    for row in aggregate_rows_result:
+        scope_key = (str(row.scope_library_id), str(row.scope_project_id) if row.scope_project_id else None)
+        scope_tables = scope_results.get(scope_key)
+        if scope_tables is None:
+            continue
+        table_name = str(row.table_name)
+        scope_tables[table_name] = {
+            "digest": _docs_fast_digest_token(
+                table_name,
+                int(row.row_count or 0),
+                row.min_key,
+                row.max_key,
+                row.hash_a,
+                row.hash_b,
+            ),
+            "count": int(row.row_count or 0),
+        }
+    return scope_results
 
 
 def docs_scope_digest(
@@ -754,8 +1805,11 @@ async def pull_docs_table(
     前回の全ページ適用後に保存した ``client_digest`` を送り、サーバの現在値と
     一致すれば「定常状態」とみなして権威セット（および行フェッチ）を省略する。
     不一致・未指定なら差分または全量 + authoritative_ids で reconcile
-    する。ダイジェストは membership と可変列を織り込むため、行の追加・更新・削除で
-    必ず変化する（可視範囲が変われば digest も変わる）。"""
+    する。knowledge_nodes は、ACL revision が検証済みの paginated pull で
+    有効な ``since`` がある場合だけ、ダイジェスト不一致を更新差分として返す。
+    revision/digest/since が欠ける旧クライアントは全量へ倒す。ダイジェストは
+    membership と可変列を織り込むため、行の追加・更新・削除で変化する（可視範囲が
+    変われば digest も変わる）。"""
     if docs_library_id is None:
         docs_library_id = workspace_id
     if docs_library_id is None:
@@ -864,48 +1918,78 @@ async def pull_docs_table(
             (KnowledgeNode.parent_id.is_(None), 1),
             else_=2,
         )
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeNode.id,
-                    KnowledgeNode.updated_at,
-                    KnowledgeNode.is_explicit_blank,
-                    KnowledgeNode.parent_id,
-                    KnowledgeNode.root_page_id,
-                    KnowledgeNode.project_id,
-                    KnowledgeNode.created_by,
-                    KnowledgeNode.archived_at,
-                    root_rank.label("pull_rank"),
-                ).where(
-                    KnowledgeNode.docs_library_id == docs_library_id,
-                    project_access,
+        digest_rows: list[Any] | None = None
+        if _session_dialect_name(session) == "postgresql":
+            # Keep the 150k-node fingerprint inside PostgreSQL.  Only the
+            # aggregate row crosses the async boundary; ORM rows are fetched
+            # later only for the requested delta page.
+            aggregate_row = (
+                await session.execute(
+                    _knowledge_nodes_aggregate_statement(
+                        docs_library_id,
+                        project_access,
+                        root_rank,
+                    )
                 )
+            ).one()
+            digest, shape_digest, authoritative_count = (
+                _knowledge_nodes_aggregate_digests(aggregate_row)
             )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{id_}:{_digest_dt(updated_at)}:{int(bool(is_explicit_blank))}"
-                for id_, updated_at, is_explicit_blank, *_ in digest_rows
-            ]
-        )
-        shape_digest = _docs_digest(
-            [
-                f"{row.id}:{row.parent_id}:{row.root_page_id}:{row.project_id}:"
-                f"{row.created_by}:{int(row.archived_at is not None)}:{row.pull_rank}"
-                for row in digest_rows
-            ]
-        )
+        else:
+            # Keep the small unbound/SQLite test doubles and legacy tooling
+            # working.  Production DatabaseManager is PostgreSQL and uses the
+            # aggregate branch above.
+            digest_rows = (
+                await session.execute(
+                    select(
+                        KnowledgeNode.id,
+                        KnowledgeNode.updated_at,
+                        KnowledgeNode.is_explicit_blank,
+                        KnowledgeNode.parent_id,
+                        KnowledgeNode.root_page_id,
+                        KnowledgeNode.project_id,
+                        KnowledgeNode.created_by,
+                        KnowledgeNode.archived_at,
+                        root_rank.label("pull_rank"),
+                    ).where(
+                        KnowledgeNode.docs_library_id == docs_library_id,
+                        project_access,
+                    )
+                )
+            ).all()
+            digest = _docs_digest(
+                [
+                    f"{id_}:{_digest_dt(updated_at)}:{int(bool(is_explicit_blank))}"
+                    for id_, updated_at, is_explicit_blank, *_ in digest_rows
+                ]
+            )
+            shape_digest = _docs_digest(
+                [
+                    f"{row.id}:{row.parent_id}:{row.root_page_id}:{row.project_id}:"
+                    f"{row.created_by}:{int(row.archived_at is not None)}:{row.pull_rank}"
+                    for row in digest_rows
+                ]
+            )
+            authoritative_count = len(digest_rows)
         envelope = pull_cursor_envelope(cursor) if paginate else None
         stable_order = paginate and (
             not cursor or bool(envelope and "node_page" in envelope)
         )
         snapshot_digest = digest
         digest_matched = not force_full and client_digest is not None and client_digest == digest
-        effective_force_full = _effective_force_full(
-            force_full,
-            client_digest,
-            digest,
-            user_id=user_id,
+        # A digest mismatch is a safe delta only for the additive paginated
+        # protocol: the route has already verified that the client's Docs ACL
+        # revision matches the current revision, and a valid ``since`` is the
+        # replay watermark.  Missing revision/digest/since remains full so
+        # legacy clients cannot skip historical or newly visible rows.
+        effective_force_full = force_full or (
+            user_id is not None
+            and (
+                not paginate
+                or client_digest is None
+                or since is None
+                or scope_revision is None
+            )
         )
         if stable_order and cursor:
             # The initial digest match also controls deletion reconciliation.
@@ -953,8 +2037,12 @@ async def pull_docs_table(
         # mobile一覧対象root→その他root→子孫の順に送る。cursorにも同じrankを
         # 含めて全ページを重複・欠落なく走査する。
         if since and not effective_force_full:
+            delta_since = _docs_delta_since(since)
             stmt = stmt.where(
-                or_(KnowledgeNode.updated_at > since, KnowledgeNode.archived_at > since)
+                or_(
+                    KnowledgeNode.updated_at > delta_since,
+                    KnowledgeNode.archived_at > delta_since,
+                )
             )
         if paginate:
             cursor_parts = _decode_pull_cursor(
@@ -1051,7 +2139,7 @@ async def pull_docs_table(
             "changes": serialized_nodes,
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": authoritative_count,
         }
         if digest_matched:
             # 権威状態一致。初回ページは changes も空にし、継続 cursor の
@@ -1067,7 +2155,20 @@ async def pull_docs_table(
         # 不一致・未指定: ハード削除を reconcile できるよう権威 ID 集合を全量返す。
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [str(row.id) for row in digest_rows]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [str(row.id) for row in digest_rows]
+                else:
+                    authoritative_id_rows = await session.execute(
+                        select(KnowledgeNode.id)
+                        .where(
+                            KnowledgeNode.docs_library_id == docs_library_id,
+                            project_access,
+                        )
+                        .order_by(KnowledgeNode.id.asc())
+                    )
+                    result["authoritative_ids"] = [
+                        str(id_) for id_ in authoritative_id_rows.scalars().all()
+                    ]
             result["authoritative_scope_id"] = str(docs_library_id)
             result["authoritative_digest"] = snapshot_digest
         return _annotate_docs_page(
@@ -1078,16 +2179,19 @@ async def pull_docs_table(
         )
 
     if table == "knowledge_supertags":
-        digest_rows = (
-            await session.execute(
-                select(KnowledgeSupertag.id, KnowledgeSupertag.updated_at).where(
-                    KnowledgeSupertag.docs_library_id == docs_library_id,
-                    tag_access,
-                )
-            )
-        ).all()
-        digest = _docs_digest(
-            [f"{id_}:{_digest_dt(updated_at)}" for id_, updated_at in digest_rows]
+        digest_statement = select(
+            KnowledgeSupertag.id.label("supertag_id"),
+            KnowledgeSupertag.updated_at.label("updated_at"),
+        ).where(
+            KnowledgeSupertag.docs_library_id == docs_library_id,
+            tag_access,
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.supertag_id, String) + literal(":")
+            + _pg_docs_datetime_iso(c.updated_at),
+            lambda row: f"{row[0]}:{_digest_dt(row[1])}",
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1101,7 +2205,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1159,11 +2263,24 @@ async def pull_docs_table(
             "changes": [serialize_docs_supertag(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [str(id_) for id_, _ in digest_rows]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [str(row[0]) for row in digest_rows]
+                else:
+                    result["authoritative_ids"] = [
+                        str(id_)
+                        for id_ in (
+                            await session.execute(
+                                select(KnowledgeSupertag.id).where(
+                                    KnowledgeSupertag.docs_library_id == docs_library_id,
+                                    tag_access,
+                                )
+                            )
+                        ).scalars().all()
+                    ]
             result["authoritative_scope_id"] = str(docs_library_id)
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
@@ -1174,16 +2291,19 @@ async def pull_docs_table(
         )
 
     if table == "knowledge_fields":
-        digest_rows = (
-            await session.execute(
-                select(KnowledgeField.id, KnowledgeField.updated_at).where(
-                    KnowledgeField.docs_library_id == docs_library_id,
-                    field_access,
-                )
-            )
-        ).all()
-        digest = _docs_digest(
-            [f"{id_}:{_digest_dt(updated_at)}" for id_, updated_at in digest_rows]
+        digest_statement = select(
+            KnowledgeField.id.label("field_id"),
+            KnowledgeField.updated_at.label("updated_at"),
+        ).where(
+            KnowledgeField.docs_library_id == docs_library_id,
+            field_access,
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.field_id, String) + literal(":")
+            + _pg_docs_datetime_iso(c.updated_at),
+            lambda row: f"{row[0]}:{_digest_dt(row[1])}",
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1197,7 +2317,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1255,11 +2375,24 @@ async def pull_docs_table(
             "changes": [serialize_docs_field(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [str(id_) for id_, _ in digest_rows]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [str(row[0]) for row in digest_rows]
+                else:
+                    result["authoritative_ids"] = [
+                        str(id_)
+                        for id_ in (
+                            await session.execute(
+                                select(KnowledgeField.id).where(
+                                    KnowledgeField.docs_library_id == docs_library_id,
+                                    field_access,
+                                )
+                            )
+                        ).scalars().all()
+                    ]
             result["authoritative_scope_id"] = str(docs_library_id)
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
@@ -1273,32 +2406,32 @@ async def pull_docs_table(
         # value クリア（行削除）が Web/他クライアントで起きても伝播するよう、削除を
         # 織り込んだダイジェストで照合する。ダイジェストは (node_id, field_id,
         # updated_at) から計算するので、値の更新（updated_at 変化）も削除も検知できる。
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeFieldValue.node_id,
-                    KnowledgeFieldValue.field_id,
-                    KnowledgeFieldValue.updated_at,
-                )
-                .join(KnowledgeNode, KnowledgeNode.id == KnowledgeFieldValue.node_id)
-                .join(KnowledgeField, KnowledgeField.id == KnowledgeFieldValue.field_id)
-                .where(
-                    KnowledgeFieldValue.node_id.in_(visible_node_ids),
-                    KnowledgeField.docs_library_id == docs_library_id,
-                    (
-                        KnowledgeFieldValue.target_node_id.is_(None)
-                        | KnowledgeFieldValue.target_node_id.in_(visible_node_ids)
-                    )
-                    if user_id is not None
-                    else True,
-                )
+        digest_statement = (
+            select(
+                KnowledgeFieldValue.node_id.label("node_id"),
+                KnowledgeFieldValue.field_id.label("field_id"),
+                KnowledgeFieldValue.updated_at.label("updated_at"),
             )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{node_id}:{field_id}:{_digest_dt(updated_at)}"
-                for node_id, field_id, updated_at in digest_rows
-            ]
+            .join(KnowledgeNode, KnowledgeNode.id == KnowledgeFieldValue.node_id)
+            .join(KnowledgeField, KnowledgeField.id == KnowledgeFieldValue.field_id)
+            .where(
+                KnowledgeFieldValue.node_id.in_(visible_node_ids),
+                KnowledgeField.docs_library_id == docs_library_id,
+                (
+                    KnowledgeFieldValue.target_node_id.is_(None)
+                    | KnowledgeFieldValue.target_node_id.in_(visible_node_ids)
+                )
+                if user_id is not None
+                else True,
+            )
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.node_id, String) + literal(":")
+            + cast(c.field_id, String) + literal(":")
+            + _pg_docs_datetime_iso(c.updated_at),
+            lambda row: f"{row[0]}:{row[1]}:{_digest_dt(row[2])}",
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1313,7 +2446,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1393,13 +2526,37 @@ async def pull_docs_table(
             "changes": [serialize_docs_field_value(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [
-                    f"{node_id}:{field_id}" for node_id, field_id, _ in digest_rows
-                ]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [
+                        f"{row[0]}:{row[1]}" for row in digest_rows
+                    ]
+                else:
+                    value_id_rows = await session.execute(
+                        select(
+                            KnowledgeFieldValue.node_id,
+                            KnowledgeFieldValue.field_id,
+                        )
+                        .join(KnowledgeNode, KnowledgeNode.id == KnowledgeFieldValue.node_id)
+                        .join(KnowledgeField, KnowledgeField.id == KnowledgeFieldValue.field_id)
+                        .where(
+                            KnowledgeFieldValue.node_id.in_(visible_node_ids),
+                            KnowledgeField.docs_library_id == docs_library_id,
+                            (
+                                KnowledgeFieldValue.target_node_id.is_(None)
+                                | KnowledgeFieldValue.target_node_id.in_(visible_node_ids)
+                            )
+                            if user_id is not None
+                            else True,
+                        )
+                    )
+                    result["authoritative_ids"] = [
+                        f"{node_id}:{field_id}"
+                        for node_id, field_id in value_id_rows.all()
+                    ]
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
             result,
@@ -1410,29 +2567,29 @@ async def pull_docs_table(
 
     # 関連表も削除を伝播できるよう、権威セットのダイジェストで照合する。
     if table == "knowledge_node_supertags":
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeNodeSupertag.node_id,
-                    KnowledgeNodeSupertag.supertag_id,
-                    KnowledgeNodeSupertag.updated_at,
-                )
-                .join(KnowledgeNode, KnowledgeNode.id == KnowledgeNodeSupertag.node_id)
-                .join(
-                    KnowledgeSupertag,
-                    KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
-                )
-                .where(
-                    KnowledgeNodeSupertag.node_id.in_(visible_node_ids),
-                    node_supertag_access,
-                )
+        digest_statement = (
+            select(
+                KnowledgeNodeSupertag.node_id.label("node_id"),
+                KnowledgeNodeSupertag.supertag_id.label("supertag_id"),
+                KnowledgeNodeSupertag.updated_at.label("updated_at"),
             )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{node_id}:{supertag_id}:{_digest_dt(updated_at)}"
-                for node_id, supertag_id, updated_at in digest_rows
-            ]
+            .join(KnowledgeNode, KnowledgeNode.id == KnowledgeNodeSupertag.node_id)
+            .join(
+                KnowledgeSupertag,
+                KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+            )
+            .where(
+                KnowledgeNodeSupertag.node_id.in_(visible_node_ids),
+                node_supertag_access,
+            )
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.node_id, String) + literal(":")
+            + cast(c.supertag_id, String) + literal(":")
+            + _pg_docs_datetime_iso(c.updated_at),
+            lambda row: f"{row[0]}:{row[1]}:{_digest_dt(row[2])}",
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1446,7 +2603,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1522,14 +2679,34 @@ async def pull_docs_table(
             "changes": [serialize_docs_node_supertag(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [
-                    f"{node_id}:{supertag_id}"
-                    for node_id, supertag_id, _ in digest_rows
-                ]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [
+                        f"{row[0]}:{row[1]}" for row in digest_rows
+                    ]
+                else:
+                    relation_ids = await session.execute(
+                        select(
+                            KnowledgeNodeSupertag.node_id,
+                            KnowledgeNodeSupertag.supertag_id,
+                        )
+                        .join(KnowledgeNode, KnowledgeNode.id == KnowledgeNodeSupertag.node_id)
+                        .join(
+                            KnowledgeSupertag,
+                            KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+                        )
+                        .where(
+                            KnowledgeNodeSupertag.node_id.in_(visible_node_ids),
+                            node_supertag_access,
+                        )
+                    )
+                    result["authoritative_ids"] = [
+                        f"{node_id}:{supertag_id}"
+                        for node_id, supertag_id in relation_ids.all()
+                    ]
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
             result,
@@ -1541,44 +2718,44 @@ async def pull_docs_table(
     if table == "knowledge_supertag_fields":
         # updated_at が無いため、可変列（sort_order/required/show_in_template/optional）
         # をダイジェストへ織り込む。列変更・削除いずれも digest が変化する。
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeSupertagField.supertag_id,
-                    KnowledgeSupertagField.field_id,
-                    KnowledgeSupertagField.sort_order,
-                    KnowledgeSupertagField.required,
-                    KnowledgeSupertagField.show_in_template,
-                    KnowledgeSupertagField.optional,
-                )
-                .join(
-                    KnowledgeSupertag,
-                    KnowledgeSupertag.id == KnowledgeSupertagField.supertag_id,
-                )
-                .join(
-                    KnowledgeField,
-                    KnowledgeField.id == KnowledgeSupertagField.field_id,
-                )
-                .where(
-                    KnowledgeSupertag.docs_library_id == docs_library_id,
-                    KnowledgeField.docs_library_id == docs_library_id,
-                    supertag_field_access,
-                )
+        digest_statement = (
+            select(
+                KnowledgeSupertagField.supertag_id.label("supertag_id"),
+                KnowledgeSupertagField.field_id.label("field_id"),
+                KnowledgeSupertagField.sort_order.label("sort_order"),
+                KnowledgeSupertagField.required.label("required"),
+                KnowledgeSupertagField.show_in_template.label("show_in_template"),
+                KnowledgeSupertagField.optional.label("optional"),
             )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{supertag_id}:{field_id}:{sort_order!r}:{int(required)}:"
-                f"{int(show_in_template)}:{int(optional)}"
-                for (
-                    supertag_id,
-                    field_id,
-                    sort_order,
-                    required,
-                    show_in_template,
-                    optional,
-                ) in digest_rows
-            ]
+            .join(
+                KnowledgeSupertag,
+                KnowledgeSupertag.id == KnowledgeSupertagField.supertag_id,
+            )
+            .join(
+                KnowledgeField,
+                KnowledgeField.id == KnowledgeSupertagField.field_id,
+            )
+            .where(
+                KnowledgeSupertag.docs_library_id == docs_library_id,
+                KnowledgeField.docs_library_id == docs_library_id,
+                supertag_field_access,
+            )
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.supertag_id, String) + literal(":")
+            + cast(c.field_id, String) + literal(":")
+            + _pg_docs_float_repr(c.sort_order) + literal(":")
+            + case((c.required.is_(True), literal("1")), else_=literal("0"))
+            + literal(":")
+            + case((c.show_in_template.is_(True), literal("1")), else_=literal("0"))
+            + literal(":")
+            + case((c.optional.is_(True), literal("1")), else_=literal("0")),
+            lambda row: (
+                f"{row[0]}:{row[1]}:{row[2]!r}:{int(row[3])}:"
+                f"{int(row[4])}:{int(row[5])}"
+            ),
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1592,7 +2769,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1655,14 +2832,38 @@ async def pull_docs_table(
             "changes": [serialize_docs_supertag_field(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [
-                    f"{supertag_id}:{field_id}"
-                    for supertag_id, field_id, *_ in digest_rows
-                ]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [
+                        f"{row[0]}:{row[1]}" for row in digest_rows
+                    ]
+                else:
+                    relation_ids = await session.execute(
+                        select(
+                            KnowledgeSupertagField.supertag_id,
+                            KnowledgeSupertagField.field_id,
+                        )
+                        .join(
+                            KnowledgeSupertag,
+                            KnowledgeSupertag.id == KnowledgeSupertagField.supertag_id,
+                        )
+                        .join(
+                            KnowledgeField,
+                            KnowledgeField.id == KnowledgeSupertagField.field_id,
+                        )
+                        .where(
+                            KnowledgeSupertag.docs_library_id == docs_library_id,
+                            KnowledgeField.docs_library_id == docs_library_id,
+                            supertag_field_access,
+                        )
+                    )
+                    result["authoritative_ids"] = [
+                        f"{supertag_id}:{field_id}"
+                        for supertag_id, field_id in relation_ids.all()
+                    ]
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
             result,
@@ -1673,25 +2874,25 @@ async def pull_docs_table(
 
     if table == "knowledge_node_placements":
         # updated_at が無いため、可変列（sort_order/collapsed）をダイジェストへ織り込む。
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeNodePlacement.id,
-                    KnowledgeNodePlacement.node_id,
-                    KnowledgeNodePlacement.parent_node_id,
-                    KnowledgeNodePlacement.sort_order,
-                    KnowledgeNodePlacement.collapsed,
-                ).where(
-                    KnowledgeNodePlacement.node_id.in_(visible_node_ids),
-                    KnowledgeNodePlacement.parent_node_id.in_(visible_node_ids),
-                )
-            )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{id_}:{node_id}:{parent_node_id}:{sort_order!r}:{int(collapsed)}"
-                for id_, node_id, parent_node_id, sort_order, collapsed in digest_rows
-            ]
+        digest_statement = select(
+            KnowledgeNodePlacement.id.label("placement_id"),
+            KnowledgeNodePlacement.node_id.label("node_id"),
+            KnowledgeNodePlacement.parent_node_id.label("parent_node_id"),
+            KnowledgeNodePlacement.sort_order.label("sort_order"),
+            KnowledgeNodePlacement.collapsed.label("collapsed"),
+        ).where(
+            KnowledgeNodePlacement.node_id.in_(visible_node_ids),
+            KnowledgeNodePlacement.parent_node_id.in_(visible_node_ids),
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.placement_id, String) + literal(":")
+            + cast(c.node_id, String) + literal(":")
+            + cast(c.parent_node_id, String) + literal(":")
+            + _pg_docs_float_repr(c.sort_order) + literal(":")
+            + case((c.collapsed.is_(True), literal("1")), else_=literal("0")),
+            lambda row: f"{row[0]}:{row[1]}:{row[2]}:{row[3]!r}:{int(row[4])}",
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1705,7 +2906,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1751,11 +2952,24 @@ async def pull_docs_table(
             "changes": [serialize_docs_placement(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [str(row[0]) for row in digest_rows]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [str(row[0]) for row in digest_rows]
+                else:
+                    result["authoritative_ids"] = [
+                        str(id_)
+                        for id_ in (
+                            await session.execute(
+                                select(KnowledgeNodePlacement.id).where(
+                                    KnowledgeNodePlacement.node_id.in_(visible_node_ids),
+                                    KnowledgeNodePlacement.parent_node_id.in_(visible_node_ids),
+                                )
+                            )
+                        ).scalars().all()
+                    ]
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
             result,
@@ -1766,25 +2980,25 @@ async def pull_docs_table(
 
     if table == "knowledge_edges":
         # updated_at が無いため、可変列（relation_type/confidence）をダイジェストへ織り込む。
-        digest_rows = (
-            await session.execute(
-                select(
-                    KnowledgeEdge.id,
-                    KnowledgeEdge.source_node_id,
-                    KnowledgeEdge.target_node_id,
-                    KnowledgeEdge.relation_type,
-                    KnowledgeEdge.confidence,
-                ).where(
-                    KnowledgeEdge.source_node_id.in_(visible_node_ids),
-                    KnowledgeEdge.target_node_id.in_(visible_node_ids),
-                )
-            )
-        ).all()
-        digest = _docs_digest(
-            [
-                f"{id_}:{source_node_id}:{target_node_id}:{relation_type}:{confidence!r}"
-                for id_, source_node_id, target_node_id, relation_type, confidence in digest_rows
-            ]
+        digest_statement = select(
+            KnowledgeEdge.id.label("edge_id"),
+            KnowledgeEdge.source_node_id.label("source_node_id"),
+            KnowledgeEdge.target_node_id.label("target_node_id"),
+            KnowledgeEdge.relation_type.label("relation_type"),
+            KnowledgeEdge.confidence.label("confidence"),
+        ).where(
+            KnowledgeEdge.source_node_id.in_(visible_node_ids),
+            KnowledgeEdge.target_node_id.in_(visible_node_ids),
+        )
+        digest, digest_count, digest_rows = await _read_docs_digest(
+            session,
+            digest_statement,
+            lambda c: cast(c.edge_id, String) + literal(":")
+            + cast(c.source_node_id, String) + literal(":")
+            + cast(c.target_node_id, String) + literal(":")
+            + func.coalesce(c.relation_type, literal("None")) + literal(":")
+            + _pg_docs_float_repr(c.confidence),
+            lambda row: f"{row[0]}:{row[1]}:{row[2]}:{row[3]}:{row[4]!r}",
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -1798,7 +3012,7 @@ async def pull_docs_table(
                     "changes": [],
                     "tombstones": [],
                     "cursor": None,
-                    "authoritative_count": len(digest_rows),
+                    "authoritative_count": digest_count,
                     "authoritative_digest": digest,
                     },
                 snapshot_revision=digest,
@@ -1844,11 +3058,24 @@ async def pull_docs_table(
             "changes": [serialize_docs_edge(row) for row in rows],
             "tombstones": [],
             "cursor": next_cursor,
-            "authoritative_count": len(digest_rows),
+            "authoritative_count": digest_count,
         }
         if next_cursor is None:
             if include_authoritative_ids:
-                result["authoritative_ids"] = [str(row[0]) for row in digest_rows]
+                if digest_rows is not None:
+                    result["authoritative_ids"] = [str(row[0]) for row in digest_rows]
+                else:
+                    result["authoritative_ids"] = [
+                        str(id_)
+                        for id_ in (
+                            await session.execute(
+                                select(KnowledgeEdge.id).where(
+                                    KnowledgeEdge.source_node_id.in_(visible_node_ids),
+                                    KnowledgeEdge.target_node_id.in_(visible_node_ids),
+                                )
+                            )
+                        ).scalars().all()
+                    ]
             result["authoritative_digest"] = digest
         return _annotate_docs_page(
             result,

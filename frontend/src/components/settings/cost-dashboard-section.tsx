@@ -25,13 +25,16 @@ import {
   CartesianGrid,
   Line,
   LineChart,
-  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
   type TooltipContentProps,
 } from "recharts";
+import {
+  buildTokenTrendChart,
+  TokenTrendChartView,
+} from "./cost-dashboard-token-trend";
 import {
   usageApi,
   type FreeTierResponse,
@@ -269,43 +272,6 @@ function pickCost(
 type CostTrendPoint = TokenUsageDailyPoint & { cost: number };
 type TrendMetric = "cost" | "tokens";
 
-type TokenTrendMetric = {
-  total_tokens: number;
-  list_cost: number;
-  estimated_billed_cost: number;
-  request_count: number;
-};
-
-type TokenTrendPoint = {
-  date: string;
-  [key: string]: unknown;
-};
-
-type TokenTrendSeries = {
-  id: string;
-  identity: string;
-  valueKey: string;
-  metricKey: string;
-  label: string;
-  color: string;
-};
-
-type TokenTrendChart = {
-  id: string;
-  title: string;
-  quotaLimit?: number;
-  data: TokenTrendPoint[];
-  series: TokenTrendSeries[];
-};
-
-const TOKEN_TREND_COLORS = [
-  "var(--chart-1)",
-  "var(--chart-2)",
-  "var(--chart-3)",
-  "var(--chart-4)",
-  "var(--chart-5)",
-];
-
 type CostTrendTooltipProps = Partial<TooltipContentProps<number, string>> & {
   applyFreeTier: boolean;
 };
@@ -345,182 +311,6 @@ function CostTrendTooltip({
             point.estimated_billed_cost ?? point.list_cost ?? point.total_cost,
           )}
         </div>
-      </div>
-    </div>
-  );
-}
-
-type TokenTrendTooltipProps = Partial<TooltipContentProps<number, string>> & {
-  applyFreeTier: boolean;
-  chart: TokenTrendChart;
-};
-
-function TokenTrendTooltip({
-  active,
-  payload,
-  label,
-  applyFreeTier,
-  chart,
-}: TokenTrendTooltipProps) {
-  const point = payload?.[0]?.payload as TokenTrendPoint | undefined;
-  if (!active || !point) return null;
-
-  const rows = chart.series
-    .map((series) => {
-      const metric = point[series.metricKey] as TokenTrendMetric | undefined;
-      return metric && metric.total_tokens > 0 ? { series, metric } : null;
-    })
-    .filter(
-      (row): row is { series: TokenTrendSeries; metric: TokenTrendMetric } =>
-        row !== null,
-    );
-
-  if (rows.length === 0) return null;
-
-  return (
-    <div className="max-w-xs rounded-lg border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">
-      <p className="mb-1 font-semibold">
-        {formatDate(String(label ?? point.date))}
-      </p>
-      <div className="space-y-2">
-        {rows.map(({ series, metric }) => (
-          <div key={series.id} className="space-y-0.5">
-            <div className="flex items-center gap-1.5 font-medium">
-              <span
-                className="size-2 shrink-0 rounded-full"
-                style={{ backgroundColor: series.color }}
-              />
-              <span className="truncate">{series.label}</span>
-            </div>
-            <div className="flex items-center justify-between gap-5">
-              <span className="text-muted-foreground">トークン</span>
-              <span>{formatTokens(metric.total_tokens)}</span>
-            </div>
-            <div className="flex items-center justify-between gap-5">
-              <span className="text-muted-foreground">
-                {applyFreeTier ? "推定請求額" : "定価換算"}
-              </span>
-              <span>
-                {formatCost(
-                  applyFreeTier
-                    ? metric.estimated_billed_cost
-                    : metric.list_cost,
-                )}
-              </span>
-            </div>
-            <div className="flex items-center justify-between gap-5">
-              <span className="text-muted-foreground">リクエスト</span>
-              <span>{metric.request_count.toLocaleString("ja-JP")}</span>
-            </div>
-            <div className="border-t pt-0.5 text-[11px] text-muted-foreground">
-              定価 {formatCost(metric.list_cost)} / 推定請求額{" "}
-              {formatCost(metric.estimated_billed_cost)}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function TokenTrendChartView({
-  chart,
-  applyFreeTier,
-}: {
-  chart: TokenTrendChart;
-  applyFreeTier: boolean;
-}) {
-  return (
-    <div className="space-y-2 rounded-lg border p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h4 className="text-xs font-semibold text-muted-foreground">
-          {chart.title}
-        </h4>
-        {typeof chart.quotaLimit === "number" && (
-          <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-            <span className="inline-block w-5 border-t border-dashed border-chart-4" />
-            無料枠 {formatTokens(chart.quotaLimit)} / 日
-          </span>
-        )}
-      </div>
-      <div
-        className="h-56 w-full"
-        data-testid={`cost-dashboard-token-trend-chart-${chart.id}`}
-      >
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart
-            data={chart.data}
-            margin={{ top: 8, right: 12, bottom: 4, left: 8 }}
-          >
-            <CartesianGrid
-              stroke="var(--border)"
-              strokeDasharray="3 3"
-              vertical={false}
-            />
-            <XAxis
-              dataKey="date"
-              tickFormatter={formatDate}
-              tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
-              tickLine={false}
-              axisLine={{ stroke: "var(--border)" }}
-              minTickGap={18}
-              interval="preserveStartEnd"
-            />
-            <YAxis
-              tickFormatter={(value: number) => formatTokens(value)}
-              tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
-              tickLine={false}
-              axisLine={false}
-              width={82}
-              allowDecimals={false}
-            />
-            <Tooltip
-              content={
-                <TokenTrendTooltip
-                  applyFreeTier={applyFreeTier}
-                  chart={chart}
-                />
-              }
-              cursor={{
-                stroke: "var(--primary)",
-                strokeDasharray: "4 4",
-                strokeOpacity: 0.65,
-              }}
-            />
-            {typeof chart.quotaLimit === "number" && (
-              <ReferenceLine
-                y={chart.quotaLimit}
-                stroke="var(--chart-4)"
-                strokeDasharray="6 4"
-                strokeWidth={1.5}
-              />
-            )}
-            {chart.series.map((series) => (
-              <Line
-                key={series.id}
-                type="monotone"
-                dataKey={series.valueKey}
-                name={series.label}
-                stroke={series.color}
-                strokeWidth={2}
-                dot={{ r: 2, fill: series.color }}
-                activeDot={{ r: 5, fill: series.color }}
-                isAnimationActive={false}
-              />
-            ))}
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-        {chart.series.map((series) => (
-          <span key={series.id} className="flex items-center gap-1">
-            <span
-              className="size-2 rounded-full"
-              style={{ backgroundColor: series.color }}
-            />
-            {series.label}
-          </span>
-        ))}
       </div>
     </div>
   );
@@ -888,119 +678,15 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
     [dashboard, applyFreeTier],
   );
 
-  const tokenTrendCharts = useMemo<TokenTrendChart[]>(() => {
-    const rows = dashboard?.daily_model_trend ?? [];
-    if (rows.length === 0 || dailyTrendData.length === 0) return [];
-
-    type SeriesAccumulator = {
-      identity: string;
-      groupKey: string;
-      label: string;
-      byDate: Map<string, TokenTrendMetric>;
-    };
-
-    const seriesByIdentity = new Map<string, SeriesAccumulator>();
-    for (const row of rows) {
-      const totalTokens = Number(row.total_tokens ?? 0);
-      if (!Number.isFinite(totalTokens) || totalTokens <= 0) continue;
-
-      const modelLabel =
-        row.resolved_model && row.resolved_model !== row.model
-          ? `${row.model} (${row.resolved_model})`
-          : row.model;
-      const label = row.provider
-        ? `${row.provider} / ${modelLabel}`
-        : modelLabel;
-      const baseIdentity = `${row.provider}:${row.model}:${row.resolved_model ?? ""}`;
-      const groupKey = row.free_incentive_group?.trim() || `model:${baseIdentity}`;
-      const identity = `${baseIdentity}:${groupKey}`;
-      const existing = seriesByIdentity.get(identity);
-      const series =
-        existing ??
-        (() => {
-          const created: SeriesAccumulator = {
-            identity,
-            groupKey,
-            label,
-            byDate: new Map(),
-          };
-          seriesByIdentity.set(identity, created);
-          return created;
-        })();
-      const dateMetric = series.byDate.get(row.date);
-      const metric: TokenTrendMetric = {
-        total_tokens: totalTokens,
-        list_cost: Number(row.list_cost ?? row.total_cost ?? 0) || 0,
-        estimated_billed_cost:
-          Number(row.estimated_billed_cost ?? row.list_cost ?? row.total_cost ?? 0) ||
-          0,
-        request_count: Number(row.request_count ?? 0) || 0,
-      };
-      if (dateMetric) {
-        dateMetric.total_tokens += metric.total_tokens;
-        dateMetric.list_cost += metric.list_cost;
-        dateMetric.estimated_billed_cost += metric.estimated_billed_cost;
-        dateMetric.request_count += metric.request_count;
-      } else {
-        series.byDate.set(row.date, metric);
-      }
-    }
-
-    const groupedSeries = new Map<string, SeriesAccumulator[]>();
-    for (const series of seriesByIdentity.values()) {
-      const group = groupedSeries.get(series.groupKey) ?? [];
-      group.push(series);
-      groupedSeries.set(series.groupKey, group);
-    }
-
-    return [...groupedSeries.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([groupKey, group], chartIndex) => {
-        const orderedGroup = [...group].sort((a, b) =>
-          a.label.localeCompare(b.label),
-        );
-        const series = orderedGroup.map((item, seriesIndex) => ({
-          id: `token-trend-${chartIndex}-${seriesIndex}`,
-          identity: item.identity,
-          valueKey: `tokens-${chartIndex}-${seriesIndex}`,
-          metricKey: `metrics-${chartIndex}-${seriesIndex}`,
-          label: item.label,
-          color: TOKEN_TREND_COLORS[seriesIndex % TOKEN_TREND_COLORS.length],
-        }));
-        const data = dailyTrendData.map(({ date }) => {
-          const point: TokenTrendPoint = { date };
-          for (const chartSeries of series) {
-            const source = seriesByIdentity.get(chartSeries.identity);
-            const metric = source?.byDate.get(date);
-            point[chartSeries.valueKey] = metric?.total_tokens ?? 0;
-            point[chartSeries.metricKey] =
-              metric ?? {
-                total_tokens: 0,
-                list_cost: 0,
-                estimated_billed_cost: 0,
-                request_count: 0,
-              } satisfies TokenTrendMetric;
-          }
-          return point;
-        });
-        const quotaLimit = freeTier?.enabled
-          ? freeTier.groups?.find((item) => item.group === groupKey)
-              ?.limit_tokens
-          : undefined;
-        const title = FREE_TIER_GROUP_LABELS[groupKey]
-          ? `${FREE_TIER_GROUP_LABELS[groupKey]}のモデル別トークン推移`
-          : groupKey.startsWith("model:")
-            ? `${orderedGroup[0]?.label ?? "モデル"}のトークン推移`
-            : `${groupKey}のモデル別トークン推移`;
-        return {
-          id: `group-${chartIndex}`,
-          title,
-          quotaLimit,
-          data,
-          series,
-        };
-      });
-  }, [dashboard, dailyTrendData, freeTier]);
+  const tokenTrendChart = useMemo(
+    () =>
+      buildTokenTrendChart(
+        dashboard?.daily_model_trend ?? [],
+        dailyTrendData.map(({ date }) => date),
+      ),
+    [dashboard, dailyTrendData],
+  );
+  const hasTrendData = dailyTrendData.length > 0 || tokenTrendChart.series.length > 0;
 
   // モデル別内訳をコスト降順にソート
   const sortedModelBreakdown = useMemo(
@@ -1388,7 +1074,7 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
               </div>
 
               {/* 30日間の価格 / トークン推移 */}
-              {dailyTrendData.length > 0 && (
+              {hasTrendData && (
                 <div className="space-y-2" data-testid="cost-dashboard-trend">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="inline-flex items-center gap-1">
@@ -1398,7 +1084,9 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
                           : "30日間トークン推移"}
                       </h3>
                       {trendMetric === "tokens" && (
-                        <HelpPopover label="30日間トークン推移">無料枠グループごとにモデル別で表示します。</HelpPopover>
+                        <HelpPopover label="30日間トークン推移">
+                          同じ日付の全モデルを一つのグラフで比較できます。日別の数値はグラフのツールチップ、または「日付を選んで数値を確認」から確認できます。無料枠の上限はグループごとに異なるため、このグラフには上限線を表示しません。
+                        </HelpPopover>
                       )}
                     </div>
                     <Tabs
@@ -1421,7 +1109,7 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
                     </Tabs>
                   </div>
 
-                  {trendMetric === "cost" ? (
+                  {trendMetric === "cost" && dailyTrendData.length > 0 ? (
                     <div
                       className="h-64 w-full"
                       data-testid="cost-dashboard-trend-chart"
@@ -1484,16 +1172,16 @@ export function CostDashboardSection({ isAdmin }: { isAdmin: boolean }) {
                         </LineChart>
                       </ResponsiveContainer>
                     </div>
-                  ) : tokenTrendCharts.length > 0 ? (
-                    <div className="space-y-3">
-                      {tokenTrendCharts.map((chart) => (
-                        <TokenTrendChartView
-                          key={chart.id}
-                          chart={chart}
-                          applyFreeTier={applyFreeTier}
-                        />
-                      ))}
-                    </div>
+                  ) : trendMetric === "cost" ? (
+                    <p className="rounded-lg border p-4 text-xs text-muted-foreground">
+                      日別のコストデータがありません
+                    </p>
+                  ) : tokenTrendChart.series.length > 0 ? (
+                    <TokenTrendChartView
+                      chart={tokenTrendChart}
+                      applyFreeTier={applyFreeTier}
+                      formatCostValue={formatCost}
+                    />
                   ) : (
                     <p className="rounded-lg border p-4 text-xs text-muted-foreground">
                       モデル別の日次トークンデータがありません

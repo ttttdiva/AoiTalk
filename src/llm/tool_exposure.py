@@ -40,10 +40,16 @@ from .tool_packs import (
     tool_visible_for_session,
 )
 from .tool_policy import (
+    AGENT_DIALOGUE_ROOT_ONLY_TOOL_NAMES,
     DOCS_READ_TOOL_NAMES,
     FILESYSTEM_READ_TOOL_NAMES,
+    agent_revision_tool_id_permits,
     PROJECT_MANAGEMENT_READ_TOOL_NAMES,
     agent_tool_scope_permits_exposure,
+    agent_revision_tool_id_permits,
+    agent_revision_tool_permits_exposure,
+    agent_tool_scope_has_explicit_tool_ids,
+    current_agent_worker_kinds,
     SEARCH_TOOL_NAMES,
     command_capabilities_from_text,
     embedding_master_enabled,
@@ -95,7 +101,9 @@ _AGENT_SCOPE_PRESENTATION_EXEMPT_TOOL_NAMES = frozenset(
     {
         "send_agent_work_message",
         "get_agent_work_status",
+        "delegate",
         "delegate_agent_work",
+        "delegate",
         "answer_agent_work_question",
         "ask_user_question",
         "load_tool_pack",
@@ -105,6 +113,11 @@ _AGENT_SCOPE_PRESENTATION_EXEMPT_TOOL_NAMES = frozenset(
 
 _STRICT_TOOL_ALLOWLIST: ContextVar[frozenset[str] | None] = ContextVar(
     "aoitalk_strict_tool_allowlist",
+    default=None,
+)
+
+_SUPPRESSED_NATIVE_TOOL_ALLOWLIST: ContextVar[frozenset[str] | None] = ContextVar(
+    "aoitalk_suppressed_native_tool_allowlist",
     default=None,
 )
 
@@ -132,6 +145,55 @@ def get_strict_tool_allowlist() -> frozenset[str] | None:
 
 def reset_strict_tool_allowlist(token: Token) -> None:
     _STRICT_TOOL_ALLOWLIST.reset(token)
+
+
+def bind_suppressed_native_tool_allowlist(
+    tool_names: Iterable[str] | None,
+) -> Token:
+    """Allow a pinned native controller turn to expose an exact tool subset.
+
+    The native runtime still intersects this request-local set with the strict
+    execution allowlist.  Without both scopes, suppressed controller turns
+    remain tool-free.
+    """
+
+    allowed = (
+        frozenset(
+            str(name or "").strip()
+            for name in tool_names or ()
+            if str(name or "").strip()
+        )
+        if tool_names is not None
+        else None
+    )
+    return _SUPPRESSED_NATIVE_TOOL_ALLOWLIST.set(allowed)
+
+
+def get_suppressed_native_tool_allowlist() -> frozenset[str] | None:
+    return _SUPPRESSED_NATIVE_TOOL_ALLOWLIST.get()
+
+
+def reset_suppressed_native_tool_allowlist(token: Token) -> None:
+    _SUPPRESSED_NATIVE_TOOL_ALLOWLIST.reset(token)
+
+
+def _agent_revision_tool_ids_allow_exposure(
+    client: Any,
+    tool_name_value: str,
+    tool_definition: Any = None,
+) -> bool | None:
+    """Apply the shared P2 id/group matcher to a client's revision allowlist."""
+
+    raw_ids = getattr(client, "_agent_tool_ids", None)
+    if raw_ids is None:
+        return None
+    if not isinstance(raw_ids, (list, tuple, set, frozenset)):
+        return False
+    return agent_revision_tool_id_permits(
+        tool_name_value,
+        tool_definition,
+        tool_ids=raw_ids,
+    )
 
 
 def _strict_scope_error(
@@ -748,8 +810,17 @@ def filter_tools_for_client(
     semantic_off_catalog_active = not embedding_master_enabled(
         _effective_client_config(client)
     )
+    worker_dialogue_turn = (
+        str(getattr(get_turn_context(), "agent_dialogue_role", "") or "")
+        .strip()
+        .casefold()
+        == "worker"
+    )
     gated_values: list[Any] = []
     for candidate in values:
+        candidate_name = tool_name(candidate)
+        if worker_dialogue_turn and candidate_name in AGENT_DIALOGUE_ROOT_ONLY_TOOL_NAMES:
+            continue
         definition = candidate
         if isinstance(candidate, str) and registry is not None:
             getter = getattr(registry, "get", None)
@@ -758,15 +829,35 @@ def filter_tools_for_client(
                     definition = getter(candidate) or candidate
                 except Exception:  # noqa: BLE001 - diagnostic registry seam
                     definition = candidate
+        revision_tool_ids_allowed = _agent_revision_tool_ids_allow_exposure(
+            client,
+            tool_name(candidate),
+            definition,
+        )
+        if revision_tool_ids_allowed is False:
+            continue
+        if agent_revision_tool_id_permits(
+            candidate_name,
+            definition,
+        ) is False:
+            continue
+        if agent_revision_tool_permits_exposure(
+            candidate_name,
+            definition,
+        ) is False:
+            continue
         if runtime_tool_capability_status(definition, client=client) is None:
             if (
-                tool_name(candidate)
-                not in _AGENT_SCOPE_PRESENTATION_EXEMPT_TOOL_NAMES
-                and agent_tool_scope_permits_exposure(
+                agent_tool_scope_permits_exposure(
                     tool_name(candidate),
                     definition,
                 )
                 is False
+                and (
+                    tool_name(candidate)
+                    not in _AGENT_SCOPE_PRESENTATION_EXEMPT_TOOL_NAMES
+                    or agent_tool_scope_has_explicit_tool_ids()
+                )
             ):
                 continue
             gated_values.append(
@@ -851,6 +942,25 @@ def filter_tools_for_client(
         # pass so a fixed provider registry removes the contextual ``apps``
         # option immediately after App context is turned off.
         original_tool = tool
+        if tool_name(tool) == "delegate_worker":
+            allowed_kinds = current_agent_worker_kinds()
+            # A new-shaped revision with no permitted kind cannot use the
+            # worker tool. Legacy definitions are rebuilt with their existing
+            # CLI/Muse permission discovery in the builder.
+            if allowed_kinds is not None and not allowed_kinds:
+                continue
+            try:
+                from ..tools.delegate_worker import build_delegate_worker_tool
+
+                dynamic_definition = build_delegate_worker_tool(
+                    allowed_kinds=allowed_kinds,
+                )
+            except Exception:  # noqa: BLE001 - fail closed on stale schemas
+                dynamic_definition = None
+            if dynamic_definition is None:
+                continue
+            if not isinstance(tool, str):
+                tool = dynamic_definition
         if tool_name(tool) == "load_tool_pack" and registry is not None:
             try:
                 dynamic_loader = build_load_tool_pack_tool(

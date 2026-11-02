@@ -16,6 +16,8 @@ from ..prompts import build_unified_instructions
 from ..tool_exposure import (
     REVIEW_TOOL_ALLOWLIST,
     filter_tools_for_client,
+    get_strict_tool_allowlist,
+    get_suppressed_native_tool_allowlist,
     tool_name,
 )
 from ...services.project_context import (
@@ -32,6 +34,45 @@ logger = logging.getLogger(__name__)
 
 class AgentSetupMixin:
     """キャラクターエージェントの生成、システムプロンプト、LLM モード、ツール解決。"""
+
+    def _suppressed_native_tool_scope(self) -> frozenset[str] | None:
+        """Return a controller's request-local native tool scope when pinned."""
+
+        turn = get_turn_context()
+        if not bool(getattr(turn, "suppress_automatic_context", False)):
+            return None
+        native_allowlist = get_suppressed_native_tool_allowlist()
+        strict_allowlist = get_strict_tool_allowlist()
+        binding = getattr(turn, "agent_execution_binding", None)
+        if (
+            native_allowlist is None
+            or strict_allowlist is None
+            or binding is None
+            or getattr(self, "_agent_execution_binding", None) is not binding
+        ):
+            return None
+        turn_agent_id = str(getattr(turn, "agent_id", None) or "")
+        turn_revision_id = str(getattr(turn, "agent_revision_id", None) or "")
+        if (
+            not turn_agent_id
+            or not turn_revision_id
+            or turn_agent_id != str(getattr(self, "agent_id", None) or "")
+            or turn_revision_id
+            != str(getattr(self, "agent_revision_id", None) or "")
+            or not str(
+                getattr(self, "_isolated_system_prompt_override", "") or ""
+            ).strip()
+        ):
+            return None
+        revision_tool_ids = getattr(self, "_agent_tool_ids", None)
+        if not isinstance(revision_tool_ids, (list, tuple, set, frozenset)):
+            return None
+        allowed = native_allowlist & strict_allowlist & frozenset(
+            str(name).strip()
+            for name in revision_tool_ids
+            if isinstance(name, str) and name.strip()
+        )
+        return allowed or None
 
     def _build_instructions(self) -> str:
         """統一的なシステムプロンプトを生成（共通関数を使用）"""
@@ -104,6 +145,11 @@ class AgentSetupMixin:
 
     def _build_effective_instructions(self) -> str:
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            if self._suppressed_native_tool_scope() is not None:
+                # The pinned background Agent prompt is request-local and was
+                # installed by build_agent_chat_turn_client. Do not replace it
+                # with the Help-only prompt used by unscoped controllers.
+                return str(self._isolated_system_prompt_override).strip()
             # Help must win over any stale Project/automation override left
             # on a long-lived client by the preceding ordinary turn.
             return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
@@ -187,12 +233,19 @@ class AgentSetupMixin:
     def _get_effective_tools_for_current_session(self):
         if not getattr(self, "_native_tools_enabled", True):
             return []
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # AoiTalk Help exposes no provider tools.
+        suppressed_native_scope = self._suppressed_native_tool_scope()
+        if (
+            bool(getattr(get_turn_context(), "suppress_automatic_context", False))
+            and suppressed_native_scope is None
+        ):
+            # AoiTalk Help and unbound controller turns expose no provider tools.
             return []
         registry = getattr(self, "_tool_registry", None)
         tools = registry.get_all() if registry is not None else list(self.agent.tools)
-        return self._filter_tools_for_generation_purpose(tools)
+        effective = self._filter_tools_for_generation_purpose(tools)
+        if suppressed_native_scope is not None:
+            return [item for item in effective if tool_name(item) in suppressed_native_scope]
+        return effective
 
     @staticmethod
     def _tool_name(tool: Any) -> str:

@@ -198,9 +198,41 @@ def summary(row, *, run=None, event=None, phase_event=None, current_tool=None, r
 
 def _run_columns():
     return (AgentRun.id, AgentRun.work_item_id, AgentRun.project_id, AgentRun.parent_run_id,
-        AgentRun.root_run_id, AgentRun.acting_subagent_id, AgentRun.work_item_attempt,
+        AgentRun.root_run_id, AgentRun.acting_subagent_id, AgentRun.resolved_execution_manifest,
+        AgentRun.work_item_attempt,
         AgentRun.status, AgentRun.started_at, AgentRun.ended_at, AgentRun.last_event_at,
         AgentRun.created_at, AgentRun.error.is_not(None).label("has_error"))
+
+
+def _legacy_run_projection(run: Any) -> dict[str, Any] | None:
+    """Project historical AgentRun pins without exposing route selectors."""
+
+    legacy: dict[str, Any] = {}
+    acting = code(getattr(run, "acting_subagent_id", None))
+    if acting:
+        legacy["acting_subagent_id"] = acting
+    manifest = getattr(run, "resolved_execution_manifest", None)
+    snapshot = manifest.get("route_snapshot") if isinstance(manifest, dict) else None
+    if isinstance(snapshot, dict):
+        roles = snapshot.get("roles", snapshot)
+        safe_roles: dict[str, dict[str, Any]] = {}
+        if isinstance(roles, dict):
+            for raw_role, raw_route in roles.items():
+                if not isinstance(raw_route, dict):
+                    continue
+                role = code(raw_role)
+                if not role:
+                    continue
+                safe: dict[str, Any] = {}
+                for key in ("acting_subagent_id", "role", "provider", "model", "effort", "route_source", "backend"):
+                    value = raw_route.get(key)
+                    if isinstance(value, str) and code(value):
+                        safe[key] = value
+                if safe:
+                    safe_roles[role] = safe
+        if safe_roles:
+            legacy["route_snapshot"] = {"roles": safe_roles}
+    return legacy or None
 
 
 def _json_key_aliases(column):
@@ -710,7 +742,7 @@ async def read_execution(session, work_id, projects, *, limit=50, runs_cursor=No
     # resolved against the bounded full tree before selecting those rows.
     tool_by_run = await current_tools(session, [run.id for run in runs if run.status in {"running", "queued"}])
     run_data = [dict(id=str(run.id), work_item_id=uid(run.work_item_id) if run.work_item_id in work_ids else None, parent_run_id=uid(run.parent_run_id) if run.parent_run_id in visible_references else None, root_run_id=uid(run.root_run_id) if run.root_run_id in visible_references else None,
-        acting_subagent_id=code(run.acting_subagent_id), work_item_attempt=run.work_item_attempt,
+        legacy=_legacy_run_projection(run), work_item_attempt=run.work_item_attempt,
         status=code(run.status, "unknown"),
         phase=("completed" if run.status == "succeeded" else "cancelled" if run.status == "cancelled"
                else "executing" if tool_by_run.get(str(run.id))

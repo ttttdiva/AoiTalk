@@ -29,7 +29,7 @@ from ..memory.models import (
     Task,
     TaskDependency,
 )
-from .agent_team_v3 import AGENT_TEAM_CAPABILITY_CATALOG
+from .agent_capabilities import AGENT_CAPABILITY_CATALOG as AGENT_TEAM_CAPABILITY_CATALOG
 from .agent_work_runtime import WorkCandidate, WorkClaim
 from .project_permissions import normalize_project_member_permissions
 

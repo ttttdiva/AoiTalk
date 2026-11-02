@@ -3,7 +3,7 @@ import { and, asc, eq } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { assertActiveWriter, type SqliteHandle, type SqliteWriter } from "../db/sqlite-writer";
-import type { LegacyMigrationStatus } from "./contract";
+import type { LegacyCaptureMetadata, LegacyMigrationStatus } from "./contract";
 import { isSyncV3ManuallyStopped } from "../sync/v3/safety";
 
 export const LEGACY_CAPTURE_ID = "sync-v3-legacy";
@@ -318,6 +318,110 @@ function snapshotCounts(snapshot: LegacySnapshot) {
   };
 }
 
+function snapshotRows(snapshot: LegacySnapshot): Pick<LegacySnapshot, "outbox" | "dirty"> {
+  const parts = flattenSnapshotParts(snapshot);
+  return {
+    outbox: uniqueByStable(parts.flatMap((part) => part.outbox)),
+    dirty: uniqueByStable(parts.flatMap((part) => part.dirty)),
+  };
+}
+
+function countRows(rows: Pick<LegacySnapshot, "outbox" | "dirty">) {
+  return {
+    captureCount: rows.outbox.length + rows.dirty.length,
+    opCount: rows.outbox.length,
+    dirtyCount: rows.dirty.length,
+  };
+}
+
+function countRowVariants<T>(previous: T[], current: T[]): { added: number; removed: number } {
+  const previousKeys = new Set(previous.map(stableLegacyJson));
+  const currentKeys = new Set(current.map(stableLegacyJson));
+  return {
+    added: [...currentKeys].filter((key) => !previousKeys.has(key)).length,
+    removed: [...previousKeys].filter((key) => !currentKeys.has(key)).length,
+  };
+}
+
+function emptyCaptureMetadata(available: boolean): LegacyCaptureMetadata {
+  return {
+    available,
+    generation: null,
+    updatedAt: null,
+    captureCount: null,
+    opCount: null,
+    dirtyCount: null,
+    ownerUnknownCount: null,
+    active: null,
+    archived: null,
+    comparisonAvailable: false,
+    comparison: null,
+  };
+}
+
+let captureMetadataCache: { key: string; value: LegacyCaptureMetadata } | null = null;
+
+function captureMetadata(row: CaptureRow): LegacyCaptureMetadata {
+  const cacheKey = `${row.generation}:${row.updatedAt}:${row.captureSha256}`;
+  if (captureMetadataCache?.key === cacheKey) return captureMetadataCache.value;
+
+  const base = emptyCaptureMetadata(false);
+  base.generation = row.generation;
+  base.updatedAt = row.updatedAt;
+  base.captureCount = row.captureCount;
+  base.opCount = row.opCount;
+  base.dirtyCount = row.dirtyCount;
+  base.ownerUnknownCount = row.ownerUnknownCount;
+  try {
+    const snapshot = parseSnapshot(row.snapshotJson);
+    const activeRows = snapshotRows(activeSnapshot(snapshot));
+    const archiveParts = (snapshot.archived ?? []).flatMap(flattenSnapshotParts);
+    const archivedRows = {
+      outbox: uniqueByStable(archiveParts.flatMap((part) => part.outbox)),
+      dirty: uniqueByStable(archiveParts.flatMap((part) => part.dirty)),
+    };
+    base.available = true;
+    base.active = countRows(activeRows);
+    base.archived = {
+      snapshotCount: archiveParts.length,
+      ...countRows(archivedRows),
+    };
+
+    const archives = snapshot.archived ?? [];
+    const previousActive = archives.length > 0 ? archives[archives.length - 1] : undefined;
+    if (previousActive) {
+      const previousSnapshot: LegacySnapshot = {
+        ...activeSnapshot(previousActive),
+        archived: archives.slice(0, -1),
+      };
+      const previousRows = snapshotRows(previousSnapshot);
+      const previousCounts = snapshotCounts(previousSnapshot);
+      const currentRows = snapshotRows(snapshot);
+      const outboxVariants = countRowVariants(previousRows.outbox, currentRows.outbox);
+      const dirtyVariants = countRowVariants(previousRows.dirty, currentRows.dirty);
+      base.comparisonAvailable = true;
+      base.comparison = {
+        captureCount: row.captureCount - previousCounts.captureCount,
+        opCount: row.opCount - previousCounts.opCount,
+        dirtyCount: row.dirtyCount - previousCounts.dirtyCount,
+        addedOutboxVariants: outboxVariants.added,
+        removedOutboxVariants: outboxVariants.removed,
+        addedDirtyVariants: dirtyVariants.added,
+        removedDirtyVariants: dirtyVariants.removed,
+      };
+    }
+  } catch {
+    // Keep the persisted aggregate columns, but fail closed on all derived
+    // counts/comparisons when the private snapshot cannot be parsed.
+    base.active = null;
+    base.archived = null;
+    base.comparisonAvailable = false;
+    base.comparison = null;
+  }
+  captureMetadataCache = { key: cacheKey, value: base };
+  return base;
+}
+
 function uniqueByStable<T>(values: T[]): T[] {
   const seen = new Set<string>();
   return values.filter((value) => {
@@ -351,6 +455,7 @@ function publicStatus(row: CaptureRow | null | undefined): LegacyMigrationStatus
   if (!row) return {
     state: "not_needed", legacyCount: 0, ownerUnknownCount: 0,
     captureSha256: null, captureFile: null, errorCode: null,
+    metadata: emptyCaptureMetadata(true),
   };
   return {
     state: row.state as LegacyMigrationStatus["state"],
@@ -359,6 +464,7 @@ function publicStatus(row: CaptureRow | null | undefined): LegacyMigrationStatus
     captureSha256: row.captureSha256,
     captureFile: null,
     errorCode: row.errorCode,
+    metadata: captureMetadata(row),
   };
 }
 

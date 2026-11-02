@@ -11,6 +11,7 @@ import {
 import {
   getPendingNewChatLlmSettings,
   hydratePendingNewChatLlmSettings,
+  type PendingNewChatLlmSettingsSnapshot,
 } from "@/lib/new-chat-llm-settings-store";
 
 export type NewChatSendRouteSource = "pending" | "defaults";
@@ -94,9 +95,18 @@ function defaultsErrorMessage(error: NewChatLlmDefaultsError): string {
 export async function resolveNewChatSendRoute(
   userId?: string | null,
   options?: FetchNewChatLlmDefaultsOptions,
+  submittedPendingSnapshot?: PendingNewChatLlmSettingsSnapshot,
 ): Promise<NewChatSendRoute> {
-  hydratePendingNewChatLlmSettings(userId);
-  const pendingRoute = getPendingNewChatLlmSettings(userId).main_route;
+  // A New Chat submit captures its owner-scoped route before ChatComposer
+  // clears the draft. When provided, that snapshot is the send's route
+  // authority; rehydrating the mutable store here can replace a selected
+  // Grok/DOTS route with the server's inherited default during submit.
+  if (!submittedPendingSnapshot) {
+    hydratePendingNewChatLlmSettings(userId);
+  }
+  const pendingRoute = submittedPendingSnapshot
+    ? submittedPendingSnapshot.settings.main_route
+    : getPendingNewChatLlmSettings(userId).main_route;
 
   if (hasAnyRouteField(pendingRoute)) {
     if (!hasExplicitSessionRoute(pendingRoute)) {

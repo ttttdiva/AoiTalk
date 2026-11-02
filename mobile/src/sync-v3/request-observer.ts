@@ -68,7 +68,6 @@ export function beginSyncV3Request(
   let finished = false;
   const runtime = laneState(authScope)[lane];
   runtime.state = "running";
-  runtime.lastErrorCode = null;
   emit();
   const observer: RequestObserver = {
     requestId,

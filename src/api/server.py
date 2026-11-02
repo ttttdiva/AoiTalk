@@ -12,6 +12,7 @@ import inspect
 import os
 import re
 from typing import Mapping
+from uuid import UUID
 from urllib.parse import urlsplit
 from sqlalchemy import select
 
@@ -29,6 +30,26 @@ from .server_parts import (
 
 
 _startup_timer = get_startup_timer()
+
+
+def _task_notification_broadcaster(manager):
+    """Keep in-app notification WebSocket events scoped to their recipient."""
+
+    async def broadcast(message):
+        data = message.get("data") if isinstance(message, Mapping) else None
+        user_id = data.get("user_id") if isinstance(data, Mapping) else None
+        if isinstance(message, Mapping) and message.get("type") == "notification_created":
+            try:
+                recipient = str(UUID(user_id)) if isinstance(user_id, str) else None
+            except (TypeError, ValueError, AttributeError):
+                recipient = None
+            if recipient is None:
+                return
+            await manager.broadcast(message, user_id=recipient)
+            return
+        await manager.broadcast(message)
+
+    return broadcast
 
 
 _CORS_DOMAIN_LABEL_RE = re.compile(
@@ -97,6 +118,52 @@ def _normalize_cors_origin(value: Any) -> str | None:
     if port is not None:
         authority = f"{authority}:{port}"
     return f"{scheme}://{authority}"
+
+
+def _register_remote_llm_consumer_routes(server: "WebChatServer") -> None:
+    """Register consumer routes with the current deployment's ticket verifier."""
+    from types import SimpleNamespace
+
+    from ..services.remote_consumer_auth import RemoteConsumerAuth
+    from ..services.remote_llm_consumers import (
+        RemoteLLMConsumers, normal_bot_service_factory, resolve_canonical_muse_binding,
+    )
+    from .routes.remote_llm_consumer_routes import create_remote_llm_consumer_router
+
+    async def get_user(user_id):
+        manager = server._db_manager
+        if manager is None or not USER_REPOSITORY_AVAILABLE:
+            raise RuntimeError("user_repository_unavailable")
+        session = await manager.get_session()
+        try:
+            user = await UserRepository.get_by_id(session, user_id)
+            if user is None:
+                return None
+            return SimpleNamespace(
+                is_active=user.is_active,
+                is_password_reset_required=user.is_password_reset_required,
+                session_version=user.session_version,
+                role=user.role,
+            )
+        finally:
+            await session.close()
+
+    server.app.include_router(create_remote_llm_consumer_router(
+        get_current_user=server._get_user_info_from_request,
+        ticket_auth=RemoteConsumerAuth(
+            get_user=get_user,
+            get_secret=lambda: os.getenv("NEXTAUTH_SECRET"),
+            get_registry=lambda: os.getenv("AOITALK_AUTH_HANDOFF_CLIENTS"),
+            get_issuer=lambda: os.getenv("AOITALK_AUTH_HANDOFF_ISSUER"),
+        ),
+        service=RemoteLLMConsumers(
+            get_config=server._load_project_overview_config_snapshot,
+            muse_binding=None,
+            muse_binding_resolver=resolve_canonical_muse_binding,
+            muse_service_factory=lambda _config: server._cli_development_session_service,
+            bot_service_factory=normal_bot_service_factory,
+        ),
+    ))
 
 
 def _register_verification_provenance_middleware(
@@ -224,6 +291,8 @@ class WebChatServer(
         self._heartbeat_execution_dispatcher = None
         self._agent_work_coordinator = None
         self._agent_work_coordinator_started = False
+        self._free_team_daily_agent_scheduler = None
+        self._free_team_daily_agent_poll_key = None
         # Optional CLI development session facade.  The route is registered
         # even when this service is disabled; startup attaches it to the one
         # shared AgentWork coordinator only after the coordinator exists.
@@ -284,6 +353,7 @@ class WebChatServer(
         self._mage_vl_preload_task: asyncio.Task[Any] | None = None
         self._register_mage_vl_lifecycle()
         self._register_gpu_admission_lifecycle()
+        self._register_embedding_resident_lifecycle()
         self._register_docs_index_lifecycle()
         self._register_media_index_lifecycle()
         self._register_files_index_lifecycle()
@@ -291,6 +361,7 @@ class WebChatServer(
         self._conversation_dispatch_recovery_task: Any | None = None
         self._conversation_dispatch_shutting_down = False
         self._conversation_generation_tasks: Dict[str, Set[Any]] = {}
+        self._background_worker_session_ids: set[str] = set()
         self._conversation_generation_status: Dict[str, Dict[str, Any]] = {}
         self._conversation_steering_queues: Dict[str, List[str]] = {}
         self._conversation_late_finalize_tasks: set[asyncio.Task[Any]] = set()
@@ -520,7 +591,7 @@ class WebChatServer(
         if TASK_NOTIFICATION_WORKER_AVAILABLE and self._db_manager is not None:
             self._task_notification_worker = TaskNotificationWorker(
                 self._db_manager,
-                broadcaster=self.manager.broadcast,
+                broadcaster=_task_notification_broadcaster(self.manager),
                 poll_interval_seconds=self._extract_task_notification_poll_interval(),
                 config=self.config,
             )
@@ -569,6 +640,9 @@ class WebChatServer(
 
         self._project_overview_worker = None
         self._register_project_overview_lifecycle()
+
+        self._native_chat_recovery_worker = None
+        self._register_native_chat_recovery_lifecycle()
 
         self._knowledge_capture_worker = None
         self._register_knowledge_capture_lifecycle()
@@ -676,6 +750,9 @@ class WebChatServer(
         # Register conversation routes if available
         if CONVERSATION_ROUTES_AVAILABLE and create_conversation_router:
             self._register_conversation_routes()
+
+        # External DOTS dialogue remains absent unless explicitly enabled.
+        self._register_dots_dialogue_routes()
 
         self._register_chat_intent_routes()
 
@@ -994,6 +1071,19 @@ class WebChatServer(
                 logger.exception("Conversation dispatch shutdown failed: %s", exc)
 
         coordinator = getattr(self, "_agent_work_coordinator", None)
+        daily_agent_poll_key = getattr(
+            self, "_free_team_daily_agent_poll_key", None
+        )
+        if coordinator is not None and daily_agent_poll_key:
+            try:
+                coordinator.unregister_poll_callback(daily_agent_poll_key)
+            except Exception as exc:
+                logger.warning(
+                    "Free Team daily Agent scheduler unregister failed: %s", exc
+                )
+            finally:
+                self._free_team_daily_agent_poll_key = None
+                self._free_team_daily_agent_scheduler = None
         if coordinator is not None and (
             not rollback or getattr(self, "_agent_work_coordinator_started", False)
         ):
@@ -1040,6 +1130,47 @@ class WebChatServer(
                     await result
             except BaseException as exc:
                 logger.exception("Shutdown task failed: %s", exc)
+
+    def apply_embedding_resident(self, enabled: bool) -> None:
+        """Apply the persisted setting and warm asynchronously when enabled."""
+        from ..rag.embedding import peek_embedding_runtime
+
+        runtime = peek_embedding_runtime()
+        if runtime is not None:
+            runtime.apply_resident(enabled)
+        if enabled:
+            self._spawn_lifespan_task(self._warm_embedding_resident(), name="embedding-resident")
+
+    async def _warm_embedding_resident(self) -> None:
+        try:
+            if self.config.get("search.embedding_resident", False) is not True:
+                return
+            from ..rag.config import get_rag_config
+            from ..rag.embedding import get_embedding
+
+            config = await asyncio.to_thread(get_rag_config)
+            if self.config.get("search.embedding_resident", False) is not True:
+                return
+            runtime = get_embedding(config.embedding)
+            runtime.apply_resident(True)
+            await runtime.initialize()
+        except Exception:
+            logger.warning("EmbeddingGemma 2 resident startup failed", exc_info=True)
+
+    def _register_embedding_resident_lifecycle(self) -> None:
+        async def start() -> None:
+            if self.config.get("search.embedding_resident", False) is True:
+                await self._warm_embedding_resident()
+
+        async def stop() -> None:
+            from ..rag.embedding import peek_embedding_runtime
+
+            runtime = peek_embedding_runtime()
+            if runtime is not None:
+                runtime.apply_resident(False)
+                await runtime.release()
+
+        self._register_lifecycle_pair(start, stop)
 
     def _register_mage_vl_lifecycle(self) -> None:
         """Register lazy Mage-VL warmup and owned-process cleanup."""
@@ -1093,13 +1224,21 @@ class WebChatServer(
 
     def _register_gpu_admission_lifecycle(self) -> None:
         """Own the GPU admission watchdog; registered before any ticket holder starts."""
-        from ..services.gpu_admission import configure_gpu_admission
+        from ..services.gpu_admission import MAX_LEASE_TTL_SECONDS, configure_gpu_admission
         from ..services.gpu_admission_driver import GpuAdmissionDriver
 
         backend = self._build_gpu_lease_backend()
-        coordinator = configure_gpu_admission(recovering=backend is not None)
-        driver = self._gpu_admission_driver = GpuAdmissionDriver(coordinator, backend)
         runtime = getattr(self, "_gpu_trial_runtime", None)
+        max_lease_ttl_seconds = (
+            runtime.max_lease_ttl_seconds
+            if backend is not None and runtime is not None
+            else MAX_LEASE_TTL_SECONDS
+        )
+        coordinator = configure_gpu_admission(
+            recovering=backend is not None,
+            max_ttl=max_lease_ttl_seconds,
+        )
+        driver = self._gpu_admission_driver = GpuAdmissionDriver(coordinator, backend)
         if runtime is None:
             self._gpu_trial_launcher = None
             self._register_lifecycle_pair(driver.start, driver.stop)
@@ -1183,6 +1322,43 @@ class WebChatServer(
             self._project_overview_worker.start,
             self._project_overview_worker.stop,
         )
+
+    def _register_native_chat_recovery_lifecycle(self) -> None:
+        """Resume native agent-link rows while the API process is alive."""
+
+        if self._db_manager is None:
+            return
+        try:
+            if isinstance(self.config, Mapping):
+                muse_settings = self.config.get("muse_chat", {})
+                native_muse = isinstance(muse_settings, Mapping) and (
+                    muse_settings.get("native_link") is True
+                )
+            else:
+                native_muse = self.config.get("muse_chat.native_link", False) is True
+        except Exception:
+            native_muse = False
+        try:
+            from ..services.grok_bot_chat_service import resolve_grok_bot_chat_settings
+
+            native_grok = resolve_grok_bot_chat_settings(self.config)[0] is not None
+        except Exception:
+            native_grok = False
+        if not native_muse and not native_grok:
+            return
+        try:
+            from ..services.muse_native_recovery_worker import (
+                NativeChatRecoveryWorker,
+            )
+
+            worker = NativeChatRecoveryWorker(self.config)
+            self._native_chat_recovery_worker = worker
+            self._register_lifecycle_pair(worker.start, worker.stop)
+        except Exception as exc:
+            logger.warning(
+                "Native Chat recovery worker registration skipped: exception_type=%s",
+                type(exc).__name__,
+            )
 
     def _register_knowledge_capture_lifecycle(self) -> None:
         """Register the optional Knowledge Capture worker.
@@ -1309,14 +1485,27 @@ class WebChatServer(
 
         def _llm_client_factory(*args: Any, **kwargs: Any) -> Any:
             del args
-            client = getattr(self, "_llm_client", None)
+            try:
+                from ..services.dreaming_memory_routing import (
+                    create_dreaming_memory_client,
+                    requires_free_only_memory_route,
+                )
+
+                use_free_only_route = requires_free_only_memory_route(self.config)
+            except Exception:
+                logger.warning("Dreaming memory route policy unavailable")
+                return None
+
+            client = (
+                owned_background_client.get("client")
+                if use_free_only_route
+                else getattr(self, "_llm_client", None)
+            )
             if client is None:
                 client = owned_background_client.get("client")
                 if client is None:
                     try:
-                        from ..llm.manager import create_llm_client
-
-                        client = create_llm_client(self.config)
+                        client = create_dreaming_memory_client(self.config)
                         owned_background_client["client"] = client
                     except Exception:
                         logger.warning("Dreaming owned LLM client creation unavailable")
@@ -1445,7 +1634,10 @@ class WebChatServer(
                 if Features.virtual_company():
                     from ..services.ai_employee_platform import register_ai_employee_work
 
-                    register_ai_employee_work(self._agent_work_coordinator, self.ai_employee_services)
+                    register_ai_employee_work(
+                        self._agent_work_coordinator,
+                        self.ai_employee_services,
+                    )
                 if getattr(self._agent_work_coordinator, "execution_actor", None) is None:
                     self._agent_work_coordinator.execution_actor = ActorPrincipal.service(
                         "aoitalk.system"
@@ -1496,8 +1688,33 @@ class WebChatServer(
                     from .agent_task_routes import bind_agent_task_service
 
                     agent_task_service = bind_agent_task_service(
-                        self._db_manager, self.config, self._agent_work_coordinator
+                        self._db_manager,
+                        self.config,
+                        self._agent_work_coordinator,
+                        openrouter_quota_refresher=getattr(
+                            self, "_free_team_openrouter_task_refresh", None
+                        ),
                     )
+                    try:
+                        from ..services.free_team_daily_agent_task_scheduler import (
+                            FreeTeamDailyAgentTaskScheduler,
+                        )
+
+                        daily_scheduler = FreeTeamDailyAgentTaskScheduler(
+                            self._agent_work_coordinator,
+                            config=self.config,
+                        )
+                        daily_poll_key = f"free-team-daily-agent:{id(self)}"
+                        self._agent_work_coordinator.register_poll_callback(
+                            daily_poll_key, daily_scheduler.tick
+                        )
+                        self._free_team_daily_agent_scheduler = daily_scheduler
+                        self._free_team_daily_agent_poll_key = daily_poll_key
+                    except Exception:
+                        logger.warning(
+                            "Free Team daily Agent scheduler registration skipped",
+                            exc_info=True,
+                        )
                 # The CLI development session facade uses the same durable
                 # coordinator and must be attached before stale recovery or
                 # the poller can observe its WorkSource.
@@ -1509,11 +1726,6 @@ class WebChatServer(
                             await agent_task_service.migrate_workspace_fence_keys()
                         except Exception:
                             logger.warning("API Agent task fence migration skipped", exc_info=True)
-                    if Features.virtual_company() and Features.voice_input():
-                        # Only expired phone sessions beyond their absolute
-                        # lifetime are classified; another worker's live call
-                        # is never interrupted and no provider command retries.
-                        await self.ai_employee_services.telephony.recover_interrupted_calls()
                 agent_work_ready = True
             except Exception as exc:
                 logger.warning("Common AgentWork coordinator startup skipped: %s", exc)
@@ -1862,6 +2074,7 @@ class WebChatServer(
         if not Features.is_enterprise():
             register_mobile_command_routes(self.app, self)
         register_conversation_dispatch_routes(self.app, self)
+        _register_remote_llm_consumer_routes(self)
         from .media_search_routes import create_media_search_router
         self.app.include_router(create_media_search_router(
             get_db_manager=lambda: self._db_manager,
@@ -1883,6 +2096,12 @@ class WebChatServer(
         self._register_agent_task_routes()
         if AGENT_IDENTITY_ROUTES_AVAILABLE and create_agent_identity_router:
             self._register_agent_identity_routes()
+        from .agent_team_graph_routes import create_agent_team_graph_router
+        self.app.include_router(create_agent_team_graph_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
+        ))
         from .agent_dialogue_routes import create_agent_dialogue_router
         from ..services.agent_dialogue_service import get_agent_dialogue_dispatch_bridge
         dialogue_dispatch_bridge = get_agent_dialogue_dispatch_bridge(self._db_manager, config=self.config)
@@ -1893,6 +2112,7 @@ class WebChatServer(
             require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
             get_dispatch_bridge=lambda: dialogue_dispatch_bridge,
             config=self.config,
+            restart_admission_server=self,
         ))
         register_live_voice_routes(self.app, self)
         register_voice_session_routes(self.app, self)
@@ -1977,6 +2197,8 @@ class WebChatServer(
         if not AGENT_WORK_ROUTES_AVAILABLE or not create_agent_work_router:
             return
         require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        from .router_helpers import restart_work_admission_dependency
+
         router = create_agent_work_router(
             get_db_manager=lambda: self._db_manager,
             require_auth_dependency=require_auth,
@@ -1984,6 +2206,7 @@ class WebChatServer(
             get_coordinator=lambda: self._agent_work_coordinator,
             get_user_from_request=self._get_user_info_from_request,
             get_generation_status=self.get_conversation_generation_status,
+            restart_work_dependency=restart_work_admission_dependency(self),
         )
         self.app.include_router(router)
         logger.info("Common AgentWork routes registered")
@@ -1992,6 +2215,7 @@ class WebChatServer(
         """Register authenticated invocation routes for generic API Agents."""
 
         from .agent_task_routes import create_agent_task_router
+        from .router_helpers import restart_work_admission_dependency
 
         require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
         self.app.include_router(
@@ -2000,7 +2224,11 @@ class WebChatServer(
                 get_coordinator=lambda: self._agent_work_coordinator,
                 get_user_from_request=self._get_user_info_from_request,
                 require_auth_dependency=require_auth,
+                restart_work_dependency=restart_work_admission_dependency(self),
                 config=self.config,
+                get_openrouter_quota_refresher=lambda: getattr(
+                    self, "_free_team_openrouter_task_refresh", None
+                ),
             )
         )
         from .agent_task_listing_routes import create_agent_task_listing_router
@@ -2388,6 +2616,58 @@ class WebChatServer(
         self.app.include_router(router)
         logger.info("Knowledge Workspace routes registered")
 
+    def _register_dots_dialogue_routes(self) -> None:
+        """Register the one approved, default-off DOTS stdio/Tunnel connection."""
+        try:
+            from .routes.dots_dialogue_routes import (
+                dots_dialogue_route_enabled,
+            )
+            from .dots_dialogue_dedicated_composition import (
+                create_dots_dialogue_dedicated_composition,
+            )
+            from plugins.AoiTalk_Plugin.aoitalk_plugin.dots_dialogue_dedicated import (
+                DedicatedDotsConfigurationError,
+                load_dedicated_dots_connection_config,
+            )
+        except Exception:
+            logger.warning("External DOTS dialogue routes unavailable")
+            return
+        if not dots_dialogue_route_enabled(
+            self.config,
+            enterprise_profile=Features.is_enterprise(),
+        ):
+            return
+        try:
+            connection_config = load_dedicated_dots_connection_config()
+        except DedicatedDotsConfigurationError:
+            # No secret-bearing values or identity claims are included in logs.
+            connection_config = None
+            logger.error("Dedicated DOTS connection configuration is unavailable")
+
+        composition = create_dots_dialogue_dedicated_composition(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=cookie_auth_dependency(self._enforce_cookie_auth),
+            config=(self.config.config if hasattr(self.config, "config") else self.config),
+            enterprise_profile=Features.is_enterprise(),
+            profile_allows_external=True,
+            connection_config=connection_config,
+            dispatcher_enabled=True,
+        )
+        self.app.include_router(composition)
+        lifecycle = getattr(composition, "dots_dialogue_dispatcher_lifecycle", None)
+        start = getattr(lifecycle, "start", None)
+        stop = getattr(lifecycle, "stop", None)
+        if callable(start):
+            self._startup_background_tasks.append(start)
+        if callable(stop):
+            self._shutdown_background_tasks.append(stop)
+        logger.info(
+            "Dedicated DOTS composition registered enabled=%s dispatcher=%s",
+            bool(getattr(composition, "dots_dialogue_dedicated_enabled", False)),
+            bool(getattr(composition, "dots_dialogue_dispatcher_enabled", False)),
+        )
+
     def _register_deep_research_routes(self):
         """Register local Deep Research API routes."""
 
@@ -2423,6 +2703,7 @@ class WebChatServer(
         """Register Conversation History API routes"""
 
         require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        from .router_helpers import conversation_restart_admission_dependency
 
         async def generate_title_via_llm(prompt: str) -> Optional[str]:
             """Generate title using the already-running main LLM client."""
@@ -2433,6 +2714,10 @@ class WebChatServer(
             get_current_user=self._get_user_info_from_request,
             get_llm_for_title_generation=generate_title_via_llm,
             get_title_config=lambda: self.config,
+            chat_admission_dependency=conversation_restart_admission_dependency(
+                self, require_auth
+            ),
+            remember_background_worker_session=self._remember_background_worker_session,
         )
         self.app.include_router(router)
         if CONVERSATION_ROUTES_AVAILABLE and create_conversation_agent_router:
@@ -2467,12 +2752,16 @@ class WebChatServer(
             return
 
         require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        from .router_helpers import conversation_restart_admission_dependency
 
         router = create_group_chat_router(
             require_auth=require_auth,
             get_current_user=self._get_user_info_from_request,
             config=self.config if hasattr(self, "config") else None,
             masking_handler=self._execute_builtin_masking_turn,
+            chat_admission_dependency=conversation_restart_admission_dependency(
+                self, require_auth
+            ),
         )
         self.app.include_router(router)
         logger.info("Group chat routes registered")
@@ -2747,10 +3036,13 @@ class WebChatServer(
                     status_code=403, detail="Administrator privileges required"
                 )
 
+        from .router_helpers import restart_work_admission_dependency
+
         self.app.include_router(create_local_agent_task_router(
             require_admin=require_admin,
             get_manager=lambda: manager,
             get_user_id=self._get_user_info_from_request,
+            restart_work_dependency=restart_work_admission_dependency(self),
         ))
         if manager is not None:
             async def _start_local_agent_tasks() -> None:
@@ -2834,6 +3126,7 @@ class WebChatServer(
                 self._db_manager,
                 config=self.config,
                 coordinator=self._agent_work_coordinator,
+                remote_config_supplier=self._load_project_overview_config_snapshot,
             )
             self._cli_development_session_service = instance
             return instance

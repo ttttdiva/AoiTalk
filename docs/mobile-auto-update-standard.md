@@ -23,7 +23,7 @@ cmd /d /c scripts\build_apk.bat
 
 通常実行は公開を行わないbuild-onlyである。launcherは設定済みの`origin`から実際の`origin/main`をfetchして固定snapshotを作り、snapshotの`mobile/app.json`のversion/versionCodeを使ってAPKとimmutable manifestを生成する。起動checkoutの未commit変更、別branch、index、untracked fileはbuild sourceに使わず、元のGit状態を保持する。
 
-一時領域・Gradle cache・npm cache・snapshotは`.local\at`、`.local\ag`、`.local\an`、`.local\as`とlockで自動管理し、成功・失敗後に所有範囲だけをcleanupする。通常の`venv\Scripts\python.exe`、検出可能なMicrosoft JDK 17、Android SDKを再利用するため、通常手順で`TEMP`、`GRADLE_USER_HOME`、`npm_config_cache`などを手動設定しない。Gradleは固定の9.1.0-binと公式SHA-256を使う。venv、JDK/SDK、依存取得、GitHubのorigin/main fetchなどが利用できない場合は停止する。
+一時領域・Gradle cache・npm cache・snapshotは、リポジトリ外のOS TEMP配下に、物理的に解決したリポジトリパスのハッシュで決まる固定の短い所有範囲を設け、その中の`at`、`ag`、`an`、`as`と`at.lock`で管理する。marker・nonce・lockとreparse pointの検証により所有範囲を保護し、成功・失敗後に所有範囲だけをcleanupする。従来の`.local\at`、`.local\ag`、`.local\an`、`.local\as`、`.local\at.lock`の残存物は新しい一時領域とは別である。Bashでは物理パスに解決したリポジトリ外の一時ディレクトリ配下に`mktemp`で所有する一時領域を作る。通常の`venv\Scripts\python.exe`、検出可能なMicrosoft JDK 17、Android SDKを再利用するため、通常手順で`TEMP`、`GRADLE_USER_HOME`、`npm_config_cache`などを手動設定しない。Gradleは固定の9.1.0-binと公式SHA-256を使う。venv、JDK/SDK、依存取得、GitHubのorigin/main fetchなどが利用できない場合は停止する。
 
 release gateのbaseを指定しない場合、first-parent上でtargetよりversionとversionCodeがともに低い直前の異versioncommitを自動選択する。同じversion/versionCodeの追随commitはスキップする。履歴が不正、rollback、候補なし、または増分が不完全な場合は停止するため、明示的な`-ReleaseBase <commit>`（`-Base <commit>` alias）または`AOITALK_MOBILE_RELEASE_BASE`を指定して再実行する。`-ReleaseBase`指定は同名環境変数より優先する。
 

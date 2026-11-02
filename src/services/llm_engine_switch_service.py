@@ -8,10 +8,7 @@ import logging
 import threading
 from typing import Any
 
-from ..services.execution_profile_service import (
-    MANUAL_EXECUTION_PROFILE_ID,
-    resolve_execution_main_route,
-)
+from ..services.model_roles_service import resolve_execution_main_route
 from ..services.llm_model_catalog import build_llm_mode_state
 
 logger = logging.getLogger(__name__)
@@ -461,7 +458,6 @@ def build_provider_model_config_changes(
     provider: str,
     model: str,
     reasoning_effort: str | None = None,
-    execution_profile_id: str | None = None,
     base_url: str | None = None,
     deployment: Any = None,
     extra_changes: dict[str, Any] | None = None,
@@ -534,9 +530,6 @@ def build_provider_model_config_changes(
         elif provider == "deepinfra" and effort in {"none", "low", "medium", "high"}:
             _apply_config("deepinfra.reasoning_effort", effort)
 
-    # Global Execution Profile ids are leftover metadata only.  Writing them
-    # here used to override Main; keep the leftover store inert.
-    del execution_profile_id
     return config_changes
 
 
@@ -557,7 +550,6 @@ def build_manual_engine_config_changes(
         provider=provider,
         model=model,
         reasoning_effort=reasoning_effort,
-        execution_profile_id=MANUAL_EXECUTION_PROFILE_ID,
         base_url=base_url,
         deployment=deployment,
         extra_changes=extra_changes,
@@ -671,7 +663,6 @@ async def apply_llm_engine_switch(
     provider: str,
     model: str,
     reasoning_effort: str | None = None,
-    execution_profile_id: str | None = None,
     config_changes: dict[str, Any] | None = None,
     deployment: Any = None,
     local_switch_in_progress: bool = False,

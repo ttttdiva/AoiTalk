@@ -8,6 +8,7 @@ import copy
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from dataclasses import replace
 import inspect
 import json
 import logging
@@ -34,6 +35,8 @@ from ..conversation_context import (
     stable_cache_key,
 )
 from ..generation_policy import GenerationProfile, get_client_generation_policy
+from ..generation_error import tool_execution_blocked_failure
+from ..graph_plan_receipt import accepted_graph_plan_receipt
 from ..provider_terminal import FAILED_TERMINAL_STATES, sanitize_terminal_evidence
 from ..agentic_completion import (
     AUTHORITATIVE_TASK_MUTATION_TOOLS,
@@ -70,12 +73,9 @@ from ..tool_exposure import filtered_registry_for_client
 from ..tool_packs import (
     ensure_load_tool_pack_tool,
     pre_route_tool_pack_for_request,
-    tool_pack_session_for_client,
 )
 from ..tool_policy import (
-    _docs_agent_delegation_available,
     command_capability_active,
-    looks_like_docs_agent_delegation_request,
 )
 from ..specialist_delegate import (
     reset_runtime_specialist_provider,
@@ -86,6 +86,7 @@ from ..generation_policy import (
     set_current_generation_policy,
 )
 from ..tool_policy import (
+    append_current_user_input_update,
     get_current_user_input,
     reset_current_user_input,
     set_current_user_input,
@@ -101,7 +102,7 @@ from ...services.agent_run_service import (
     get_current_agent_run_id,
     redact_sensitive_model_transcript,
 )
-from ...services.agent_team_service import (
+from ...services.runtime_policy_utils import (
     reset_current_continuation_state,
     set_current_continuation_state,
 )
@@ -114,6 +115,7 @@ from ...services.outbound_privacy_service import (
 from ..generation_cancellation import (
     AgentDialogueInputPending,
     GenerationInterrupted,
+    PlanningInteractionTerminated,
     reset_current_generation_mutation_gate,
     set_current_generation_mutation_gate,
 )
@@ -234,6 +236,9 @@ _OWNER_PROGRESS_EVENT_KEYS: dict[str, frozenset[str]] = {
             "error_code",
             "input_tokens",
             "output_tokens",
+            "bytes_received",
+            "events_received",
+            "last_event_type",
         }
     ),
 }
@@ -794,6 +799,7 @@ class TurnExecutionMixin:
         instructions = await self._consume_steering_instructions(steering_callback)
         if not instructions:
             return context
+        append_current_user_input_update("\n".join(instructions))
         if stream_callback:
             await stream_callback(
                 "status_update",
@@ -1022,10 +1028,23 @@ class TurnExecutionMixin:
     ) -> str:
         # Snapshot this immutable policy before any await.  Do not read the
         # shared client attribute again while the runner is active.
+        graph_context = copy.deepcopy(
+            getattr(self, "_agent_required_tool_graph_context", None)
+        ) if (
+            required_tool_name == "delegate_plan"
+            and getattr(self, "_agent_required_tool_name", None) == "delegate_plan"
+        ) else None
         turn = get_turn_context()
         suppress_automatic_context = bool(
             getattr(turn, "suppress_automatic_context", False)
         )
+        turn_snapshot = _native_turn_result_snapshot.get()
+        usage_batch_id = uuid.uuid4().hex
+        if isinstance(turn_snapshot, dict):
+            # One AgentRun may contain several tool/review generations. Keep
+            # a stable ID for this NativeRunResult batch so the outer loop's
+            # terminal publication can repeat the last snapshot idempotently.
+            turn_snapshot["native_usage_batch_id"] = usage_batch_id
         effective_user_id = str(
             getattr(turn, "user_id", None)
             or self._get_session_user_id()
@@ -1066,6 +1085,30 @@ class TurnExecutionMixin:
                 generation_policy=run_generation_policy,
             )
         )
+        if isinstance(graph_context, dict) and graph_context and not tool_free:
+            # The verified graph supplies its frozen roster. Project the existing
+            # graph branch locally so both the runner and cache see that contract.
+            projected_tools = []
+            for tool in agent.tools:
+                if tool.name != "delegate_plan":
+                    projected_tools.append(tool)
+                    continue
+                parameters = []
+                for param in tool.parameters:
+                    if param.name == "planning":
+                        schema = copy.deepcopy(param.schema["anyOf"][0])
+                        param = replace(
+                            param, required=True, schema=schema,
+                            description="Planning options; the fixed graph roster is supplied by the server.",
+                        )
+                    elif param.name == "work_role":
+                        param = replace(
+                            param, enum=["researcher", "writer", "data_worker", "general_worker"],
+                            description="Parent work role; child code_worker is selected by the fixed graph.",
+                        )
+                    parameters.append(param)
+                projected_tools.append(replace(tool, parameters=parameters))
+            agent = replace(agent, tools=projected_tools)
         # Cache fingerprints must describe the same effective schemas sent to
         # the provider, not the full registry held by ``agent.tools``.  The
         # latter includes deferred Apps/Spotify/media definitions and can
@@ -1074,7 +1117,7 @@ class TurnExecutionMixin:
         # already narrow allowlist.
         cache_tools = (
             []
-            if tool_free or suppress_automatic_context
+            if tool_free or (suppress_automatic_context and not graph_context)
             else list(getattr(agent, "tools", []))
         )
         if (
@@ -1300,6 +1343,19 @@ class TurnExecutionMixin:
                 )
             ):
                 run_kwargs["tool_free"] = True
+            if (
+                isinstance(graph_context, dict) and graph_context
+                and required_tool_name == "delegate_plan" and not tool_free
+                and "tool_result_completion_check" in runner_parameters
+            ):
+                def _graph_plan_completion_check(record):
+                    if accepted_graph_plan_receipt(
+                        record, source=graph_context.get("source"), graph=graph_context
+                    ):
+                        return "計画の作成を開始しました。"
+                    return None
+
+                run_kwargs["tool_result_completion_check"] = _graph_plan_completion_check
             # NativeRunResult can classify an empty final response without
             # raising. Reset the attempt-local marker before running so a
             # previous turn cannot leak its failure into this one.
@@ -1399,6 +1455,19 @@ class TurnExecutionMixin:
             result_generation_failure = generation_failure_from_stopped_reason(
                 getattr(result, "stopped_reason", None)
             )
+        result_tool_records = list(getattr(result, "tool_calls", None) or [])
+        graph_receipt_accepted = None
+        if isinstance(graph_context, dict) and graph_context:
+            graph_receipt_accepted = any(
+                accepted_graph_plan_receipt(
+                    record, source=graph_context.get("source"), graph=graph_context
+                )
+                for record in result_tool_records
+            )
+            if not graph_receipt_accepted and result_generation_failure is None:
+                result_generation_failure = tool_execution_blocked_failure(
+                    source="required_delegate_plan_receipt"
+                )
         result_provider_terminal = sanitize_terminal_evidence(
             getattr(result, "provider_terminal", None)
         )
@@ -1406,7 +1475,6 @@ class TurnExecutionMixin:
             self._last_generation_failure = result_generation_failure
             self._last_provider_terminal_evidence = result_provider_terminal
             self._last_provider_failure = getattr(result, "provider_failure", None)
-        result_tool_records = list(getattr(result, "tool_calls", None) or [])
         result_tool_rounds_exhausted = bool(
             getattr(result, "tool_rounds_exhausted", False)
         )
@@ -1475,6 +1543,7 @@ class TurnExecutionMixin:
                     if isinstance(item, dict)
                 ],
                 failure=result_generation_failure,
+                usage_batch_id=usage_batch_id,
             )
         await self._record_native_usage(result, agent)
         if (
@@ -1546,6 +1615,10 @@ class TurnExecutionMixin:
                     self.history_manager.set_model_messages(active_model_transcript)
         if result_tool_records:
             print(f"[AgentLLMClient] Tool messages found: {len(result_tool_records)}")
+        if graph_receipt_accepted is not None:
+            if result_generation_failure is not None:
+                return result_generation_failure.user_message
+            return "計画の作成を開始しました。"
         if required_tool_name and not any(
             record.tool == required_tool_name and record.successful
             for record in result_tool_records
@@ -1780,11 +1853,16 @@ class TurnExecutionMixin:
         ]
         if not records and not tool_records:
             return
+        turn_snapshot = _native_turn_result_snapshot.get()
         try:
             self._publish_native_agent_run_state(
                 get_current_agent_run_id(),
                 tool_records=tool_records,
                 usage_records=records,
+                usage_batch_id=(
+                    str((turn_snapshot or {}).get("native_usage_batch_id") or "")
+                    or None
+                ),
             )
         except Exception:
             # Never replace the durable question control flow with an
@@ -1814,14 +1892,17 @@ class TurnExecutionMixin:
         tool_records: list[Any] | None,
         usage_records: list[dict[str, Any]] | None = None,
         failure: Any = None,
+        usage_batch_id: str | None = None,
     ) -> None:
         """Publish attempt evidence under the owning AgentRun id.
 
         The SGLang compatibility client already exposes a run-keyed completed
         ledger.  Native OpenAI turns need the same seam because a final text
         request can fail after a durable task mutation and before the shared
-        ``_last_*`` fields are updated.  Keep this projection in memory only;
-        AgentRun persistence acknowledges it after terminalization.
+        ``_last_*`` fields are updated. Preserve each generation batch under
+        the same Run and make the outer final snapshot idempotent. Keep this
+        projection in memory only; AgentRun persistence acknowledges it after
+        terminalization.
         """
 
         normalized_run_id = str(run_id or "").strip()
@@ -1839,69 +1920,97 @@ class TurnExecutionMixin:
             lock = threading.Lock()
             setattr(self, "_native_completed_agent_run_states_lock", lock)
 
-        usage: dict[str, Any] = {}
-        output_includes_reasoning_values: list[bool] = []
-        total_sources: list[str] = []
-        for item in usage_records or ():
-            if not isinstance(item, dict):
-                continue
-            if isinstance(item.get("output_includes_reasoning"), bool):
-                output_includes_reasoning_values.append(
-                    item["output_includes_reasoning"]
-                )
-            if item.get("total_tokens_source") in {"reported", "derived"}:
-                total_sources.append(item["total_tokens_source"])
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "reasoning_tokens",
-                "cached_tokens",
-                "total_tokens",
-            ):
-                value = item.get(key)
-                if value is None:
-                    continue
-                try:
-                    usage[key] = usage.get(key, 0) + max(0, int(value))
-                except (TypeError, ValueError):
-                    continue
-        if usage:
-            if output_includes_reasoning_values and len(
-                set(output_includes_reasoning_values)
-            ) == 1:
-                usage["output_includes_reasoning"] = (
-                    output_includes_reasoning_values[0]
-                )
-            if total_sources and len(set(total_sources)) == 1:
-                usage["total_tokens_source"] = total_sources[0]
-            # A provider's explicit total is authoritative.  For a derived
-            # record, only add reasoning when the reported output is visible
-            # output rather than an already reasoning-inclusive completion.
-            reasoning_is_separate = not bool(
-                usage.get("output_includes_reasoning", False)
-            )
-            usage.setdefault(
-                "total_tokens",
-                usage.get("input_tokens", 0)
-                + usage.get("output_tokens", 0)
-                + (
-                    usage.get("reasoning_tokens", 0)
-                    if reasoning_is_separate
-                    else 0
-                ),
-            )
+        batch_id = str(usage_batch_id or uuid.uuid4().hex).strip()[:96]
         failure_text = ""
         if failure is not None:
             failure_text = str(
                 getattr(failure, "technical_detail", None) or failure
             ).strip()
-        payload: dict[str, Any] = {
-            "tool_calls": list(tool_records or ()),
-            "usage": usage,
-        }
-        if failure_text:
-            payload["failure"] = failure_text
         with lock:
+            previous = states.get(normalized_run_id)
+            previous = previous if isinstance(previous, dict) else {}
+            usage_receipts = dict(previous.get("_usage_receipts") or {})
+            for index, item in enumerate(usage_records or ()):
+                if not isinstance(item, dict):
+                    continue
+                provider_usage_key = str(item.get("usage_key") or "").strip()
+                receipt_key = (
+                    f"{batch_id}:{provider_usage_key or 'record'}:{index}"
+                )
+                if receipt_key in usage_receipts:
+                    continue
+                normalized_record: dict[str, Any] = {}
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "cached_tokens",
+                    "total_tokens",
+                    "cost_micros",
+                ):
+                    value = item.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        normalized_record[key] = max(0, int(value))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                if not normalized_record:
+                    continue
+                reasoning_flag = item.get("output_includes_reasoning")
+                if isinstance(reasoning_flag, bool):
+                    normalized_record["output_includes_reasoning"] = reasoning_flag
+                source = item.get("total_tokens_source")
+                if source not in {"reported", "derived", "mixed"}:
+                    source = "reported" if item.get("total_tokens") is not None else "derived"
+                normalized_record["total_tokens_source"] = source
+                if "total_tokens" not in normalized_record:
+                    normalized_record["total_tokens"] = (
+                        normalized_record.get("input_tokens", 0)
+                        + normalized_record.get("output_tokens", 0)
+                        + (
+                            normalized_record.get("reasoning_tokens", 0)
+                            if reasoning_flag is not True
+                            else 0
+                        )
+                    )
+                usage_receipts[receipt_key] = normalized_record
+
+            usage: dict[str, Any] = {}
+            reasoning_flags: set[bool] = set()
+            total_sources: set[str] = set()
+            for item in usage_receipts.values():
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "cached_tokens",
+                    "total_tokens",
+                    "cost_micros",
+                ):
+                    value = item.get(key)
+                    if value is not None:
+                        usage[key] = usage.get(key, 0) + int(value)
+                flag = item.get("output_includes_reasoning")
+                if isinstance(flag, bool):
+                    reasoning_flags.add(flag)
+                source = item.get("total_tokens_source")
+                if source in {"reported", "derived", "mixed"}:
+                    total_sources.add(source)
+            if len(reasoning_flags) == 1:
+                usage["output_includes_reasoning"] = next(iter(reasoning_flags))
+            if len(total_sources) == 1:
+                usage["total_tokens_source"] = next(iter(total_sources))
+            elif total_sources:
+                usage["total_tokens_source"] = "mixed"
+
+            payload: dict[str, Any] = {
+                "tool_calls": list(tool_records or ()),
+                "usage": usage,
+                "_usage_receipts": usage_receipts,
+            }
+            if failure_text:
+                payload["failure"] = failure_text
             states[normalized_run_id] = payload
             # Bound in-memory evidence for abandoned requests.  Terminalized
             # runs are removed by ack_completed_agent_run_state below.
@@ -1955,7 +2064,12 @@ class TurnExecutionMixin:
     ) -> str:
         run_generation_policy = self._snapshot_generation_policy()
         policy_client = self._generation_policy_client(run_generation_policy)
-        if not getattr(self, "_native_tools_enabled", True):
+        from ..image_budget import current_image_price
+
+        # Verified image review is a single bounded provider request.  The
+        # generic completion reviewer issues an extra text-only call that has
+        # no matching image proof and must not run inside this scope.
+        if current_image_price() is not None or not getattr(self, "_native_tools_enabled", True):
             return await self._run_once_with_agent(
                 agent,
                 context,
@@ -2442,6 +2556,10 @@ class TurnExecutionMixin:
                     if turn_snapshot is not None
                     else None
                 ),
+                usage_batch_id=(
+                    str((turn_snapshot or {}).get("native_usage_batch_id") or "")
+                    or None
+                ),
             )
         return response
 
@@ -2774,6 +2892,12 @@ class TurnExecutionMixin:
                 if suppress_automatic_context
                 else self._required_command_tool_name(user_input)
             )
+            internal_required_tool = getattr(self, "_agent_required_tool_name", None)
+            if (
+                internal_required_tool == "delegate_plan"
+                and getattr(self, "_agent_required_tool_graph_context", None)
+            ):
+                required_tool_name = internal_required_tool
             try:
                 available_tools = self._get_available_tools()
             except (AttributeError, TypeError):
@@ -2873,24 +2997,9 @@ class TurnExecutionMixin:
                 return response
 
             try:
-                # An explicit specialist-role request is a routing contract,
-                # not merely a hint for the model.  In particular an
-                # ambiguous Docs mutation must still run through the
-                # docs_operator child so that the child can apply its
-                # no-guess/no-write policy.  Ensure the Agent Team
-                # pack for this generic role signal, expose only the delegate
-                # function, and require that function on the root turn.  This
-                # prevents a model from answering (or asking clarification)
-                # directly while still preserving the normal dynamic
-                # load/registry/dispatch path for ordinary turns.
-                force_docs_specialist = bool(
-                    not suppress_automatic_context
-                    and looks_like_docs_agent_delegation_request(user_input)
-                    and _docs_agent_delegation_available(self.config)
-                )
-                if force_docs_specialist:
-                    pack_session = tool_pack_session_for_client(self)
-                    pack_session.load("agent_team")
+                # Team/Subagent specialist forcing was retired in P5.
+                # Ordinary turns use the registered Agent tools; the P3
+                # delegate path owns explicit cross-Agent delegation.
                 effective_agent = Agent(
                     name=self.agent.name,
                     instructions=self._build_effective_instructions(),
@@ -2899,56 +3008,17 @@ class TurnExecutionMixin:
                     model_settings=self.agent.model_settings,
                 )
                 required_specialist_tool = None
-                if force_docs_specialist:
-                    delegate_tool = next(
-                        (
-                            tool
-                            for tool in effective_agent.tools
-                            if str(getattr(tool, "name", ""))
-                            == "agent_team_delegate"
-                        ),
-                        None,
+                if (
+                    required_tool_name == "delegate_plan"
+                    and internal_required_tool == "delegate_plan"
+                    and getattr(self, "_agent_required_tool_graph_context", None)
+                    and not any(self._tool_name(tool) == required_tool_name for tool in effective_agent.tools)
+                ):
+                    raise PlanningInteractionTerminated(
+                        reason="required_delegate_plan_unavailable",
+                        agent_run_status="failed",
+                        user_message="必須ツール `delegate_plan` を利用できません。",
                     )
-                    if delegate_tool is not None:
-                        # Keep the manual team loader alongside the delegate
-                        # function.  The pack session controls schema
-                        # tool exposure, while the team loader owns the separate
-                        # per-turn team activation state checked by the
-                        # delegate implementation.  Requiring the delegate
-                        # (rather than the loader) lets the native loop call
-                        # load_agent_team first and then continue to the
-                        # actual child run.
-                        team_loader = next(
-                            (
-                                tool
-                                for tool in effective_agent.tools
-                                if str(getattr(tool, "name", ""))
-                                == "load_agent_team"
-                            ),
-                            None,
-                        )
-                        # Keep the declared reasoning preference while making
-                        # the Subagent delegate (and its manual team loader) the
-                        # only callable surface on this turn.
-                        effective_agent = Agent(
-                            name=effective_agent.name,
-                            instructions=effective_agent.instructions,
-                            tools=[
-                                tool
-                                for tool in (team_loader, delegate_tool)
-                                if tool is not None
-                            ],
-                            model=effective_agent.model,
-                            model_settings=ModelSettings(
-                                tool_choice="required",
-                                reasoning=getattr(
-                                    effective_agent.model_settings,
-                                    "reasoning",
-                                    None,
-                                ),
-                            ),
-                        )
-                        required_specialist_tool = "agent_team_delegate"
                 if required_tool_name:
                     effective_agent = self._agent_requiring_tool(
                         effective_agent,
@@ -2958,6 +3028,7 @@ class TurnExecutionMixin:
                     context = await self._append_pending_steering_to_context(
                         context, steering_callback, stream_callback
                     )
+                effective_user_input = get_current_user_input() or user_input
                 if required_tool_name:
                     response = await self._run_once_with_agent(
                         effective_agent,
@@ -2977,7 +3048,7 @@ class TurnExecutionMixin:
                         effective_agent,
                         self._add_image_to_prompt_messages(context, image_data),
                         stream_callback,
-                        user_input=user_input,
+                        user_input=effective_user_input,
                     )
             except Exception:
                 # The caller owns the terminal/user-visible error boundary.
@@ -3284,6 +3355,13 @@ class TurnExecutionMixin:
                         if isinstance(item, dict)
                     ],
                     failure=getattr(result, "generation_failure", None),
+                    usage_batch_id=(
+                        str(
+                            (turn_snapshot or {}).get("native_usage_batch_id")
+                            or ""
+                        )
+                        or None
+                    ),
                 )
             await self._record_native_usage(result, agent)
             if not suppress_automatic_context:
@@ -3319,6 +3397,27 @@ class TurnExecutionMixin:
                 getattr(self, "_route_source", "main_inherit") or "main_inherit"
             ).strip(),
         }
+        from ...services.session_llm_generation import (
+            session_generation_route_metadata_for,
+        )
+
+        projected_route = session_generation_route_metadata_for(self)
+        current_route_source = metadata["route"]["route_source"]
+        # Explicit response-model, Team, and other client-owned route stamps
+        # remain authoritative.  The projection only fills the implicit Main
+        # metadata that would otherwise describe the durable client's provider
+        # instead of its ephemeral session turn.
+        if (
+            isinstance(projected_route, dict)
+            and current_route_source in {"main_inherit", "runtime_main"}
+        ):
+            metadata["route"] = {
+                "provider": str(projected_route.get("provider") or "").strip().lower() or None,
+                "model": str(projected_route.get("model") or "").strip() or None,
+                "route_source": str(
+                    projected_route.get("route_source") or "session_main_route"
+                ).strip(),
+            }
         if self._last_context_snapshots:
             bounded_snapshot = sanitized_snapshot_series(
                 self._last_context_snapshots

@@ -1,5 +1,5 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
-import { getDb, getEffectiveSqliteJournalMode, schema } from "../db/client";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { getDb, getEffectiveSqliteJournalMode, getSqlite, schema } from "../db/client";
 import {
   isSqliteBusyError,
   isSqliteDiagnosticsEnabled,
@@ -16,6 +16,7 @@ import { normalizeChatHistoryStatus } from "../lib/chat-session-view";
 import { conversationAgentApi } from "../lib/conversation-agent-api";
 import {
   canAttemptAoiTalkServer,
+  hasAoiTalkNetworkPath,
   isServerKnownUnreachable,
   useNetworkStore,
 } from "../stores/network";
@@ -33,6 +34,12 @@ import { conversationPerformanceDiagnostics } from "../features/conversation/per
 import { hasManualConversationTitle } from "../features/conversation/title";
 import { enqueueOutbox, getOutboxMutationWakeScope, hasPendingOutbox, randomId } from "./outbox";
 import { notifyMutationQueued } from "../sync/task-mutation-wake";
+import {
+  GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY,
+  GENERAL_MESSAGE_SYNC_PROJECTION_KEY,
+  GENERAL_MESSAGE_SYNC_SCOPE_KEY,
+  generalMessageSyncProjection,
+} from "../sync/general-message-sync-receipt";
 import { interruptConversationForSend } from "./conversation-interrupt";
 import {
   CONVERSATION_MESSAGE_UPSERT_CHUNK_SIZE,
@@ -47,6 +54,14 @@ type ProvisionalReadFence = {
   token: number;
   completionAt: string | null;
 };
+
+function tracePendingConversationFlush(
+  stage: string,
+  details: Record<string, unknown> = {},
+): void {
+  if (process.env.EXPO_PUBLIC_AOITALK_CHAT_RETRY_TRACE !== "1") return;
+  console.info("[mobile-chat-flush]", JSON.stringify({ stage, ...details }));
+}
 
 const conversationChangeListeners = new Set<ConversationChangeListener>();
 const provisionalReadFences = new Map<string, ProvisionalReadFence>();
@@ -83,6 +98,8 @@ export type ApplyRemoteConversationMessagesResult = {
 
 export type ApplyRemoteConversationMessagesOptions = {
   reconcileSessionId?: string;
+  serverSyncScope?: string;
+  authoritativeIds?: string[];
 };
 
 export type ConversationMessageRefreshMode =
@@ -169,12 +186,18 @@ function publicMessageMetadata(
       ? { ...(value as Record<string, unknown>) }
       : {};
   delete metadata[BRANCH_COUNT_METADATA_KEY];
+  delete metadata[GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY];
+  delete metadata[GENERAL_MESSAGE_SYNC_SCOPE_KEY];
+  delete metadata[GENERAL_MESSAGE_SYNC_PROJECTION_KEY];
   return metadata;
 }
 
 function storedMessageMetadata(
   message: ConversationMessage,
   existing?: DbMessage,
+  serverSyncScope?: string,
+  createdAt?: string,
+  updatedAt?: string,
 ): Record<string, unknown> {
   const metadata = publicMessageMetadata(message.metadata);
   const branchCount =
@@ -189,6 +212,24 @@ function storedMessageMetadata(
     const value = message[key];
     if (typeof value === "string" && value.trim()) metadata[key] = value.trim();
     else if (value === null) metadata[key] = null;
+  }
+  const syncFingerprint = message._sync_fingerprint;
+  if (
+    serverSyncScope
+    && typeof syncFingerprint === "string"
+    && /^[a-f0-9]{32}$/.test(syncFingerprint)
+  ) {
+    metadata[GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY] = syncFingerprint;
+    metadata[GENERAL_MESSAGE_SYNC_SCOPE_KEY] = serverSyncScope;
+    metadata[GENERAL_MESSAGE_SYNC_PROJECTION_KEY] = generalMessageSyncProjection({
+      ...message,
+      created_at: createdAt ?? message.created_at ?? null,
+      updated_at: updatedAt ?? message.updated_at ?? null,
+    });
+  } else {
+    delete metadata[GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY];
+    delete metadata[GENERAL_MESSAGE_SYNC_SCOPE_KEY];
+    delete metadata[GENERAL_MESSAGE_SYNC_PROJECTION_KEY];
   }
   return metadata;
 }
@@ -257,7 +298,26 @@ function valuesEqual(left: unknown, right: unknown): boolean {
   );
 }
 
-function remoteRevisionMatches(row: DbMessage, message: ConversationMessage): boolean {
+function remoteRevisionMatches(
+  row: DbMessage,
+  message: ConversationMessage,
+  serverSyncScope?: string,
+): boolean {
+  if (row.deletedAt !== null) return false;
+  const syncFingerprint = message._sync_fingerprint;
+  if (serverSyncScope && typeof syncFingerprint === "string") {
+    const metadata = (row.messageMetadata as Record<string, unknown> | null) ?? {};
+    if (
+      metadata[GENERAL_MESSAGE_SYNC_SCOPE_KEY] !== serverSyncScope
+      || metadata[GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY] !== syncFingerprint
+    ) return false;
+    const expectedProjection = generalMessageSyncProjection({
+      ...message,
+      created_at: message.created_at ?? row.createdAt ?? null,
+      updated_at: message.updated_at ?? row.updatedAt ?? null,
+    });
+    if (metadata[GENERAL_MESSAGE_SYNC_PROJECTION_KEY] !== expectedProjection) return false;
+  }
   const remoteUpdatedAt = message.updated_at ?? null;
   if (remoteUpdatedAt && row.updatedAt === remoteUpdatedAt) {
     return (
@@ -499,8 +559,25 @@ async function canUseServer(): Promise<boolean> {
   return canAttemptAoiTalkServer() && Boolean(await getToken());
 }
 
-async function canAttemptServer(): Promise<boolean> {
-  return canAttemptAoiTalkServer() && Boolean(await getToken());
+async function canAttemptServer(options?: { userInitiated?: boolean }): Promise<boolean> {
+  const userInitiated = options?.userInitiated === true;
+  const physicalNetworkPath = userInitiated ? hasAoiTalkNetworkPath() : null;
+  const hasNetworkPath = userInitiated
+    ? Boolean(physicalNetworkPath)
+    : canAttemptAoiTalkServer();
+  const token = hasNetworkPath ? await getToken() : null;
+  const allowed = hasNetworkPath && Boolean(token);
+  if (userInitiated) {
+    tracePendingConversationFlush("preflight", {
+      user_initiated: true,
+      physical_network_path: physicalNetworkPath,
+      stale_server_unreachable: isServerKnownUnreachable(),
+      token_checked: hasNetworkPath,
+      token_present: Boolean(token),
+      allowed,
+    });
+  }
+  return allowed;
 }
 
 async function canRefreshServer(): Promise<boolean> {
@@ -1956,12 +2033,16 @@ async function uploadLocalSessionOnce(
   return remoteId;
 }
 
-const pendingFlushFlights = new Map<string, Promise<string>>();
+const pendingFlushFlights = new Map<
+  string,
+  { promise: Promise<string>; userInitiated: boolean }
+>();
 
 async function flushPendingConversationOnce(
   sessionId: string,
+  options?: { userInitiated?: boolean },
 ): Promise<string> {
-  if (!(await canAttemptServer())) return sessionId;
+  if (!(await canAttemptServer(options))) return sessionId;
 
   const db = getDb();
   const row = (
@@ -1970,10 +2051,18 @@ async function flushPendingConversationOnce(
       .from(schema.conversationSessions)
       .where(eq(schema.conversationSessions.id, sessionId))
   )[0];
-  if (!row) return sessionId;
+  if (!row) {
+    if (options?.userInitiated) tracePendingConversationFlush("session_missing");
+    return sessionId;
+  }
   if (row.deletedAt) {
     const metadata = row.sessionMetadata as Record<string, unknown> | null;
     const promotedTo = metadata?.promoted_to_session_id;
+    if (options?.userInitiated) {
+      tracePendingConversationFlush("session_deleted", {
+        promoted_session_present: typeof promotedTo === "string",
+      });
+    }
     return typeof promotedTo === "string" ? promotedTo : sessionId;
   }
 
@@ -1983,6 +2072,12 @@ async function flushPendingConversationOnce(
   await flushPendingCharacterUpdate(row);
 
   const pendingBeforePromotion = await listPendingMessagesForSessionId(row.id);
+  if (options?.userInitiated) {
+    tracePendingConversationFlush("pending_rows", {
+      row_found: true,
+      pending_count: pendingBeforePromotion.length,
+    });
+  }
   if (!pendingBeforePromotion.length) return sessionId;
 
   let remoteSessionId = row.id;
@@ -2020,18 +2115,53 @@ async function flushPendingConversationOnce(
   return remoteSessionId;
 }
 
-export function flushPendingConversation(sessionId: string): Promise<string> {
-  if (isMobileReadOnlyDiagnosticsEnabled()) return Promise.resolve(sessionId);
-  if (sessionDeleteFlights.has(sessionId)) return Promise.resolve(sessionId);
-  const existing = pendingFlushFlights.get(sessionId);
-  if (existing) return existing;
-  const flight = flushPendingConversationOnce(sessionId).finally(() => {
-    if (pendingFlushFlights.get(sessionId) === flight) {
+function startPendingConversationFlush(
+  sessionId: string,
+  options?: { userInitiated?: boolean },
+): Promise<string> {
+  const userInitiated = options?.userInitiated === true;
+  const flight = flushPendingConversationOnce(sessionId, options).finally(() => {
+    if (pendingFlushFlights.get(sessionId)?.promise === flight) {
       pendingFlushFlights.delete(sessionId);
     }
   });
-  pendingFlushFlights.set(sessionId, flight);
+  pendingFlushFlights.set(sessionId, { promise: flight, userInitiated });
   return flight;
+}
+
+export function flushPendingConversation(
+  sessionId: string,
+  options?: { userInitiated?: boolean },
+): Promise<string> {
+  if (isMobileReadOnlyDiagnosticsEnabled()) {
+    if (options?.userInitiated) tracePendingConversationFlush("read_only_guard");
+    return Promise.resolve(sessionId);
+  }
+  if (sessionDeleteFlights.has(sessionId)) {
+    if (options?.userInitiated) tracePendingConversationFlush("session_delete_guard");
+    return Promise.resolve(sessionId);
+  }
+  const existing = pendingFlushFlights.get(sessionId);
+  if (!existing) {
+    if (options?.userInitiated) tracePendingConversationFlush("flight_start", { user_initiated: true });
+    return startPendingConversationFlush(sessionId, options);
+  }
+  if (options?.userInitiated) {
+    tracePendingConversationFlush("flight_join", {
+      existing_user_initiated: existing.userInitiated,
+    });
+  }
+  if (!options?.userInitiated || existing.userInitiated) return existing.promise;
+  // A user tap may follow a background flight that returned early because a
+  // recent server failure was cached. Reuse successful promotion, otherwise
+  // run one explicit probe after that flight settles. Per-session dispatch
+  // flights and client_message_id duplicate checks keep the follow-up idempotent.
+  return existing.promise.then(
+    (result) => result === sessionId
+      ? flushPendingConversation(sessionId, options)
+      : result,
+    () => flushPendingConversation(sessionId, options),
+  );
 }
 
 export async function getPromotedConversationSessionId(
@@ -2052,23 +2182,78 @@ export async function getPromotedConversationSessionId(
 
 export async function flushPendingConversations(): Promise<void> {
   if (isMobileReadOnlyDiagnosticsEnabled()) return;
-  if (!(await canAttemptServer())) return;
+  const startedAt = Date.now();
+  let candidateSessionCount = 0;
+  let flushAttemptCount = 0;
+  let candidateQueryMs = 0;
+  if (!(await canAttemptServer())) {
+    console.info("[sync] pending conversation flush", JSON.stringify({
+      event: "pending_conversation_flush",
+      outcome: "server_unavailable",
+      candidateSessionCount,
+      flushAttemptCount,
+      candidateQueryMs,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+    }));
+    return;
+  }
 
-  const db = getDb();
-  const sessions = await db
-    .select()
-    .from(schema.conversationSessions)
-    .where(isNull(schema.conversationSessions.deletedAt));
-  for (const session of sessions) {
-    if (!isServerBackedSession(session)) continue;
-    const pending = await listPendingMessagesForSessionId(session.id);
-    if (!pending.length && !pendingCharacterSlug(session)) continue;
-    try {
-      await flushPendingConversation(session.id);
-    } catch (error) {
-      // Leave pending metadata intact for the next sync attempt.
-      if (isApiConnectionError(error)) throw error;
+  let outcome: "complete" | "error" = "complete";
+  try {
+    const candidateQueryStartedAt = Date.now();
+    const sessions = await getSqlite().getAllAsync<{ id: string }>(`
+    SELECT s.id
+    FROM conversation_sessions AS s
+    WHERE s.deleted_at IS NULL
+      AND s.user_id IS NOT NULL
+      AND s.user_id <> ''
+      AND COALESCE(json_extract(s.session_metadata, '$.local_only'), 0) <> 1
+      AND (
+        (json_type(s.session_metadata, '$.pending_character_slug') = 'text'
+          AND length(trim(json_extract(s.session_metadata, '$.pending_character_slug'))) > 0)
+        OR (
+          json_type(s.session_metadata, '$.pending_agent_binding') = 'object'
+          AND COALESCE(json_extract(s.session_metadata, '$.pending_agent_binding.auth_scope'), '') <> ''
+          AND COALESCE(json_extract(s.session_metadata, '$.pending_agent_binding.server_fingerprint'), '') <> ''
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM conversation_messages AS m
+          WHERE m.session_id = s.id
+            AND m.deleted_at IS NULL
+            AND m.role = 'user'
+            AND COALESCE(m.is_active_branch, 1) <> 0
+            AND json_extract(m.message_metadata, '$.local_only') = 1
+            AND json_extract(m.message_metadata, '$.pending') = 1
+            AND COALESCE(json_extract(m.message_metadata, '$.delivery_route'), '') <> 'direct'
+            AND COALESCE(json_extract(m.message_metadata, '$.direct_cloud'), 0) = 0
+        )
+      )
+      ORDER BY s.id
+    `);
+    candidateQueryMs = Math.max(0, Date.now() - candidateQueryStartedAt);
+    candidateSessionCount = sessions.length;
+    for (const session of sessions) {
+      flushAttemptCount += 1;
+      try {
+        await flushPendingConversation(session.id);
+      } catch (error) {
+        // Leave pending metadata intact for the next sync attempt.
+        if (isApiConnectionError(error)) throw error;
+      }
     }
+  } catch (error) {
+    outcome = "error";
+    throw error;
+  } finally {
+    console.info("[sync] pending conversation flush", JSON.stringify({
+      event: "pending_conversation_flush",
+      outcome,
+      candidateSessionCount,
+      flushAttemptCount,
+      candidateQueryMs,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+    }));
   }
 }
 
@@ -2240,8 +2425,25 @@ export function applyRemoteConversationMessages(
   list: ConversationMessage[],
   options: ApplyRemoteConversationMessagesOptions = {},
 ): Promise<ApplyRemoteConversationMessagesResult> {
-  return runBackgroundSqliteWrite((w) =>
-    getDb().transaction((tx) => applyRemoteConversationMessagesInWriter(w, tx, list, options)));
+  return (async () => {
+    let effectiveOptions = options;
+    if (
+      !options.serverSyncScope
+      && list.some((message) => typeof message._sync_fingerprint === "string")
+    ) {
+      const token = await getToken();
+      if (token) {
+        effectiveOptions = {
+          ...options,
+          serverSyncScope: getTokenAuthScope(token),
+        };
+      }
+    }
+    return runBackgroundSqliteWrite((w) =>
+      getDb().transaction((tx) =>
+        applyRemoteConversationMessagesInWriter(w, tx, list, effectiveOptions),
+      ));
+  })();
 }
 
 /** Synchronous body: runs inside one coordinator write unit and the caller's transaction. */
@@ -2252,7 +2454,7 @@ export function applyRemoteConversationMessagesInWriter(
   options: ApplyRemoteConversationMessagesOptions = {},
 ): ApplyRemoteConversationMessagesResult {
   assertActiveWriter(w);
-  if (!list.length) {
+  if (!list.length && options.authoritativeIds == null) {
     return {
       receivedCount: 0,
       insertedCount: 0,
@@ -2280,6 +2482,13 @@ export function applyRemoteConversationMessagesInWriter(
   const reconciledLocalIds = options.reconcileSessionId
     ? loadReconciledLocalMessageIdsSync(tx, options.reconcileSessionId, list)
     : [];
+  const staleServerMessageIds = options.serverSyncScope && options.authoritativeIds
+    ? findStaleServerMessageIdsInWriter(
+        tx,
+        options.serverSyncScope,
+        options.authoritativeIds,
+      )
+    : [];
   // Synchronous reads after the final await: no deletion can interleave before the transaction.
   const parentIds = [...new Set(list.map((message) => message.session_id))];
   const deletedParents = new Set<string>();
@@ -2295,7 +2504,11 @@ export function applyRemoteConversationMessagesInWriter(
   const changed = list.filter((message) => {
     if (deletedParents.has(message.session_id)) return false;
     const existing = existingById.get(message.id);
-    return !existing || !remoteRevisionMatches(existing, message);
+    return !existing || !remoteRevisionMatches(
+      existing,
+      message,
+      options.serverSyncScope,
+    );
   });
   const insertedCount = changed.filter(
     (message) => !existingById.has(message.id),
@@ -2305,7 +2518,9 @@ export function applyRemoteConversationMessagesInWriter(
     changed.length,
   );
   const hasTransactionWrites =
-    changed.length > 0 || reconciledLocalIds.length > 0;
+    changed.length > 0
+    || reconciledLocalIds.length > 0
+    || staleServerMessageIds.length > 0;
   const bridgeStatementCount =
     1 + parentReadStatements +
     (options.reconcileSessionId ? 1 : 0) +
@@ -2323,6 +2538,9 @@ export function applyRemoteConversationMessagesInWriter(
       messageMetadata: storedMessageMetadata(
         message,
         existingById.get(message.id),
+        options.serverSyncScope,
+        message.created_at ?? now,
+        message.updated_at ?? now,
       ),
       tokenCount: message.token_count ?? null,
       parentMessageId: message.parent_message_id ?? null,
@@ -2344,6 +2562,17 @@ export function applyRemoteConversationMessagesInWriter(
             .where(
               inArray(schema.conversationMessages.id, reconciledLocalIds),
             )
+            .run();
+        }
+        for (const id of staleServerMessageIds) {
+          tx
+            .update(schema.conversationMessages)
+            .set({
+              deletedAt: now,
+              updatedAt: now,
+              isActiveBranch: false,
+            })
+            .where(eq(schema.conversationMessages.id, id))
             .run();
         }
         for (
@@ -2408,6 +2637,46 @@ export function applyRemoteConversationMessagesInWriter(
   };
 }
 
+/**
+ * Reconcile clean server-backed rows after a complete general message replay.
+ * Missing rows become local tombstones so content remains recoverable; no
+ * body is physically deleted, and any conversation-message outbox entry
+ * disables reconciliation for the whole set.
+ */
+function findStaleServerMessageIdsInWriter(
+  tx: SqliteHandle,
+  authScope: string,
+  authoritativeIds: readonly string[],
+): string[] {
+  const pending = tx
+    .select({ opId: schema.outbox.opId })
+    .from(schema.outbox)
+    .where(and(
+      eq(schema.outbox.tableName, "conversation_messages"),
+      or(eq(schema.outbox.authScope, authScope), isNull(schema.outbox.authScope)),
+    ))
+    .all();
+  if (pending.length) return [];
+  const remoteIds = new Set(authoritativeIds);
+  const serverBackedRows = tx
+    .select({ id: schema.conversationMessages.id })
+    .from(schema.conversationMessages)
+    .where(and(
+      isNull(schema.conversationMessages.deletedAt),
+      sql`json_extract(
+        ${schema.conversationMessages.messageMetadata},
+        '$.__aoitalk_general_sync_scope'
+      ) = ${authScope}`,
+      sql`coalesce(json_extract(
+        ${schema.conversationMessages.messageMetadata}, '$.local_only'
+      ), 0) <> 1`,
+    ))
+    .all();
+  return serverBackedRows
+    .filter(({ id }) => !remoteIds.has(id))
+    .map(({ id }) => id);
+}
+
 export function applyConversationMessageTombstones(
   tombstones: Array<{ id: string; deleted_at?: string | null }>,
 ): Promise<void> {
@@ -2418,15 +2687,40 @@ export function applyConversationMessageTombstones(
 export function applyConversationMessageTombstonesInWriter(
   w: SqliteWriter,
   tx: SqliteHandle,
-  tombstones: Array<{ id: string; deleted_at?: string | null }>,
+  tombstones: Array<{
+    id: string;
+    deleted_at?: string | null;
+    _sync_fingerprint?: string;
+  }>,
+  options: { serverSyncScope?: string } = {},
 ): void {
   assertActiveWriter(w);
   if (!tombstones.length) return;
   for (const item of tombstones) {
     const deletedAt = item.deleted_at ?? new Date().toISOString();
+    const existing = tx.select().from(schema.conversationMessages)
+      .where(eq(schema.conversationMessages.id, item.id)).all()[0];
+    const metadata = publicMessageMetadata(existing?.messageMetadata);
+    if (
+      options.serverSyncScope
+      && typeof item._sync_fingerprint === "string"
+      && /^[a-f0-9]{32}$/.test(item._sync_fingerprint)
+    ) {
+      metadata[GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY] = item._sync_fingerprint;
+      metadata[GENERAL_MESSAGE_SYNC_SCOPE_KEY] = options.serverSyncScope;
+      delete metadata[GENERAL_MESSAGE_SYNC_PROJECTION_KEY];
+    } else {
+      delete metadata[GENERAL_MESSAGE_SYNC_FINGERPRINT_KEY];
+      delete metadata[GENERAL_MESSAGE_SYNC_SCOPE_KEY];
+      delete metadata[GENERAL_MESSAGE_SYNC_PROJECTION_KEY];
+    }
     tx
       .update(schema.conversationMessages)
-      .set({ deletedAt, updatedAt: deletedAt })
+      .set({
+        deletedAt,
+        updatedAt: deletedAt,
+        ...(existing ? { messageMetadata: metadata } : {}),
+      })
       .where(eq(schema.conversationMessages.id, item.id))
       .run();
   }
@@ -3023,7 +3317,11 @@ export const conversationsRepo = {
         }
         const local = listActiveMessagesInWriter(w, tx, sessionId);
         const applyResult = applyRemoteConversationMessagesInWriter(
-          w, tx, response.messages, { reconcileSessionId: sessionId });
+          w,
+          tx,
+          response.messages,
+          { reconcileSessionId: sessionId, serverSyncScope: authScope },
+        );
         const isFull = mode !== "delta";
         const reconciledInactiveCount = isFull
           ? reconcileFullActiveMessagesInWriter(w, tx, local, response.messages)

@@ -50,15 +50,17 @@ class AppReleaseError(ValueError):
 
 
 def _release_temp_dir(prefix: str) -> Path:
-    """Create ephemeral Release staging below the repository scratch root.
+    """Create ephemeral Release staging below the OS temp root.
 
-    Release packaging is a normal server operation, but the staging tree is
-    still disposable task data.  Keeping it below ``.local`` avoids creating
-    sibling directories outside the repository on Windows and in CI.
+    Release packaging is a normal server operation, but staging is disposable
+    task data, so it belongs in OS temp rather than repository scratch. A TEMP
+    configured inside the repository is rejected before anything is created.
     """
-    scratch_root = Path(__file__).resolve().parents[2] / ".local"
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=scratch_root))
+    repo_root = Path(__file__).resolve().parents[2]
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if temp_root == repo_root or repo_root in temp_root.parents:
+        raise AppReleaseError("release staging temp is inside the repository")
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=temp_root))
 
 
 def _assert_release_inputs_unchanged(

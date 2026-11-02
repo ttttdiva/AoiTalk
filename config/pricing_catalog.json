@@ -1,7 +1,7 @@
 {
-  "catalog_version": "2026-10-07.1",
+  "catalog_version": "2026-10-29.1",
   "schema_version": 1,
-  "generated_at": "2026-10-07T00:00:00Z",
+  "generated_at": "2026-10-29T18:55:55Z",
   "free_incentive_groups": {
     "1m": [
       "gpt-6-astra",
@@ -626,6 +626,82 @@
       "effective_to": null,
       "source": "local",
       "catalog_version": "2026-07-29.1"
+    },
+    {
+      "rule_id": "openai_realtime:gpt-realtime-2.1:2026-10-29",
+      "provider": "openai_realtime",
+      "canonical_model": "gpt-realtime-2.1",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "32.00",
+        "cached_input": "32.00",
+        "output": "64.00",
+        "cache_write": "32.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-10-29T00:00:00Z",
+      "effective_to": null,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "catalog_version": "2026-10-29.1"
+    },
+    {
+      "rule_id": "openai_realtime:gpt-realtime-2.1-mini:2026-10-29",
+      "provider": "openai_realtime",
+      "canonical_model": "gpt-realtime-2.1-mini",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "32.00",
+        "cached_input": "32.00",
+        "output": "64.00",
+        "cache_write": "32.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-10-29T00:00:00Z",
+      "effective_to": null,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "catalog_version": "2026-10-29.1"
+    },
+    {
+      "rule_id": "openai_realtime:gpt-realtime-2:2026-10-29",
+      "provider": "openai_realtime",
+      "canonical_model": "gpt-realtime-2",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "32.00",
+        "cached_input": "32.00",
+        "output": "64.00",
+        "cache_write": "32.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-10-29T00:00:00Z",
+      "effective_to": null,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "catalog_version": "2026-10-29.1"
+    },
+    {
+      "rule_id": "openai_realtime:gpt-realtime-1.5:2026-10-29",
+      "provider": "openai_realtime",
+      "canonical_model": "gpt-realtime-1.5",
+      "aliases": [],
+      "pricing_kind": "flat_token",
+      "rates": {
+        "input": "32.00",
+        "cached_input": "32.00",
+        "output": "64.00",
+        "cache_write": "32.00"
+      },
+      "long_context": null,
+      "tool_rates": {},
+      "effective_from": "2026-10-29T00:00:00Z",
+      "effective_to": null,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "catalog_version": "2026-10-29.1"
     }
   ]
 }

@@ -7,6 +7,7 @@ import concurrent.futures
 import http.client
 import ipaddress
 import logging
+import math
 import socket
 import ssl
 import threading
@@ -56,6 +57,89 @@ _OGP_MEDIA_CONTENT_TYPES = frozenset(
         "image/webp",
     }
 )
+
+_BASE36_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _base36_integer(value: int) -> str:
+    if value == 0:
+        return "0"
+
+    digits: list[str] = []
+    while value:
+        value, digit = divmod(value, 36)
+        digits.append(_BASE36_DIGITS[digit])
+    return "".join(reversed(digits))
+
+
+def _increment_base36(value: str) -> str:
+    digits = list(value)
+    for index in range(len(digits) - 1, -1, -1):
+        digit = _BASE36_DIGITS.index(digits[index])
+        if digit < 35:
+            digits[index] = _BASE36_DIGITS[digit + 1]
+            return "".join(digits)
+        digits[index] = "0"
+    return "1" + "".join(digits)
+
+
+def _x_syndication_token(post_id: str) -> str:
+    """Match react-tweet's JS Number/id token for public X syndication."""
+
+    if not post_id or not post_id.isascii() or not post_id.isdigit():
+        raise ValueError("X post id must contain only ASCII digits")
+
+    # Preserve the exact JS evaluation order and binary64 rounding.
+    value = (float(post_id) / 1e15) * math.pi
+    if not math.isfinite(value):
+        raise ValueError("X post id is outside the supported numeric range")
+
+    integer = math.floor(value)
+    fraction = value - integer
+    whole = _base36_integer(integer)
+    fractional: list[str] = []
+
+    # V8 DoubleToRadixCString stops when the remaining base-36 tail is within
+    # half an ULP of the original double, rounding the last digit when needed.
+    delta = 0.5 * (math.nextafter(value, math.inf) - value)
+    for _ in range(64):
+        if fraction == 0:
+            break
+        fraction *= 36
+        delta *= 36
+        digit = int(fraction)
+        fraction -= digit
+        fractional.append(_BASE36_DIGITS[digit])
+
+        if fraction > 0.5:
+            if fraction + delta >= 1:
+                index = len(fractional) - 1
+                while index >= 0 and fractional[index] == "z":
+                    fractional[index] = "0"
+                    index -= 1
+                if index >= 0:
+                    fractional[index] = _BASE36_DIGITS[
+                        _BASE36_DIGITS.index(fractional[index]) + 1
+                    ]
+                else:
+                    whole = _increment_base36(whole)
+                break
+        elif fraction <= delta:
+            break
+    else:
+        raise ValueError("X syndication token did not converge")
+
+    token = whole
+    if fractional:
+        token += "." + "".join(fractional).rstrip("0")
+        token = token.rstrip(".")
+    return token.replace("0", "").replace(".", "")
+
+
+def _x_syndication_url(post_id: str) -> str:
+    return "https://cdn.syndication.twimg.com/tweet-result?" + urlencode(
+        {"id": post_id, "lang": "ja", "token": _x_syndication_token(post_id)}
+    )
 
 
 class OGPFetchError(ValueError):
@@ -718,10 +802,7 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
             async def fetch_x_photo(post_id: str):
                 # Optional enrichment: any failure leaves the text card as-is.
                 try:
-                    enrich_resp = await _safe_fetch(
-                        "https://cdn.syndication.twimg.com/tweet-result?"
-                        + urlencode({"id": post_id, "lang": "ja"})
-                    )
+                    enrich_resp = await _safe_fetch(_x_syndication_url(post_id))
                     enrich_resp.raise_for_status()
                     enrich = enrich_resp.json()
                     if str(enrich.get("id_str") or enrich.get("id") or "") != post_id:
@@ -792,8 +873,7 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # cookies or operator credentials are used by link previews.
                 try:
                     tweet_id = re.match(r"^/[^/]+/status(?:es)?/(\d+)", urlsplit(url).path)[1]
-                    syndication_url = "https://cdn.syndication.twimg.com/tweet-result?" + urlencode({"id": tweet_id, "lang": "ja"})
-                    syndication_resp = await _safe_fetch(syndication_url)
+                    syndication_resp = await _safe_fetch(_x_syndication_url(tweet_id))
                     syndication_resp.raise_for_status()
                     post = syndication_resp.json()
                     body = post.get("text")

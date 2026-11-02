@@ -862,6 +862,33 @@ export const outbox = sqliteTable(
   }),
 );
 
+// Private, read-only history for outbox operations discarded by automatic
+// resolution. Payload snapshots remain stored locally and are never returned
+// by the user-facing list projection.
+export const outboxDiscardLog = sqliteTable(
+  'outbox_discard_log',
+  {
+    id: text('id').primaryKey(),
+    authScope: text('auth_scope').notNull(),
+    opId: text('op_id').notNull(),
+    tableName: text('table_name').notNull(),
+    entityId: text('entity_id').notNull(),
+    action: text('action').notNull(),
+    payload: text('payload'),
+    basePayload: text('base_payload'),
+    conflictPayload: text('conflict_payload'),
+    lastError: text('last_error'),
+    reason: text('reason').notNull(),
+    discardedAt: text('discarded_at').notNull(),
+  },
+  (t) => ({
+    byAuthScope: index('idx_outbox_discard_auth_scope').on(
+      t.authScope,
+      t.discardedAt,
+    ),
+  }),
+);
+
 // ---------- outbox resolution journal ----------
 //
 // This is an app-private, durable journal for the explicit resolution flow.
@@ -922,6 +949,19 @@ export const syncState = sqliteTable('sync_state', {
   lastPushedAt: text('last_pushed_at'),
   cursor: text('cursor'),
 });
+
+export const generalRowVersions = sqliteTable(
+  'general_row_versions',
+  {
+    authScope: text('auth_scope').notNull(),
+    tableName: text('table_name').notNull(),
+    rowId: text('row_id').notNull(),
+    version: text('version').notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.authScope, t.tableName, t.rowId] }),
+  }),
+);
 
 // ---------- sync_v3_membership ----------
 // Which server scope (generation) currently delivers each local entity for an

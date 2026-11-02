@@ -20,6 +20,7 @@ from ..memory.models import KnowledgeSource
 from ..services.media_asset_storage import open_asset
 from ..services.search_sources import SourceRef
 from ..services.storage_roots import StorageRoot, lexical_path
+from . import __file__ as _rag_package_file
 from .config import DEFAULT_COLLECTION_NAME
 from .embedding import get_embedding
 from .embedding_identity import document_input, EMBEDDING_FINGERPRINT
@@ -121,9 +122,19 @@ async def migrate_legacy_files(session, resolver, config, ledger, *, collections
                         report['excluded'] += 1
                         continue
                     storage = StorageRoot('eg2-files', 'Registered source', str(root), external=False, read_only=True)
-                    scratch = Path(__file__).resolve().parents[2] / '.local'
-                    scratch.mkdir(exist_ok=True)
+                    scratch = Path(tempfile.gettempdir()).resolve()
+                    protected = [Path(_rag_package_file).resolve().parents[2]]
+                    protected.extend(lexical_path(item.root_path).resolve() for item in sources
+                                     if item.source_type != 'growi' and item.root_path)
+                    protected.extend(lexical_path(item.local_path).resolve()
+                                     for item in (config.qdrant, source_config.qdrant) if item.local_path)
+                    def check_scratch(candidate, *, child=False):
+                        if any(candidate == root or root in candidate.parents or
+                               (child and candidate in root.parents) for root in protected):
+                            raise RuntimeError('files_migration_temp_inside_protected_root')
+                    check_scratch(scratch)
                     with tempfile.TemporaryDirectory(prefix='eg2-files-', dir=scratch) as directory:
+                        check_scratch(Path(directory).resolve(), child=True)
                         snapshot = Path(directory) / path.name
                         def copy_original():
                             with open_asset(storage, relative) as (handle, _):

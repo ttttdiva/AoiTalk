@@ -13,7 +13,8 @@ export type SyncStage =
   | "pending-conversations"
   | "pending-clips"
   | "clip-targets"
-  | "profiles";
+  | "profiles"
+  | "finalizing";
 
 export type SyncOutcome = "success" | "partial" | "error" | "aborted";
 

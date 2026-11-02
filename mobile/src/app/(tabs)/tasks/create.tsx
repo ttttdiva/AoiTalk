@@ -18,10 +18,7 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import { useProject } from "../../../contexts/ProjectContext";
 import { tasksRepo } from "../../../repositories";
 import { taskApi } from "../../../lib/task-api";
-import {
-  isTaskDateOnlyInput,
-  toTaskWallClockIso,
-} from "../../../lib/task-datetime";
+import { buildTaskSchedulePayload } from "../../../lib/task-datetime";
 import { TaskDateField } from "../../../components/task-date-field";
 import type { Tag } from "../../../types/api";
 
@@ -168,10 +165,7 @@ export default function TaskCreateScreen() {
         title: normalizedTitle,
         description: description.trim() || null,
         status,
-        start_at: startAt ? toTaskWallClockIso(startAt) : null,
-        end_at: endAt ? toTaskWallClockIso(endAt) : null,
-        all_day:
-          allDay || isTaskDateOnlyInput(startAt) || isTaskDateOnlyInput(endAt),
+        ...buildTaskSchedulePayload(allDay, startAt, endAt),
         notifications_enabled: notificationsEnabled,
         reminder_offsets: reminders,
         tag_ids: selectedTagIds,

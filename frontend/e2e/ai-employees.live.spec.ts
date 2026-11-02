@@ -82,15 +82,6 @@ test("Agent: authenticated draft, role, scopes, bounded fixture policy, rule, re
   const projectOptionsResponse = await page.request.get("/api/projects"); expect(projectOptionsResponse.ok()).toBeTruthy();
   const projectOptions = await projectOptionsResponse.json() as { projects: { id: string; name: string }[] };
   const qaProject = projectOptions.projects.find(p => p.id === projectId); expect(qaProject, "QA Project must be visible to the authenticated user").toBeTruthy();
-  const catalogResponse = await page.request.get("/api/python-proxy/agents/catalog");
-  expect(catalogResponse.ok()).toBeTruthy();
-  const catalog = await catalogResponse.json() as { teams: { team_id: string; name: string; execution_profiles: { profile_id: string; name: string }[] }[] };
-  const team = catalog.teams.find(t => t.team_id === "employee"); expect(team).toBeTruthy();
-  await choose(page, "Execution Team", team!.name);
-  const manualProfile = team!.execution_profiles.find(p => p.profile_id === "manual"); expect(manualProfile).toBeTruthy();
-  await choose(page, "Execution Profile", manualProfile!.name);
-  const operator = page.getByRole("group", { name: "許可する Subagents" }).getByRole("checkbox").first();
-  await operator.check();
   await page.getByRole("checkbox", { name: /external_action_propose/ }).check();
   await page.getByLabel("ミッション", { exact: true }).fill("社員の水切れ報告に対応する");
   await page.getByLabel("業務指示", { exact: true }).fill("固定の商品と配送先を使い、要確認の注文を再実行しない。");

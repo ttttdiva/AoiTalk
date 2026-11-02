@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,9 +64,8 @@ from src.llm.openai_compatible_local_profiles import (
 from src.llm.openai_model_context_registry import (
     openai_model_context_spec,
 )
-from src.services.agent_team_v3 import (
-    agent_team_v3_subagents,
-    resolve_agent_team_v3_route,
+from src.services.agent_revision_v2 import (
+    revision_role_route_candidates,
 )
 
 LLM_PROVIDER_LABELS = {
@@ -82,6 +82,7 @@ LLM_PROVIDER_LABELS = {
     "claude-cli": "Claude Code",
     "antigravity-cli": "Antigravity CLI",
     "grok-cli": "Grok Build CLI",
+    "grok-bot": "Grok Bot",
 }
 
 LLM_ENGINE_OPTIONS = [
@@ -138,6 +139,221 @@ PROVIDER_ORDER = [
     "antigravity-cli",
     "grok-cli",
 ]
+
+# These providers have names users expect to find in Chat, but no supported
+# ordinary-Chat send/history adapter is currently connected. Keep them in a
+# separate status projection so settings/model discovery does not treat them
+# as configured LLM engines.
+CHAT_PROVIDER_STATUS_CATALOG = (
+    {
+        "id": "gpt-dots",
+        "label": "GPT dots",
+        "chat_status": {
+            "state": "unavailable",
+            "label": "未接続",
+            "selectable": False,
+            "message": (
+                "GPT dots連携は既定でOFFで、通常Chatから外部GPT dotsへ送る経路もありません。"
+            ),
+            "required_configuration": (
+                "承認済みのChat送信経路と、このChatの所有者確認済みbindingが必要です。"
+            ),
+        },
+    },
+    {
+        "id": "grok-bot",
+        "label": "Grok Bot",
+        "chat_status": {
+            "state": "unavailable",
+            "label": "Chat未接続",
+            "selectable": False,
+            "message": (
+                "Grok BotはGrok Build CLIとは別サービスです。通常Chat向けのGrok Bot bindingが有効ではありません。"
+            ),
+            "required_configuration": (
+                "設定 grok_bot_chat に、対象Grok Bot・所有者別generationのbindingが必要です。"
+            ),
+        },
+    },
+    {
+        "id": "muse-remote",
+        "label": "Muse",
+        "chat_status": {
+            "state": "unavailable",
+            "label": "Chat route 未設定",
+            "selectable": False,
+            "message": (
+                "Museのremote接続は、AgentRevisionのchat役割に設定されたMuse routeと、"
+                "所有者別の通常Chat adapterが必要です。"
+            ),
+            "required_configuration": (
+                "Chat会話に結び付いた所有者別Museセッションadapterが必要です。"
+            ),
+        },
+    },
+)
+
+
+
+def _grok_bot_chat_projection(
+    cfg: Any, deployment: Any
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Grok Botを有効bindingがある時だけ選択可能providerとして返す。
+
+    戻り値は ``(provider_payload, chat_status)`` のどちらか一方。bindingが
+    無効な場合はproviderを出さず、理由付きのChat statusだけを返す。
+    """
+
+    base = next(
+        entry for entry in CHAT_PROVIDER_STATUS_CATALOG if entry["id"] == "grok-bot"
+    )
+    status = dict(base["chat_status"])
+    if deployment is not None:
+        status["reason_code"] = "DEPLOYMENT_UNSUPPORTED"
+        status["message"] = (
+            f"{status['message']} Enterprise deployment構成ではGrok Bot Chatを使用しません。"
+        )
+        return None, status
+    try:
+        from .grok_bot_chat_service import MODEL_ID, grok_bot_chat_catalog_status
+
+        bound, problem = grok_bot_chat_catalog_status(cfg)
+    except Exception:
+        bound, problem = False, None
+    if not bound:
+        status["reason_code"] = problem.code if problem else "BINDING_CHECK_FAILED"
+        detail = problem.message if problem else "Grok Bot bindingを確認できませんでした。"
+        status["message"] = f"{status['message']} {detail}"
+        return None, status
+    option = model_option(
+        MODEL_ID,
+        "Grok Bot",
+        description="AoiTalk のネイティブ連携で既存のGrok Botへ送信する通常Chat",
+    )
+    message = (
+        "Grok BotへAoiTalk のネイティブ連携で送信します。処理はGrok Bot側(remote)で行われ、"
+        "remoteの完了状態取得と取消には対応していません（取消はAoiTalk側の待機のみ）。"
+    )
+    payload = {
+        "id": "grok-bot",
+        "label": "Grok Bot",
+        "models": [dict(option)],
+        "chat_models": [dict(option)],
+        "available_models": [dict(option)],
+        "availability": {"state": "available", "error": None},
+        "configured_model": MODEL_ID,
+        "supports_custom_model": False,
+        "capabilities": ProviderCapabilities(
+            supports_stream=False,
+            supports_tools=False,
+            supports_response_format=False,
+            supports_model_pull=False,
+            supports_model_delete=False,
+            supports_extra_body=False,
+        ).to_dict(),
+        "settings": {},
+        "source": "grok_bot_gateway",
+        "refreshed": False,
+        "cached_at": None,
+        "error": None,
+        "available": True,
+        "unavailable": False,
+        "disabled": False,
+        "availability_reason": None,
+        "chat_status": {
+            "state": "available",
+            "label": "Gateway接続",
+            "selectable": True,
+            "message": message,
+            "required_configuration": "",
+            "reason_code": None,
+            "remote_terminal": "unsupported",
+            "remote_cancel": "unsupported",
+        },
+    }
+    return payload, None
+
+
+def _muse_chat_projection(
+    cfg: Any, deployment: Any
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Museを通常Chat設定が揃った時だけ選択可能providerとして返す。
+
+    ``(provider_payload, chat_status)`` のどちらか一方。条件不足時は
+    providerを出さず、不足設定キー名付きのdisabled statusだけを返す。
+    """
+
+    base = next(
+        entry for entry in CHAT_PROVIDER_STATUS_CATALOG if entry["id"] == "muse-remote"
+    )
+    status = dict(base["chat_status"])
+    status["required_configuration"] = (
+        "cli_development_sessions.enabled、feature remote_server_view、remote_targets.muse の "
+        "enabled / egress_enabled / allowed_owner_ids / 認証参照(credential_ref か owner_credential_refs)、"
+        "Chat用Agent (chat_agent_id か allowed_agent_ids 1件)、およびそのAgentRevisionのchat routeが必要です。"
+    )
+    if deployment is not None:
+        status["reason_code"] = "DEPLOYMENT_UNSUPPORTED"
+        status["message"] = "Enterprise deployment構成ではMuse Chatを使用しません。"
+        return None, status
+    try:
+        from .muse_chat_service import MODEL_ID, muse_chat_catalog_status
+
+        ready, problem = muse_chat_catalog_status(cfg)
+    except Exception:
+        ready, problem = False, None
+    if not ready:
+        status["label"] = "Chat未設定"
+        status["reason_code"] = problem.code if problem else "CONFIG_CHECK_FAILED"
+        status["message"] = (
+            "Muse通常Chat adapterは実装済みですが、設定条件を満たしていません。 "
+            + (problem.message if problem else "Muse設定を確認できませんでした。")
+        )
+        return None, status
+    option = model_option(
+        MODEL_ID,
+        "Muse",
+        description="所有者専用のMuse side sessionへ自然文で送信する通常Chat",
+    )
+    payload = {
+        "id": "muse-remote",
+        "label": "Muse",
+        "models": [dict(option)],
+        "chat_models": [dict(option)],
+        "available_models": [dict(option)],
+        "availability": {"state": "available", "error": None},
+        "configured_model": MODEL_ID,
+        "supports_custom_model": False,
+        "capabilities": ProviderCapabilities(
+            supports_stream=False,
+            supports_tools=False,
+            supports_response_format=False,
+            supports_model_pull=False,
+            supports_model_delete=False,
+            supports_extra_body=False,
+        ).to_dict(),
+        "settings": {},
+        "source": "muse_remote_chat",
+        "refreshed": False,
+        "cached_at": None,
+        "error": None,
+        "available": True,
+        "unavailable": False,
+        "disabled": False,
+        "availability_reason": None,
+        "chat_status": {
+            "state": "available",
+            "label": "Chat接続",
+            "selectable": True,
+            "message": (
+                "Museへ自然文で送信し、返信をこのChatの履歴に保存します。処理はMuse側(remote)で行われ、"
+                "取消はAoiTalk側の待機のみです。開発用tool loopは別機能です。"
+            ),
+            "required_configuration": "",
+            "reason_code": None,
+        },
+    }
+    return payload, None
 
 
 def model_supports_vision(provider: str, model: str) -> bool | None:
@@ -288,6 +504,14 @@ STATIC_MODEL_CATALOG = {
     ],
     "deepinfra": [
         {
+            "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "label": "DeepSeek V4.1 Flash 1017 (DeepInfra)",
+            "description": "DeepInfra公式APIの既定推論モデル",
+            "context_length": 1048576,
+            "supports_reasoning": True,
+            "media": {"image": True},
+        },
+        {
             "id": "deepseek-ai/DeepSeek-V4-Flash",
             "label": "DeepSeek V4 Flash (DeepInfra)",
             "description": "DeepInfra公式APIの高速・低コスト推論モデル",
@@ -348,6 +572,7 @@ STATIC_MODEL_CATALOG = {
         {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
         {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna"},
+        {"id": "gpt-6.1-sol", "label": "GPT-6.1 Sol"},
         {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
         {"id": "gpt-5.4", "label": "GPT-5.4"},
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini"},
@@ -2501,9 +2726,12 @@ def _strata_static_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
         port = 8080
     if not 1 <= port <= 65535:
         port = 8080
+    deepseek = str(profile.get("setup_family") or "").casefold() == "deepseek41"
     try:
         context_size = int(
-            raw.get("context_size", profile.get("default_context_size", 32768))
+            profile.get("default_context_size", 32768)
+            if deepseek
+            else raw.get("context_size", profile.get("default_context_size", 32768))
         )
     except (TypeError, ValueError):
         context_size = int(profile.get("default_context_size", 32768))
@@ -2512,7 +2740,7 @@ def _strata_static_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
     except (TypeError, ValueError):
         readiness_timeout = 600.0
     host = str(raw.get("host") or "127.0.0.1")
-    vision = str(raw.get("vision") or "none")
+    vision = "none" if deepseek else str(raw.get("vision") or "none")
     auto_start = _bool_value(
         os.getenv("STRATA_AUTO_START", raw.get("auto_start")),
         True,
@@ -3732,6 +3960,8 @@ def reasoning_effort_options_for_model(
     model_id = _normalize_model_id_for_effort(model)
 
     if provider_id == "codex-cli":
+        if model_id == "gpt-6.1-sol":
+            return CODEX_GPT56_SOL_REASONING_EFFORT_OPTIONS
         if model_id == "gpt-5.6-sol" or model_id.startswith("gpt-5.6-sol-"):
             return CODEX_GPT56_SOL_REASONING_EFFORT_OPTIONS
         if model_id == "gpt-5.6-luna" or model_id.startswith("gpt-5.6-luna-"):
@@ -3926,26 +4156,74 @@ def provider_saved_model(provider: str, cfg: Any) -> Optional[str]:
     return None
 
 
-def agent_team_models_by_provider(cfg: Any) -> Dict[str, List[Dict[str, str]]]:
+def model_role_models_by_provider(cfg: Any) -> Dict[str, List[Dict[str, str]]]:
+    """Return configured global role routes grouped for catalog projection.
+
+    The catalog has no Agent binding to inspect, so it uses a complete empty
+    v2 policy.  The canonical resolver then reads the primary Chat route,
+    ``model_roles`` role rows, and their Chat inheritance/fallback chain.  A
+    pool route is intentionally omitted here: the virtual Free Team provider
+    below owns its pool/candidate projection.
+    """
+
     result: Dict[str, List[Dict[str, str]]] = {}
-    for subagent in agent_team_v3_subagents(cfg, include_disabled=False):
-        subagent_id = str(subagent.get("subagent_id") or "").strip()
-        if not subagent_id:
+    revision = {
+        "model_overrides": {},
+        "tool_ids": [],
+        "delegate_policy": {},
+    }
+    configured_chat_model = str(_config_get(cfg, "llm_model", "") or "").strip()
+    configured_roles = _config_get(cfg, "model_roles.roles", {})
+    configured_roles = configured_roles if isinstance(configured_roles, Mapping) else {}
+    for role in ("chat", "summarize", "code", "review", "research"):
+        role_block = configured_roles.get(role)
+        # An empty/missing non-chat row inherits Chat at runtime, but there is
+        # no concrete primary model to advertise when the legacy write-through
+        # Chat setting itself is empty.  Explicit fallback/role rows remain
+        # visible below.
+        if not configured_chat_model and role == "chat":
+            skip_primary = True
+        elif not configured_chat_model and role != "chat" and not (
+            isinstance(role_block, Mapping)
+            and isinstance(role_block.get("routes"), list)
+            and role_block.get("routes")
+        ):
             continue
-        route = resolve_agent_team_v3_route(cfg, subagent_id) or {}
-        provider = str(route.get("provider") or "").strip()
-        model = str(route.get("model") or "").strip()
-        if not provider or not model or is_retired_model(model):
+        else:
+            skip_primary = False
+        try:
+            routes, _allow_paid_fallback, _source = revision_role_route_candidates(
+                cfg,
+                revision,
+                role,
+            )
+        except Exception:
+            # A malformed optional role must not make the entire settings
+            # catalog unavailable.  The runtime resolver remains fail-closed.
             continue
-        result.setdefault(provider, []).append(
-            {
-                "subagent_id": subagent_id,
-                "name": str(subagent.get("name") or subagent_id),
-                "model": model,
-                "llm_profile_id": None,
-                "execution_profile_id": str(route.get("execution_profile_id") or "") or None,
-            }
-        )
+        for index, route in enumerate(routes):
+            if skip_primary and index == 0:
+                continue
+            if not isinstance(route, Mapping):
+                continue
+            if str(route.get("kind") or "").strip().lower() == "pool":
+                continue
+            provider = str(route.get("provider") or "").strip().lower()
+            model = str(route.get("model") or "").strip()
+            if (
+                not provider
+                or not model
+                or is_retired_model(model)
+                or (provider == "ollama" and _is_ollama_incompatible_model(model))
+            ):
+                continue
+            result.setdefault(provider, []).append(
+                {
+                    "role": role,
+                    "route_index": str(index),
+                    "model": model,
+                }
+            )
     return result
 
 
@@ -3964,7 +4242,7 @@ def build_model_catalog(
     current_m = _config_get(cfg, "llm_model", "gpt-4o")
     current_m = "" if is_retired_model(current_m) else str(current_m or "").strip()
     deployment = resolve_llm_deployment(cfg)
-    team_models = agent_team_models_by_provider(cfg)
+    role_models = model_role_models_by_provider(cfg)
     providers = []
     refresh_target = (refresh_provider or "").strip() or None
 
@@ -4223,25 +4501,24 @@ def build_model_catalog(
                     source_label="現在の設定" if provider == current_p else "保存済み設定",
                 ),
             )
-        configured_subagents = (
+        configured_role_models = (
             []
             if enterprise_model or fixed_provider or not provider_available
-            else team_models.get(provider, [])
+            else role_models.get(provider, [])
         )
-        for configured_subagent in reversed(configured_subagents):
-            configured_model = configured_subagent["model"]
+        for configured_role in reversed(configured_role_models):
+            configured_model = configured_role["model"]
             if any(m["id"] == configured_model for m in models):
                 continue
-            subagent_id = str(configured_subagent.get("subagent_id") or "").strip()
-            subagent_label = str(configured_subagent.get("name") or subagent_id)
+            role_name = str(configured_role.get("role") or "chat").strip()
             models.insert(
                 0,
                 model_option(
                     configured_model,
                     configured_model,
                     custom_current=True,
-                    source="agent-team-configured",
-                    source_label=f"Agent Team Subagent: {subagent_label}",
+                    source="model-role-configured",
+                    source_label=f"Model role: {role_name}",
                 ),
             )
         configured_provider_model = saved_model
@@ -4288,7 +4565,7 @@ def build_model_catalog(
                             error = None
         if provider not in {"openai_compatible_local", "ollama", "sglang"}:
             # Cloud/CLI providers retain the established catalog semantics,
-            # including explicitly configured custom models and Agent Team
+            # including explicitly configured custom models and model role
             # routes inserted above.  Only local runtime-bound providers use
             # the strict discovery projection.
             chat_models = [dict(model) for model in models]
@@ -4424,10 +4701,44 @@ def build_model_catalog(
                 "availability_reason": routing_reason,
             }
         )
+    grok_bot_payload, grok_bot_status = _grok_bot_chat_projection(cfg, deployment)
+    if grok_bot_payload is not None:
+        providers.append(grok_bot_payload)
+    muse_payload, muse_status = _muse_chat_projection(cfg, deployment)
+    if muse_payload is not None:
+        providers.append(muse_payload)
+    projected_status = {"grok-bot": grok_bot_status, "muse-remote": muse_status}
     providers.insert(0, routing_provider_payload)
     result = {
         "current": {"provider": current_p, "model": current_m},
         "providers": providers,
+        "chat_providers": [
+            {
+                "id": entry["id"],
+                "label": entry["label"],
+                "available": False,
+                "disabled": True,
+                "unavailable": True,
+                "availability_reason": entry["chat_status"]["message"],
+                "models": [],
+                "chat_models": [],
+                "available_models": [],
+                "availability": {
+                    "state": "unavailable",
+                    "error": entry["chat_status"]["message"],
+                    "message": entry["chat_status"]["message"],
+                },
+                "chat_status": dict(entry["chat_status"]),
+            }
+            for entry in (
+                {**item, "chat_status": projected_status[item["id"]]}
+                if item["id"] in projected_status
+                else item
+                for item in CHAT_PROVIDER_STATUS_CATALOG
+                if item["id"] not in projected_status
+                or projected_status[item["id"]] is not None
+            )
+        ],
         "provider_visibility": {
             "hidden_provider_ids": _global_hidden_provider_ids(cfg),
         },
@@ -4490,6 +4801,10 @@ def configured_provider_model(
 def header_engine_label(provider: str, model: str) -> str:
     if provider == "routing-profile" and model == "free-team":
         return "無料Team"
+    if provider == "grok-bot" and model == "grok-bot":
+        return "Grok Bot"
+    if provider == "muse-remote" and model == "muse-chat":
+        return "Muse"
     provider_label = LLM_PROVIDER_LABELS.get(provider, provider)
     return f"{provider_label} ({model})" if model else provider_label
 

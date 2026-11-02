@@ -29,7 +29,7 @@ if (-not $Base) {
 }
 
 $files = @(& git diff --name-only "$Base..$Target")
-$mobile = @($files | Where-Object { $_ -match '^(mobile/|mobile\\|resources/chat-background/|resources\\chat-background\\)' })
+$mobile = @($files | Where-Object { $_ -match '^(mobile/|mobile\\|shared/|shared\\|resources/chat-background/|resources\\chat-background\\)' })
 $required = ($mobile.Count -gt 0 -and -not $ReleaseDisabled)
 
 function Read-MobileExpoConfig([string]$Ref) {

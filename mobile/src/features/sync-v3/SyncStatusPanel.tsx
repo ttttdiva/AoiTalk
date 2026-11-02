@@ -3,7 +3,7 @@ import { Alert, StyleSheet, View } from "react-native";
 import { Button, Text } from "react-native-paper";
 import { getSyncV3Engine } from "../../sync-v3/contract";
 import type { LaneState, SyncV3Status } from "../../sync-v3/contract";
-import { describeSyncStatus } from "./status-presentation";
+import { describeLaneErrorCode, describeSyncStatus, safeSyncErrorCode } from "./status-presentation";
 
 export type SyncPanelScope = { scopeKey: string; label: string };
 
@@ -11,14 +11,14 @@ function formatTime(value: number | null): string {
   return value === null ? "-" : new Date(value).toLocaleString("ja-JP");
 }
 
-function LaneRow({ name, lane }: { name: string; lane: LaneState }) {
+function LaneRow({ name, lane, errorCode }: { name: string; lane: LaneState; errorCode: string | null }) {
   return (
     <View style={styles.lane} testID={`sync-lane-${name}`}>
       <Text variant="titleSmall">{name}</Text>
       <Text variant="bodySmall">状態: {lane.state}</Text>
       <Text variant="bodySmall">最終成功: {formatTime(lane.lastSuccessAt)}</Text>
-      <Text variant="bodySmall">次回試行: {formatTime(lane.nextAttemptAt)}</Text>
-      <Text variant="bodySmall">エラーコード: {lane.lastErrorCode ?? "-"}</Text>
+      <Text variant="bodySmall">次回時刻: {lane.nextAttemptAt == null ? "UNKNOWN（予定時刻は保持なし）" : formatTime(lane.nextAttemptAt)}</Text>
+      <Text variant="bodySmall">error code: {errorCode ?? "UNKNOWN"}</Text>
     </View>
   );
 }
@@ -82,9 +82,9 @@ export function SyncStatusPanel({
           <Text variant="bodySmall">scope revision: {status.scopeSetRevision ?? "-"}</Text>
           <Text variant="bodySmall">最終同期成功: {formatTime(status.lastSuccessAt ?? null)}</Text>
           {status.sweepError ? <Text variant="bodySmall">scope保全停止: {status.sweepError}</Text> : null}
-          <LaneRow name="push" lane={status.push} />
-          <LaneRow name="changes" lane={status.changes} />
-          <LaneRow name="bootstrap" lane={status.bootstrap} />
+          <LaneRow name="push" lane={status.push} errorCode={describeLaneErrorCode(status, "push")} />
+          <LaneRow name="changes" lane={status.changes} errorCode={describeLaneErrorCode(status, "changes")} />
+          <LaneRow name="bootstrap" lane={status.bootstrap} errorCode={describeLaneErrorCode(status, "bootstrap")} />
           <Text variant="bodySmall">queue: queued {status.queue.queued} / backoff {status.queue.backoff} / sent {status.queue.sent}</Text>
           <Text variant="bodySmall">競合: {status.openConflicts}件</Text>
           <Text variant="bodySmall">entity counts: {JSON.stringify(status.entityCounts ?? {})}</Text>
@@ -94,7 +94,9 @@ export function SyncStatusPanel({
               <Text variant="titleSmall">直近のrequest outcome</Text>
               {status.recentRequests.slice(-8).reverse().map((request) => (
                 <View key={request.requestId} style={styles.request}>
-                  <Text variant="bodySmall">{request.lane}: {request.outcome} / HTTP {request.status ?? "-"}</Text>
+                  <Text variant="bodySmall">
+                    {request.lane}: {request.outcome} / HTTP {request.status ?? "-"} / safe error code {safeSyncErrorCode(request.errorCode) ?? "UNKNOWN"} / {formatTime(request.occurredAt)}
+                  </Text>
                   <Text variant="bodySmall" selectable>{request.requestId}</Text>
                   {onCopy ? <Button compact onPress={() => onCopy(request.requestId)}>request idをコピー</Button> : null}
                 </View>

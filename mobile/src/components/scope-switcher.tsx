@@ -176,6 +176,8 @@ type ScopeSwitcherProps = {
   allowSpaceSelection?: boolean;
   /** Compact chat header: display the project name, not its space path. */
   projectNameOnly?: boolean;
+  /** Keep chat header labels on one line while retaining the complete accessible name. */
+  compact?: boolean;
 };
 
 function ScopeIcon({ source }: { source: string }) {
@@ -210,6 +212,7 @@ export function ScopeSwitcher({
   disabled = false,
   allowSpaceSelection = false,
   projectNameOnly = false,
+  compact = false,
 }: ScopeSwitcherProps) {
   const {
     spaces,
@@ -217,6 +220,7 @@ export function ScopeSwitcher({
     selectedSpaceId,
     selectedProjectId: contextProjectId,
     selectedSpace,
+    scopeHydrated = true,
     setSelectedSpaceId,
     setSelectedProjectId,
     refreshProjects,
@@ -230,18 +234,25 @@ export function ScopeSwitcher({
   const selectionInFlight = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
+  const isHydrated = onSelectProject ? true : scopeHydrated;
+  const unhydratedLabel = "未確定";
   const compactScopeLabel =
-    selectedProject?.name ??
-    ((!onSelectProject || allowSpaceSelection) ? selectedSpace?.name : undefined) ??
-    (selectedProjectId ? "プロジェクト" : allLabel);
-  const currentScopeLabel = projectNameOnly
-    ? compactScopeLabel
-    : selectedProject
-    ? projectScopeLabel(selectedProject, spaces, projects)
-    : selectedProjectId ? `取得できないプロジェクト [${selectedProjectId}]`
-    : selectedSpace && (!onSelectProject || allowSpaceSelection)
-      ? spaceScopeLabel(selectedSpace, spaces)
-      : allLabel;
+    !isHydrated
+      ? unhydratedLabel
+      : selectedProject?.name ??
+        ((!onSelectProject || allowSpaceSelection) ? selectedSpace?.name : undefined) ??
+        (selectedProjectId ? "プロジェクト" : allLabel);
+  const currentScopeLabel =
+    !isHydrated
+      ? unhydratedLabel
+      : projectNameOnly
+      ? compactScopeLabel
+      : selectedProject
+      ? projectScopeLabel(selectedProject, spaces, projects)
+      : selectedProjectId ? `取得できないプロジェクト [${selectedProjectId}]`
+      : selectedSpace && (!onSelectProject || allowSpaceSelection)
+        ? spaceScopeLabel(selectedSpace, spaces)
+        : allLabel;
 
   const close = () => void select(async () => {});
   const open = () => {
@@ -282,29 +293,37 @@ export function ScopeSwitcher({
   );
 
   const anchorLabel = label ? `${label}: ${currentScopeLabel}` : currentScopeLabel;
+  const anchorAccessibilityLabel = compact
+    ? accessibilityLabel
+      ? `${accessibilityLabel}。現在は${currentScopeLabel}`
+      : `範囲: ${currentScopeLabel}`
+    : accessibilityLabel ?? `範囲: ${currentScopeLabel}`;
 
   const anchor =
     variant === "inline" ? (
       <Pressable
         testID="scope-switcher-inline"
         accessibilityRole="button"
-        accessibilityLabel={accessibilityLabel ?? `範囲: ${currentScopeLabel}`}
+        accessibilityLabel={anchorAccessibilityLabel}
         accessibilityState={{ disabled }}
         disabled={disabled}
         onPress={open}
-        style={({ pressed }) => [styles.inline, disabled && styles.disabledAnchor, pressed && styles.rowPressed]}
+        style={({ pressed }) => [compact ? styles.inlineCompact : styles.inline, disabled && styles.disabledAnchor, pressed && styles.rowPressed]}
       >
-        <Text testID="scope-switcher-inline-label" style={[styles.inlineText, projectNameOnly && styles.projectName]}>
+        <Text
+          testID="scope-switcher-inline-label"
+          style={[compact ? styles.inlineCompactText : styles.inlineText, projectNameOnly && styles.projectName]}
+          numberOfLines={compact ? 1 : undefined}
+          ellipsizeMode={compact ? "tail" : undefined}
+        >
           {currentScopeLabel.replace(/^スペース: /, "")}
         </Text>
-        <Text style={styles.inlineChevron} importantForAccessibility="no">⌄</Text>
+        <Text style={[styles.inlineChevron, compact && styles.inlineCompactChevron]} importantForAccessibility="no">⌄</Text>
       </Pressable>
     ) : variant === "chip" ? (
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={
-          accessibilityLabel ?? `範囲: ${currentScopeLabel}`
-        }
+        accessibilityLabel={accessibilityLabel ?? `範囲: ${currentScopeLabel}`}
         accessibilityState={{ disabled }}
         disabled={disabled}
         onPress={open}
@@ -316,9 +335,7 @@ export function ScopeSwitcher({
     ) : (
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={
-          accessibilityLabel ?? `範囲: ${currentScopeLabel}`
-        }
+        accessibilityLabel={accessibilityLabel ?? `範囲: ${currentScopeLabel}`}
         accessibilityState={{ disabled }}
         disabled={disabled}
         onPress={open}
@@ -462,6 +479,9 @@ export function ScopeSwitcher({
 const styles = StyleSheet.create({
   inline: { width: "100%", flex: 1, minWidth: 0, minHeight: 44, flexDirection: "row", alignItems: "center", paddingLeft: 6, paddingRight: 2 },
   inlineText: { flex: 1, minWidth: 0, flexShrink: 1, color: "#cdd6f4", fontSize: 12, paddingVertical: 6 },
+  inlineCompact: { maxWidth: "100%", minWidth: 0, minHeight: 44, flexShrink: 1, alignSelf: "flex-start", flexDirection: "row", alignItems: "center", paddingLeft: 4, paddingRight: 0 },
+  inlineCompactText: { minWidth: 0, flexShrink: 1, color: "#cdd6f4", fontSize: 12, paddingVertical: 6 },
+  inlineCompactChevron: { marginLeft: 1 },
   projectName: { fontSize: 13, fontWeight: "600" },
   inlineChevron: { color: "#a6adc8", fontSize: 16, marginLeft: 2, flexShrink: 0 },
   disabledAnchor: { opacity: 0.5 },

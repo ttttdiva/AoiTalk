@@ -2519,6 +2519,7 @@ class AppBuildWorkflow:
 
             from ..memory.database import get_database_manager
             from ..memory.models import App, AppJob, AppTarget, ProjectApp, User
+            from .app_operation_lock import app_job_input_reference_lock, app_operation_lock
             from .app_job_service import execute_app_job
             from .app_service import AppAccessError, AppService
             from .turn_context import get_turn_context
@@ -2592,8 +2593,13 @@ class AppBuildWorkflow:
                 input_json=dict(input_json or {}),
                 started_by=owner_uuid,
             )
-            session.add(job)
-            await session.commit()
+            async with app_operation_lock(app_uuid, workspace_root=workspace_root):
+                async with app_job_input_reference_lock(workspace_root=workspace_root):
+                    await session.scalar(
+                        select(App.id).where(App.id == app_uuid).with_for_update().limit(1)
+                    )
+                    session.add(job)
+                    await session.commit()
             job_id = str(job.id)
         finally:
             await session.close()

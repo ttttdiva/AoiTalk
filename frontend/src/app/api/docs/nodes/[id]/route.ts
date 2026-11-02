@@ -10,6 +10,7 @@ import {
   appendKnowledgeRevision,
   cleanOptionalString,
   DOCS_DELETION_MAX_DESCENDANT_DEPTH,
+  docsReferenceTokenTargetIds,
   effectiveDocsSearchBodyText,
   ensureProjectWritable,
   getAllProjectKnowledgeNodePointerIds,
@@ -592,6 +593,11 @@ export async function PATCH(
         && body.archived === false
         && Object.keys(body).every((key) => key === "archived")
         && updates.archivedAt === null;
+      const titleOnlyReferencePatch =
+        "title" in body && Object.keys(body).length === 1;
+      let previousReferenceTokenTargetIds: string | null = titleOnlyReferencePatch
+        ? docsReferenceTokenTargetIds(lockedTarget).join("\0")
+        : null;
       if (typeof tx.select === "function") {
         // Project pointer writers use the Project->node lock order.  Acquire
         // the reverse pointer (and, for a strict canonical resolution, the
@@ -817,6 +823,9 @@ export async function PATCH(
           throw new DocsNodeInvariantError("Docs nodeが同時に削除されたため更新できません");
         }
         lockedTarget = targetRow;
+        previousReferenceTokenTargetIds = titleOnlyReferencePatch
+          ? docsReferenceTokenTargetIds(lockedTarget).join("\0")
+          : null;
         // The preflight managed-policy check is not a write boundary. Re-read
         // and lock the complete target/ancestor chain before any lifecycle or
         // content update so a concurrent reparent cannot attach this ordinary
@@ -1050,6 +1059,8 @@ export async function PATCH(
       if (!row) {
         throw new DocsNodeInvariantError("Docs nodeが同時に削除されたため更新できません");
       }
+      const referenceTokensUnchanged = previousReferenceTokenTargetIds !== null
+        && previousReferenceTokenTargetIds === docsReferenceTokenTargetIds(row).join("\0");
 
     if (restoreDescendantIds.length > 0) {
       const restoredRows = await updateDocsNodesByIds(tx, restoreDescendantIds, {
@@ -1097,9 +1108,10 @@ export async function PATCH(
     }
 
       await upsertKnowledgeSearchIndex(tx, row, effectiveDocsSearchBodyText(row));
-      if (!lifecycleOnlyRestoreRequest) {
-        // Pure lifecycle restores preserve existing edge metadata. Content or
-        // mixed PATCHes retain the historical root reference re-resolution.
+      if (!lifecycleOnlyRestoreRequest && !referenceTokensUnchanged) {
+        // Pure lifecycle restores and title-only edits with an unchanged
+        // reference-token set preserve existing edge metadata. Other edits
+        // retain the historical root reference re-resolution.
         await syncKnowledgeNodeReferenceEdges(tx, row, user.id);
       }
       await appendKnowledgeRevision(tx, row, user.id, "nodeを更新");

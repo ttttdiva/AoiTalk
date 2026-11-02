@@ -483,6 +483,20 @@ def project_operation_lock(
     return _get_lock("project", project_id, workspace_root)
 
 
+def app_job_input_reference_lock(
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> AppOperationLock:
+    """Serialize AppJob input commits with cleanup of referenced runtime files.
+
+    AppJob inputs can contain absolute paths that cross App and Project
+    boundaries on platforms without file-scoped isolation.  A shared lock
+    closes the enqueue-versus-runtime-cleanup race for every job producer.
+    """
+
+    return _get_lock("app-job-input-reference", "global", workspace_root)
+
+
 __all__ = [
     "AppOperationLock",
     "AppOperationLockError",
@@ -490,5 +504,6 @@ __all__ = [
     "ACQUIRE_TIMEOUT_ENV_KEY",
     "DEFAULT_ACQUIRE_TIMEOUT",
     "app_operation_lock",
+    "app_job_input_reference_lock",
     "project_operation_lock",
 ]

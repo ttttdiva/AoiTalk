@@ -738,6 +738,7 @@ class EngagementOpportunity(_OperationModel, Base):
             "development_requirements_revision": (self.metadata_json or {}).get("development_requirements_revision"),
             "development_requirements_note": (self.metadata_json or {}).get("development_requirements_note"),
             "review_artifact_version_ids": list((self.metadata_json or {}).get("review_artifact_version_ids") or [])[:20],
+            "ai_review_status": (self.metadata_json or {}).get("ai_review_status"),
             "card_summary_lines": list((self.metadata_json or {}).get("card_summary_lines") or [])[:3],
             "screening_status": (self.metadata_json or {}).get("screening_status"),
             "screening_reason": (self.metadata_json or {}).get("screening_reason"),

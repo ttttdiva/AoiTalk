@@ -64,6 +64,13 @@ class MemoryConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class SearchConfig(BaseModel):
+    """Search settings shared with the application configuration."""
+    embedding_resident: bool = Field(default=False, description="Keep the embedding worker loaded")
+
+    model_config = ConfigDict(extra="allow")
+
+
 class BaseConfig(BaseModel):
     """Base configuration model"""
     default_character: str = Field(default="ずんだもん", description="Default character")
@@ -74,5 +81,6 @@ class BaseConfig(BaseModel):
     tts: TTSConfig = Field(default_factory=TTSConfig)
     speech_recognition: SpeechRecognitionConfig = Field(default_factory=SpeechRecognitionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    search: SearchConfig = Field(default_factory=SearchConfig)
 
     model_config = ConfigDict(extra="allow")

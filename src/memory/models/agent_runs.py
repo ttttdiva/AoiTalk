@@ -62,9 +62,24 @@ def _safe_execution_manifest(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     result: dict[str, Any] = {}
+    legacy: dict[str, Any] = {}
     for key, item in value.items():
         name = str(key)
         if name not in _SAFE_EXECUTION_MANIFEST_KEYS:
+            continue
+        legacy_name = {
+            "team_id": "agent_team_id",
+            "execution_profile_id": "execution_profile_id",
+            "subagent_id": "acting_subagent_id",
+        }.get(name)
+        if legacy_name:
+            if item is None or (
+                isinstance(item, str)
+                and len(item) <= 512
+                and "/" not in item
+                and "\\" not in item
+            ):
+                legacy[legacy_name] = item
             continue
         if name == "route_snapshot":
             try:
@@ -84,7 +99,7 @@ def _safe_execution_manifest(value: Any) -> dict[str, Any] | None:
             except Exception:
                 selection = None
             if selection:
-                result[name] = selection
+                legacy[name] = selection
             continue
         if isinstance(item, str):
             if len(item) > 512 or "/" in item or "\\" in item:
@@ -102,6 +117,8 @@ def _safe_execution_manifest(value: Any) -> dict[str, Any] | None:
             ):
                 continue
             result[name] = list(item)[:128]
+    if legacy:
+        result["legacy"] = legacy
     return result or None
 
 
@@ -344,7 +361,6 @@ class AgentRun(Base):
             "task_id": str(self.task_id) if self.task_id else None,
             "work_item_id": str(self.work_item_id) if self.work_item_id else None,
             "work_item_attempt": int(self.work_item_attempt) if self.work_item_attempt is not None else None,
-            "acting_subagent_id": self.acting_subagent_id,
             "previous_attempt_run_id": (
                 str(self.previous_attempt_run_id)
                 if self.previous_attempt_run_id
@@ -381,6 +397,11 @@ class AgentRun(Base):
             "ended_at": _dt(self.ended_at),
             "last_event_at": _dt(self.last_event_at),
         }
+        legacy = dict(payload.get("legacy") or {})
+        if self.acting_subagent_id:
+            legacy["acting_subagent_id"] = self.acting_subagent_id
+        if legacy:
+            payload["legacy"] = legacy
         if include_events:
             payload["events"] = [event.to_dict() for event in self.events or []]
         if include_tool_calls:

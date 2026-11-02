@@ -762,7 +762,9 @@ function Assert-WorkspaceIdentity([psobject]$Workspace) {
 }
 
 function New-Workspace([string]$RepositoryRoot) {
-    $localRoot = Join-Path $RepositoryRoot ".local"
+    $resolver = Join-Path $RepositoryRoot "scripts\resolve_release_work_root.ps1"
+    Assert-RegularFile $resolver
+    $localRoot = & $resolver -SourceRoot $RepositoryRoot -MobileTemporary
     Assert-NoReparseAncestors $localRoot
     if (-not (Test-Path -LiteralPath $localRoot -PathType Container)) {
         [void][System.IO.Directory]::CreateDirectory($localRoot)
@@ -785,7 +787,7 @@ function New-Workspace([string]$RepositoryRoot) {
     try {
         $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
     } catch {
-        Stop-Launcher "Another Mobile launcher owns the serialized .local workspace"
+        Stop-Launcher "Another Mobile launcher owns the serialized temporary workspace"
     }
     $created = [System.Collections.Generic.List[string]]::new()
     try {
@@ -1090,6 +1092,11 @@ function Invoke-StageChatBackground([string]$PythonPath, [string]$SourceRoot, [s
     Invoke-CanonicalPython $PythonPath $scriptPath @("--source-root", (Join-Path $SourceRoot "resources\chat-background"), "--build-root", $BuildRoot)
 }
 
+function Invoke-StageShared([string]$PythonPath, [string]$SourceRoot, [string]$BuildRoot) {
+    $scriptPath = Join-Path $SourceRoot "scripts\stage_mobile_shared.py"
+    Invoke-CanonicalPython $PythonPath $scriptPath @("--source-root", (Join-Path $SourceRoot "shared"), "--build-root", $BuildRoot)
+}
+
 function Replace-TextFile([string]$Path, [scriptblock]$Transform) {
     Assert-RegularFile $Path
     $content = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
@@ -1124,6 +1131,7 @@ function Invoke-NativeSnapshotBuild([string]$SourceRoot, [psobject]$Workspace, [
     Assert-RegularFile (Join-Path $buildRoot "modules\apk-installer\android\src\main\java\expo\modules\apkinstaller\ApkInstallerModule.kt")
     Invoke-StageRuntime $PythonPath $SourceRoot $Workspace.Temp
     Invoke-StageChatBackground $PythonPath $SourceRoot $Workspace.Temp
+    Invoke-StageShared $PythonPath $SourceRoot $Workspace.Temp
 
     $npm = Resolve-TrustedTool "npm" $SourceRoot
     $npx = Resolve-TrustedTool "npx" $SourceRoot

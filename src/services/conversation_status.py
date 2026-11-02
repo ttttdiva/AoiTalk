@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 import uuid
 
@@ -60,6 +60,8 @@ _ACTIVE_RUN_STATES = frozenset({"queued", "running"})
 _FAILURE_RUN_STATES = frozenset(
     {"failed", "uncertain", "blocked", "awaiting_approval"}
 )
+_AUTO_CLEARING_FAILURE_RUN_STATES = frozenset({"failed", "uncertain"})
+FAILURE_ATTENTION_TTL = timedelta(hours=24)
 _TERMINAL_DIALOGUE_STATES_EXCLUDING_PENDING = frozenset({"cancelled", "expired"})
 _IGNORED_ASSISTANT_GENERATION_STATES = frozenset(
     {"cancelled", "failed", "error", "partial", "input_pending", "awaiting_input"}
@@ -384,6 +386,7 @@ def project_conversation_status_projection(
     runs: Sequence[Any] = (),
     assistant_messages: Sequence[Any] = (),
     human_inputs: Sequence[Any] = (),
+    now: datetime | None = None,
 ) -> ConversationStatusProjection:
     """Project one session into the four shared history filter states.
 
@@ -426,10 +429,32 @@ def project_conversation_status_projection(
     ]
     latest_failure = max(failures, key=_created_key, default=None)
     latest_success = max(successes, key=_created_key, default=None)
+    read_at = _dt(last_read_at)
     if latest_failure is not None and (
         latest_success is None or _created_key(latest_failure) > _created_key(latest_success)
     ):
-        return ConversationStatusProjection("needs_attention", completion_at)
+        failure_status = str(_row_value(latest_failure, "status", "") or "").casefold()
+        failure_at = (
+            _dt(_row_value(latest_failure, "ended_at"))
+            or _dt(_row_value(latest_failure, "updated_at"))
+            or _dt(_row_value(latest_failure, "created_at"))
+        )
+        current_at = _dt(now) if now is not None else _dt(datetime.now(timezone.utc))
+        read_or_expired = bool(
+            failure_at is not None
+            and (
+                (read_at is not None and read_at >= failure_at)
+                or (
+                    current_at is not None
+                    and current_at - failure_at >= FAILURE_ATTENTION_TTL
+                )
+            )
+        )
+        if (
+            failure_status not in _AUTO_CLEARING_FAILURE_RUN_STATES
+            or not read_or_expired
+        ):
+            return ConversationStatusProjection("needs_attention", completion_at)
 
     if any(
         str(_row_value(run, "status", "") or "").casefold() in _ACTIVE_RUN_STATES
@@ -437,7 +462,6 @@ def project_conversation_status_projection(
     ):
         return ConversationStatusProjection("working", completion_at)
 
-    read_at = _dt(last_read_at)
     if completion_at is not None and (read_at is None or completion_at > read_at):
         return ConversationStatusProjection("ready", completion_at)
 
@@ -450,6 +474,7 @@ def project_conversation_status(
     runs: Sequence[Any] = (),
     assistant_messages: Sequence[Any] = (),
     human_inputs: Sequence[Any] = (),
+    now: datetime | None = None,
 ) -> ConversationStatus:
     """Return only the four-state value for callers that do not need a fence."""
 
@@ -458,6 +483,7 @@ def project_conversation_status(
         runs=runs,
         assistant_messages=assistant_messages,
         human_inputs=human_inputs,
+        now=now,
     ).status
 
 

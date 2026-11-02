@@ -55,16 +55,20 @@ from urllib.request import Request, urlopen
 
 import psutil
 
+from src.runtime_release_contract import persistent_path
+
 from ._gateway_activation import restore_activation_secret as _restore_gateway_activation_secret
 from ._qdrant_server import (
     managed_qdrant_status,
-    start_managed_qdrant,
+    start_managed_qdrant_background,
     stop_managed_qdrant,
 )
+from ._browser_broker import start_managed_browser_broker, stop_managed_browser_broker
 
 from src.llm.openai_compatible_local_profiles import (
     EXO_BASE_URL,
     MLX_LM_BASE_URL,
+    STRATA_DEEPSEEK_MODEL_ID,
     is_macos,
     local_server_profile_for_model,
     managed_local_runtime_for_model,
@@ -72,6 +76,7 @@ from src.llm.openai_compatible_local_profiles import (
     openai_compatible_local_base_url,
 )
 from src.services.strata_runtime import (
+    _is_http_loopback_url,
     strata_api_key,
     strata_settings,
     strata_base_url,
@@ -1914,7 +1919,9 @@ def _wait_for_llama_cpp_startup_listener(
     )
     expected_alias = str(settings.get("model_alias") or "").strip()
     host, port = _base_url_host_port(base_url)
-    log_path = Path(__file__).resolve().parents[2] / "logs" / "models" / "llama_cpp.log"
+    log_path = persistent_path(
+        "logs/models/llama_cpp.log", Path(__file__).resolve().parents[2]
+    )
 
     try:
         if proc.poll() is not None:
@@ -2470,6 +2477,7 @@ def _strata_post_load(
     endpoint: str,
     *,
     deadline: float,
+    model: str | None = None,
 ) -> None:
     base = endpoint.rstrip("/")
     if base.endswith("/v1"):
@@ -2487,6 +2495,29 @@ def _strata_post_load(
     timeout = deadline - time.monotonic()
     if timeout <= 0:
         raise TimeoutError("Strata model load deadline expired before POST /load")
+    if (
+        str(model or "").casefold() == STRATA_DEEPSEEK_MODEL_ID.casefold()
+        and _is_http_loopback_url(endpoint)
+    ):
+        # The DeepSeek managed Strata load request carries the local API key.
+        # Keep this one managed loopback request independent from OS proxy
+        # settings and refuse redirects before credentials can leave localhost.
+        import httpx
+
+        with httpx.Client(
+            trust_env=False,
+            follow_redirects=False,
+            timeout=timeout,
+        ) as client:
+            with client.stream(
+                "POST",
+                f"{base}/load",
+                content=b"{}",
+                headers=headers,
+            ) as response:
+                response.raise_for_status()
+                next(response.iter_bytes(chunk_size=64 * 1024), b"")
+        return
     with urlopen(request, timeout=timeout) as response:
         response.read(64 * 1024)
 
@@ -2527,7 +2558,12 @@ def _strata_start_or_join_loader(
 
         def run() -> None:
             try:
-                _strata_post_load(config, endpoint, deadline=deadline)
+                _strata_post_load(
+                    config,
+                    endpoint,
+                    deadline=deadline,
+                    model=model,
+                )
             except BaseException as exc:  # preserve loader failure for caller
                 result["error"] = exc
             finally:
@@ -3009,6 +3045,7 @@ def _ensure_strata_server(
                     raise RuntimeError("Strataの起動待ち中にgeneration leaseが解放されませんでした")
                 continue
             proc = None
+            stage = "readiness"
             try:
                 loading_proc = (
                     _owned_strata_process_at(endpoint)
@@ -3045,6 +3082,7 @@ def _ensure_strata_server(
                     # it for a force restart until its strict loaded-model
                     # readiness is proven. A timeout leaves this old owner
                     # untouched and rolls back only a process started here.
+                    stage = "readiness_wait"
                     _wait_for_strata_model_readiness(
                         loading_proc,
                         config,
@@ -3053,6 +3091,7 @@ def _ensure_strata_server(
                         budget=budget,
                         require_loaded=True,
                     )
+                    stage = "readiness"
                     readiness = strata_readiness(
                         config,
                         model=model,
@@ -3064,6 +3103,7 @@ def _ensure_strata_server(
                 if readiness["ready"] and loading_proc is not None:
                     setattr(loading_proc, "_aoi_local_readiness_state", "ready")
                 if not available and loading_proc is not None:
+                    stage = "readiness_wait"
                     _wait_for_strata_model_readiness(
                         loading_proc,
                         config,
@@ -3077,6 +3117,7 @@ def _ensure_strata_server(
                     # it to proc: rollback belongs only to this call's launch.
                     available = True
                 if force_restart or not available:
+                    stage = "port_guard"
                     host, port = _base_url_host_port(endpoint)
                     owned = _owned_strata_process_at(endpoint)
                     stale_owned = (
@@ -3095,7 +3136,9 @@ def _ensure_strata_server(
                         )
                     if budget is not None:
                         budget.checkpoint()
+                    stage = "source_plan"
                     args, cwd = strata_launch_plan(config, model=model)
+                    stage = "replace_owned"
                     if owned is not None:
                         # Only this endpoint was drained. Never stop an owned
                         # llama.cpp/FreeToken process on a different port.
@@ -3103,13 +3146,16 @@ def _ensure_strata_server(
                             raise RuntimeError("Strataの対象endpointは応答生成中です")
                         _terminate_process_tree(owned)
                         _remove_tracked_process(owned)
-                    startup_log_path = Path(__file__).resolve().parents[2] / "logs/models/strata.log"
+                    startup_log_path = persistent_path(
+                        "logs/models/strata.log", Path(__file__).resolve().parents[2]
+                    )
                     try:
                         startup_log_offset = startup_log_path.stat().st_size
                     except OSError:
                         startup_log_offset = 0
                     from src.utils.process_identity import strata_title_template
 
+                    stage = "launch_process"
                     proc = _start_logged_openai_compatible_process(
                         args, cwd=cwd,
                         log_path=startup_log_path,
@@ -3138,6 +3184,7 @@ def _ensure_strata_server(
                     proc._aoi_local_startup_log_offset = startup_log_offset
                     proc._aoi_local_startup_started_at = time.monotonic()
                     proc._aoi_local_readiness_state = "loading"
+                    stage = "readiness_wait"
                     if wait_for_model or raise_on_launch_error or force_restart or acquire_generation_lease:
                         _wait_for_strata_model_readiness(
                             proc,
@@ -3156,6 +3203,7 @@ def _ensure_strata_server(
                     # listener alive.  Stop only same-model Strata processes,
                     # after the replacement is ready; unrelated llama.cpp or
                     # FreeToken processes on other ports remain untouched.
+                    stage = "stale_cleanup"
                     for stale in stale_owned:
                         if _peek_llama_cpp_lifecycle_lease(
                             str(getattr(stale, "_aoi_local_base_url", ""))
@@ -3164,6 +3212,7 @@ def _ensure_strata_server(
                         _terminate_process_tree(stale)
                         _remove_tracked_process(stale)
                     started = True
+                stage = "lease_acquire"
                 if budget is not None:
                     budget.checkpoint()
                 if acquire_generation_lease:
@@ -3172,12 +3221,22 @@ def _ensure_strata_server(
                         lease_tickets.append(ticket)
                 return started
             except Exception as exc:
+                try:
+                    from src.services.strata_runtime import _safe_probe_error_type, _safe_probe_int
+
+                    logger.warning(
+                        "strata_start_diagnostic scope=manager stage=%s class=%s errno=%s winerror=%s returncode=%s",
+                        stage, _safe_probe_error_type(exc), _safe_probe_int(getattr(exc, "errno", None)),
+                        _safe_probe_int(getattr(exc, "winerror", None)),
+                        _safe_probe_int(getattr(exc, "returncode", None)),
+                    )
+                except Exception:
+                    pass
                 if proc is not None:
                     _terminate_process_tree(proc)
                     _remove_tracked_process(proc)
                 if raise_on_launch_error:
                     raise
-                logger.warning("Strataの起動を延期します: %s", exc)
                 return False
 
 
@@ -4845,14 +4904,19 @@ def start_services(config: object | None = None) -> None:
                 (("AOITALK_CADDY_PORT",), "caddy.port", 6002),
             )
         }
-        qdrant_started = start_managed_qdrant(
+        # Qdrant starts (and retries) in the background; FastAPI and Next.js
+        # do not wait for it.  Its users report "preparing" until it is ready.
+        qdrant_started = not managed_qdrant_status().get("container_owned")
+        start_managed_qdrant_background(
             config, is_windows=_IS_WINDOWS, reserved_ports=reserved_ports,
         )
+        start_managed_browser_broker()
         _start_services(config)
     except BaseException:
         try:
             _rollback_tracked_processes(tracked_process_start)
         finally:
+            stop_managed_browser_broker()
             if qdrant_started:
                 stop_managed_qdrant()
         raise
@@ -4866,6 +4930,7 @@ def kill_services() -> None:
         _child_processes.clear()
         _openai_compatible_local_processes.clear()
     finally:
+        stop_managed_browser_broker()
         stop_managed_qdrant()
 
 

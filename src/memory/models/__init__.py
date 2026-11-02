@@ -11,11 +11,19 @@ from .personal_draft import PersonalDraftEvent
 from .personal_reminder import PersonalReminderEvent
 from .personal_finance_receipt import PersonalFinanceReceiptCandidate
 from .task_api_receipts import TaskApiOperationReceipt
+from .dots_dialogue import (
+    DotsDialogueBinding,
+    DotsDialogueSubscription,
+    DotsDialogueRequest,
+    DotsDialogueOutbox,
+    DotsDialogueOperationReceipt,
+)
 from .auth_handoff import (
     AuthHandoffClientTransaction,
     AuthHandoffRateLimit,
     AuthHandoffTransaction,
 )
+from .agent_team_graph import AgentTeamGraph, AgentTeamGraphRevision
 from .agent_delegation import AgentDelegation, AgentDelegationArtifact, AgentDelegationBudgetReservation
 from .daily_capture import DocsDailyCapture
 from .agent_automation import (
@@ -374,6 +382,7 @@ from .media_operations_research import (
     RESEARCH_CANDIDATE_DECISION_ACTOR_TYPES,
     ResearchCandidateDecision,
     ContentItemFinding,
+    ContentItemStockDecision,
 )
 from .media_operations_generation import (
     GENERATION_WORKSPACE_STATUS_VALUES,
@@ -503,6 +512,8 @@ __all__ = [
     "OrganizationSettings",
     "Agent",
     "AgentRevision",
+    "AgentTeamGraph",
+    "AgentTeamGraphRevision",
     "AgentOrganizationProfile",
     "AgentSpaceAssignment",
     "AgentProjectGrant",
@@ -789,6 +800,7 @@ __all__ = [
     "EditorialProgramRevision",
     "ContentItem",
     "ContentItemFinding",
+    "ContentItemStockDecision",
     "GENERATION_WORKSPACE_STATUS_VALUES",
     "CREATIVE_RECIPE_TYPE_VALUES",
     "GENERATION_PLAN_STATUS_VALUES",

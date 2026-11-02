@@ -23,56 +23,7 @@ AGENT_TEAM_SCHEMA_VERSION = 3
 # topology.
 AGENT_TEAM_CONTEXT_TAGS = frozenset({"app_development"})
 
-AGENT_TEAM_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
-    "workspace_read": {"id": "workspace_read", "family": "workspace", "access": "read", "native": True},
-    "workspace_write": {"id": "workspace_write", "family": "workspace", "access": "write", "native": True},
-    "repo_map": {"id": "repo_map", "family": "workspace", "access": "read", "native": True},
-    "command_execute": {"id": "command_execute", "family": "workspace", "access": "write", "native": True},
-    "aoi_tools": {"id": "aoi_tools", "family": "aoi", "access": "read", "native": False},
-    "docs_read": {"id": "docs_read", "family": "docs", "access": "read", "native": False},
-    "docs_write": {"id": "docs_write", "family": "docs", "access": "write", "native": False},
-    "project_read": {"id": "project_read", "family": "project", "access": "read", "native": False},
-    "project_write": {"id": "project_write", "family": "project", "access": "write", "native": False},
-    "web_read": {"id": "web_read", "family": "web", "access": "read", "native": False, "shared": True},
-    # QA Browser is a parent-issued capability.  It is intentionally not part
-    # of the default Team roster; a parent controller must inject a scoped
-    # capability facade for a configured UI-QA worker.
-    "browser_qa": {"id": "browser_qa", "family": "browser", "access": "write", "native": False, "parent_owned": True},
-    # Shared integrations are intentionally not fresh Team entries.
-    "media": {"id": "media", "family": "media", "access": "write", "native": False},
-    "spotify": {"id": "spotify", "family": "spotify", "access": "write", "native": False},
-    # Declarations only: the server-owned action policy/attempt boundary
-    # authorizes execution independently of a Team or model tool selection.
-    "external_action_propose": {"id": "external_action_propose", "family": "employee", "access": "write", "native": False},
-    "telephony_control": {"id": "telephony_control", "family": "employee", "access": "write", "native": False},
-    # Remote Muse delegation is an explicit Agent capability.  It is kept out
-    # of every built-in Subagent roster so existing revisions do not gain it
-    # merely because the catalog knows the capability.
-    "remote_agent_delegate": {
-        "id": "remote_agent_delegate", "family": "remote", "access": "write", "native": False,
-    },
-    # Explicit owner-invoked personal adapters. These are intentionally
-    # separate from generic AoiTalk/Project capabilities and have no provider
-    # or external-action authority.
-    "personal_deadline_read": {
-        "id": "personal_deadline_read", "family": "personal", "access": "read", "native": False,
-    },
-    "personal_deadline_draft": {
-        "id": "personal_deadline_draft", "family": "personal", "access": "read", "native": False,
-    },
-    "personal_inventory_read": {
-        "id": "personal_inventory_read", "family": "personal", "access": "read", "native": False,
-    },
-    "personal_inventory_draft": {
-        "id": "personal_inventory_draft", "family": "personal", "access": "read", "native": False,
-    },
-    "personal_finance_read": {
-        "id": "personal_finance_read", "family": "personal", "access": "read", "native": False,
-    },
-    "personal_career_context": {
-        "id": "personal_career_context", "family": "personal", "access": "read", "native": False,
-    },
-}
+from .agent_capabilities import AGENT_CAPABILITY_CATALOG as AGENT_TEAM_CAPABILITY_CATALOG
 AGENT_TEAM_SHARED_READ_CAPABILITIES = frozenset({"web_read"})
 
 PROJECT_OPERATOR_TASK_HIERARCHY_INSTRUCTIONS = (
@@ -140,7 +91,7 @@ AGENT_TEAM_SUBAGENT_CATALOG: dict[str, dict[str, Any]] = {
         workspace="none",
         native_tools=False,
     ),
-    "employee_operator": _subagent("employee_operator", "Agent業務", "管理者が設定した自動化と電話受付を担当する。", "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。", ["external_action_propose", "telephony_control"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
+    "employee_operator": _subagent("employee_operator", "Agent業務", "管理者が設定した自動化を担当する。", "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証する。", ["external_action_propose"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
     "general_worker": _subagent("general_worker", "汎用作業", "特定分野へ固定しない一般作業。比較、整理、要約、補助調査、小規模なファイル作業等。", "特定分野に固定せず、比較、整理、要約、補助調査、小規模なファイル作業を行う。CLI Agentを選択した場合はnative toolsを利用できる。", ["workspace_read", "workspace_write", "repo_map", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
     "general_researcher": _subagent("general_researcher", "汎用調査", "Web・Workspace を直接調査し、Docs/Project は専用 operator へ委譲する横断調査。", "Web検索とWorkspace/repo mapのread-only調査を行う。DocsやProject/Tasksの詳細は docs_operator / project_operator への委譲を前提とし、自分で high-level Docs/Project tools を直接使わない。根拠を添えて報告する。", ["workspace_read", "repo_map", "web_read", "aoi_tools"], scalable=True, default_instances=1, max_instances=6, workspace="read", native_tools=True),
     "docs_operator": _subagent("docs_operator", "Docs操作", "Docsノードの検索、読み取り、整理、再構成、更新。", "AoiTalkのDocs high-level toolsのみ使用する。canonical nodeを確認し、曖昧な対象を推測して更新せず、書き込み前に対象を確認する。AoiTalk DBへ直接アクセスしない。", ["docs_read", "docs_write"], scalable=True, default_instances=1, max_instances=4, workspace="none", native_tools=False),
@@ -997,9 +948,9 @@ def agent_team_v3_subagents(config: Any, *, include_disabled: bool = True) -> li
 
 
 def _main_route(config: Any) -> dict[str, Any]:
-    # Keep provider fallback policy in the service facade while avoiding a
-    # module-import cycle; this function is called only after app bootstrap.
-    from .agent_team_service import _main_route as resolve_main_route
+    # Historical migration callers may still import this helper; live route
+    # resolution belongs to the neutral model_roles service.
+    from .model_roles_service import resolve_execution_main_route as resolve_main_route
 
     return resolve_main_route(config)
 
@@ -1078,7 +1029,7 @@ def _profile_route(
 ) -> dict[str, Any]:
     target_type = str(profile.get("target_type") or "inherit")
     # The root Main route is already resolved from ``llm_provider`` /
-    # ``llm_model`` by ``agent_team_service._main_route``.  In particular, a
+    # ``llm_model`` by the neutral model_roles Main resolver. In particular, a
     # stale provider-specific key such as ``openai.model`` must not be read
     # again here and override an explicitly active Main model.  Static and
     # pool profiles are the only routes allowed to replace provider/model.
@@ -1257,7 +1208,7 @@ def resolve_team_execution_route(
 
 
 def resolve_agent_team_v3_route(config: Any, subagent_id: str, *, main_route: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    from .execution_profile_service import resolve_execution_main_route
+    from .model_roles_service import resolve_execution_main_route
 
     subagent = next((item for item in agent_team_v3_subagents(config) if item.get("subagent_id") == str(subagent_id)), None)
     if not subagent:

@@ -411,8 +411,12 @@ function workSummary(
 function timelineRunFailureMessage(
   status: string | undefined,
   hasRunError: boolean,
+  runError: string | null | undefined,
 ): string {
   if (status === "cancelled") return "実行を停止しました。";
+  if (runError?.trim() === "Agent run interrupted by process restart") {
+    return "サーバー再起動により実行が中断されました。結果を確認してから再実行してください。";
+  }
   if (status === "failed" || hasRunError) return SAFE_AGENT_FAILURE_MESSAGE;
   return SAFE_LOG_FAILURE_MESSAGE;
 }
@@ -683,7 +687,7 @@ export function AgentRunTimeline({
             <div className="mb-1 flex items-start gap-1.5 text-destructive">
               <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
               <span className="min-w-0 [overflow-wrap:anywhere]">
-                {timelineRunFailureMessage(run?.status, hasRunError)}
+                {timelineRunFailureMessage(run?.status, hasRunError, run?.error)}
               </span>
             </div>
           )}

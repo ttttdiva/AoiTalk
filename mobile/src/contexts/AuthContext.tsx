@@ -136,15 +136,77 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     const generation = ++lifecycleGenerationRef.current;
+    const authAttempt = loginAttemptRef.current;
     const isCurrent = () =>
       mountedRef.current
       && !cancelled
       && lifecycleGenerationRef.current === generation;
+    const isRefreshCurrent = () =>
+      isCurrent()
+      && loginAttemptRef.current === authAttempt;
     const currentServer = async (): Promise<string | null> => {
       try {
         return await getConfiguredApiServerFingerprint();
       } catch {
         return null;
+      }
+    };
+    const refreshExpiredTokenInBackground = async (
+      expiredToken: string,
+      expectedUser: UserInfo,
+      expectedServerFingerprint: string | null,
+    ) => {
+      try {
+        // Pin refresh to the server that was checked against the persisted
+        // actor. This work must never delay the local account projection.
+        const refreshed = await tryRefreshToken(undefined, expectedServerFingerprint);
+        if (!isRefreshCurrent()) return;
+        const serverAfterRefresh = await currentServer();
+        if (!isRefreshCurrent() || serverAfterRefresh !== expectedServerFingerprint) return;
+        const refreshedToken = await getToken();
+        if (!isRefreshCurrent()) return;
+        const serverAfterTokenRead = await currentServer();
+        if (!isRefreshCurrent() || serverAfterTokenRead !== expectedServerFingerprint) return;
+
+        if (refreshed && refreshedToken) {
+          const refreshedUser = inspectTokenPayload(refreshedToken).user;
+          if (!refreshedUser || refreshedUser.user_id !== expectedUser.user_id) return;
+          await runAuthScopeTransition(async () => {
+            if (!isRefreshCurrent()) return;
+            const currentFingerprint = await currentServer();
+            if (!isRefreshCurrent() || currentFingerprint !== expectedServerFingerprint) return;
+            const currentToken = await getToken();
+            if (!isRefreshCurrent() || currentToken !== refreshedToken) return;
+            const serverAtCommit = await currentServer();
+            if (!isRefreshCurrent() || serverAtCommit !== expectedServerFingerprint) return;
+            if (expectedServerFingerprint) {
+              await saveAuthActor(refreshedUser, expectedServerFingerprint).catch(() => undefined);
+            }
+            if (!isRefreshCurrent()) return;
+            setUser(refreshedUser);
+            setTokenPresent(true);
+            setReauthRequired(false);
+            setReauthIdentityUnknown(false);
+          });
+        } else if (!refreshed && refreshedToken === expiredToken) {
+          await runAuthScopeTransition(async () => {
+            if (!isRefreshCurrent()) return;
+            const currentFingerprint = await currentServer();
+            if (!isRefreshCurrent() || currentFingerprint !== expectedServerFingerprint) return;
+            const currentToken = await getToken();
+            if (!isRefreshCurrent() || currentToken !== expiredToken) return;
+            const serverAtCommit = await currentServer();
+            if (!isRefreshCurrent() || serverAtCommit !== expectedServerFingerprint) return;
+            await removeToken();
+            if (!isRefreshCurrent()) return;
+            setTokenPresent(false);
+            setReauthRequired(true);
+            setReauthIdentityUnknown(false);
+          });
+        }
+      } catch {
+        // Transport/timeout/temporary refresh failures preserve the already
+        // visible local account projection for a later retry.
       }
     };
     void (async () => {
@@ -193,35 +255,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             if (serverFingerprint) {
               await saveAuthActor(decoded, serverFingerprint).catch(() => undefined);
             }
-            if (inspection.expired) {
-              try {
-                const refreshed = await tryRefreshToken();
-                if (!isCurrent()) return;
-                const refreshedToken = await getToken();
-                if (refreshed && refreshedToken) {
-                  const refreshedUser = inspectTokenPayload(refreshedToken).user;
-                  if (refreshedUser) {
-                    setUser(refreshedUser);
-                    setTokenPresent(true);
-                    setReauthRequired(false);
-                    setReauthIdentityUnknown(false);
-                    if (serverFingerprint) {
-                      await saveAuthActor(refreshedUser, serverFingerprint).catch(() => undefined);
-                    }
-                  }
-                } else if (!refreshed && refreshedToken === token) {
-                  await runAuthScopeTransition(async () => {
-                    if (isCurrent()) await removeToken();
-                  });
-                  if (!isCurrent()) return;
-                  setTokenPresent(false);
-                  setReauthRequired(true);
-                  setReauthIdentityUnknown(false);
-                }
-              } catch {
-                // Transport/timeout/temporary refresh failures preserve the
-                // initial authenticated projection for a later retry.
-              }
+            if (inspection.expired && isRefreshCurrent()) {
+              void refreshExpiredTokenInBackground(token, decoded, serverFingerprint);
             }
           } else {
             if (!isCurrent()) return;

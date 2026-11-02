@@ -74,10 +74,37 @@ export type LaneState = {
   state: 'idle' | 'running' | 'backoff' | 'offline' | 'auth_required' | 'disabled';
   lastSuccessAt: number | null; nextAttemptAt: number | null; lastErrorCode: string | null;
 };
+export type LegacyCaptureMetadata = {
+  available: boolean;
+  generation: number | null;
+  updatedAt: number | null;
+  captureCount: number | null;
+  opCount: number | null;
+  dirtyCount: number | null;
+  ownerUnknownCount: number | null;
+  active: { captureCount: number; opCount: number; dirtyCount: number } | null;
+  archived: {
+    snapshotCount: number;
+    captureCount: number;
+    opCount: number;
+    dirtyCount: number;
+  } | null;
+  comparisonAvailable: boolean;
+  comparison: {
+    captureCount: number;
+    opCount: number;
+    dirtyCount: number;
+    addedOutboxVariants: number;
+    removedOutboxVariants: number;
+    addedDirtyVariants: number;
+    removedDirtyVariants: number;
+  } | null;
+};
 export type LegacyMigrationStatus = {
   state: 'not_needed' | 'capturing' | 'awaiting_confirm' | 'migrating' | 'migrated' | 'failed';
   legacyCount: number | null; ownerUnknownCount: number | null;
   captureSha256: string | null; captureFile: string | null; errorCode: string | null;
+  metadata?: LegacyCaptureMetadata;
 };
 export type SyncV3Overall = 'synced' | 'syncing' | 'pending' | 'bootstrapping' | 'offline'
   | 'auth_required' | 'disabled' | 'migration_pending' | 'degraded';

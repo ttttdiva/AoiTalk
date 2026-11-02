@@ -9,10 +9,7 @@ for (const phase of ["create", "handoff"] as const) {
     await mockAuthenticatedApis(page);
     await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => socket.close());
     const mainRoute = { provider: "mock", model: "mock-model" };
-    const settings = {
-      agent_team_selection: { mode: "auto", team_id: "", loaded_team_ids: [] },
-      main_route: mainRoute, special_routing: {}, execution_profile_id: "",
-    };
+    const settings = { main_route: mainRoute };
     const existing = {
       id: "existing-selection", user_id: E2E_USER_ID, character_name: "aoi",
       title: "Keep this conversation", message_count: 1, is_active: true,

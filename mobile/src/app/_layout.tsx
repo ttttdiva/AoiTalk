@@ -2,8 +2,15 @@
  * Root Layout — AuthProvider + PaperProvider
  */
 
-import { useEffect, useState } from "react";
-import { AppState, Linking, Pressable, Text, View } from "react-native";
+import { useEffect, useRef, useState } from "react";
+import {
+  AppState,
+  InteractionManager,
+  Linking,
+  Pressable,
+  Text,
+  View,
+} from "react-native";
 import { Slot } from "expo-router";
 import { PaperProvider, MD3DarkTheme } from "react-native-paper";
 import { StatusBar } from "expo-status-bar";
@@ -16,7 +23,11 @@ import { AppSidebar } from "../components/app-sidebar";
 import { KeyboardAwareLayout } from "../components/keyboard-aware-layout";
 import { TaskCompletionUndoStack } from "../components/task-completion-undo-stack";
 import { ProjectProvider } from "../contexts/ProjectContext";
-import { ensureSchema, ensureSchemaAsync } from "../db/migrate";
+import {
+  ensureSchema,
+  ensureSchemaAsync,
+  ensureSchemaMaintenanceAsync,
+} from "../db/migrate";
 import { queryClient, asyncStoragePersister } from "../query/client";
 import { useNetworkStore } from "../stores/network";
 import { getToken, getTokenAuthScope } from "../lib/auth";
@@ -107,7 +118,10 @@ export default function RootLayout() {
   const [schemaState, setSchemaState] = useState<"pending" | "ready" | "error">(
     "pending",
   );
+  const [maintenanceReady, setMaintenanceReady] = useState(false);
+  const [maintenanceAttempt, setMaintenanceAttempt] = useState(0);
   const [schemaAttempt, setSchemaAttempt] = useState(0);
+  const maintenanceFailedRef = useRef(false);
 
   // Gateway OAuth returns to the app scheme while the app may be cold, warm,
   // or resumed from the browser. Complete the SDK exchange at the root so the
@@ -174,6 +188,56 @@ export default function RootLayout() {
 
   useEffect(() => {
     if (schemaState !== "ready") return;
+    let cancelled = false;
+    maintenanceFailedRef.current = false;
+    // Required tables/indexes are ready now, so local screens can mount while
+    // compatibility backfills wait until the initial navigation interaction
+    // has settled. Sync remains behind this maintenance transaction.
+    const interactionTask = InteractionManager.runAfterInteractions(() => {
+      if (cancelled) return;
+      void (ensureSchemaMaintenanceAsync
+        ? ensureSchemaMaintenanceAsync()
+        : Promise.resolve())
+        .then(() => {
+          if (!cancelled) {
+            maintenanceFailedRef.current = false;
+            setMaintenanceReady(true);
+          }
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          maintenanceFailedRef.current = true;
+          console.warn(
+            "[startup] local schema maintenance failed",
+            error instanceof Error ? error.message : "UnknownError",
+          );
+        });
+    });
+    return () => {
+      cancelled = true;
+      interactionTask.cancel();
+    };
+  }, [schemaState, maintenanceAttempt]);
+
+  useEffect(() => {
+    if (schemaState !== "ready" || maintenanceReady) return;
+    let wasActive = AppState.currentState === "active";
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active") {
+        wasActive = false;
+        return;
+      }
+      if (wasActive) return;
+      wasActive = true;
+      if (maintenanceFailedRef.current) {
+        setMaintenanceAttempt((attempt) => attempt + 1);
+      }
+    });
+    return () => subscription.remove();
+  }, [maintenanceReady, schemaState]);
+
+  useEffect(() => {
+    if (schemaState !== "ready" || !maintenanceReady) return;
 
     useNetworkStore.getState().start();
     void initializeLocalNotifications()
@@ -276,7 +340,7 @@ export default function RootLayout() {
       unsubscribe();
       useNetworkStore.getState().stop();
     };
-  }, [schemaState]);
+  }, [maintenanceReady, schemaState]);
 
   useEffect(() => {
     if (schemaState !== "ready") return;
@@ -288,6 +352,8 @@ export default function RootLayout() {
   }, [schemaState]);
 
   const retrySchema = () => {
+    setMaintenanceReady(false);
+    setMaintenanceAttempt(0);
     setSchemaState("pending");
     setSchemaAttempt((attempt) => attempt + 1);
   };
@@ -305,7 +371,7 @@ export default function RootLayout() {
                 <StatusBar style="light" />
                 {schemaState === "ready" ? (
                   <>
-                    <SyncV3Lifecycle />
+                    {maintenanceReady ? <SyncV3Lifecycle /> : null}
                     <ProjectProvider>
                       <AoiDotsProvider>
                         <AppSidebar>

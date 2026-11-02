@@ -385,6 +385,46 @@
         ]
       },
       {
+        "id": "operations.agents",
+        "path": "operations/agents/index",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.operations"
+        ]
+      },
+      {
+        "id": "operations.agents.detail",
+        "path": "operations/agents/[agentId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.operations.agents"
+        ]
+      },
+      {
+        "id": "operations.team_graphs",
+        "path": "operations/team-graphs/index",
+        "kind": "workspace",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.operations"
+        ]
+      },
+      {
+        "id": "operations.team_graphs.detail",
+        "path": "operations/team-graphs/[graphId]",
+        "kind": "detail",
+        "auth_required": true,
+        "tab": false,
+        "entry_points": [
+          "parent.operations.team_graphs"
+        ]
+      },
+      {
         "id": "native-intent",
         "path": "+native-intent",
         "kind": "deep_link",
@@ -516,6 +556,18 @@
         "kind": "parent",
         "target": "operations",
         "from": "sidebar.operations"
+      },
+      {
+        "id": "parent.operations.agents",
+        "kind": "parent",
+        "target": "operations.agents",
+        "from": "parent.operations"
+      },
+      {
+        "id": "parent.operations.team_graphs",
+        "kind": "parent",
+        "target": "operations.team_graphs",
+        "from": "parent.operations"
       },
       {
         "id": "system.native_intent",
@@ -1109,6 +1161,18 @@
           "role": "read"
         },
         {
+          "operation_id": "list_work_api_agent_work_get",
+          "transport": "fastapi",
+          "method": "GET",
+          "role": "read"
+        },
+        {
+          "operation_id": "history_fence_api_agent_work__work_item_id__history_fence_post",
+          "transport": "fastapi",
+          "method": "POST",
+          "role": "command"
+        },
+        {
           "operation_id": "get_dialogue_api_agent_dialogues__dialogue_id__get",
           "transport": "fastapi",
           "method": "GET",
@@ -1223,6 +1287,12 @@
           "given": "multiple delegated dialogues run in parallel",
           "when": "their child messages, work items and receipts settle",
           "then": "delivery and control CAS remain isolated per dialogue so parallel work can coexist with ordinary Chat sessions"
+        },
+        {
+          "id": "chat.aoidots.unknown_history_fence",
+          "given": "a prior interactive Run has an unknown provider outcome and blocks the owner's AoiDots root",
+          "when": "the owner reviews a dry-run summary and explicitly acknowledges the result as unknown",
+          "then": "the client applies the owner-scoped history fence with its expected state digest and stable Work idempotency key, never replays the prior request, and enables sending only after the server confirms the fence or a fresh check proves no blocker remains"
         }
       ]
     },
@@ -1691,6 +1761,12 @@
           "given": "the selected project is readable",
           "when": "a file is opened and edited offline",
           "then": "the scoped mutation is queued and is not applied to another project"
+        },
+        {
+          "id": "files.navigation.parent",
+          "given": "a server Files listing returns can_go_up=true and parent_path, even when current_path is an empty root",
+          "when": "the user activates Up",
+          "then": "navigation uses the API-provided parent path while non-admin project/user roots and the device-local sandbox remain scoped"
         }
       ]
     },

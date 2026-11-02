@@ -23,6 +23,7 @@ class GenerationBudget:
     enable_thinking: bool | None = None
     response_model: str | None = None
     max_requests: int | None = None
+    track_request_count: bool = False
     interruptible_transport: bool = False
     parent: GenerationBudget | None = field(default=None, repr=False)
     request_lock: Any = field(default_factory=threading.Lock, repr=False)
@@ -38,7 +39,9 @@ class GenerationBudget:
             return inherited
         remaining = self.timeout_seconds - (time.monotonic() - self.started_at)
         if remaining <= 0:
-            raise TimeoutError("ephemeral_generation_timeout")
+            exc = TimeoutError("ephemeral_generation_timeout")
+            exc.interruption_reason = "budget_deadline"
+            raise exc
         return min(remaining, inherited) if inherited is not None else remaining
 
     def expired(self) -> bool:
@@ -51,7 +54,9 @@ class GenerationBudget:
         self.checkpoint()
         with self.request_lock:
             if self.max_requests is not None and self.request_count >= self.max_requests:
-                raise GenerationCancelled("ephemeral_request_budget_exhausted")
+                exc = GenerationCancelled("ephemeral_request_budget_exhausted")
+                exc.interruption_reason = "request_limit"
+                raise exc
             if self.parent is not None:
                 self.parent.record_request(payload)
             self.request_count += 1
@@ -62,7 +67,7 @@ class GenerationBudget:
 
     def provenance(self, status: str) -> dict[str, Any]:
         result = {"status": status}
-        if self.worker_tracked or self.request_count:
+        if self.worker_tracked or self.track_request_count or self.request_count:
             result["request_count"] = self.request_count
         if self.worker_tracked:
             result["worker_pending"] = self.worker_pending.is_set()
@@ -120,7 +125,7 @@ def record_bounded_model_request(payload: dict[str, Any]) -> GenerationBudget | 
         return None
     # A child without its own limit still counts against a limited parent.
     node = budget
-    while node is not None and node.max_requests is None:
+    while node is not None and node.max_requests is None and not node.track_request_count:
         node = node.parent
     if node is None:
         return None

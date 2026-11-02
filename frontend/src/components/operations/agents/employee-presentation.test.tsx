@@ -28,9 +28,9 @@ describe("Agentのラベルと因果イベント表示", () => {
   });
 
   it("preserves a caller-provided id and the composite AppSelect accessible name", () => {
-    render(<><EmployeeField label="業務指示"><textarea id="existing-instructions" value="事前入力" readOnly /></EmployeeField><EmployeeSelect label="Execution Team" value="employee" onChange={() => undefined} options={[{ value: "employee", label: "Agentチーム" }]} /></>);
+    render(<><EmployeeField label="業務指示"><textarea id="existing-instructions" value="事前入力" readOnly /></EmployeeField><EmployeeSelect label="モデル役割" value="chat" onChange={() => undefined} options={[{ value: "chat", label: "会話" }]} /></>);
     expect(screen.getByLabelText("業務指示", { exact: true })).toHaveAttribute("id", "existing-instructions");
-    expect(screen.getByLabelText("Execution Team", { exact: true })).toBe(screen.getByRole("combobox", { name: "Execution Team" }));
+    expect(screen.getByLabelText("モデル役割", { exact: true })).toBe(screen.getByRole("combobox", { name: "モデル役割" }));
   });
 
   it("retains causal kind in the normalized snapshot even when authorization and attempt share an ID", () => {

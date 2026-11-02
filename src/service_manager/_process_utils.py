@@ -22,6 +22,7 @@ from pathlib import Path
 
 import psutil
 
+from src.runtime_release_contract import persistent_path
 from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -346,14 +347,14 @@ def _read_log_tail(path: Path, max_chars: int = 3000) -> str:
 
 def _web_log_dir(project_root: Path) -> Path:
     """HTTP 境界ログ（frontend / Caddy）用ディレクトリ。"""
-    log_dir = project_root / "logs" / "web"
+    log_dir = persistent_path("logs/web", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
 
 def _models_log_dir(project_root: Path) -> Path:
     """ローカル LLM サーバーログ用ディレクトリ。"""
-    log_dir = project_root / "logs" / "models"
+    log_dir = persistent_path("logs/models", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 

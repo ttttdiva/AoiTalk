@@ -180,9 +180,11 @@ delegation. Its generated operation IDs are
 `control_api_agent_dialogues__dialogue_id__control_post`,
 `stop_api_agent_dialogues__dialogue_id__stop_post`,
 `resume_api_agent_dialogues__dialogue_id__resume_post`, and
-`rework_api_agent_dialogues__dialogue_id__rework_post`. Mobile uses the direct
-FastAPI transport for these operations; the project hint is context only and
-the private root remains projectless and owned by the human account.
+`rework_api_agent_dialogues__dialogue_id__rework_post`. Unknown interactive
+history recovery also uses `list_work_api_agent_work_get` and
+`history_fence_api_agent_work__work_item_id__history_fence_post`. Mobile uses
+the direct FastAPI transport for these operations; the project hint is context
+only and the private root remains projectless and owned by the human account.
 
 The wire projection is a strict nested DTO: `AoiDotsWorkItem` contains
 `AgentDialogueRefs`, `AgentDialogueInputDTO`, and `ArtifactSafeRef` values.
@@ -195,6 +197,18 @@ and control revisions. A stale compare-and-swap answer or control command is
 rejected. The worker is represented by an ordinary linked Chat child session,
 so consultation, delegation, pending input, rework/restart and normal Chat
 history keep their own ownership and ACL boundaries.
+
+If an unknown prior provider outcome blocks the root, the client keeps sending
+disabled while it reads owner-visible uncertain Work and previews eligible
+history fences. The preview shows Run state and bounded child Work states; it
+does not show conversation bodies, provider data or credentials. Applying a
+fence requires the literal `provider_outcome_unknown_no_replay`, the current
+`expected_state_digest` and a stable Work-scoped idempotency key. It records
+unknown outcome metadata only and never retries the prior request. A successful
+fence or a fresh check that proves the blocker is gone enables a new, explicit
+user submission. Failed previews and applies leave the unsent composer draft in
+place; 503 can be retried after a delay, while 409 requires a fresh review and
+never triggers an automatic retry.
 
 The capability must support multiple AoiDots sessions at once. Refresh,
 reconnect and parallel child work preserve dialogue, child-session, AgentRun,

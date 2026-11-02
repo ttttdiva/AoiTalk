@@ -28,7 +28,7 @@ export function ExecutionTree({ data }: { data: WorkExecution }) {
     visited.add(run.id);
     return <li key={run.id} className="min-w-0 space-y-3 rounded-lg border border-border bg-card p-3" data-run-id={run.id}>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="break-all font-semibold">{run.acting_subagent_id || (run.parent_run_id ? "Subagent" : "Main agent")}</h3>
+        <h3 className="break-all font-semibold">{run.legacy?.acting_subagent_id ? `旧実行: ${run.legacy.acting_subagent_id}` : (run.parent_run_id ? "旧実行" : "Main agent")}</h3>
         <span className="rounded bg-muted px-2 py-1 text-xs">{run.status}</span>
       </div>
       <p className="break-all text-xs text-muted-foreground">Attempt {run.work_item_attempt ?? "未記録"} · Run {run.id}</p>

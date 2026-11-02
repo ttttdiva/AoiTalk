@@ -18,9 +18,52 @@ import logging
 import warnings
 from pathlib import Path
 from datetime import datetime
-from dotenv import load_dotenv
 from typing import TYPE_CHECKING, Optional, Union, Any
 from argparse import Namespace
+
+
+# A release path is an explicit opt-in supplied by the existing 85 source/cwd
+# bindings. Load only the stdlib-only guard before any src.* import or dotenv;
+# ordinary development starts keep the historical import and dotenv order.
+_runtime_release_context = None
+_runtime_source_binding = str(os.environ.get("GATEWAY_AOITALK_ROOT", "")).strip()
+_main_source_root = Path(__file__).absolute().parent
+_release_layout = (
+    _main_source_root.parent.name.lower() == "releases"
+    and _main_source_root.parent.parent.name.lower() == "artifacts"
+)
+if _runtime_source_binding or _release_layout:
+    _bound_source = Path(os.path.abspath(_runtime_source_binding))
+    _same_source = bool(_runtime_source_binding) and (
+        os.path.normcase(os.path.abspath(_bound_source))
+        == os.path.normcase(os.path.abspath(_main_source_root))
+    )
+    if _release_layout or not _same_source:
+        import importlib.util
+
+        _release_contract_path = _main_source_root / "src" / "runtime_release_contract.py"
+        _release_contract_spec = importlib.util.spec_from_file_location(
+            "_aoitalk_runtime_release_contract", _release_contract_path
+        )
+        if _release_contract_spec is None or _release_contract_spec.loader is None:
+            raise RuntimeError("Pinned AoiTalk runtime contract is unavailable")
+        _release_contract_module = importlib.util.module_from_spec(_release_contract_spec)
+        sys.modules[_release_contract_spec.name] = _release_contract_module
+        try:
+            _release_contract_spec.loader.exec_module(_release_contract_module)
+            _runtime_release_context = _release_contract_module.prepare_runtime_release(
+                __file__,
+                os.environ,
+                module_paths=sys.path,
+                python_executable=sys.executable,
+                python_prefix=sys.prefix,
+                loaded_modules=sys.modules,
+            )
+        except Exception:
+            sys.modules.pop(_release_contract_spec.name, None)
+            raise
+
+from dotenv import load_dotenv
 
 from src.utils.startup_timing import get_startup_timer
 from src.utils.startup_console import safe_startup_reason, startup_console
@@ -56,8 +99,19 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-# Load environment variables from .env file
-load_dotenv()
+# Load the canonical environment only after a pinned source has passed its
+# read-only preflight; normal development preserves the original dotenv call.
+if _runtime_release_context is None:
+    load_dotenv()
+else:
+    load_dotenv(dotenv_path=_runtime_release_context.dotenv_file, override=False)
+    _release_contract_module.activate_runtime_paths(_runtime_release_context, os.environ)
+
+# Materialize secret files and move the organization Usage API credential out
+# of os.environ before any runtime service can launch child processes.
+from src.security.secret_env import load_secret_environment
+
+load_secret_environment()
 
 # Initialize Feature Flags system
 from src.features import Features
@@ -239,6 +293,19 @@ async def main() -> None:
         log_file,
         extra=FILE_ONLY_LOG_EXTRA,
     )
+
+    # One boot at a time: a previous main.py that outlived its shutdown would
+    # keep its background workers running next to this boot.
+    from src.utils.aoitalk_processes import stop_previous_boot
+
+    with _startup_timer.phase("startup.previous_boot"):
+        stop_previous_boot(
+            Path(__file__),
+            tuple(
+                int(os.getenv(name) or default)
+                for name, default in (("AOITALK_WEB_PORT", 3000), ("AOITALK_NEXT_PORT", 3002))
+            ),
+        )
 
     try:
         with _startup_timer.phase("startup.features.initialize"):

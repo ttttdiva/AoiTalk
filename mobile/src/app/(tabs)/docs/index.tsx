@@ -49,6 +49,11 @@ import {
   type DocsListViewportLayout,
 } from "../../../components/docs/list-position-guard";
 import { docsRepo, type DocsPagesReadSummary } from "../../../repositories/docs";
+import {
+  docsRootSnapshotNodes,
+  readDocsRootSnapshot,
+  saveDocsRootSnapshot,
+} from "../../../repositories/docs-root-snapshot";
 import { docsApi } from "../../../lib/docs-api";
 import { useNetworkStore } from "../../../stores/network";
 import { useSyncStatusStore } from "../../../stores/sync-status";
@@ -703,14 +708,38 @@ function DocsDiagnostics({
                 server Docs count: {remoteValidation === "validated-scoped-empty" ? "確認したscopeは0件・サーバー全体は未確認" : remoteValidation === "has-rows" ? "件数あり" : "未確認"}
               </Text>
               {actionSync.docsSubstage ? (
-                <Text style={styles.diagnosticsLine}>
-                  Docs substage {actionSync.docsSubstage.stage}・elapsed {actionSync.docsSubstage.elapsedMs}ms・runState {actionSync.docsSubstage.runState ?? "未取得"}・pendingTables {actionSync.docsSubstage.pendingTables ?? "未取得"}
-                </Text>
+                <>
+                  <Text style={styles.diagnosticsLine}>
+                    Docs substage {actionSync.docsSubstage.stage}・elapsed {actionSync.docsSubstage.elapsedMs}ms・runState {actionSync.docsSubstage.runState ?? "未取得"}・pendingTables {actionSync.docsSubstage.pendingTables ?? "未取得"}
+                  </Text>
+                  {actionSync.docsSubstage.scopeCategory ? (
+                    <Text style={styles.diagnosticsLine}>
+                      Docs scope {actionSync.docsSubstage.scopeCategory}・順 {actionSync.docsSubstage.scopeOrdinal ?? "未取得"}/{actionSync.docsSubstage.scopeCount ?? "未取得"}
+                    </Text>
+                  ) : null}
+                  {actionSync.docsSubstage.promotionEligibility ? (
+                    <Text style={styles.diagnosticsLine}>
+                      promotion path {actionSync.docsSubstage.promotionEligibility.enginePath}・fallback reasons {actionSync.docsSubstage.promotionEligibility.engineReasons.join(",") || "none"}・authority tables {actionSync.docsSubstage.promotionEligibility.authoritativeIdTableCount}・max IDs {actionSync.docsSubstage.promotionEligibility.maxAuthoritativeIdCount}・repository {actionSync.docsSubstage.promotionEligibility.repositoryPath ?? "pending"}/{actionSync.docsSubstage.promotionEligibility.repositoryReason ?? "pending"}
+                    </Text>
+                  ) : null}
+                </>
               ) : null}
               {actionSync.docsWatchdog ? (
-                <Text style={styles.diagnosticsLine}>
-                  Docs watchdog固定時点 {actionSync.docsWatchdog.stage}・elapsed {actionSync.docsWatchdog.elapsedMs}ms・runState {actionSync.docsWatchdog.runState ?? "未取得"}・pendingTables {actionSync.docsWatchdog.pendingTables ?? "未取得"}
-                </Text>
+                <>
+                  <Text style={styles.diagnosticsLine}>
+                    Docs watchdog無進捗時点 {actionSync.docsWatchdog.stage}・elapsed {actionSync.docsWatchdog.elapsedMs}ms・runState {actionSync.docsWatchdog.runState ?? "未取得"}・pendingTables {actionSync.docsWatchdog.pendingTables ?? "未取得"}
+                  </Text>
+                  {actionSync.docsWatchdog.scopeCategory ? (
+                    <Text style={styles.diagnosticsLine}>
+                      Docs scope {actionSync.docsWatchdog.scopeCategory}・順 {actionSync.docsWatchdog.scopeOrdinal ?? "未取得"}/{actionSync.docsWatchdog.scopeCount ?? "未取得"}
+                    </Text>
+                  ) : null}
+                  {actionSync.docsWatchdog.promotionEligibility ? (
+                    <Text style={styles.diagnosticsLine}>
+                      promotion path {actionSync.docsWatchdog.promotionEligibility.enginePath}・fallback reasons {actionSync.docsWatchdog.promotionEligibility.engineReasons.join(",") || "none"}・authority tables {actionSync.docsWatchdog.promotionEligibility.authoritativeIdTableCount}・max IDs {actionSync.docsWatchdog.promotionEligibility.maxAuthoritativeIdCount}・repository {actionSync.docsWatchdog.promotionEligibility.repositoryPath ?? "pending"}/{actionSync.docsWatchdog.promotionEligibility.repositoryReason ?? "pending"}
+                    </Text>
+                  ) : null}
+                </>
               ) : null}
               {actionSync && actionSync.pulls.length === 0 ? (
                 <Text style={styles.diagnosticsLine}>Docs pull: 未実行</Text>
@@ -791,6 +820,7 @@ export default function DocsListScreen() {
   const authIdentityKey = auth.user?.user_id
     ? `user:${auth.user.user_id}`
     : `${auth.authState}:${authIdentityUnknown ? "unknown" : "none"}`;
+  const docsRootSnapshotUserId = auth.user?.user_id ?? null;
   const creatingRef = useRef(false);
   const [creating, setCreating] = useState(false);
   // AoiTalk may be reachable on the current LAN even when Android reports no
@@ -805,6 +835,7 @@ export default function DocsListScreen() {
   const [busyToday, setBusyToday] = useState(false);
   const [clipIngestVisible, setClipIngestVisible] = useState(false);
   const [hasRead, setHasRead] = useState(false);
+  const [rootSnapshotDisplayed, setRootSnapshotDisplayed] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [syncWarning, setSyncWarning] = useState<string | null>(null);
@@ -930,6 +961,9 @@ export default function DocsListScreen() {
   serverDiagnosticEnabledRef.current = serverDiagnosticEnabled;
   const loadRequestRef = useRef(0);
   const loadControllersRef = useRef(new Set<AbortController>());
+  const rootBootstrapControllerRef = useRef<AbortController | null>(null);
+  const rootBootstrapSequenceRef = useRef(0);
+  const rootBootstrapHandledRef = useRef<string | null>(null);
   const refreshActionSequenceRef = useRef(0);
   const revalidateFlightMetaRef = useRef<DocsSyncBinding | null>(null);
   const requestReceiptHandleRef = useRef<SyncDiagnosticRequestHandle | null>(null);
@@ -1174,8 +1208,52 @@ export default function DocsListScreen() {
     const signal = controller.signal;
     let timedOut = false;
     try {
+      let fastPagesApplied = false;
+      const applyFastPages = (
+        fastPages: DocsNode[],
+        readStatus: "success" | "degraded",
+        readDegradedReasons: DocsPagesReadSummary["readDegradedReasons"],
+      ) => {
+        const nextPages = readStatus === "degraded"
+          && fastPages.length === 0
+          && pagesRef.current.length > 0
+          ? pagesRef.current
+          : fastPages;
+        if (signal.aborted || requestId !== loadRequestRef.current) return;
+        fastPagesApplied = true;
+        pagesRef.current = nextPages;
+        setPages(nextPages);
+        setHasRead(true);
+        setReadError(null);
+        setRootSnapshotDisplayed(false);
+        setLastRead({
+          requestId,
+          source: "local-cache",
+          visibleCount: nextPages.length,
+          activeNodeCount: null,
+          activeRootCount: null,
+          localDirtyNodeCount: null,
+          localDirtyRootCount: null,
+          workspaceProjectionCount: null,
+          outboxPendingCount: null,
+          outboxFailedCount: null,
+          actorScopeStatus: "unknown",
+          aggregateStatus: "success",
+          readStatus,
+          readDegradedReasons,
+          generationStatus: "unknown",
+          outcome: readStatus === "success" ? "success" : "error",
+        });
+        setLoading(false);
+        if (readStatus === "success" && docsRootSnapshotUserId) {
+          void saveDocsRootSnapshot(docsRootSnapshotUserId, nextPages).catch(() => undefined);
+        }
+      };
       const readSummary = await withDocsLocalReadWatchdog(
-        Promise.resolve().then(() => docsRepo.listPagesWithDiagnostics({ signal })),
+        Promise.resolve().then(() => docsRepo.listPagesWithDiagnostics({
+          signal,
+          onPages: (fastPages, readStatus, reasons) => applyFastPages(fastPages, readStatus, reasons),
+        })),
         signal,
       );
       const nextPages = readSummary.readStatus === "degraded"
@@ -1184,6 +1262,11 @@ export default function DocsListScreen() {
         ? pagesRef.current
         : readSummary.pages;
       if (signal.aborted || requestId !== loadRequestRef.current) return "cancelled";
+      if (!fastPagesApplied) applyFastPages(
+        readSummary.pages,
+        readSummary.readStatus,
+        readSummary.readDegradedReasons,
+      );
       pagesRef.current = nextPages;
       setPages(nextPages);
       setHasRead(true);
@@ -1204,7 +1287,7 @@ export default function DocsListScreen() {
         readStatus: readSummary.readStatus,
         readDegradedReasons: readSummary.readDegradedReasons,
         generationStatus: readSummary.generationStatus,
-        outcome: "success",
+        outcome: readSummary.readStatus === "success" ? "success" : "error",
       });
       setLoading(false);
       return "applied";
@@ -1237,15 +1320,33 @@ export default function DocsListScreen() {
     } finally {
       if (requestId === loadRequestRef.current && (!signal.aborted || timedOut)) setLoading(false);
     }
-  }, []);
+  }, [docsRootSnapshotUserId]);
 
   const loadPages = useCallback(async () => {
     const requestId = ++loadRequestRef.current;
     for (const previous of loadControllersRef.current) previous.abort();
     const controller = new AbortController();
     loadControllersRef.current.add(controller);
+    let localReadApplied = false;
+    void readDocsRootSnapshot(docsRootSnapshotUserId).then((roots) => {
+      if (
+        !roots?.length
+        || localReadApplied
+        || controller.signal.aborted
+        || requestId !== loadRequestRef.current
+        || authIdentityRef.current !== authIdentityKey
+        || pagesRef.current.length > 0
+      ) return;
+      const snapshotPages = docsRootSnapshotNodes(roots);
+      pagesRef.current = snapshotPages;
+      setPages(snapshotPages);
+      setRootSnapshotDisplayed(true);
+      setHasRead(true);
+      setLoading(false);
+    }).catch(() => undefined);
     try {
       const initialRead = await readLocalPages(requestId, controller);
+      localReadApplied = initialRead === "applied";
       if (controller.signal.aborted || requestId !== loadRequestRef.current || initialRead !== "applied") return;
       // Root display is read-only. Durable Task/Docs outbox rows stay
       // untouched; repair requires an explicit, separately guarded action.
@@ -1253,7 +1354,47 @@ export default function DocsListScreen() {
       loadControllersRef.current.delete(controller);
       if (requestId === loadRequestRef.current && !controller.signal.aborted) setLoading(false);
     }
-  }, [readLocalPages]);
+  }, [authIdentityKey, docsRootSnapshotUserId, readLocalPages]);
+
+  const readBootstrapRootProjection = useCallback(async (runKey: string) => {
+    if (rootBootstrapHandledRef.current === runKey) return;
+    rootBootstrapHandledRef.current = runKey;
+    rootBootstrapSequenceRef.current += 1;
+    const sequence = rootBootstrapSequenceRef.current;
+    rootBootstrapControllerRef.current?.abort();
+    const controller = new AbortController();
+    rootBootstrapControllerRef.current = controller;
+    const requestedAuthIdentity = authIdentityKey;
+    try {
+      const roots = await docsRepo.listPages({ signal: controller.signal });
+      if (
+        controller.signal.aborted
+        || rootBootstrapSequenceRef.current !== sequence
+        || authIdentityRef.current !== requestedAuthIdentity
+      ) return;
+      // An incomplete/failed visibility projection must not collapse a root
+      // snapshot or a previously displayed list to an empty state.
+      if (roots.length === 0 && pagesRef.current.length > 0) return;
+      pagesRef.current = roots;
+      setPages(roots);
+      setHasRead(true);
+      setLoading(false);
+      setReadError(null);
+      setRootSnapshotDisplayed(false);
+      if (docsRootSnapshotUserId) {
+        void saveDocsRootSnapshot(docsRootSnapshotUserId, roots).catch(() => undefined);
+      }
+    } catch {
+      // The staged run remains resumable; existing local roots stay visible.
+    }
+  }, [authIdentityKey, docsRootSnapshotUserId]);
+
+  const latestDocsSubstage = diagnosticSnapshot.latest?.docsSubstage;
+  useEffect(() => {
+    if (latestDocsSubstage?.stage !== "roots_visible") return;
+    const runKey = `${diagnosticSnapshot.latest?.requestId ?? ""}:${latestDocsSubstage.runId ?? ""}`;
+    void readBootstrapRootProjection(runKey);
+  }, [diagnosticSnapshot.latest?.requestId, latestDocsSubstage?.runId, latestDocsSubstage?.stage, readBootstrapRootProjection]);
 
   useEffect(() => {
     if (authIdentityRef.current === authIdentityKey) return;
@@ -1265,8 +1406,13 @@ export default function DocsListScreen() {
     loadRequestRef.current += 1;
     for (const controller of loadControllersRef.current) controller.abort();
     loadControllersRef.current.clear();
+    rootBootstrapSequenceRef.current += 1;
+    rootBootstrapControllerRef.current?.abort();
+    rootBootstrapControllerRef.current = null;
+    rootBootstrapHandledRef.current = null;
     setPages([]);
     setHasRead(false);
+    setRootSnapshotDisplayed(false);
     setReadError(null);
     setLastRead(null);
     setLastSync(null);
@@ -1338,7 +1484,7 @@ export default function DocsListScreen() {
     }
   }, [authIdentityKey, serverDiagnosticEnabled]);
 
-  const revalidatePages = useCallback((options: { explicit?: boolean } = {}): Promise<void> => {
+  const revalidatePages = useCallback((options: { explicit?: boolean; localReadStarted?: boolean } = {}): Promise<void> => {
     const actionAuthIdentity = authIdentityRef.current;
     const actionAuthGeneration = authSessionGenerationRef.current;
     const actionBelongsToCurrentAuth = () =>
@@ -1366,7 +1512,7 @@ export default function DocsListScreen() {
         syncSkipReason: null,
         syncFailureReason: null,
       });
-      return loadPages();
+      return options.localReadStarted ? Promise.resolve() : loadPages();
     }
     if (!online && !explicit) {
       setLastRefreshAction({
@@ -1381,7 +1527,7 @@ export default function DocsListScreen() {
         syncSkipReason: null,
         syncFailureReason: null,
       });
-      return loadPages();
+      return options.localReadStarted ? Promise.resolve() : loadPages();
     }
     if (revalidateFlightRef.current) {
       const runningMeta = revalidateFlightMetaRef.current;
@@ -1556,7 +1702,7 @@ export default function DocsListScreen() {
         setSyncError(safeDiagnosticMessage(error, "サーバーからDocsを取得できませんでした"));
         setSyncWarning(null);
       })
-      .then(() => actionBelongsToCurrentAuth() ? loadPages() : undefined)
+      .then(() => actionBelongsToCurrentAuth() && focusedRef.current ? loadPages() : undefined)
       .finally(() => {
         if (revalidateFlightRef.current === flight) {
           revalidateFlightRef.current = null;
@@ -1580,9 +1726,21 @@ export default function DocsListScreen() {
         tryRestorePagePosition(token);
       }
       layoutTrace.record("focus", { focused: true });
-      void loadPages();
-      void revalidatePages();
+      let refreshStarted = false;
+      let active = true;
+      const startRefresh = () => {
+        if (!active || refreshStarted) return;
+        refreshStarted = true;
+        void revalidatePages({ localReadStarted: true });
+      };
+      const refreshTimer = setTimeout(startRefresh, 400);
+      void loadPages().then(() => {
+        clearTimeout(refreshTimer);
+        startRefresh();
+      });
       return () => {
+        active = false;
+        clearTimeout(refreshTimer);
         focusedRef.current = false;
         if (!isAndroid) positionGuard.blur();
         if (isAndroid) publishMeasurementToken(positionRestore.blur());
@@ -1605,6 +1763,9 @@ export default function DocsListScreen() {
     loadRequestRef.current += 1;
     for (const controller of loadControllersRef.current) controller.abort();
     loadControllersRef.current.clear();
+    rootBootstrapSequenceRef.current += 1;
+    rootBootstrapControllerRef.current?.abort();
+    rootBootstrapControllerRef.current = null;
     serverDiagnosticGenerationRef.current += 1;
     serverDiagnosticControllerRef.current?.abort();
     serverDiagnosticControllerRef.current = null;
@@ -1705,15 +1866,17 @@ export default function DocsListScreen() {
       : authIsAnonymous
         ? "サーバーDocsを表示するにはログインしてください。端末内の未送信データは保持されます。"
         : undefined;
-  const failureTitle = readError
-    ? "Docsのローカル読込に失敗しました"
-    : syncError
-      ? "Docsの取得に失敗しました"
-      : localReadDegraded
-        ? "Docsの可視性確認が未完了です"
-        : syncWarning
-          ? "同期の一部に失敗しました"
-          : null;
+  const failureTitle = pages.length > 0
+    ? null
+    : readError
+      ? "Docsのローカル読込に失敗しました"
+      : syncError
+        ? "Docsの取得に失敗しました"
+        : localReadDegraded
+          ? "Docsの可視性確認が未完了です"
+          : syncWarning
+            ? "同期の一部に失敗しました"
+            : null;
   const failureDetail = readError
     ? `${readError} 保存済みデータがあれば、そのまま表示しています。`
     : syncError
@@ -1732,6 +1895,21 @@ export default function DocsListScreen() {
     && (readError || syncError || localReadDegraded || syncWarning || emptySyncTitle),
   );
   const statusCanRetry = statusNeedsRetry || authChecking || authNeedsReauth || authIsAnonymous;
+  const syncHint = pages.length > 0
+    ? currentSync?.outcome === "running"
+      ? "同期中…"
+      : rootSnapshotDisplayed
+        ? "前回保存したDocs一覧を表示しています"
+        : readError
+          ? "ローカル再読込に失敗しました。表示中の一覧は保持されています。"
+          : syncError
+            ? "同期に失敗しました。表示中の一覧は保持されています。"
+            : syncWarning
+              ? "一部の同期に失敗しました。表示中の一覧は保持されています。"
+              : typeof lastRead?.outboxPendingCount === "number" && lastRead.outboxPendingCount > 0
+                ? `未同期の変更 ${lastRead.outboxPendingCount}`
+                : null
+    : null;
 
   const runSearch = useCallback(
     async (value: string) => {
@@ -2008,6 +2186,7 @@ export default function DocsListScreen() {
                     layoutTrace.record("header-layout", { headerHeight: height });
                   }}
                 >
+                  {syncHint ? <Text style={styles.syncHint}>{syncHint}</Text> : null}
                   {statusTitle ? (
                     <DocsStatusCard
                       title={statusTitle}
@@ -2174,6 +2353,12 @@ const styles = StyleSheet.create({
     backgroundColor: "#181825",
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: "#313244",
+  },
+  syncHint: {
+    paddingHorizontal: 14,
+    paddingTop: 8,
+    color: "#a6adc8",
+    fontSize: 11,
   },
   emptyContainer: { flexGrow: 1 },
   emptyText: { color: "#a6adc8", fontSize: 16 },

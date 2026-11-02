@@ -42,21 +42,11 @@ import {
   serializeDocsNodeEdit,
   waitForDocsEditorIdle,
 } from "../../../components/docs/doc-block-drafts";
-import {
-  adoptDocsNodeServerConflict,
-  docsRepo,
-} from "../../../repositories/docs";
+import { docsRepo } from "../../../repositories/docs";
 import { docsApi } from "../../../lib/docs-api";
 import { useNetworkStore } from "../../../stores/network";
 import { runSync } from "../../../sync/engine";
-import {
-  getOutboxConflict,
-  rebaseOutboxConflict,
-  type OutboxConflictReference,
-} from "../../../repositories/outbox";
 import type { DocsNode, DocsSupertag } from "../../../types/api";
-
-type ConflictField = "title" | "description" | "body_text" | "body_json";
 
 const DOCS_LOAD_ERROR_MESSAGE = "文書を読み込めませんでした。再試行してください。";
 type DocsCanonicalProjectionMode = "blocking" | "deferred";
@@ -180,80 +170,6 @@ function isDocsNodePayload(value: unknown, expectedId: string): value is DocsNod
     && (node.read_only === undefined || typeof node.read_only === "boolean");
 }
 
-function parseConflictPayload(value: unknown): Record<string, unknown> {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  if (typeof value !== "string" || !value.trim()) return {};
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function formatConflictValue(value: unknown): string {
-  if (value == null || value === "") return "（空）";
-  if (typeof value === "string") return value;
-  try {
-    const text = JSON.stringify(value);
-    return text.length > 600 ? `${text.slice(0, 600)}…` : text;
-  } catch {
-    return String(value);
-  }
-}
-
-function docsScopeKey(node: DocsNode | null): string | null {
-  if (!node?.workspace_id) return null;
-  return `${node.workspace_id}|project:${node.project_id ?? ""}`;
-}
-
-function conflictReasonMessage(reason?: string): string {
-  switch (reason) {
-    case "auth_scope_changed":
-      return "アカウントが切り替わったため、競合の解決を中止しました。再読み込みしてください。";
-    case "docs_scope_missing":
-    case "docs_scope_mismatch":
-    case "docs_scope_not_writable":
-    case "node_not_writable":
-      return "Docsの権限が変わったため、競合を解決できません。最新の権限を確認してください。";
-    case "server_scope_missing":
-    case "server_scope_mismatch":
-    case "server_id_mismatch":
-      return "サーバー版のDocsスコープを確認できないため、競合を解決できません。再同期してください。";
-    case "missing_server_snapshot":
-    case "server_version_missing":
-      return "サーバー版が取得できないため、競合を解決できません。再同期してください。";
-    case "outbox_replaced":
-      return "端末で新しい編集が発生したため、古い競合操作は適用しませんでした。画面を更新してください。";
-    default:
-      return "競合を解決できませんでした。最新状態を取得して再試行してください。";
-  }
-}
-
-function conflictFieldValue(
-  field: ConflictField,
-  localPayload: Record<string, unknown>,
-  localNode: DocsNode | null,
-  serverPayload: Record<string, unknown>,
-): { local: unknown; server: unknown } {
-  const localFallback: Record<ConflictField, unknown> = {
-    title: localNode?.title ?? "",
-    description: localNode?.description ?? "",
-    body_text: localNode?.body_text ?? "",
-    body_json: localNode?.body_json ?? null,
-  };
-  const serverKey = field;
-  const localKey = field;
-  return {
-    local: localPayload[localKey] ?? localFallback[field],
-    server: serverPayload[serverKey],
-  };
-}
-
 export default function DocsNodeScreen() {
   const router = useRouter();
   const navigation = useNavigation();
@@ -288,9 +204,6 @@ export default function DocsNodeScreen() {
   const [loadError, setLoadError] = useState(false);
   const [moveTargetId, setMoveTargetId] = useState<string | null>(null);
   const [clipIngestVisible, setClipIngestVisible] = useState(false);
-  const [conflict, setConflict] = useState<OutboxConflictReference | null>(null);
-  const [conflictBusy, setConflictBusy] = useState(false);
-  const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const draftsInitialized = useRef(false);
   const initialFocusApplied = useRef(false);
   const titleInputRef = useRef<{ focus: () => void } | null>(null);
@@ -347,7 +260,6 @@ export default function DocsNodeScreen() {
   const visibleTags = node ? tags : [];
   const visibleBacklinks = node ? backlinks : [];
   const visibleOutgoingReferences = node ? outgoingReferences : [];
-  const visibleConflict = node ? conflict : null;
   const screenLoading = loading
     || nodeOwnerNodeIdRef.current !== nodeId
     || nodeAuthIdentityRef.current !== authIdentity;
@@ -393,28 +305,6 @@ export default function DocsNodeScreen() {
   const flushBodies = useCallback(
     () => trackDocsOperation(() => performFlushBodies()),
     [performFlushBodies, trackDocsOperation],
-  );
-
-  const conflictLocalPayload = visibleConflict
-    ? parseConflictPayload(visibleConflict.payload)
-    : {};
-  const conflictServerPayload = visibleConflict
-    ? parseConflictPayload(visibleConflict.conflictPayload)
-    : {};
-  const conflictFields: ConflictField[] = [
-    "title",
-    "description",
-    "body_text",
-    "body_json",
-  ];
-  const conflictWritable = Boolean(
-    visibleConflict
-    && node
-    && !nodeReadOnly
-    && !protectedProjectNode
-    && !node.read_only
-    && node.access !== "read"
-    && visibleConflict.docsScopeKey,
   );
 
   const bump = useCallback(() => {
@@ -580,34 +470,6 @@ export default function DocsNodeScreen() {
       commitNode(loaded, requestAuthIdentity, requestNodeId);
       emitDocsScreenMetric(traceId, metricStartedAt, "commit_node", docsScreenNodeMetricDetails(loaded));
       setLocalSyncWarning(remoteLocalSyncWarning);
-      if (!loaded) {
-        setConflict(null);
-        setConflictMessage(null);
-      } else if (typeof getOutboxConflict === "function") {
-        // Conflicts are read through the account/scope-bound outbox helper;
-        // never infer one from a sibling project that happens to share UUIDs.
-        emitDocsScreenMetric(traceId, metricStartedAt, "outbox_conflict_start");
-        try {
-          const loadedConflict = await getOutboxConflict(
-            "knowledge_nodes",
-            requestNodeId,
-            { docsScopeKey: docsScopeKey(loaded) },
-          );
-          emitDocsScreenMetric(traceId, metricStartedAt, "outbox_conflict_end", {
-            result: loadedConflict ? "hit" : "miss",
-          });
-          if (await isAuthCurrent()) {
-            setConflict(loadedConflict);
-            if (loadedConflict) setConflictMessage(null);
-          }
-        } catch (error) {
-          emitDocsScreenMetric(traceId, metricStartedAt, "outbox_conflict_error", {
-            result: "error",
-            errorClass: safeDocsScreenErrorClass(error),
-          });
-          if (await isAuthCurrent()) setConflict(null);
-        }
-      }
       if (!(await isAuthCurrent())) return null;
       if (loaded && !remoteLocalSyncWarning) loadRelations();
       if (loaded) {
@@ -652,15 +514,22 @@ export default function DocsNodeScreen() {
       if (await isAuthCurrent()) setLoadError(true);
       return null;
     } finally {
-      const authCurrentForLoading = await isAuthCurrent();
-      if (authCurrentForLoading) {
+      const currentSnapshot = isCurrent() ? await getTokenSnapshot().catch(() => null) : null;
+      if (isCurrent() && !currentSnapshot) {
+        // An unavailable snapshot is not evidence of a token change. Stop
+        // automatic retries and let the user retry after authentication recovers.
+        setLoadError(true);
+        setLoading(false);
+      } else if (isCurrent() && currentSnapshot && (
+        currentSnapshot.token !== requestAuthSnapshot.token
+        || currentSnapshot.revision !== requestAuthSnapshot.revision
+      )) {
+        emitDocsScreenMetric(traceId, metricStartedAt, "loading_clear", { result: "blocked" });
+        // A confirmed token change requires a fresh guarded read.
+        setReloadToken((value) => value + 1);
+      } else if (isCurrent()) {
         emitDocsScreenMetric(traceId, metricStartedAt, "loading_clear", { result: "cleared" });
         setLoading(false);
-      } else if (isCurrent()) {
-        emitDocsScreenMetric(traceId, metricStartedAt, "loading_clear", { result: "blocked" });
-        // Token refresh can keep the same actor and screen mounted. Retry
-        // with the new snapshot instead of leaving the discarded load busy.
-        setReloadToken((value) => value + 1);
       }
     }
   }, [authIdentity, commitNode, nodeId, online]);
@@ -728,9 +597,6 @@ export default function DocsNodeScreen() {
     descDraftRevisionRef.current += 1;
     setTitleDraft("");
     setDescDraft("");
-    setConflict(null);
-    setConflictMessage(null);
-    setConflictBusy(false);
     setTitleEditing(false);
     setPropertiesVisible(false);
     setMoveTargetId(null);
@@ -920,88 +786,6 @@ export default function DocsNodeScreen() {
     () => trackDocsOperation(() => performSaveDescription()),
     [performSaveDescription, trackDocsOperation],
   );
-
-  const resolveServerConflict = useCallback(async () => {
-    const reference = conflict;
-    const requestAuthIdentity = authIdentityRef.current;
-    if (!reference || !node || protectedProjectNode) return;
-    if (nodeAuthIdentityRef.current !== requestAuthIdentity) return;
-    if (node.read_only || node.access === "read" || !reference.docsScopeKey) {
-      setConflictMessage(conflictReasonMessage("node_not_writable"));
-      return;
-    }
-    setConflictBusy(true);
-    setConflictMessage(null);
-    try {
-      if (typeof adoptDocsNodeServerConflict !== "function") {
-        throw new Error("競合解決機能を利用できません");
-      }
-      const result = await trackDocsOperation(() => adoptDocsNodeServerConflict(reference));
-      if (
-        authIdentityRef.current !== requestAuthIdentity
-        || nodeAuthIdentityRef.current !== requestAuthIdentity
-      ) return;
-      if (!result.ok) {
-        setConflictMessage(conflictReasonMessage(result.reason));
-        return;
-      }
-      setConflict(null);
-      setConflictMessage(null);
-      const generation = loadGeneration.current;
-      await loadNode(generation, true);
-      await outlineRef.current?.reloadFromRepository();
-    } catch (error) {
-      setConflictMessage(
-        error instanceof Error && error.message
-          ? error.message
-          : conflictReasonMessage(),
-      );
-    } finally {
-      setConflictBusy(false);
-    }
-  }, [conflict, loadNode, node, nodeId, protectedProjectNode, trackDocsOperation]);
-
-  const reapplyDeviceConflict = useCallback(async () => {
-    const reference = conflict;
-    const requestAuthIdentity = authIdentityRef.current;
-    if (!reference || !node || protectedProjectNode) return;
-    if (nodeAuthIdentityRef.current !== requestAuthIdentity) return;
-    if (node.read_only || node.access === "read" || !reference.docsScopeKey) {
-      setConflictMessage(conflictReasonMessage("node_not_writable"));
-      return;
-    }
-    setConflictBusy(true);
-    setConflictMessage(null);
-    try {
-      if (typeof rebaseOutboxConflict !== "function") {
-        throw new Error("競合解決機能を利用できません");
-      }
-      const result = await trackDocsOperation(() => rebaseOutboxConflict(reference));
-      if (
-        authIdentityRef.current !== requestAuthIdentity
-        || nodeAuthIdentityRef.current !== requestAuthIdentity
-      ) return;
-      if (!result.ok) {
-        setConflictMessage(conflictReasonMessage(result.reason));
-        return;
-      }
-      // The local node/payload remains untouched.  Only the outbox base and
-      // conflict marker changed, so the next sync can safely push the device
-      // edit against the accepted server version.
-      setConflict(null);
-      setConflictMessage(null);
-      const generation = loadGeneration.current;
-      await loadNode(generation, true);
-    } catch (error) {
-      setConflictMessage(
-        error instanceof Error && error.message
-          ? error.message
-          : conflictReasonMessage(),
-      );
-    } finally {
-      setConflictBusy(false);
-    }
-  }, [conflict, loadNode, node, protectedProjectNode, trackDocsOperation]);
 
   const archiveSelf = useCallback(async () => {
     const requestAuthIdentity = authIdentityRef.current;
@@ -1194,80 +978,9 @@ export default function DocsNodeScreen() {
               )
             )}
             {visibleLocalSyncWarning ? (
-              <Text testID="docs-local-sync-warning" style={styles.conflictWarning}>
+              <Text testID="docs-local-sync-warning" style={styles.localSyncWarning}>
                 {visibleLocalSyncWarning}
               </Text>
-            ) : null}
-            {visibleConflict ? (
-              <Surface
-                testID="docs-sync-conflict"
-                style={styles.conflictCard}
-                elevation={0}
-              >
-                <Text style={styles.conflictTitle}>同期競合</Text>
-                <Text style={styles.conflictDescription}>
-                  端末編集とサーバー編集が同じ項目で競合しています。どちらを残すか選択してください。
-                </Text>
-                {conflictFields.map((field) => {
-                  const values = conflictFieldValue(
-                    field,
-                    conflictLocalPayload,
-                    node,
-                    conflictServerPayload,
-                  );
-                  if (
-                    values.server === undefined
-                    && values.local === undefined
-                  ) return null;
-                  const labels: Record<ConflictField, string> = {
-                    title: "タイトル",
-                    description: "概要",
-                    body_text: "本文",
-                    body_json: "本文データ",
-                  };
-                  return (
-                    <View key={field} style={styles.conflictValueRow}>
-                      <Text style={styles.conflictFieldLabel}>{labels[field]}</Text>
-                      <Text style={styles.conflictValue}>
-                        端末: {formatConflictValue(values.local)}
-                      </Text>
-                      <Text style={styles.conflictValue}>
-                        サーバー: {formatConflictValue(values.server)}
-                      </Text>
-                    </View>
-                  );
-                })}
-                <View style={styles.conflictActions}>
-                  <Button
-                    compact
-                    mode="outlined"
-                    textColor="#89b4fa"
-                    disabled={!conflictWritable || conflictBusy}
-                    loading={conflictBusy}
-                    onPress={() => void resolveServerConflict()}
-                  >
-                    サーバー版を採用
-                  </Button>
-                  <Button
-                    compact
-                    mode="contained"
-                    buttonColor="#7c3aed"
-                    disabled={!conflictWritable || conflictBusy}
-                    loading={conflictBusy}
-                    onPress={() => void reapplyDeviceConflict()}
-                  >
-                    端末編集を再適用
-                  </Button>
-                </View>
-                {!conflictWritable ? (
-                  <Text style={styles.conflictWarning}>
-                    権限またはDocsスコープが変わったため、解決操作を無効にしています。
-                  </Text>
-                ) : null}
-                {conflictMessage ? (
-                  <Text style={styles.conflictWarning}>{conflictMessage}</Text>
-                ) : null}
-              </Surface>
             ) : null}
             {visibleTags.length > 0 ? (
               <Text style={styles.tagSummary} numberOfLines={1}>
@@ -1464,28 +1177,7 @@ const styles = StyleSheet.create({
   titleDisplayText: { color: "#cdd6f4", fontSize: 21, fontWeight: "700", lineHeight: 28, includeFontPadding: false },
   titlePlaceholder: { color: "#6c7086", fontSize: 21, fontWeight: "700", lineHeight: 28, includeFontPadding: false },
   tagSummary: { color: "#a6adc8", fontSize: 12, paddingHorizontal: 6, paddingBottom: 5 },
-  conflictCard: {
-    backgroundColor: "#2a1f35",
-    borderColor: "#c084fc",
-    borderWidth: 1,
-    borderRadius: 8,
-    marginHorizontal: 10,
-    marginBottom: 10,
-    padding: 10,
-    gap: 6,
-  },
-  conflictTitle: { color: "#f9e2af", fontSize: 16, fontWeight: "700" },
-  conflictDescription: { color: "#cdd6f4", fontSize: 12, lineHeight: 18 },
-  conflictValueRow: {
-    borderTopColor: "#45405a",
-    borderTopWidth: StyleSheet.hairlineWidth,
-    paddingTop: 5,
-    gap: 2,
-  },
-  conflictFieldLabel: { color: "#c084fc", fontSize: 12, fontWeight: "700" },
-  conflictValue: { color: "#a6adc8", fontSize: 12, lineHeight: 17 },
-  conflictActions: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 },
-  conflictWarning: { color: "#f38ba8", fontSize: 12, lineHeight: 17 },
+  localSyncWarning: { color: "#f38ba8", fontSize: 12, lineHeight: 17 },
   dialog: { backgroundColor: "#1e1e2e", maxHeight: "88%" },
   dialogTitle: { color: "#cdd6f4" },
   dialogScrollArea: { maxHeight: 620, borderColor: "#313244" },

@@ -61,17 +61,17 @@ $env:AOITALK_PLUGIN_CONFIG_FILE = Join-Path $plugin '.env'
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File plugins\AoiTalk_Plugin\scripts\install_autostart.ps1
-Start-ScheduledTask -TaskName 'AoiTalk Plugin 41'
+Start-ScheduledTask -TaskName 'AoiTalk Plugin'
 ```
 
-Task名は`AoiTalk Plugin 41`、working directoryは41 checkout、entryはこのpackageの`connect_tunnel.ps1 -Watch`です。homeのTask/config/runtimeは変更しません。watchは30秒ごとに専用aliasのhealth/readyを確認し、専用aliasだけを再接続します。
+Task名は`AoiTalk Plugin`、working directoryは41 checkout、entryはこのpackageの`connect_tunnel.ps1 -Watch`です。homeのTask/config/runtimeは変更しません。watchは30秒ごとに専用aliasのhealth/readyを確認し、専用aliasだけを再接続します。
 
 状態・PID・時刻は`logs/aoitalk_plugin/status.json`、watchログは`logs/aoitalk_plugin/supervisor.log`、clientログは`logs/aoitalk_plugin/tunnel-client.log`、tool telemetryは`logs/aoitalk_plugin/tool_logs/`です。profileは`data/aoitalk_plugin/profiles/`、cacheは`cache/aoitalk_plugin/`です。
 
 切断・再起動前に利用者へ通知してください。手動復帰はこの41 checkoutで行います。
 
 ```powershell
-Stop-ScheduledTask -TaskName 'AoiTalk Plugin 41'
+Stop-ScheduledTask -TaskName 'AoiTalk Plugin'
 powershell -NoProfile -ExecutionPolicy Bypass -File plugins\AoiTalk_Plugin\scripts\connect_tunnel.ps1 -Stop
 powershell -NoProfile -ExecutionPolicy Bypass -File plugins\AoiTalk_Plugin\scripts\connect_tunnel.ps1 -Watch
 ```
@@ -100,3 +100,9 @@ plugins\AoiTalk_Plugin\venv\Scripts\python.exe plugins\AoiTalk_Plugin\scripts\ch
 Plugin正本は41の`plugins/AoiTalk_Plugin/aoitalk_plugin`です。80のclient modulesはdispatcher/supervisor等の内部実装として残ります。MCP packageを80からimportせず、大きな共通化もしません。移管baselineは80の`e130d4744623f4518cad6785fe200b09e288c317`で、CLI client/schemaのRole/Muse契約は80の`4c1ba420301140b799ee0c30e440f250230743b5`から同期しました。manifestのCLI recordsだけこのsource commitへ更新し、他moduleのprovenanceは各recordの既存pinを維持します。管理contract fixtureはSHA付き固定copyで両repo同じ内容です。移管中の重複は契約回帰でdriftを確認します。
 
 Enterprise handoffからこの任意Plugin packageを除外します。Enterprise外部連携制約は変更しません。Public配布は既存tracked-file規則でpackageを含めます。ID、runtime key、`.env`、binary、venv、profile、log、cacheは配布しません。
+
+## External DOTS dialogue source status
+
+The source includes an MCP Events adapter and narrow request read/reply tools, but the canonical aoitalk_plugin_server.py does not install the adapter. Its normal catalog remains 35 tools and it advertises no Events capability. The installed stdio/Tunnel server has no verified caller principal or Aoi owner mapping, so no owner binding, callback subscription, outbox delivery, or reply tool can be activated through the current runtime. Do not configure the bootstrap Aoi account as a substitute identity. See the implementation and handoff status in ../../docs/external_dots_dialogue.md.
+
+The adapter is enabled only with an explicit synthetic test context, backend, principal resolver, and callback sender. It does not create or refresh a subscription in ChatGPT, send a callback, or create OAuth configuration. The Aoi owner API is mounted only when dots_dialogue.enabled is the literal boolean true in a non-Enterprise profile. The current runtime supplies no verified MCP principal, so binding confirmation returns 503 until an approved identity bridge exists.

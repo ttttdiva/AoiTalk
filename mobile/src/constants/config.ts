@@ -121,6 +121,9 @@ export const API_TIMEOUT = 10000;
 // Deletion includes route selection and signed Gateway identity checks.
 // Keep reads/offline detection fast and bound this explicit mutation once.
 export const FILES_DELETE_TIMEOUT_MS = 30_000;
+// A download may take any total duration; only a period with no response or
+// body activity is bounded so large, steadily progressing files can finish.
+export const FILES_DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
 export const CHAT_TIMEOUT = 30000;
 // プロバイダーAPIからのモデル一覧取得タイムアウト。
 export const MODEL_LIST_TIMEOUT = 8000;

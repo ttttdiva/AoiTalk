@@ -21,8 +21,6 @@ const REQUIRED_SELECTS = [
   "Provider",
   "Model",
   "推論・LLMモード",
-  "Execution Team",
-  "Execution Profile",
   "キャラクター",
 ] as const;
 
@@ -120,43 +118,8 @@ async function mockChatSettingsRuntime(page: Page) {
       },
     });
   });
-  await page.route("**/api/python-proxy/llm/execution-profiles", async (route) => {
-    await route.fulfill({
-      json: {
-        active_profile_id: "manual",
-        profiles: [
-          {
-            profile_id: "coding",
-            display_name: "Coding",
-            enabled: true,
-          },
-          {
-            profile_id: "research",
-            display_name: "Research",
-            enabled: true,
-          },
-        ],
-        effective_main: null,
-      },
-    });
-  });
-  await page.route("**/api/python-proxy/agent-team/config", async (route) => {
-    await route.fulfill({
-      json: {
-        teams: {
-          writers: {
-            team_id: "writers",
-            name: "Writers",
-            enabled: true,
-            execution_profiles: [
-              { profile_id: "coding", name: "Coding", enabled: true },
-              { profile_id: "research", name: "Research", enabled: true },
-            ],
-          },
-        },
-      },
-    });
-  });
+;
+;
 }
 
 async function openChatSettings(page: Page) {
@@ -288,26 +251,6 @@ async function closeInnerIfOpen(page: Page) {
   await expect(page.getByRole("option")).toHaveCount(0);
 }
 
-async function ensureWritersTeamForMultipleProfiles(page: Page) {
-  // Auto only exposes Execution Profile=None. Pick Writers first so the
-  // profile list has None + Coding + Research before the contract runs.
-  const team = page.getByRole("combobox", { name: "Execution Team" });
-  const profile = page.getByRole("combobox", { name: "Execution Profile" });
-  await expect(team).toBeVisible();
-  await expect(team).toBeEnabled();
-  await expect(profile).toBeVisible();
-  await expect(profile).toBeEnabled();
-  if ((await team.innerText()).includes("Writers")) return;
-
-  await closeInnerIfOpen(page);
-  await team.click();
-  await expect(page.getByRole("option", { name: "Writers" })).toBeVisible();
-  await page.getByRole("option", { name: "Writers" }).click();
-  await expect(page.getByRole("option")).toHaveCount(0);
-  await expect(team).toContainText("Writers");
-  await expect(profile).toBeEnabled();
-}
-
 async function prepareSettingsSelect(page: Page, label: SettingsSelectLabel) {
   await addAuthCookie(page);
   await mockAuthenticatedApis(page);
@@ -317,9 +260,6 @@ async function prepareSettingsSelect(page: Page, label: SettingsSelectLabel) {
   const labels = await visibleSettingsLabels(page);
   for (const required of REQUIRED_SELECTS) {
     expect(labels, `missing required Select "${required}"`).toContain(required);
-  }
-  if (label === "Execution Profile") {
-    await ensureWritersTeamForMultipleProfiles(page);
   }
 }
 
@@ -370,7 +310,7 @@ async function assertEnterCommit(
   await expect(trigger).toBeFocused();
 }
 
-test("Chat settings pointer click → focused option → ArrowDown → Enter commit (all 6 Selects)", async ({
+test("Chat settings pointer click → focused option → ArrowDown → Enter commit (all remaining Selects)", async ({
   page,
 }) => {
   for (const label of REQUIRED_SELECTS) {
@@ -386,7 +326,7 @@ test("Chat settings pointer click → focused option → ArrowDown → Enter com
   }
 });
 
-test("Chat settings Enter open → focused option → ArrowDown → Enter commit (all 6 Selects)", async ({
+test("Chat settings Enter open → focused option → ArrowDown → Enter commit (all remaining Selects)", async ({
   page,
 }) => {
   for (const label of REQUIRED_SELECTS) {
@@ -402,7 +342,7 @@ test("Chat settings Enter open → focused option → ArrowDown → Enter commit
   }
 });
 
-test("Chat settings ArrowRight open → focused option → ArrowDown (all 6 Selects)", async ({
+test("Chat settings ArrowRight open → focused option → ArrowDown (all remaining Selects)", async ({
   page,
 }) => {
   for (const label of REQUIRED_SELECTS) {

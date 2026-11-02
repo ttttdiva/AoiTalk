@@ -233,6 +233,9 @@ def _compress_and_prune_caddy_family(
                     _track(uncompressed)
             continue
         if name.endswith(".log"):
+            if _is_active(path, active_paths):
+                # A running process may still append to it; never gzip-and-delete.
+                continue
             gz_path = path.with_suffix(path.suffix + ".gz")
             if _gzip_file_fail_open(path, gz_path):
                 if gz_path.is_file():

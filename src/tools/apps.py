@@ -58,7 +58,11 @@ from ..services.app_manifest_service import (
     sync_manifest_targets_unlocked,
     validate_manifest_workspace,
 )
-from ..services.app_operation_lock import app_operation_lock, project_operation_lock
+from ..services.app_operation_lock import (
+    app_job_input_reference_lock,
+    app_operation_lock,
+    project_operation_lock,
+)
 from ..services.app_release_service import (
     AppReleaseError,
     create_app_release as create_app_release_service,
@@ -1259,8 +1263,9 @@ def build_app_tool_definitions(
                     input_json=input_json or {},
                     started_by=_ctx_user_id(runtime_context),
                 )
-                session.add(job)
-                await session.commit()
+                async with app_job_input_reference_lock(workspace_root=workspace_root):
+                    session.add(job)
+                    await session.commit()
                 job_id = job.id
                 # Durability is established before execution. The task is linked to
                 # the AppJob row and can be stopped through the matching tool/API.

@@ -13,6 +13,7 @@ export type AuthHandoffClient = {
   callbackPath: string;
   audience: string;
   secretSha256?: string;
+  consumerApp?: "73" | "86";
 };
 
 export const AUTH_HANDOFF_CLIENTS_ENV = "AOITALK_AUTH_HANDOFF_CLIENTS";
@@ -155,6 +156,7 @@ function validateClient(value: unknown): ConfiguredClient | null {
       "callbackPath",
       "audience",
       "secretSha256",
+      "consumerApp",
     ]) ||
     typeof entry.clientId !== "string" ||
     !CLIENT_ID_RE.test(entry.clientId) ||
@@ -164,7 +166,8 @@ function validateClient(value: unknown): ConfiguredClient | null {
     !isExactAudience(entry.audience) ||
     typeof entry.secretSha256 !== "string" ||
     !HASH_RE.test(entry.secretSha256) ||
-    entry.secretSha256 === "0".repeat(64)
+    entry.secretSha256 === "0".repeat(64) ||
+    (entry.consumerApp !== undefined && entry.consumerApp !== "73" && entry.consumerApp !== "86")
   ) {
     return null;
   }
@@ -175,6 +178,7 @@ function validateClient(value: unknown): ConfiguredClient | null {
     callbackPath: entry.callbackPath,
     audience: entry.audience,
     secretSha256: entry.secretSha256,
+    ...(entry.consumerApp === undefined ? {} : { consumerApp: entry.consumerApp as "73" | "86" }),
   };
 }
 
@@ -217,15 +221,18 @@ export function getAuthHandoffClients(
     `${LEGACY_CLIENT.origin}\u0000${LEGACY_CLIENT.callbackPath}`,
   ]);
   const audiences = new Set<string>([LEGACY_CLIENT.audience]);
+  const consumerApps = new Set<string>();
   for (const client of external) {
     const callbackPair = `${client.origin}\u0000${client.callbackPath}`;
     if (
       ids.has(client.clientId) ||
       callbackPairs.has(callbackPair) ||
-      audiences.has(client.audience)
+      audiences.has(client.audience) ||
+      (client.consumerApp !== undefined && consumerApps.has(client.consumerApp))
     ) {
       return [LEGACY_CLIENT];
     }
+    if (client.consumerApp !== undefined) consumerApps.add(client.consumerApp);
     ids.add(client.clientId);
     callbackPairs.add(callbackPair);
     audiences.add(client.audience);
@@ -251,6 +258,17 @@ export function getExternalAuthHandoffClients(
   return getAuthHandoffClients(raw).filter((client) => !isLegacyAuthHandoffClient(client));
 }
 
+export function getExternalAuthHandoffClientRegistryStatus(raw?: string): {
+  fieldPresent: boolean;
+  entryCount: number;
+} {
+  const source = raw === undefined ? process.env[AUTH_HANDOFF_CLIENTS_ENV] : raw;
+  return {
+    fieldPresent: typeof source === "string" && source.trim().length > 0,
+    entryCount: getExternalAuthHandoffClients(source ?? "").length,
+  };
+}
+
 export function getAuthHandoffIssuer(
   raw = process.env[AUTH_HANDOFF_ISSUER_ENV],
 ): string | null {
@@ -266,6 +284,7 @@ export function authHandoffRegistrationHash(client: AuthHandoffClient): string {
     client.callbackPath,
     client.audience,
     client.secretSha256 ?? "",
+    ...(client.consumerApp === undefined ? [] : [client.consumerApp]),
   ].join("\u0000");
   return createHash("sha256").update(canonical, "utf8").digest("hex");
 }

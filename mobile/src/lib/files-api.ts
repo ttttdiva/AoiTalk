@@ -4,11 +4,15 @@ import { FILES_DELETE_TIMEOUT_MS } from "../constants/config";
 import { fetchApi, getBaseUrl, getCredentialIdentityRevision } from "./api-client";
 import { getTokenAuthScope, getTokenSnapshot } from "./auth";
 import { sendWithTransportAuth } from "./transport-auth";
-import { cacheProtectedMediaResource } from "./media-cache";
+import {
+  cacheProtectedMediaResource,
+  type MediaCacheProgress,
+} from "./media-cache";
 import { nativeMultipartUpload } from "./native-multipart";
 import { projectApi } from "./project-api";
 import {
   downloadFileToDevice,
+  type FilesDownloadProgress,
   type FilesDownloadResult,
 } from "./files-download";
 import type {
@@ -32,6 +36,8 @@ export type {
   FilesSource,
   FilesUploadInput,
 } from "./files-types";
+
+export type { FilesDownloadProgress } from "./files-download";
 
 /**
  * Identity of the bookmark collection used by the Files API.
@@ -133,6 +139,7 @@ const AUDIO_EXTENSIONS = new Set([
 const metadataCache = new Map<string, FilesEntryMetadata>();
 const metadataInFlight = new Map<string, Promise<FilesEntryMetadata>>();
 const thumbnailCache = new Map<string, Promise<FilesMediaSource>>();
+type FilesDownloadProgressCallback = (event: FilesDownloadProgress) => void;
 
 export function clearFilesApiCaches(): void {
   metadataCache.clear();
@@ -543,7 +550,7 @@ async function listServerDirectory(path = ""): Promise<{
   }));
 
   return {
-    currentPath: payload.current_path || path,
+    currentPath: payload.current_path ?? path,
     parentPath: payload.parent_path ?? null,
     canGoUp: payload.can_go_up === true,
     isAdminMode: payload.is_admin_mode === true,
@@ -1157,6 +1164,38 @@ async function getServerMediaUrl(path: string): Promise<string> {
   return `${baseUrl}/api/explorer/serve?path=${encodeURIComponent(path)}`;
 }
 
+function trustedFileSize(entry: FilesEntry): number | undefined {
+  return typeof entry.size === "number" &&
+    Number.isSafeInteger(entry.size) &&
+    entry.size >= 0
+    ? entry.size
+    : undefined;
+}
+
+function progressTotal(
+  receivedBytes: number,
+  totalBytes: number | undefined,
+): Pick<FilesDownloadProgress, "totalBytes" | "percent"> {
+  if (totalBytes === undefined || receivedBytes > totalBytes) return {};
+  return {
+    totalBytes,
+    ...(totalBytes > 0
+      ? { percent: Math.min(100, (receivedBytes / totalBytes) * 100) }
+      : {}),
+  };
+}
+
+function reportDownloadProgress(
+  callback: FilesDownloadProgressCallback | undefined,
+  event: FilesDownloadProgress,
+): void {
+  try {
+    callback?.(event);
+  } catch {
+    // Progress reporting must never change the file download result.
+  }
+}
+
 async function getServerThumbnailUrl(path: string, kind: FilesMediaKind, size = 320) {
   const baseUrl = await getBaseUrl();
   if (kind === "video") {
@@ -1175,13 +1214,15 @@ async function cacheProtectedMedia(
   targetUri: string,
   targetBaseUrl: string,
   signal?: AbortSignal,
+  onProgress?: (progress: MediaCacheProgress) => void,
 ): Promise<string | null> {
   return cacheProtectedMediaResource(url, targetUri, {}, signal, {
     revisionReader: getCredentialIdentityRevision,
+    onProgress,
     request: async (send, requestSignal) => await sendWithTransportAuth(
       url,
       { targetBaseUrl, signal: requestSignal ?? signal },
-      async (headers) => await send(headers),
+      async (headers) => await send(headers, requestSignal ?? signal),
     ),
   });
 }
@@ -1223,15 +1264,20 @@ async function downloadServerMediaToCache(
     if (cached) return cached;
     throw new Error("メディアキャッシュを利用できません");
   } catch (error) {
-    await FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(() => {});
+    await deleteFileQuietly(targetUri);
     throw error;
   }
 }
 
-async function downloadServerFileForExport(entry: FilesEntry): Promise<string> {
+async function downloadServerFileForExport(
+  entry: FilesEntry,
+  reportExternalProgress?: FilesDownloadProgressCallback,
+  signal?: AbortSignal,
+): Promise<string> {
   const cacheRoot = FileSystem.cacheDirectory;
   if (!cacheRoot) throw new Error("ファイル保存用キャッシュを利用できません");
   const cacheScope = await getCredentialCacheScope();
+  assertDownloadNotAborted(signal);
   const baseName = cacheNameFor(entry, cacheScope);
   const extension = getExtension(baseName);
   const stem = extension ? baseName.slice(0, -extension.length) : baseName;
@@ -1239,14 +1285,69 @@ async function downloadServerFileForExport(entry: FilesEntry): Promise<string> {
     .toString(16)
     .slice(2)}${extension}`;
   const url = await getServerMediaUrl(entry.path);
+  assertDownloadNotAborted(signal);
   const parsedBaseUrl = url.slice(0, url.indexOf("/api/"));
+  const expectedTotalBytes = trustedFileSize(entry);
+  let receivedBytes = 0;
+  let latestTotalBytes = expectedTotalBytes;
+  let receiveCompleted = false;
+  reportDownloadProgress(reportExternalProgress, {
+    operation: "receive",
+    state: "started",
+    receivedBytes: 0,
+    ...progressTotal(0, expectedTotalBytes),
+  });
   try {
-    const cached = await cacheProtectedMedia(url, targetUri, parsedBaseUrl);
-    if (cached) return cached;
+    const cached = await cacheProtectedMedia(
+      url,
+      targetUri,
+      parsedBaseUrl,
+      signal,
+      (progress) => {
+        receivedBytes = progress.receivedBytes;
+        latestTotalBytes = progress.totalBytes ?? expectedTotalBytes;
+        reportDownloadProgress(reportExternalProgress, {
+          operation: "receive",
+          state: "progress",
+          receivedBytes,
+          ...progressTotal(receivedBytes, latestTotalBytes),
+        });
+      },
+    );
+    if (cached) {
+      receiveCompleted = true;
+      return cached;
+    }
     throw new Error("ファイルキャッシュを利用できません");
   } catch (error) {
-    await FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(() => {});
+    await deleteFileQuietly(targetUri);
     throw error;
+  } finally {
+    // A completed receive event gives consumers one stable terminal byte
+    // value.  The copy/share phase is reported by files-download afterwards.
+    if (receiveCompleted && reportExternalProgress) {
+      reportDownloadProgress(reportExternalProgress, {
+        operation: "receive",
+        state: "completed",
+        receivedBytes,
+        ...progressTotal(receivedBytes, latestTotalBytes),
+      });
+    }
+  }
+}
+
+function assertDownloadNotAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("ファイル取得を中止しました");
+  error.name = "AbortError";
+  throw error;
+}
+
+async function deleteFileQuietly(uri: string): Promise<void> {
+  try {
+    await FileSystem.deleteAsync(uri, { idempotent: true });
+  } catch {
+    // Keep the original download/export error when cleanup also fails.
   }
 }
 
@@ -1386,25 +1487,35 @@ export const filesApi = {
     }
   },
 
-  async download(entry: FilesEntry): Promise<FilesDownloadResult> {
+  async download(
+    entry: FilesEntry,
+    reportExternalProgress?: FilesDownloadProgressCallback,
+    signal?: AbortSignal,
+  ): Promise<FilesDownloadResult> {
     let temporaryUri: string | null = null;
     try {
+      assertDownloadNotAborted(signal);
       return await downloadFileToDevice(entry, async () => {
+        assertDownloadNotAborted(signal);
         if (entry.source === "local") {
           const info = await FileSystem.getInfoAsync(entry.path);
+          assertDownloadNotAborted(signal);
           if (!info.exists || info.isDirectory) {
             throw new Error("ローカルファイルが見つかりません");
           }
           return entry.path;
         }
-        temporaryUri = await downloadServerFileForExport(entry);
+        temporaryUri = await downloadServerFileForExport(
+          entry,
+          reportExternalProgress,
+          signal,
+        );
+        assertDownloadNotAborted(signal);
         return temporaryUri;
-      });
+      }, undefined, reportExternalProgress, signal);
     } finally {
       if (temporaryUri) {
-        await FileSystem.deleteAsync(temporaryUri, { idempotent: true }).catch(
-          () => {},
-        );
+        await deleteFileQuietly(temporaryUri);
       }
     }
   },

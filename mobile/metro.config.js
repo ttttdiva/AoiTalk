@@ -7,6 +7,7 @@ config.watchFolders = [
   ...(config.watchFolders || []),
   path.resolve(__dirname, '../resources/seethrough-rig/runtime'),
   path.resolve(__dirname, '../resources/chat-background'),
+  path.resolve(__dirname, '../shared'),
 ];
 
 if (!config.resolver.assetExts.includes('wasm')) {

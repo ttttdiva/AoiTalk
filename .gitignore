@@ -165,6 +165,7 @@ aoitalk-mobile.apk
 # Skill録画の一時データ
 data/skill_recordings/
 /data/mobile_server_identity-*.json
+/data/launcher-generation.txt
 /data/mobile_server_identity-*.json.lock
 /data/.mobile_server_identity-*.json.*.tmp
 tests/.artifacts/
@@ -180,3 +181,10 @@ tests/.artifacts/
 # Generated az-vnetspace wiki build output
 /deploy/az-vnetspace-wiki/.site-dist/
 /deploy/az-vnetspace-wiki/.site-build-report.json
+
+# Local runtime state and transient worktree data
+/.codex-remote-attachments/
+/codex-validation-output-20261019.txt
+/data/aoitalk_plugin/
+/data/provider_key_attribution.json
+/repo.local/

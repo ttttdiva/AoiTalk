@@ -10,16 +10,11 @@ from typing import Any
 from ..llm.openai_compatible_local_profiles import managed_local_runtime_for_model
 from .conversation_session_selection import (
     read_session_llm_settings,
-    session_loaded_team_ids,
     session_main_route_override_for_binding,
 )
-from .execution_profile_service import resolve_execution_main_route
+from .model_roles_service import resolve_execution_main_route
 from .session_llm_runtime_context import (
-    bind_session_agent_team_selection,
-    bind_session_execution_profile_id,
     bind_session_main_route_override,
-    reset_session_agent_team_selection,
-    reset_session_execution_profile_id,
     reset_session_main_route_override,
     session_main_route_override,
 )
@@ -27,10 +22,7 @@ from .session_llm_runtime_context import (
 
 @dataclass(frozen=True)
 class SessionLlmRuntimeBinding:
-    agent_team_token: Any
     main_route_token: Any
-    execution_profile_token: Any
-    loaded_team_token: Any | None = None
 
 
 # Only these two MTP controls are user-owned/persistable.  Availability and
@@ -70,56 +62,6 @@ _SESSION_LLAMA_CPP_FREETOKEN_MASK_KEYS = (
 )
 
 
-def _session_registry_key(*, user_id: str | None, session_id: str | None) -> str:
-    clean_session = str(session_id or "").strip()
-    if not clean_session:
-        return ""
-    clean_user = str(user_id or "").strip()
-    return f"{clean_user}:{clean_session}" if clean_user else clean_session
-
-
-def release_session_agent_team_registry(
-    user_id: str | None,
-    session_id: str | None,
-) -> None:
-    """Release the process-local manual Team projection for one session.
-
-    The durable conversation row is the source of truth for manual Team
-    selection.  This in-memory projection is therefore removed only after a
-    successful durable delete.  Keep key construction in
-    :func:`_session_registry_key` so the release path cannot drift from the
-    restore/bind paths (and never clear another user's session).
-    """
-
-    session_key = _session_registry_key(user_id=user_id, session_id=session_id)
-    if not session_key:
-        return
-
-    from ..llm.runtime_tool_registry import (
-        _LOADED_AGENT_TEAM_IDS_BY_SESSION,
-        _LOADED_AGENT_TEAM_IDS_LOCK,
-    )
-
-    with _LOADED_AGENT_TEAM_IDS_LOCK:
-        _LOADED_AGENT_TEAM_IDS_BY_SESSION.pop(session_key, None)
-
-
-def restore_session_agent_team_registry(
-    user_id: str | None,
-    session_id: str | None,
-    settings: dict[str, Any] | None,
-) -> None:
-    """Restore per-session manual Team load registry from persisted settings."""
-    from ..llm.runtime_tool_registry import _LOADED_AGENT_TEAM_IDS_BY_SESSION, _LOADED_AGENT_TEAM_IDS_LOCK
-
-    session_key = _session_registry_key(user_id=user_id, session_id=session_id)
-    if not session_key:
-        return
-    loaded_ids = frozenset(session_loaded_team_ids(settings or {}))
-    with _LOADED_AGENT_TEAM_IDS_LOCK:
-        _LOADED_AGENT_TEAM_IDS_BY_SESSION[session_key] = loaded_ids
-
-
 def bind_session_llm_runtime(
     *,
     settings: dict[str, Any] | None,
@@ -128,39 +70,11 @@ def bind_session_llm_runtime(
     config: Any | None = None,
 ) -> SessionLlmRuntimeBinding:
     settings = settings if isinstance(settings, dict) else {}
-    team_selection = settings.get("agent_team_selection")
-    team_selection = team_selection if isinstance(team_selection, dict) else {}
-    agent_team_token = bind_session_agent_team_selection(team_selection)
     main_route_token = bind_session_main_route_override(
         session_main_route_override_for_binding(settings),
     )
-    execution_profile_id = str(settings.get("execution_profile_id") or "").strip()
-    special = settings.get("special_routing") if isinstance(settings.get("special_routing"), dict) else {}
-    if (
-        str(team_selection.get("mode") or "auto").strip().lower() != "fixed"
-        or str(special.get("routing_profile_id") or "").strip() == "free-team"
-    ):
-        execution_profile_id = ""
-    execution_profile_token = bind_session_execution_profile_id(execution_profile_id)
-    loaded_team_token = None
-    session_key = _session_registry_key(user_id=user_id, session_id=session_id)
-    if session_key:
-        from ..llm.runtime_tool_registry import (
-            _LOADED_AGENT_TEAM_IDS,
-            _LOADED_AGENT_TEAM_IDS_BY_SESSION,
-            _LOADED_AGENT_TEAM_IDS_LOCK,
-        )
-
-        loaded_ids = frozenset(session_loaded_team_ids(settings))
-        with _LOADED_AGENT_TEAM_IDS_LOCK:
-            _LOADED_AGENT_TEAM_IDS_BY_SESSION[session_key] = loaded_ids
-        loaded_team_token = _LOADED_AGENT_TEAM_IDS.set(loaded_ids)
-    return SessionLlmRuntimeBinding(
-        agent_team_token=agent_team_token,
-        main_route_token=main_route_token,
-        execution_profile_token=execution_profile_token,
-        loaded_team_token=loaded_team_token,
-    )
+    del user_id, session_id, config
+    return SessionLlmRuntimeBinding(main_route_token=main_route_token)
 
 
 def bind_session_llm_runtime_from_context(
@@ -181,13 +95,7 @@ def bind_session_llm_runtime_from_context(
 def reset_session_llm_runtime(binding: SessionLlmRuntimeBinding | None) -> None:
     if binding is None:
         return
-    reset_session_agent_team_selection(binding.agent_team_token)
     reset_session_main_route_override(binding.main_route_token)
-    reset_session_execution_profile_id(binding.execution_profile_token)
-    if binding.loaded_team_token is not None:
-        from ..llm.runtime_tool_registry import _LOADED_AGENT_TEAM_IDS
-
-        _LOADED_AGENT_TEAM_IDS.reset(binding.loaded_team_token)
 
 
 def _client_provider_model(client: Any) -> tuple[str, str]:
@@ -532,12 +440,16 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
         and managed_local_runtime_for_model(config, model) == "freetoken"
     ):
         effort = ""
+    provider_options = {"ephemeral_session_client": True}
+    pool_id = str(route.get("pool_id") or "").strip()
+    if provider == "routing-profile" and pool_id:
+        provider_options["pool_id"] = pool_id
     turn_client = create_llm_client_for_target(
         config,
         provider=provider,
         model=model,
         effort=effort,
-        provider_options={"ephemeral_session_client": True},
+        provider_options=provider_options,
     )
     if provider == "openai_compatible_local":
         _overlay_session_llama_cpp_mtp_runtime(turn_client, model)
@@ -564,6 +476,7 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
         "_provider_state",
         "_provider_state_mode",
         "_runtime_registry_project_id",
+        "_agent_tool_ids",
     ):
         if hasattr(source_client, attr):
             setattr(turn_client, attr, getattr(source_client, attr))
@@ -679,7 +592,5 @@ __all__ = [
     "bind_session_llm_runtime_from_context",
     "build_session_turn_client",
     "reset_session_llm_runtime",
-    "release_session_agent_team_registry",
-    "restore_session_agent_team_registry",
     "session_route_differs_from_client",
 ]

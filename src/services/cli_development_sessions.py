@@ -13,21 +13,26 @@ binding, and the effective Agent capabilities before it is admitted.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
+import importlib
 import inspect
 import json
 import os
+import re
 import stat
+import sys
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import object_session
 
 from ..memory.models import (
     AgentExecutionBinding,
@@ -51,7 +56,13 @@ from .muse_remote_execution import (
     MUSE_ADAPTER_KEY as MUSE_REMOTE_ADAPTER_KEY,
     MUSE_EXECUTION_TARGET,
     MUSE_PROVIDER,
+    MAX_MUSE_OUTPUT_CHARS,
     REMOTE_AGENT_DELEGATE,
+    MuseErrorCode,
+)
+from .muse_cli_diagnostics import (
+    sanitize_cause,
+    sanitize_cli_failure_diagnostic,
 )
 from .muse_remote_session_store import (
     MUSE_REMOTE_CONTEXT_KEY,
@@ -59,6 +70,32 @@ from .muse_remote_session_store import (
     MuseRemoteSessionStore,
     MuseRemoteTargetResolver,
 )
+
+
+def _managed_muse_cli_executable(
+    *, platform: str, environ: Mapping[str, str], home: Path
+) -> Path:
+    """Resolve the pinned CLI without creating or installing anything."""
+    if platform == "win32":
+        root_value = environ.get("LOCALAPPDATA", "")
+        executable_parts = ("Scripts", "muse-cli.exe")
+    elif platform == "darwin":
+        root_value = str(home / "Library" / "Application Support")
+        executable_parts = ("bin", "muse-cli")
+    else:
+        root_value = environ.get("XDG_DATA_HOME", str(home / ".local" / "share"))
+        executable_parts = ("bin", "muse-cli")
+    root = Path(root_value)
+    if not root_value or not root.is_absolute():
+        raise ValueError("Muse CLI user data root must be an absolute path")
+    root = root.resolve()
+    executable = (
+        root / "AoiTalk" / "runtimes" / "muse-cli" / "0.3.2" / "venv"
+    ).joinpath(*executable_parts).resolve()
+    repository_root = Path(__file__).resolve().parents[2]
+    if root.is_relative_to(repository_root) or executable.is_relative_to(repository_root):
+        raise ValueError("Muse CLI user data root must be outside the repository")
+    return executable
 
 
 CLI_SESSION_SOURCE_TYPE = "cli_session_turn"
@@ -93,6 +130,218 @@ CLI_DEVELOPMENT_TERMINAL_STATUSES = frozenset(
 CLI_DEVELOPMENT_PERMISSION_MODES = frozenset({"native_default", "standard", "accept_edits"})
 CLI_ROLE_CONTEXT_MODES = frozenset({"raw", "agent_role"})
 CLI_ROLE_CONTEXT_MAX_BYTES = 128 * 1024
+_REMOTE_HISTORY_RECONCILIATION_LOCKS: dict[str, asyncio.Lock] = {}
+_REMOTE_HISTORY_RECONCILIATION_LOCKS_GUARD = asyncio.Lock()
+_MUSE_CLI_PROCESS_FAILED = "cli_process_failed"
+_SHARED_CLI_DEVELOPMENT_SERVICES: dict[int, tuple[Any, Any]] = {}
+
+
+def get_shared_cli_development_session_service(
+    db_manager: Any | None = None,
+    *,
+    config: Any | None = None,
+) -> Any | None:
+    """Return the server-composed CLI session service for one DB manager.
+
+    Delegate workers must join the already registered AgentWork coordinator;
+    constructing an unbound service here would persist work that nobody can
+    execute.  Tests and embedded callers can inject the service explicitly.
+    """
+
+    manager = db_manager
+    if manager is None:
+        from ..memory.database import get_database_manager
+
+        manager = get_database_manager()
+    entry = _SHARED_CLI_DEVELOPMENT_SERVICES.get(id(manager))
+    if entry is None:
+        return None
+    registered_manager, service = entry
+    if registered_manager is not manager or getattr(service, "coordinator", None) is None:
+        return None
+    if config is not None and getattr(service, "config", None) is not config:
+        return None
+    return service
+
+
+def _register_shared_cli_development_session_service(service: Any) -> None:
+    manager = getattr(service, "_db_manager", None)
+    if manager is None or getattr(service, "coordinator", None) is None:
+        return
+    _SHARED_CLI_DEVELOPMENT_SERVICES[id(manager)] = (manager, service)
+
+
+async def _remote_history_reconciliation_lock(session_id: str) -> asyncio.Lock:
+    """Serialize same-process reconnect recovery for one remote session."""
+
+    async with _REMOTE_HISTORY_RECONCILIATION_LOCKS_GUARD:
+        lock = _REMOTE_HISTORY_RECONCILIATION_LOCKS.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _REMOTE_HISTORY_RECONCILIATION_LOCKS[session_id] = lock
+        return lock
+
+
+def _safe_remote_delivery(value: Any) -> dict[str, Any]:
+    """Keep only the bounded role-delivery receipt emitted by Muse."""
+
+    source = value if isinstance(value, Mapping) else {}
+    mode = "managed_role" if source.get("mode") == "managed_role" else "raw"
+    receipt: dict[str, Any] = {
+        "mode": mode,
+        "mechanism": "first_turn_user_prefix" if mode == "managed_role" else "none",
+        "system_prompt_applied": False,
+        "native_persona_replaced": False,
+        "adherence_guaranteed": False,
+    }
+    if mode == "managed_role":
+        revision_id = source.get("role_revision_id")
+        digest = source.get("role_context_sha256")
+        if isinstance(revision_id, str) and len(revision_id) <= 256:
+            receipt["role_revision_id"] = revision_id
+        if (
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(char in "0123456789abcdef" for char in digest.lower())
+        ):
+            receipt["role_context_sha256"] = digest.lower()
+        receipt["limitation"] = (
+            "Muse CLI has no system prompt flag; role text was sent in the first user turn."
+        )
+    return receipt
+
+
+def _muse_curl56_cause_matches(value: Any) -> bool:
+    """Match the closed Muse diagnostic for the known ambiguous send failure."""
+
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("cause_code") == _MUSE_CLI_PROCESS_FAILED
+        and value.get("command") == "send"
+        and value.get("stage") == "api_call"
+        and value.get("phase_class") == "handshake"
+        and value.get("exception_type") == "curl_cffi.curl.CurlError"
+        and type(value.get("curl_code")) is int
+        and value.get("curl_code") == 56
+        and type(value.get("returncode")) is int
+        and value.get("returncode") == 1
+        and value.get("timed_out") is False
+    )
+
+
+def _muse_curl56_recovery_evidence_matches(
+    binding: Any, result_summary: Any
+) -> bool:
+    """Require both persisted binding and Work evidence for history-only recovery."""
+
+    return bool(
+        isinstance(binding, Mapping)
+        and binding.get("state") == "unsafe"
+        and binding.get("safe_to_send") is False
+        and binding.get("unsafe_reason") == _MUSE_CLI_PROCESS_FAILED
+        and _muse_curl56_cause_matches(binding.get("unsafe_cause"))
+        and isinstance(result_summary, Mapping)
+        and result_summary.get("execution_target") == MUSE_EXECUTION_TARGET
+        and result_summary.get("local_filesystem") is False
+        and result_summary.get("sandbox") == "remote_uncontrolled"
+        and result_summary.get("turn_status") == "uncertain"
+        and result_summary.get("send_attempted") is True
+        and result_summary.get("send_attempted_known") is True
+        and result_summary.get("acceptance") == "acceptance_unconfirmed"
+        and result_summary.get("safe_to_send") is False
+        and _muse_curl56_cause_matches(result_summary.get("cause"))
+    )
+
+
+def _remote_recovery_error_matches(
+    *, run_error: Any, work_error: Any, binding: Any, result_summary: Any
+) -> bool:
+    """Keep legacy recovery while admitting one fully evidenced CLI failure."""
+
+    run_code = str(run_error or "")
+    work_code = str(work_error or "")
+    if run_code != work_code:
+        return False
+    if run_code == str(MuseErrorCode.SEND_RESPONSE_UNCORRELATED):
+        return True
+    return run_code == _MUSE_CLI_PROCESS_FAILED and _muse_curl56_recovery_evidence_matches(
+        binding, result_summary
+    )
+
+
+def _matching_muse_tool_loop_opt_in(
+    work_metadata: Any, run_cli_metadata: Any
+) -> bool | None:
+    """Return the matching persisted opt-in, or None for malformed/mismatched records."""
+
+    work_value = (
+        work_metadata.get("muse_tool_loop_opt_in", False)
+        if isinstance(work_metadata, Mapping)
+        else False
+    )
+    run_value = (
+        run_cli_metadata.get("muse_tool_loop_opt_in", False)
+        if isinstance(run_cli_metadata, Mapping)
+        else False
+    )
+    if type(work_value) is not bool or type(run_value) is not bool:
+        return None
+    if work_value != run_value:
+        return None
+    return work_value
+
+
+def _remote_uncertain_event_matches(
+    event: Any, *, run_id: Any, attempt: int, error_code: str
+) -> bool:
+    """Match the coordinator's append-only uncertain event without status."""
+
+    if (
+        event is None
+        or str(getattr(event, "event_type", "") or "") != "work.uncertain"
+        or str(getattr(event, "to_state", "") or "") != "uncertain"
+        or getattr(event, "status", None) not in (None, "uncertain")
+        or error_code
+        not in {
+            str(MuseErrorCode.SEND_RESPONSE_UNCORRELATED),
+            _MUSE_CLI_PROCESS_FAILED,
+        }
+        or str(getattr(event, "safe_error_code", "") or "") != error_code
+        or str(getattr(event, "agent_run_id", "") or "") != str(run_id)
+    ):
+        return False
+    payload = getattr(event, "payload_json", None)
+    if not isinstance(payload, Mapping):
+        payload = getattr(event, "payload", None)
+    if not isinstance(payload, Mapping):
+        payload = {}
+    classification = payload.get("classification")
+    if (
+        classification not in (None, "uncertain")
+        or (
+            error_code == _MUSE_CLI_PROCESS_FAILED
+            and classification != "uncertain"
+        )
+        or (
+            error_code == _MUSE_CLI_PROCESS_FAILED
+            and payload.get("error_code") != error_code
+        )
+    ):
+        return False
+    event_attempt = payload.get("attempt")
+    if error_code == _MUSE_CLI_PROCESS_FAILED and (
+        type(event_attempt) is not int or event_attempt != attempt
+    ):
+        return False
+    if event_attempt is not None:
+        if isinstance(event_attempt, bool):
+            return False
+        try:
+            if int(event_attempt) != int(attempt):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return True
 CLI_PROVIDER_PERMISSION_MODES = {
     "antigravity-cli": frozenset({"native_default", "standard", "accept_edits"}),
     "claude-cli": frozenset({"native_default", "standard", "accept_edits"}),
@@ -100,6 +349,89 @@ CLI_PROVIDER_PERMISSION_MODES = {
     "grok-cli": frozenset({"native_default", "standard"}),
 }
 REMOTE_SESSION_CAPABILITIES = (REMOTE_AGENT_DELEGATE,)
+
+
+# Bounded, owner-scoped observation of the latest remote reconnect attempt.
+# The receipt is diagnostics only: it never feeds safe_to_send, the Muse
+# binding, the provider turn nonce, Run/Work state or any retry decision.
+REMOTE_RECONNECT_RECEIPT_KEY = "remote_reconnect_receipt"
+REMOTE_RECONNECT_SEQUENCE_KEY = "remote_reconnect_attempt_sequence"
+REMOTE_RECONNECT_RECEIPT_SCHEMA_VERSION = 1
+REMOTE_RECONNECT_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+_REMOTE_RECONNECT_DIAGNOSTICS = frozenset(
+    {
+        "confirmed",
+        "history_unavailable",
+        "history_nonterminal",
+        "history_unconfirmed",
+        "binding_mismatch",
+        "authority_unavailable",
+        "binding_persist_failed",
+        "recovery_state_ineligible",
+        "no_pending_nonce",
+        "settlement_conflict",
+        "settlement_unavailable",
+        "tool_loop_metadata_mismatch",
+        "tool_loop_recovery_required",
+        "history_observation_conflict",
+    }
+)
+_REMOTE_RECONNECT_RECEIPT_FIELDS = (
+    "schema_version",
+    "attempt_id",
+    "attempt_sequence",
+    "state",
+    "terminal",
+    "started_at",
+    "finished_at",
+    "history_outcome",
+    "reconciled",
+    "history_reconciled",
+    "history_observed",
+    "history_observation_present",
+    "reconciliation_diagnostic",
+    "session_status",
+    "remote_binding_state",
+    "run_id",
+    "work_item_id",
+    "error_type",
+    "error_code",
+)
+_RECEIPT_TOKEN = re.compile(r"[a-z0-9_]{1,32}")
+_RECEIPT_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+_RECEIPT_ERROR_CODE = re.compile(r"[a-z0-9_.-]{1,64}")
+
+
+def _receipt_token(value: Any, allowed: Iterable[str] | None = None) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if allowed is not None:
+        return value if value in allowed else "other"
+    return value if _RECEIPT_TOKEN.fullmatch(value) else "other"
+
+
+def _receipt_error_fields(error: BaseException | None) -> dict[str, Any]:
+    """Expose only the exception class name and a typed code, never its text."""
+
+    if error is None:
+        return {"error_type": None, "error_code": None}
+    name = type(error).__name__
+    code = getattr(error, "code", None)
+    return {
+        "error_type": name if _RECEIPT_ERROR_TYPE.fullmatch(name) else "other",
+        "error_code": (
+            code
+            if isinstance(code, str) and _RECEIPT_ERROR_CODE.fullmatch(code)
+            else None
+        ),
+    }
+
+
+def _remote_reconnect_receipt_projection(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = context.get(REMOTE_RECONNECT_RECEIPT_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    return {key: copy.deepcopy(raw.get(key)) for key in _REMOTE_RECONNECT_RECEIPT_FIELDS}
 
 
 class CLIDevelopmentSessionError(RuntimeError):
@@ -223,6 +555,328 @@ def normalize_cli_capabilities(value: Any) -> tuple[str, ...]:
     return tuple(sorted(set(items)))
 
 
+_DELEGATE_WORKER_PROVIDERS = {
+    "codex": "codex-cli",
+    "antigravity": "antigravity-cli",
+    "claude": "claude-cli",
+    "grok": "grok-cli",
+    "muse": MUSE_PROVIDER,
+}
+_DELEGATE_WORKER_BUDGET_LIMITS = {
+    "max_tokens": 1_000_000,
+    "max_cost_micros": 1_000_000_000_000,
+    "max_attempts": 100,
+}
+
+
+def _typed_delegate_worker_context(value: Any) -> dict[str, Any] | None:
+    """Accept only the internal runtime marker, never a caller mapping."""
+
+    if value is None:
+        return None
+    from .delegate_worker_runtime import DelegateWorkerSessionContext
+
+    if not isinstance(value, DelegateWorkerSessionContext):
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker context must be an internal marker",
+            code="delegate_worker_context_invalid",
+        )
+    try:
+        marker = copy.deepcopy(dict(value.to_dict()))
+    except Exception as exc:
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker context is invalid",
+            code="delegate_worker_context_invalid",
+        ) from exc
+    return marker
+
+
+def _validate_delegate_worker_context(
+    marker: Mapping[str, Any] | None,
+    request: CreateCLIDevelopmentSessionRequest,
+    *,
+    agent_id: str,
+    revision_id: str,
+) -> dict[str, Any] | None:
+    """Validate an internal worker marker against the fixed session route."""
+
+    if marker is None:
+        return None
+    normalized = copy.deepcopy(dict(marker))
+    expected_marker_keys = {
+        "schema_version",
+        "dialogue_id",
+        "kind",
+        "workspace_scope",
+        "workspace_scope_sha256",
+        "timeout_seconds",
+        "budgets",
+        "owner_id",
+        "agent_id",
+        "agent_revision_id",
+        "agent_dialogue_tool_ids",
+        "allow_cli_native_tools",
+        "capabilities",
+    }
+    kind = str(normalized.get("kind") or "").strip().casefold()
+    scope = normalized.get("workspace_scope")
+    if (
+        set(normalized) != expected_marker_keys
+        or type(normalized.get("schema_version")) is not int
+        or normalized.get("schema_version") != 1
+        or _safe_uuid(normalized.get("dialogue_id")) is None
+        or kind not in _DELEGATE_WORKER_PROVIDERS
+        or str(normalized.get("owner_id") or "") != request.owner_id
+        or str(normalized.get("agent_id") or "") != agent_id
+        or str(normalized.get("agent_revision_id") or "") != revision_id
+        or request.provider != _DELEGATE_WORKER_PROVIDERS[kind]
+        or not isinstance(scope, Mapping)
+        or set(scope) != {"mode", "root", "paths"}
+        or scope.get("mode") not in {"read", "write"}
+        or not isinstance(scope.get("root"), str)
+        or len(scope.get("root") or "") > 512
+        or not isinstance(scope.get("paths"), list)
+        or not scope["paths"]
+        or len(scope["paths"]) > 64
+        or normalized.get("workspace_scope_sha256") != _json_hash(dict(scope))
+    ):
+        raise CLIDevelopmentSessionConflict(
+            "managed worker context differs from the fixed session route",
+            code="delegate_worker_context_mismatch",
+        )
+    try:
+        raw_root = Path(scope["root"]).expanduser()
+        if not raw_root.is_absolute():
+            raise ValueError
+        root = Path(scope["root"]).expanduser().resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError
+        if str(root).casefold() != str(scope["root"]).casefold():
+            raise ValueError
+        canonical_paths: list[Path] = []
+        for raw_path in scope["paths"]:
+            if not isinstance(raw_path, str) or not raw_path:
+                raise ValueError
+            supplied_path = Path(raw_path).expanduser()
+            if not supplied_path.is_absolute():
+                raise ValueError
+            path = supplied_path.resolve(strict=True)
+            if not path.is_dir():
+                raise ValueError
+            try:
+                path.relative_to(root)
+            except ValueError:
+                raise ValueError from None
+            canonical_paths.append(path)
+        if any(str(path).casefold() != str(raw).casefold() for path, raw in zip(canonical_paths, scope["paths"])):
+            raise ValueError
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise CLIDevelopmentSessionConflict(
+            "managed worker scope is unavailable or outside its root",
+            code="delegate_worker_scope_invalid",
+        ) from None
+    timeout = normalized.get("timeout_seconds")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or not 1 <= timeout <= 3600
+    ):
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker timeout is invalid",
+            code="delegate_worker_timeout_invalid",
+        )
+    budgets = normalized.get("budgets")
+    if not isinstance(budgets, Mapping) or any(
+        key not in _DELEGATE_WORKER_BUDGET_LIMITS
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= _DELEGATE_WORKER_BUDGET_LIMITS[key]
+        for key, value in budgets.items()
+    ):
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker budgets are invalid",
+            code="delegate_worker_budget_invalid",
+        )
+    if any(
+        not isinstance(path, str) or not path or len(path) > 512
+        for path in scope["paths"]
+    ):
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker scope paths are invalid",
+            code="delegate_worker_scope_invalid",
+        )
+    try:
+        expected_caps = (
+            REMOTE_SESSION_CAPABILITIES
+            if kind == "muse"
+            else normalize_cli_capabilities(request.allowed_capabilities)
+        )
+        marker_caps = normalize_cli_capabilities(normalized.get("capabilities")) if kind != "muse" else tuple(normalized.get("capabilities") or ())
+    except CLIDevelopmentSessionInvalid:
+        raise
+    if (
+        not isinstance(normalized.get("capabilities"), list)
+        or tuple(sorted(marker_caps)) != tuple(sorted(expected_caps))
+        or normalized.get("allow_cli_native_tools") is not (kind != "muse")
+        or normalized.get("agent_dialogue_tool_ids") != []
+    ):
+        raise CLIDevelopmentSessionConflict(
+            "managed worker capabilities are invalid",
+            code="delegate_worker_capability_mismatch",
+        )
+    if kind != "muse":
+        requested_cwd = request.working_directory
+        if not requested_cwd or str(Path(requested_cwd).expanduser().resolve()).casefold() != str(canonical_paths[0]).casefold():
+            raise CLIDevelopmentSessionConflict(
+                "managed worker working directory differs from its scope",
+                code="delegate_worker_scope_mismatch",
+            )
+    return normalized
+
+
+def _assert_delegate_worker_receipt(
+    context: Mapping[str, Any], marker: Mapping[str, Any] | None
+) -> None:
+    stored = context.get("delegate_worker")
+    if marker is None and stored is None:
+        return
+    if not isinstance(stored, Mapping) or marker is None or dict(stored) != dict(marker):
+        raise CLIDevelopmentSessionConflict(
+            "session idempotency key has a different managed worker scope",
+            code="delegate_worker_idempotency_conflict",
+        )
+
+
+def _delegate_worker_audit_marker(marker: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Copy only bounded scope proof and limits into Work/Run metadata."""
+
+    if marker is None:
+        return None
+    return {
+        key: copy.deepcopy(marker[key])
+        for key in (
+            "schema_version",
+            "dialogue_id",
+            "kind",
+            "workspace_scope_sha256",
+            "timeout_seconds",
+            "budgets",
+            "allow_cli_native_tools",
+            "capabilities",
+            "agent_dialogue_tool_ids",
+        )
+        if key in marker
+    }
+
+
+def _safe_delegate_worker_usage(value: Any) -> dict[str, int] | None:
+    """Keep only bounded numeric provider usage counters."""
+
+    if not isinstance(value, Mapping):
+        return None
+    allowed = {
+        "input_tokens",
+        "prompt_tokens",
+        "output_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cost_micros",
+        "estimated_cost_micros",
+    }
+    projected: dict[str, int] = {}
+    for key, item in list(value.items())[:32]:
+        normalized_key = str(key).strip().casefold()
+        if (
+            normalized_key in allowed
+            and isinstance(item, int)
+            and not isinstance(item, bool)
+            and 0 <= item <= 10**15
+        ):
+            projected[normalized_key] = item
+    return projected or None
+
+
+def _typed_delegate_worker_limits(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    from .delegate_worker_runtime import DelegateWorkerRunLimits
+
+    if not isinstance(value, DelegateWorkerRunLimits):
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker limits must be an internal marker",
+            code="delegate_worker_limits_invalid",
+        )
+    try:
+        return copy.deepcopy(dict(value.to_dict()))
+    except Exception as exc:
+        raise CLIDevelopmentSessionInvalid(
+            "managed worker limits are invalid",
+            code="delegate_worker_limits_invalid",
+        ) from exc
+
+
+def _validate_delegate_worker_limits(
+    marker: Mapping[str, Any] | None,
+    limits: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if marker is None and limits is None:
+        return None
+    if marker is None or limits is None:
+        raise CLIDevelopmentSessionConflict(
+            "managed worker run limits are missing",
+            code="delegate_worker_limits_mismatch",
+        )
+    budgets = limits.get("budgets")
+    attempt = limits.get("attempt", 1)
+    expected_limit_keys = {
+        "schema_version",
+        "dialogue_id",
+        "workspace_scope_sha256",
+        "budgets",
+        "timeout_seconds",
+        "attempt",
+    }
+    if (
+        not set(limits) <= expected_limit_keys
+        or not {"schema_version", "dialogue_id", "workspace_scope_sha256", "budgets", "timeout_seconds"} <= set(limits)
+        or type(limits.get("schema_version")) is not int
+        or limits.get("schema_version") != 1
+        or str(limits.get("dialogue_id") or "") != str(marker.get("dialogue_id") or "")
+        or str(limits.get("workspace_scope_sha256") or "")
+        != str(marker.get("workspace_scope_sha256") or "")
+        or not isinstance(marker.get("budgets"), Mapping)
+        or not isinstance(budgets, Mapping)
+        or any(
+            not isinstance(key, str)
+            or key not in _DELEGATE_WORKER_BUDGET_LIMITS
+            or type(value) is not int
+            or value < 1
+            for key, value in budgets.items()
+        )
+        or dict(budgets) != dict(marker.get("budgets") or {})
+        or (
+            limits.get("timeout_seconds") is not None
+            and type(limits.get("timeout_seconds")) is not int
+        )
+        or limits.get("timeout_seconds") != marker.get("timeout_seconds")
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or attempt > int((marker.get("budgets") or {}).get("max_attempts", 1))
+    ):
+        raise CLIDevelopmentSessionConflict(
+            "managed worker run limits differ from the fixed session scope",
+            code="delegate_worker_limits_mismatch",
+        )
+    return {"attempt": attempt, **_delegate_worker_audit_marker(marker)}
+
+
 def pinned_cli_capabilities(context: Mapping[str, Any]) -> tuple[str, ...]:
     """Read the ceiling pinned at create time; malformed state fails closed."""
 
@@ -310,6 +964,88 @@ def _sha256(value: str) -> str:
 
 def _json_hash(value: Any) -> str:
     return _sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str))
+
+
+def _safe_delegate_worker_usage_receipt(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    usage: dict[str, Any] = {
+        str(key): max(0, int(item))
+        for key, item in value.items()
+        if str(key)
+        in {
+            "input_tokens",
+            "prompt_tokens",
+            "output_tokens",
+            "completion_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "estimated_cost_micros",
+            "total_tokens",
+            "cost_micros",
+            "budget_overrun_tokens",
+            "budget_overrun_cost_micros",
+        }
+        and isinstance(item, int)
+        and not isinstance(item, bool)
+        and 0 <= item <= 10**15
+    }
+    if isinstance(value.get("available"), bool):
+        usage["available"] = value["available"]
+    provider = value.get("provider")
+    if isinstance(provider, str) and provider in {"muse-remote", "codex-cli", "antigravity-cli", "claude-cli", "grok-cli"}:
+        usage["provider"] = provider
+    reason = value.get("reason")
+    if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{2,63}", reason):
+        usage["reason"] = reason
+    return usage
+
+
+def _safe_delegate_worker_result(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    from .outbound_privacy_service import redact_secret_for_local_display
+
+    result: dict[str, Any] = {}
+    summary = value.get("summary")
+    if isinstance(summary, str):
+        safe_summary = redact_secret_for_local_display(summary[:30_000])
+        result["summary"] = str(safe_summary)[:3_000]
+    diff = value.get("diff")
+    if isinstance(diff, str):
+        safe_diff = redact_secret_for_local_display(diff[:30_000])
+        result["diff"] = str(safe_diff)[:30_000]
+    changed_files = value.get("changed_files")
+    if isinstance(changed_files, (list, tuple)):
+        safe_paths: list[str] = []
+        for item in changed_files[:128]:
+            if not isinstance(item, str) or not item or len(item) > 512:
+                continue
+            path = item.replace("\\", "/")
+            if path.startswith("/") or re.match(r"^[A-Za-z]:", path) or any(part in {"", ".", ".."} for part in path.split("/")):
+                continue
+            safe_paths.append(path)
+        result["changed_files"] = list(dict.fromkeys(safe_paths))
+    artifact_refs = value.get("artifact_refs")
+    if isinstance(artifact_refs, (list, tuple)):
+        result["artifact_refs"] = [
+            item[:512]
+            for item in artifact_refs[:64]
+            if isinstance(item, str) and item and len(item) <= 512
+        ]
+    usage = _safe_delegate_worker_usage_receipt(value.get("usage"))
+    if usage is not None:
+        result["usage"] = usage
+    if isinstance(value.get("change_evidence_available"), bool):
+        result["change_evidence_available"] = value["change_evidence_available"]
+    evidence_status = value.get("change_evidence_status")
+    if evidence_status in {"verified", "read_only", "unverified", "truncated"}:
+        result["change_evidence_status"] = evidence_status
+    return result
 
 
 def _utcnow() -> datetime:
@@ -589,8 +1325,42 @@ def _binding_value(binding: Any, name: str, default: Any = None) -> Any:
     return getattr(binding, name, default)
 
 
+def _muse_chat_route(binding: Any) -> Mapping[str, Any]:
+    """Return the bound AgentRevision Chat route for Muse admission.
+
+    New v2 snapshots may expose ``chat`` directly. Older immutable snapshots
+    use the ``operator`` role, whose v2 mapping is the Chat model role; keep
+    that historical spelling readable while requiring the route itself to be
+    the typed Muse remote route.
+    """
+
+    raw = _binding_value(binding, "route_snapshot")
+    roles = raw.get("roles", raw) if isinstance(raw, Mapping) else {}
+    route = roles.get("chat") if isinstance(roles, Mapping) else None
+    if not isinstance(route, Mapping):
+        route = roles.get("operator") if isinstance(roles, Mapping) else None
+    if (
+        not isinstance(route, Mapping)
+        or str(route.get("provider") or "").strip().casefold() != MUSE_PROVIDER
+        or str(route.get("backend") or "").strip().casefold() != "remote"
+        or route.get("model") not in (None, "", "muse-chat")
+        or route.get("effort") not in (None, "")
+    ):
+        raise CLIDevelopmentSessionConflict(
+            "AgentRevision Chat route is not a Muse remote route",
+            code="agent_route_mismatch",
+        )
+    return {
+        "provider": MUSE_PROVIDER,
+        "model": None,
+        "effort": None,
+        "backend": "remote",
+        "route_source": str(route.get("route_source") or "")[:80],
+    }
+
+
 def _assert_route(binding: Any, *, provider: str, model: str | None, effort: str | None) -> dict[str, Any]:
-    routes = _executable_routes(binding)
+    routes = [_muse_chat_route(binding)] if provider.strip().casefold() == MUSE_PROVIDER else _executable_routes(binding)
     if not routes:
         raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable")
     want = (provider.strip().lower(), str(model or "").strip(), str(effort or "").strip())
@@ -632,62 +1402,17 @@ def _assert_route(binding: Any, *, provider: str, model: str | None, effort: str
         return result
     if key[3] != "cli":
         raise CLIDevelopmentSessionConflict("Agent route is not a CLI route", code="agent_route_backend_mismatch")
-    if _binding_selected_profile(binding) is not None:
-        # Explicit ExecutionProfile: an empty backend is not implied CLI and
-        # the provider must have a registered CLI session adapter.
-        from .agent_model_routing import AgentModelRouteError, assert_registered_route_backend
+    # The pinned P2 role route itself must name a registered CLI adapter.
+    from .agent_model_routing import AgentModelRouteError, assert_registered_route_backend
 
-        raw_backend = declared_backends.get(key, "")
-        declared = "cli" if raw_backend in _CLI_BACKEND_ALIASES else raw_backend
-        try:
-            assert_registered_route_backend(key[0], declared, ingress="cli")
-        except AgentModelRouteError as exc:
-            code = "cli_route_not_supported" if exc.code == "agent_route_provider_unsupported" else exc.code
-            raise CLIDevelopmentSessionConflict("Agent route has no registered CLI adapter", code=code) from None
-    return result
-
-
-def _execution_profile_kwargs(execution_profile_id: Any) -> dict[str, Any]:
-    # Revision-default sessions keep the historical bind call shape.
-    return {} if execution_profile_id is None else {"execution_profile_id": execution_profile_id}
-
-
-def _binding_selected_profile(binding: Any) -> str | None:
-    selection = getattr(binding, "execution_selection", None)
-    if selection is None or not getattr(selection, "is_explicit", False):
-        return None
-    return str(selection.selected_execution_profile_id)
-
-
-def _assert_binding_selection(binding: Any, execution_profile_id: Any) -> None:
-    """The immutable binding must carry exactly the admitted selection."""
-
+    raw_backend = declared_backends.get(key, "")
+    declared = "cli" if not raw_backend or raw_backend in _CLI_BACKEND_ALIASES else raw_backend
     try:
-        selected = _binding_selected_profile(binding)
-    except Exception:
-        raise CLIDevelopmentSessionConflict("Agent execution selection is inconsistent", code="agent_binding_selection_invalid") from None
-    if selected != (str(execution_profile_id) if execution_profile_id is not None else None):
-        raise CLIDevelopmentSessionConflict("Agent execution selection is inconsistent", code="agent_binding_selection_invalid")
-
-
-def _binding_selection_manifest_fields(binding: Any, execution_profile_id: Any) -> dict[str, Any]:
-    """Selection block for a Run manifest; empty for revision defaults.
-
-    An explicit selection replaces the manifest ``route_snapshot`` with the
-    binding's full frozen roles: the selection's ``role_backends`` digest
-    covers every role, so routes, selection and header must come from the
-    same immutable binding (``execution_manifest_route_fields``).
-    """
-
-    _assert_binding_selection(binding, execution_profile_id)
-    if execution_profile_id is None:
-        return {}
-    from .agent_model_routing import execution_manifest_route_fields
-
-    fields = execution_manifest_route_fields(getattr(binding, "route_snapshot", None))
-    if not fields.get("route_snapshot") or fields.get("execution_profile_id") != execution_profile_id:
-        raise CLIDevelopmentSessionConflict("Agent execution selection is inconsistent", code="agent_binding_selection_invalid")
-    return fields
+        assert_registered_route_backend(key[0], declared, ingress="cli")
+    except AgentModelRouteError as exc:
+        code = "cli_route_not_supported" if exc.code == "agent_route_provider_unsupported" else exc.code
+        raise CLIDevelopmentSessionConflict("Agent route has no registered CLI adapter", code=code) from None
+    return result
 
 
 def _decision_allowed(decision: Any) -> bool:
@@ -711,7 +1436,6 @@ class CreateCLIDevelopmentSessionRequest:
     project_id: str | None = None
     permission_mode: str | None = None
     allowed_capabilities: tuple[str, ...] = CLI_DEVELOPMENT_CAPABILITIES
-    execution_profile_id: str | None = None
     role_context_mode: str = "raw"
     execution_target: str | None = None
     provided_fields: frozenset[str] = frozenset()
@@ -720,6 +1444,11 @@ class CreateCLIDevelopmentSessionRequest:
     def from_value(cls, value: Any = None, **kwargs: Any) -> "CreateCLIDevelopmentSessionRequest":
         source = dict(value) if isinstance(value, Mapping) else {}
         source.update(kwargs)
+        if "execution_profile_id" in source:
+            raise CLIDevelopmentSessionInvalid(
+                "execution_profile_id is no longer accepted",
+                code="agent_execution_profile_removed",
+            )
         provided_raw = source.get("_provided_fields")
         provided = (
             frozenset(str(item) for item in provided_raw)
@@ -742,9 +1471,6 @@ class CreateCLIDevelopmentSessionRequest:
                 code="remote_execution_target_mismatch",
             )
         caps = REMOTE_SESSION_CAPABILITIES if remote else normalize_cli_capabilities(source.get("allowed_capabilities"))
-        execution_profile_id = source.get("execution_profile_id")
-        if execution_profile_id is not None and (not isinstance(execution_profile_id, str) or not execution_profile_id):
-            raise CLIDevelopmentSessionInvalid("execution_profile_id is invalid", code="agent_execution_profile_invalid")
         raw_role_context_mode = source.get("role_context_mode")
         role_context_mode = (
             "raw"
@@ -782,7 +1508,6 @@ class CreateCLIDevelopmentSessionRequest:
                 else str(source["permission_mode"]).strip().lower()
             ),
             allowed_capabilities=caps,
-            execution_profile_id=execution_profile_id,
             role_context_mode=role_context_mode,
             execution_target=MUSE_EXECUTION_TARGET if remote else execution_target,
             provided_fields=provided,
@@ -794,6 +1519,7 @@ class SendCLIDevelopmentSessionRequest:
     owner_id: str
     content: str
     send_key: str
+    muse_tool_loop_opt_in: bool = False
 
     @classmethod
     def from_value(cls, value: Any = None, **kwargs: Any) -> "SendCLIDevelopmentSessionRequest":
@@ -801,10 +1527,17 @@ class SendCLIDevelopmentSessionRequest:
         source.update(kwargs)
         if "content" not in source and "raw" in source:
             source["content"] = source["raw"]
+        opt_in = source.get("muse_tool_loop_opt_in", False)
+        if not isinstance(opt_in, bool):
+            raise CLIDevelopmentSessionInvalid(
+                "muse_tool_loop_opt_in must be a boolean",
+                code="muse_tool_loop_opt_in_invalid",
+            )
         return cls(
             owner_id=_identifier(source.get("owner_id", source.get("user_id")), field_name="owner_id"),
             content=_text(source.get("content"), field_name="content", limit=128_000),
             send_key=_text(source.get("send_key", source.get("idempotency_key")), field_name="send_key", limit=512),
+            muse_tool_loop_opt_in=opt_in,
         )
 
 
@@ -888,7 +1621,9 @@ class CLIDevelopmentSessionService:
         agent_service: Any | None = None,
         authority_resolver: Any | None = None,
         clock: Any | None = None,
+        remote_config_supplier: Any | None = None,
     ) -> None:
+        self._remote_config_supplier = remote_config_supplier
         self._db_manager = db_manager
         self.config = config
         self.coordinator = coordinator
@@ -898,6 +1633,7 @@ class CLIDevelopmentSessionService:
         self._clock = clock or _utcnow
         self.remote_adapter: Any | None = None
         self.remote_binding_store: Any | None = None
+        _register_shared_cli_development_session_service(self)
 
     async def _session(self) -> Any:
         manager = self._db_manager
@@ -930,8 +1666,9 @@ class CLIDevelopmentSessionService:
         policy = cli_development_policy(self.config)
         return policy.to_diagnostic(cwd=working_directory, owner_id=owner_id)
 
-    def _remote_target_config(self) -> Mapping[str, Any]:
-        config = self.config
+    def _remote_target_config(self, *, _remote_config_snapshot: Any = None) -> Mapping[str, Any]:
+        # Only trusted internal callers may supply a server-owned snapshot.
+        config = self.config if _remote_config_snapshot is None else _remote_config_snapshot
         if isinstance(config, Mapping):
             section = config.get("remote_targets", {})
             return section.get("muse", {}) if isinstance(section, Mapping) and isinstance(section.get("muse", {}), Mapping) else {}
@@ -944,34 +1681,47 @@ class CLIDevelopmentSessionService:
             return section.get("muse", {}) if isinstance(section, Mapping) and isinstance(section.get("muse", {}), Mapping) else {}
         return {}
 
-    def _get_remote_adapter(self) -> Any:
-        """Return the server-owned Muse adapter used by the shared Work lane."""
+    async def _resolve_remote_config_snapshot(self, explicit: Any = None) -> Any:
+        """Resolve a trusted server snapshot once at an operation boundary."""
+        if explicit is not None:
+            return explicit
+        if self._remote_config_supplier is None:
+            return None
+        value = self._remote_config_supplier()
+        if inspect.isawaitable(value):
+            value = await value
+        if value is None:
+            raise CLIDevelopmentSessionUnavailable(
+                "remote configuration is unavailable", code="remote_config_unavailable"
+            )
+        return value
 
-        if self.remote_adapter is not None:
+    def _get_remote_adapter(self, *, _remote_config_snapshot: Any = None) -> Any:
+        """Build snapshot-bound adapters; retain the startup adapter cache by default."""
+        if _remote_config_snapshot is None and self.remote_adapter is not None:
             return self.remote_adapter
         from .muse_remote_execution import MuseRemoteClient, MuseRemoteExecutionAdapter
 
-        repository_root = Path(__file__).resolve().parents[2]
-        muse_venv = repository_root / ".local" / "tools" / "muse-cli-0.3.2" / "venv"
-        if os.name == "nt":
-            executable = muse_venv / "Scripts" / "muse-cli.exe"
-        else:
-            executable = muse_venv / "bin" / "muse-cli"
-
+        executable = _managed_muse_cli_executable(
+            platform=sys.platform, environ=os.environ, home=Path.home()
+        )
         self.remote_binding_store = self.remote_binding_store or MuseRemoteSessionStore(
             self._db_manager
         )
-        target = self._remote_target_config()
-        self.remote_adapter = MuseRemoteExecutionAdapter(
+        config = self.config if _remote_config_snapshot is None else _remote_config_snapshot
+        target = self._remote_target_config(_remote_config_snapshot=_remote_config_snapshot)
+        adapter = MuseRemoteExecutionAdapter(
             client=MuseRemoteClient(executable=str(executable)),
-            credential_resolver=MuseRemoteTargetResolver(self.config),
+            credential_resolver=MuseRemoteTargetResolver(config),
             binding_store=self.remote_binding_store,
-            privacy_gateway=MuseRemotePrivacyGateway(self.config),
+            privacy_gateway=MuseRemotePrivacyGateway(config),
             wait_seconds=target.get("wait_seconds", 30.0),
             reconcile_timeout_seconds=target.get("reconcile_timeout_seconds", 120.0),
             poll_interval_seconds=target.get("poll_interval_seconds", 2.0),
         )
-        return self.remote_adapter
+        if _remote_config_snapshot is None:
+            self.remote_adapter = adapter
+        return adapter
 
     @staticmethod
     def _remote_allowlisted(value: str, raw: Any) -> bool:
@@ -983,8 +1733,10 @@ class CLIDevelopmentSessionService:
             values = []
         return bool(values) and value in {str(item).strip() for item in values if str(item).strip()}
 
-    def _assert_remote_admission(self, *, owner_id: str, agent_id: str) -> Mapping[str, Any]:
-        target = self._remote_target_config()
+    def _assert_remote_admission(
+        self, *, owner_id: str, agent_id: str, _remote_config_snapshot: Any = None
+    ) -> Mapping[str, Any]:
+        target = self._remote_target_config(_remote_config_snapshot=_remote_config_snapshot)
         if not bool(target.get("enabled") is True or str(target.get("enabled") or "").strip().lower() in {"1", "true", "yes", "on"}):
             raise CLIDevelopmentSessionUnavailable("Muse remote target is disabled", code="remote_target_disabled")
         try:
@@ -1091,10 +1843,15 @@ class CLIDevelopmentSessionService:
         revision_id: str,
         project_id: str | None,
         capabilities: Iterable[str],
+        managed_backend: bool = False,
     ) -> dict[str, Any]:
         decisions: dict[str, Any] = {}
         for capability in tuple(dict.fromkeys(str(item).strip() for item in capabilities if str(item).strip())):
             try:
+                backend_options = (
+                    {"_backend_execution_without_agent_tools": True}
+                    if managed_backend else {}
+                )
                 decision = await self.authority_resolver.resolve(
                     agent_id=agent_id,
                     revision_id=revision_id,
@@ -1102,6 +1859,7 @@ class CLIDevelopmentSessionService:
                     required_capability=capability,
                     tool_capabilities=tuple(capabilities),
                     harness_capabilities=tuple(capabilities),
+                    **backend_options,
                 )
             except Exception as exc:
                 raise CLIDevelopmentSessionUnavailable("Agent authority is unavailable", code="agent_authority_unavailable") from exc
@@ -1110,6 +1868,42 @@ class CLIDevelopmentSessionService:
                 reason = getattr(decision, "reason", None) or decisions[capability].get("reason") or "agent_authority_denied"
                 raise CLIDevelopmentSessionForbidden("Agent authority denied", code=f"agent_authority_{str(reason)[:80]}")
         return decisions
+
+    async def _verified_managed_backend(self, db: Any, row: Any, context: Mapping[str, Any]) -> bool:
+        marker = context.get("delegate_worker")
+        if marker is None:
+            return False
+        if not isinstance(marker, Mapping) or _safe_uuid(marker.get("dialogue_id")) is None:
+            raise CLIDevelopmentSessionForbidden("managed worker marker is invalid", code="delegate_worker_context_invalid")
+        from ..memory.models import AgentDialogue
+        from .delegate_worker_runtime import DelegateWorkerRuntime
+
+        try:
+            verified = await DelegateWorkerRuntime(cli_session_service=self, config=self.config)._validate_dialogue_session(
+                str(row.id), str(marker["dialogue_id"]), owner_id=str(row.user_id), _db_session=db,
+            )
+            dialogue = await db.get(AgentDialogue, uuid.UUID(str(marker["dialogue_id"])))
+            if (
+                any(marker.get(key) != verified.get(key) for key in (
+                    "dialogue_id", "kind", "workspace_scope", "workspace_scope_sha256",
+                    "timeout_seconds", "budgets", "owner_id", "agent_id", "agent_revision_id",
+                    "allow_cli_native_tools",
+                ))
+                or str(dialogue.project_id or "") != str(context.get("project_id") or "")
+                or str(marker.get("agent_id") or "") != str(context.get("agent_id") or row.agent_id or "")
+                or str(marker.get("agent_revision_id") or "") != str(context.get("agent_revision_id") or "")
+                or sorted(marker.get("capabilities") or []) != sorted(
+                    REMOTE_SESSION_CAPABILITIES
+                    if context.get("provider") == MUSE_PROVIDER
+                    and context.get("allowed_capabilities") == list(REMOTE_SESSION_CAPABILITIES)
+                    else pinned_cli_capabilities(context)
+                )
+                or marker.get("agent_dialogue_tool_ids") != []
+            ):
+                raise ValueError("managed worker binding mismatch")
+        except Exception as exc:
+            raise CLIDevelopmentSessionForbidden("managed worker binding is invalid", code="delegate_worker_dialogue_binding_invalid") from exc
+        return True
 
     @staticmethod
     def _session_identity(owner_id: str, idempotency_key: str) -> uuid.UUID:
@@ -1148,10 +1942,6 @@ class CLIDevelopmentSessionService:
         }
         if request.provider == MUSE_PROVIDER:
             material["execution_target"] = request.execution_target or MUSE_EXECUTION_TARGET
-        if request.execution_profile_id is not None:
-            # Only an explicit runtime selection joins the identity; omitted
-            # keeps every historical fingerprint byte-identical.
-            material["execution_profile_id"] = request.execution_profile_id
         if request.agent_revision_id is not None:
             # Exact-revision callers opt into a new identity component;
             # raw/legacy callers keep their historical request shape.
@@ -1322,6 +2112,36 @@ class CLIDevelopmentSessionService:
         )
         turn_status = run_result.get("turn_status") or work_result.get("turn_status")
         delivery = run_result.get("delivery") or work_result.get("delivery")
+        artifact_complete = run_result.get("assistant_artifact_complete")
+        if not isinstance(artifact_complete, bool):
+            artifact_complete = work_result.get("assistant_artifact_complete")
+        raw_observation = run_result.get("muse_tool_loop_history_observation")
+        observation_fields = (
+            "schema_version",
+            "status",
+            "run_id",
+            "work_item_id",
+            "binding_id",
+            "binding_snapshot_hash",
+            "turn_nonce_sha256",
+            "provider_assistant_message_id",
+            "assistant_text_sha256",
+            "assistant_text_length",
+            "tool_dispatch",
+            "tool_receipts",
+            "work_budget",
+            "observed_at",
+        )
+        observation = (
+            {
+                key: raw_observation[key]
+                for key in observation_fields
+                if key in raw_observation
+            }
+            if isinstance(raw_observation, Mapping)
+            and raw_observation.get("status") == "tool_loop_recovery_required"
+            else None
+        )
         return {
             "execution_target": MUSE_EXECUTION_TARGET,
             "local_filesystem": False,
@@ -1332,6 +2152,693 @@ class CLIDevelopmentSessionService:
                 else None
             ),
             "delivery": dict(delivery) if isinstance(delivery, Mapping) else None,
+            "assistant_artifact_complete": (
+                artifact_complete if isinstance(artifact_complete, bool) else None
+            ),
+            "history_observation": observation,
+        }
+
+    @staticmethod
+    def _remote_cli_failure_projection(
+        *, row: Any, run: Any | None, work: Any | None,
+        context: Mapping[str, Any], owner_id: str,
+    ) -> dict[str, Any] | None:
+        """Return cause labels only after the complete remote record tuple matches."""
+
+        if (
+            run is None
+            or work is None
+            or str(context.get("provider") or "").strip().lower() != MUSE_PROVIDER
+        ):
+            return None
+        session_id = str(getattr(row, "id", "") or "")
+        run_id = str(getattr(run, "id", "") or "")
+        work_id = str(getattr(work, "id", "") or "")
+        agent_id = str(context.get("agent_id") or "")
+        revision_id = str(context.get("agent_revision_id") or "")
+        binding_id = str(context.get("binding_id") or "")
+        binding_hash = str(context.get("binding_snapshot_hash") or "")
+        run_metadata = getattr(run, "run_metadata", None)
+        run_metadata = run_metadata if isinstance(run_metadata, Mapping) else {}
+        cli_metadata = run_metadata.get("cli_development")
+        cli_metadata = cli_metadata if isinstance(cli_metadata, Mapping) else {}
+        work_metadata = getattr(work, "metadata_json", None)
+        work_metadata = work_metadata if isinstance(work_metadata, Mapping) else {}
+        row_context = getattr(row, "context", None)
+        row_context = row_context if isinstance(row_context, Mapping) else {}
+        remote_context = row_context.get(MUSE_REMOTE_CONTEXT_KEY)
+        remote_binding = (
+            remote_context.get("binding")
+            if isinstance(remote_context, Mapping)
+            and isinstance(remote_context.get("binding"), Mapping)
+            else remote_context
+        )
+        if not isinstance(remote_binding, Mapping):
+            return None
+
+        # The IDs are checked here but are never copied into ``cli_failure``.
+        if (
+            not all((session_id, run_id, work_id, agent_id, revision_id, binding_id, binding_hash))
+            or str(getattr(row, "user_id", "") or "") != owner_id
+            or str(context.get("owner_id") or "") != owner_id
+            or str(getattr(run, "user_id", "") or "") != owner_id
+            or str(work_metadata.get("owner_id") or "") != owner_id
+            or str(getattr(row, "agent_id", "") or "") != agent_id
+            or str(getattr(run, "session_id", "") or "") != session_id
+            or str(getattr(run, "work_item_id", "") or "") != work_id
+            or str(getattr(run, "run_type", "") or "") != REMOTE_SESSION_SOURCE_TYPE
+            or str(getattr(run, "agent_id", "") or "") != agent_id
+            or str(getattr(run, "agent_revision_id", "") or "") != revision_id
+            or str(getattr(work, "conversation_session_id", "") or "") != session_id
+            or str(getattr(work, "source_id", "") or "") != run_id
+            or str(getattr(work, "source_revision", "") or "") != revision_id
+            or str(getattr(work, "source_type", "") or "") != REMOTE_SESSION_SOURCE_TYPE
+            or str(getattr(work, "execution_adapter", "") or "") != MUSE_REMOTE_ADAPTER_KEY
+            or str(getattr(work, "assigned_agent_id", "") or "") != agent_id
+            or str(getattr(work, "agent_revision_id", "") or "") != revision_id
+            or str(work_metadata.get("binding_id") or "") != binding_id
+            or str(work_metadata.get("binding_snapshot_hash") or "") != binding_hash
+            or str(work_metadata.get("remote_target_key") or "") != session_id
+            or str(cli_metadata.get("binding_id") or "") != binding_id
+            or str(cli_metadata.get("binding_snapshot_hash") or "") != binding_hash
+            or str(cli_metadata.get("remote_target_key") or "") != session_id
+            or str(remote_binding.get("owner_id") or "") != owner_id
+            or str(remote_binding.get("agent_id") or "") != agent_id
+            or str(remote_binding.get("revision_id") or "") != revision_id
+            or str(remote_binding.get("remote_target_key") or "") != session_id
+        ):
+            return None
+
+        run_result = getattr(run, "result", None)
+        run_result = run_result if isinstance(run_result, Mapping) else {}
+        work_result = getattr(work, "result_summary_json", None)
+        work_result = work_result if isinstance(work_result, Mapping) else {}
+        run_cause = sanitize_cause(run_result.get("cause"))
+        work_cause = sanitize_cause(work_result.get("cause"))
+        if run_cause is not None and work_cause is not None and run_cause != work_cause:
+            return None
+        cause = run_cause or work_cause
+        if cause is None:
+            return None
+        command = cause.get("command")
+        if command is None:
+            return None
+        bound_run_id = str(remote_binding.get("current_run_id") or "")
+        run_status = str(getattr(run, "status", "") or "")
+        work_state = str(getattr(work, "state", "") or "")
+        outcome_classification = str(getattr(work, "outcome_classification", "") or "")
+        unsafe_failure = (
+            run_status == "failed"
+            and work_state in {"blocked", "uncertain", "failed", "dead_letter"}
+            and outcome_classification != "succeeded"
+            and str(remote_binding.get("state") or "") == "unsafe"
+            and remote_binding.get("safe_to_send") is False
+        )
+        retryable_history_failure = (
+            run_status == "failed"
+            and work_state in {"retry_wait", "dead_letter"}
+            and outcome_classification == "transient"
+            and command == "history"
+            and str(remote_binding.get("state") or "") == "bound"
+            and remote_binding.get("safe_to_send") is True
+            and not bound_run_id
+        )
+        if not (unsafe_failure or retryable_history_failure):
+            return None
+        if command == "send" and bound_run_id != run_id:
+            return None
+        if bound_run_id and bound_run_id != run_id:
+            return None
+
+        return {
+            "classification": "cli_failure",
+            "cause_code": cause.get("cause_code"),
+            "command": command,
+            "stderr_class": cause.get("stderr_class"),
+            "stage": cause.get("stage"),
+            "phase_class": cause.get("phase_class"),
+            "exception_type": cause.get("exception_type") or cause.get("cause_type"),
+            "returncode": cause.get("returncode"),
+            "duration_ms": cause.get("duration_ms"),
+            "curl_code": cause.get("curl_code"),
+            "http_status": cause.get("http_status"),
+            "gateway_status": cause.get("gateway_status"),
+            "timed_out": cause.get("timed_out"),
+        }
+
+    @staticmethod
+    def _sanitize_cause_in_result_projection(value: Any, *, result_key: str) -> Any:
+        """Sanitize bounded Muse failure evidence in a copied result projection."""
+
+        if not isinstance(value, Mapping):
+            return value
+        projection = dict(value)
+        result = projection.get(result_key)
+        if isinstance(result, Mapping) and (
+            "cause" in result or "cli_failure_diagnostic" in result
+        ):
+            safe_result = dict(result)
+            if "cause" in safe_result:
+                cause = sanitize_cause(safe_result.get("cause"))
+                if cause is None:
+                    safe_result.pop("cause", None)
+                else:
+                    safe_result["cause"] = cause
+            if "cli_failure_diagnostic" in safe_result:
+                diagnostic = sanitize_cli_failure_diagnostic(
+                    safe_result.get("cli_failure_diagnostic")
+                )
+                if diagnostic is None:
+                    safe_result.pop("cli_failure_diagnostic", None)
+                else:
+                    safe_result["cli_failure_diagnostic"] = diagnostic
+            projection[result_key] = safe_result
+        return projection
+
+    @staticmethod
+    def _muse_authorized_scope_store() -> Any | None:
+        """Resolve the server-owned Muse scope store without accepting caller input.
+
+        The approval store is deliberately looked up by the service boundary so
+        both the coordinator callback and the read-only status projection use
+        the same owner-bound source.  A missing store is a fail-closed
+        condition; it never turns an authorized request into the QA default.
+        """
+
+        for module_name in ("muse_authorized_scope", "muse_authorized_scope_store"):
+            try:
+                module = importlib.import_module(f".{module_name}", __package__)
+                factory = getattr(module, "MuseAuthorizedScopeStore", None)
+                if callable(factory):
+                    return factory()
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    async def _read_active_muse_authorized_scope(
+        cls,
+        session: Any,
+        identity: Any,
+        *,
+        session_id: str | None = None,
+        binding_id: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Read one active approved scope from the server-owned store.
+
+        ``identity`` is created from the immutable Agent binding by the caller;
+        this method does not inspect model text, request bodies, or a user
+        supplied workspace.  Store errors and malformed values fail closed.
+        """
+
+        if identity is None:
+            return None
+        if not session_id or not binding_id:
+            raise RuntimeError("muse_authorized_scope_context_unavailable")
+        store = cls._muse_authorized_scope_store()
+        if store is None:
+            raise RuntimeError("muse_authorized_scope_store_unavailable")
+        reader = getattr(store, "read_active_for_identity", None)
+        if not callable(reader):
+            raise RuntimeError("muse_authorized_scope_reader_unavailable")
+        value = reader(
+            session,
+            identity,
+            session_id=session_id,
+            binding_id=binding_id,
+        )
+        if inspect.isawaitable(value):
+            value = await value
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise TypeError("muse_authorized_scope_record_invalid")
+        return dict(value)
+
+    async def _muse_authorized_scope_for_context(
+        self,
+        session: Any,
+        *,
+        context: Mapping[str, Any],
+        owner_id: str,
+        session_id: str,
+        binding_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Resolve the active approved scope using only the immutable context."""
+
+        try:
+            from .cli_session_work_adapter import muse_authorized_scope_identity
+
+            identity = muse_authorized_scope_identity(
+                owner_id=owner_id,
+                agent_id=str(context.get("agent_id") or ""),
+                revision_id=str(context.get("agent_revision_id") or ""),
+                binding_snapshot_hash=str(context.get("binding_snapshot_hash") or ""),
+            )
+        except Exception:
+            return None
+        try:
+            return await self._read_active_muse_authorized_scope(
+                session,
+                identity,
+                session_id=session_id,
+                binding_id=binding_id,
+            )
+        except Exception:
+            # Status projection is read-only and may omit diagnostics when the
+            # approval store is unavailable.  The execution callback uses the
+            # same helper directly, so it still blocks instead of falling back
+            # to the QA scope.
+            return None
+
+    def _muse_tool_loop_diagnostics(
+        self,
+        *,
+        row: Any,
+        run: Any | None,
+        work: Any | None,
+        context: Mapping[str, Any],
+        owner_id: str,
+        authorized_scope_record: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Flatten owner/run-scoped Muse receipt facts without exposing output.
+
+        QA diagnostics keep their fixed repository scope.  Authorized
+        diagnostics reconstruct the workspace and tool allowlist only from the
+        active server-owned scope record and require its persisted id/digest to
+        match the exact plan receipt.
+        """
+
+        if (
+            run is None
+            or work is None
+            or not self._is_remote_context(context)
+            or str(context.get("provider") or "").strip().lower() != MUSE_PROVIDER
+        ):
+            return None
+        session_id = str(getattr(row, "id", "") or "")
+        run_id = str(getattr(run, "id", "") or "")
+        work_id = str(getattr(work, "id", "") or "")
+        agent_id = str(context.get("agent_id") or getattr(row, "agent_id", "") or "")
+        revision_id = str(context.get("agent_revision_id") or "")
+        binding_id = str(context.get("binding_id") or "")
+        binding_snapshot_hash = str(context.get("binding_snapshot_hash") or "")
+        if (
+            not all((session_id, run_id, work_id, agent_id, revision_id, binding_id, binding_snapshot_hash))
+            or str(getattr(row, "user_id", "") or "") != owner_id
+            or str(getattr(run, "user_id", "") or "") != owner_id
+            or str(getattr(run, "session_id", "") or "") != session_id
+            or str(getattr(run, "work_item_id", "") or "") != work_id
+            or str(getattr(run, "run_type", "") or "") != REMOTE_SESSION_SOURCE_TYPE
+            or str(getattr(work, "conversation_session_id", "") or "") != session_id
+            or str(getattr(work, "source_id", "") or "") != run_id
+            or str(getattr(work, "source_type", "") or "") != REMOTE_SESSION_SOURCE_TYPE
+            or str(getattr(work, "execution_adapter", "") or "") != MUSE_REMOTE_ADAPTER_KEY
+            or str(getattr(work, "assigned_agent_id", "") or "") != agent_id
+            or str(getattr(work, "agent_revision_id", "") or "") != revision_id
+        ):
+            return None
+
+        run_metadata = getattr(run, "run_metadata", None)
+        run_metadata = run_metadata if isinstance(run_metadata, Mapping) else {}
+        cli_metadata = run_metadata.get("cli_development")
+        cli_metadata = cli_metadata if isinstance(cli_metadata, Mapping) else {}
+        work_metadata = getattr(work, "metadata_json", None)
+        work_metadata = work_metadata if isinstance(work_metadata, Mapping) else {}
+        if (
+            work_metadata.get("owner_id") != owner_id
+            or _matching_muse_tool_loop_opt_in(work_metadata, cli_metadata) is not True
+            or str(work_metadata.get("binding_id") or "") != binding_id
+            or str(work_metadata.get("binding_snapshot_hash") or "") != binding_snapshot_hash
+            or str(cli_metadata.get("binding_id") or "") != binding_id
+            or str(cli_metadata.get("binding_snapshot_hash") or "") != binding_snapshot_hash
+        ):
+            return None
+
+        summary = getattr(work, "result_summary_json", None)
+        summary = summary if isinstance(summary, Mapping) else {}
+        plan_receipt = summary.get("muse_tool_loop_scope")
+        work_loop_summary = summary.get("muse_tool_loop")
+        if not isinstance(plan_receipt, Mapping):
+            return None
+        known_tools = frozenset({"read_file", "edit_file", "execute_command"})
+
+        def valid_loop_receipt_count(candidate: Any) -> int:
+            if not isinstance(candidate, Mapping):
+                return 0
+            receipts = candidate.get("receipts")
+            if not isinstance(receipts, list):
+                return 0
+            return sum(
+                1
+                for item in receipts
+                if isinstance(item, Mapping)
+                and isinstance(item.get("operation_id"), str)
+                and re.fullmatch(r"[a-f0-9]{64}", item["operation_id"])
+                and item.get("tool") in known_tools
+            )
+
+        loop_summary = work_loop_summary if isinstance(work_loop_summary, Mapping) else {}
+        loop_receipt_source = "work_summary" if isinstance(work_loop_summary, Mapping) else None
+        run_result = getattr(run, "result", None)
+        run_result = run_result if isinstance(run_result, Mapping) else {}
+        run_loop_summary = run_result.get("muse_tool_loop")
+        if isinstance(run_loop_summary, Mapping):
+            summaries_match = True
+            if isinstance(work_loop_summary, Mapping):
+                summaries_match = all(
+                    work_loop_summary.get(key) is None
+                    or run_loop_summary.get(key) is None
+                    or work_loop_summary.get(key) == run_loop_summary.get(key)
+                    for key in ("status", "error_code", "round_count", "tool_call_count")
+                )
+            if (
+                summaries_match
+                and valid_loop_receipt_count(run_loop_summary)
+                > valid_loop_receipt_count(work_loop_summary)
+            ):
+                # AgentWorkItem's generic safe JSON projection is depth capped;
+                # nested receipts can become empty objects. AgentRun.result is
+                # bound to this exact owner/session/run/work tuple above and
+                # retains the adapter's bounded loop receipt summary.
+                loop_summary = run_loop_summary
+                loop_receipt_source = "run_result"
+        loop_summary_present = loop_receipt_source is not None
+        raw_tools = plan_receipt.get("allowed_tools")
+        if not isinstance(raw_tools, (list, tuple, set, frozenset)):
+            return None
+
+        mode = plan_receipt.get("mode")
+        authorized_scope = None
+        if mode == "qa_default":
+            expected_tools = known_tools
+            if (
+                plan_receipt.get("authorized_scope") != "unconfigured"
+                or frozenset(raw_tools) != expected_tools
+            ):
+                return None
+        elif mode == "authorized_scope":
+            if plan_receipt.get("authorized_scope") != "authorized" or authorized_scope_record is None:
+                return None
+            try:
+                from .cli_session_work_adapter import muse_authorized_scope_identity
+                from .muse_authorized_scope import build_muse_authorized_scope
+
+                identity = muse_authorized_scope_identity(
+                    owner_id=owner_id,
+                    agent_id=agent_id,
+                    revision_id=revision_id,
+                    binding_snapshot_hash=binding_snapshot_hash,
+                )
+                if identity is None:
+                    return None
+                authorized_scope = build_muse_authorized_scope(
+                    authorized_scope_record,
+                    expected_identity=identity,
+                )
+            except Exception:
+                return None
+            expected_tools = frozenset(authorized_scope.allowed_tools)
+            if (
+                not expected_tools
+                or not expected_tools.issubset(known_tools)
+                or frozenset(raw_tools) != expected_tools
+                or plan_receipt.get("authorized_scope_id") != authorized_scope.scope_id
+                or plan_receipt.get("authorized_scope_digest") != authorized_scope.digest
+            ):
+                return None
+        else:
+            return None
+
+        try:
+            from .cli_session_work_adapter import _muse_base_authority_revision
+            from .muse_scoped_tool_execution import (
+                MuseToolExecutionScope,
+                read_muse_tool_receipt_diagnostics,
+            )
+
+            managed_repository_root = Path(
+                getattr(self, "_muse_tool_loop_repository_root", None)
+                or Path(__file__).resolve().parents[2]
+            ).resolve(strict=True)
+            repository_root = (
+                authorized_scope.workspace_root
+                if authorized_scope is not None else managed_repository_root
+            )
+            authority_revision = _muse_base_authority_revision(
+                owner_id=owner_id,
+                agent_id=agent_id,
+                revision_id=revision_id,
+                session_id=session_id,
+                run_id=run_id,
+                binding_id=binding_id,
+                binding_snapshot_hash=binding_snapshot_hash,
+                allowed_tools=expected_tools,
+            )
+            if authorized_scope is not None:
+                from .muse_authorized_scope import build_muse_authorized_execution_scope
+
+                scope = build_muse_authorized_execution_scope(
+                    authorized_scope,
+                    session_id=session_id,
+                    run_id=run_id,
+                    base_authority_revision=authority_revision,
+                )
+            else:
+                scope = MuseToolExecutionScope(
+                    owner_id=owner_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    workspace_root=repository_root,
+                    allowed_tools=expected_tools,
+                    authority_revision=authority_revision,
+                )
+            from .muse_journal_path import _ready_muse_journal
+
+            journal_path = _ready_muse_journal(repository_root, managed_repository_root=managed_repository_root)
+            executor = read_muse_tool_receipt_diagnostics(
+                journal_path, scope, expected_internal_journal_path=journal_path,
+            )
+        except Exception:
+            executor = {"status": "journal_unavailable", "receipts": []}
+
+        raw_loop_receipts = loop_summary.get("receipts")
+        loop_receipts = raw_loop_receipts if isinstance(raw_loop_receipts, list) else []
+        loop_by_id = {
+            item["operation_id"]: item
+            for item in loop_receipts
+            if isinstance(item, Mapping)
+            and isinstance(item.get("operation_id"), str)
+            and re.fullmatch(r"[a-f0-9]{64}", item["operation_id"])
+            and item.get("tool") in expected_tools
+        }
+        raw_executor_receipts = executor.get("receipts")
+        executor_receipts = raw_executor_receipts if isinstance(raw_executor_receipts, list) else []
+        executor_by_id = {
+            item["operation_id"]: item
+            for item in executor_receipts
+            if isinstance(item, Mapping)
+            and isinstance(item.get("operation_id"), str)
+            and item.get("tool") in expected_tools
+        }
+        operations: list[dict[str, Any]] = []
+        operation_ids = list(loop_by_id)
+        operation_ids.extend(operation_id for operation_id in executor_by_id if operation_id not in loop_by_id)
+        for operation_id in operation_ids[:32]:
+            loop_receipt = loop_by_id.get(operation_id)
+            executor_receipt = executor_by_id.get(operation_id)
+            if loop_receipt is not None and executor_receipt is not None:
+                loop_call_hash = loop_receipt.get("call_id_sha256")
+                executor_call_hash = executor_receipt.get("call_id_sha256")
+                if (
+                    loop_receipt.get("tool") != executor_receipt.get("tool")
+                    or loop_receipt.get("status") != executor_receipt.get("status")
+                    or (
+                        isinstance(loop_call_hash, str)
+                        and isinstance(executor_call_hash, str)
+                        and loop_call_hash != executor_call_hash
+                    )
+                ):
+                    correlation = "receipt_mismatch"
+                elif isinstance(loop_call_hash, str) and isinstance(executor_call_hash, str):
+                    correlation = "matched"
+                else:
+                    correlation = "operation_id_matched_call_id_digest_missing"
+            elif loop_receipt is not None:
+                correlation = "loop_receipt_only"
+            else:
+                correlation = "executor_receipt_only"
+
+            executor_state = executor_receipt.get("state") if executor_receipt else None
+            executed = executor_receipt.get("executed") if executor_receipt else None
+            return_code = (
+                executor_receipt.get("command_return_code")
+                if executor_receipt and type(executor_receipt.get("command_return_code")) is int
+                else None
+            )
+            if executor_receipt is None:
+                execution_evidence = "receipt_missing"
+            elif executor_state in {"admitted", "aborted"}:
+                execution_evidence = "not_dispatched"
+            elif executor_state in {"started", "uncertain"}:
+                execution_evidence = "dispatch_unconfirmed"
+            elif executor_state == "completed" and executed is False:
+                execution_evidence = "router_completed_without_execution"
+            elif executor_state == "completed" and (loop_receipt or executor_receipt).get("tool") == "execute_command" and executor_receipt.get("command_timed_out") is True:
+                execution_evidence = "command_timed_out"
+            elif executor_state == "completed" and (loop_receipt or executor_receipt).get("tool") == "execute_command" and return_code is None:
+                execution_evidence = "child_return_code_unknown"
+            elif executor_state == "completed" and (loop_receipt or executor_receipt).get("tool") == "execute_command":
+                execution_evidence = "child_completed"
+            elif executor_state == "completed" and executed is True:
+                execution_evidence = "tool_completed"
+            else:
+                execution_evidence = "unknown"
+
+            operations.append(
+                {
+                    "operation_id": operation_id,
+                    "call_id_sha256": (
+                        loop_receipt.get("call_id_sha256")
+                        if loop_receipt
+                        and isinstance(loop_receipt.get("call_id_sha256"), str)
+                        and re.fullmatch(r"[a-f0-9]{64}", loop_receipt["call_id_sha256"])
+                        else None
+                    ),
+                    "executor_call_id_sha256": (
+                        executor_receipt.get("call_id_sha256") if executor_receipt else None
+                    ),
+                    "tool": (loop_receipt or executor_receipt).get("tool"),
+                    "correlation": correlation,
+                    "execution_evidence": execution_evidence,
+                    "loop_status": (
+                        loop_receipt.get("status")
+                        if loop_receipt and loop_receipt.get("status") in {
+                            "completed", "rejected", "cancelled", "conflict", "fenced", "uncertain"
+                        }
+                        else None
+                    ),
+                    "loop_success": (
+                        loop_receipt.get("success")
+                        if loop_receipt and isinstance(loop_receipt.get("success"), bool)
+                        else None
+                    ),
+                    "loop_executed": (
+                        loop_receipt.get("executed")
+                        if loop_receipt and isinstance(loop_receipt.get("executed"), bool)
+                        else None
+                    ),
+                    "mutation_epoch": (
+                        loop_receipt.get("mutation_epoch")
+                        if loop_receipt
+                        and isinstance(loop_receipt.get("mutation_epoch"), int)
+                        and not isinstance(loop_receipt.get("mutation_epoch"), bool)
+                        else None
+                    ),
+                    "executor_state": executor_state,
+                    "executor_status": executor_receipt.get("status") if executor_receipt else None,
+                    "executor_success": executor_receipt.get("success") if executor_receipt else None,
+                    "executor_executed": executed,
+                    "blocked_reason": (
+                        executor_receipt.get("blocked_reason")[:300]
+                        if executor_receipt
+                        and isinstance(executor_receipt.get("blocked_reason"), str)
+                        else None
+                    ),
+                    "output_truncated": executor_receipt.get("output_truncated") if executor_receipt else None,
+                    "error_truncated": executor_receipt.get("error_truncated") if executor_receipt else None,
+                    "admitted_at": executor_receipt.get("admitted_at") if executor_receipt else None,
+                    "started_at": executor_receipt.get("started_at") if executor_receipt else None,
+                    "operation_updated_at": executor_receipt.get("operation_updated_at") if executor_receipt else None,
+                    "receipt_terminal_at": (
+                        executor_receipt.get("operation_updated_at")
+                        if executor_receipt and executor_state in {"completed", "uncertain", "aborted"}
+                        else None
+                    ),
+                    "command_return_code": return_code,
+                    "command_timed_out": executor_receipt.get("command_timed_out") if executor_receipt else None,
+                    "receipt_present": executor_receipt is not None,
+                }
+            )
+
+        loop_status = loop_summary.get("status")
+        if loop_status not in {"running", "completed", "rejected", "uncertain", "cancelled", "exhausted"}:
+            loop_status = None
+        error_code = loop_summary.get("error_code")
+        if not isinstance(error_code, str) or not re.fullmatch(r"[a-z0-9_]{1,128}", error_code):
+            error_code = None
+        successful_tools = {
+            item.get("tool")
+            for item in operations
+            if item.get("correlation") == "matched"
+            and item.get("loop_success") is True
+            and item.get("loop_executed") is True
+            and item.get("executor_success") is True
+            and item.get("executor_executed") is True
+            and item.get("output_truncated") is False
+            and item.get("error_truncated") is False
+            and item.get("tool") in expected_tools
+        }
+        edit_epochs = [
+            item.get("mutation_epoch")
+            for item in operations
+            if item.get("correlation") == "matched"
+            and item.get("tool") == "edit_file"
+            and item.get("loop_success") is True
+            and item.get("loop_executed") is True
+            and item.get("executor_success") is True
+            and item.get("executor_executed") is True
+            and type(item.get("mutation_epoch")) is int
+        ]
+        latest_mutation_epoch = max(edit_epochs) if edit_epochs else None
+        command_operations = [item for item in operations if item.get("tool") == "execute_command"]
+        verification = command_operations[-1] if command_operations else None
+        verification_epoch = verification.get("mutation_epoch") if verification else None
+        if not loop_summary_present:
+            requirements = "loop_summary_missing"
+        elif not expected_tools.issubset(successful_tools):
+            requirements = "required_tool_success_missing"
+        elif verification is None:
+            requirements = "verification_receipt_missing"
+        elif verification.get("command_timed_out") is True:
+            requirements = "command_timed_out"
+        elif verification.get("command_return_code") is None:
+            requirements = "command_return_code_unknown"
+        elif verification["command_return_code"] != 0:
+            requirements = "command_nonzero_exit"
+        elif verification.get("correlation") != "matched":
+            requirements = "receipt_mapping_mismatch"
+        elif verification.get("executor_executed") is not True or verification.get("output_truncated") is True or verification.get("error_truncated") is True:
+            requirements = "verification_receipt_incomplete"
+        elif latest_mutation_epoch is not None and verification_epoch != latest_mutation_epoch:
+            requirements = "test_epoch_mismatch"
+        else:
+            requirements = "required_evidence_present"
+
+        round_count = loop_summary.get("round_count")
+        if isinstance(round_count, bool) or not isinstance(round_count, int) or round_count < 0:
+            round_count = None
+        tool_call_count = loop_summary.get("tool_call_count")
+        if isinstance(tool_call_count, bool) or not isinstance(tool_call_count, int) or tool_call_count < 0:
+            tool_call_count = None
+        return {
+            "schema_version": 1,
+            "status": executor.get("status") or "unavailable",
+            "run_id": run_id,
+            "session_id": session_id,
+            "work_item_id": work_id,
+            "loop_status": loop_status,
+            "error_code": error_code,
+            "loop_receipt_source": loop_receipt_source,
+            "loop_summary_present": loop_summary_present,
+            "round_count": round_count,
+            "tool_call_count": tool_call_count,
+            "successful_tools": sorted(successful_tools),
+            "executor_journal_status": executor.get("status") or "unavailable",
+            "latest_mutation_epoch": latest_mutation_epoch,
+            "verification_epoch": verification_epoch,
+            "requirements_diagnosis": requirements,
+            "operations": operations,
         }
 
     async def _binding_for_row(self, session: Any, row: Any) -> Any:
@@ -1355,6 +2862,105 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
         return AgentExecutionBindingSnapshot.from_row(binding)
 
+    async def _resolve_remote_backend_execution(
+        self, db: Any, row: Any, context: Mapping[str, Any], *, _remote_config_snapshot: Any = None
+    ) -> dict[str, Any]:
+        """Authorize only the persisted, owned canonical Muse backend route."""
+        agent_id = str(context.get("agent_id") or "")
+        revision_id = str(context.get("agent_revision_id") or "")
+        if (
+            context != self._context(row)
+            or context.get("provider") != MUSE_PROVIDER
+            or context.get("execution_target") != MUSE_EXECUTION_TARGET
+            or context.get("remote_target_key") != str(row.id)
+            or context.get("allowed_capabilities") != list(REMOTE_SESSION_CAPABILITIES)
+            or not agent_id or agent_id != str(row.agent_id or "")
+            or not revision_id
+            or str(context.get("owner_id") or "") != str(row.user_id)
+        ):
+            raise CLIDevelopmentSessionForbidden("remote session binding is invalid", code="session_binding_unsafe")
+        self._assert_remote_admission(owner_id=str(row.user_id), agent_id=agent_id, _remote_config_snapshot=_remote_config_snapshot)
+        verified_managed = await self._verified_managed_backend(db, row, context)
+        from ..memory.models import User
+        from .conversation_agent_service import ConversationAgentError
+        try:
+            owner = await db.get(User, uuid.UUID(str(row.user_id)))
+            if owner is None or not owner.is_active or str(row.project_id or "") != str(context.get("project_id") or ""):
+                raise ValueError("owner or project mismatch")
+            _, current_revision = await self.agent_service.validate_agent_selection(
+                agent_id=agent_id, actor_user_id=str(row.user_id), actor_role=owner.role,
+                project_id=context.get("project_id"), db_session=db,
+            )
+            if not verified_managed and str(current_revision.id) != revision_id:
+                raise ValueError("Agent revision changed")
+        except (ConversationAgentError, ValueError) as exc:
+            raise CLIDevelopmentSessionForbidden("remote Agent selection is invalid", code="agent_selection_denied") from exc
+        except Exception as exc:
+            raise CLIDevelopmentSessionUnavailable("remote Agent selection is unavailable", code="agent_selection_unavailable") from exc
+        binding = await self._binding_for_row(db, row)
+        if any((
+            str(_binding_value(binding, "binding_id") or "") != str(context.get("binding_id") or ""),
+            str(_binding_value(binding, "snapshot_hash") or "") != str(context.get("binding_snapshot_hash") or ""),
+            not context.get("binding_id") or not context.get("binding_snapshot_hash"),
+            str(_binding_value(binding, "session_id") or "") != str(row.id),
+            str(_binding_value(binding, "agent_id") or "") != agent_id,
+            str(_binding_value(binding, "agent_revision_id") or "") != revision_id,
+            str(_binding_value(binding, "created_by") or "") != str(row.user_id),
+        )):
+            raise CLIDevelopmentSessionForbidden("remote session binding is invalid", code="session_binding_unsafe")
+        _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+        return await self._resolve_authority(
+            agent_id=agent_id, revision_id=revision_id, project_id=context.get("project_id"),
+            capabilities=REMOTE_SESSION_CAPABILITIES, managed_backend=True,
+        )
+
+    async def _resolve_remote_work_authority(self, db: Any, claim: Any, *, _remote_config_snapshot: Any = None) -> None:
+        """Revalidate a canonical Muse Work's durable session and backend authority."""
+        from ..memory.models import AgentRun, AgentWorkItem, ConversationSession
+
+        work = await db.get(AgentWorkItem, uuid.UUID(claim.work_item_id))
+        if work is None or work.conversation_session_id is None:
+            raise ValueError("remote Work is missing")
+        row = await db.get(ConversationSession, work.conversation_session_id)
+        run = await db.get(AgentRun, work.active_agent_run_id) if work.active_agent_run_id else None
+        metadata = work.metadata_json if isinstance(work.metadata_json, Mapping) else {}
+        if row is None or run is None or getattr(row, "deleted_at", None) is not None:
+            raise ValueError("remote Work binding is missing")
+        context = self._context(row)
+        if any((
+            claim.source_type != REMOTE_SESSION_SOURCE_TYPE,
+            claim.execution_adapter != REMOTE_SESSION_SOURCE_TYPE,
+            work.source_type != claim.source_type,
+            work.execution_adapter != claim.execution_adapter,
+            str(work.source_id) != claim.source_id or str(run.id) != claim.source_id,
+            str(work.source_revision) != claim.source_revision,
+            claim.source_revision != str(claim.agent_revision_id),
+            str(work.agent_revision_id) != str(claim.agent_revision_id),
+            str(work.assigned_agent_id) != str(claim.assigned_agent_id),
+            str(work.conversation_session_id) != str(claim.conversation_session_id),
+            str(work.project_id or "") != str(claim.project_id or ""),
+            str(work.space_id or "") != str(claim.space_id or ""),
+            str(work.persona_id or "") != str(claim.persona_id or ""),
+            str(work.task_id or "") != str(claim.task_id or ""),
+            str(work.app_id or "") != str(claim.app_id or ""),
+            tuple(work.required_capabilities_json or ()) != claim.required_capabilities,
+            claim.required_capabilities != tuple(REMOTE_SESSION_CAPABILITIES),
+            str(run.work_item_id) != str(work.id),
+            str(run.session_id) != str(row.id),
+            run.run_type != REMOTE_SESSION_SOURCE_TYPE,
+            str(run.agent_id) != str(work.assigned_agent_id),
+            str(run.agent_revision_id) != str(work.agent_revision_id),
+            str(run.user_id) != str(row.user_id),
+            str(metadata.get("owner_id") or "") != str(row.user_id),
+            str(metadata.get("remote_target_key") or "") != str(row.id),
+            str(context.get("agent_id") or "") != str(work.assigned_agent_id),
+            str(context.get("agent_revision_id") or "") != str(work.agent_revision_id),
+            str(context.get("project_id") or "") != str(work.project_id or ""),
+        )):
+            raise ValueError("remote Work binding mismatch")
+        _remote_config_snapshot = await self._resolve_remote_config_snapshot(_remote_config_snapshot)
+        await self._resolve_remote_backend_execution(db, row, context, _remote_config_snapshot=_remote_config_snapshot)
+
     @staticmethod
     def _managed_role_mapping(binding: Any, context: Mapping[str, Any]) -> dict[str, Any] | None:
         if str(context.get("role_context_mode") or "raw") != "agent_role":
@@ -1372,10 +2978,18 @@ class CLIDevelopmentSessionService:
             "text": role.text,
         }
 
-    async def _create_remote_session(self, req: CreateCLIDevelopmentSessionRequest, *, session_id: uuid.UUID, wire_fingerprint: str) -> dict[str, Any]:
+    async def _create_remote_session(
+        self,
+        req: CreateCLIDevelopmentSessionRequest,
+        *,
+        session_id: uuid.UUID,
+        wire_fingerprint: str,
+        delegate_worker_marker: Mapping[str, Any] | None = None,
+        _remote_config_snapshot: Any = None,
+    ) -> dict[str, Any]:
         """Admit one typed Muse route without entering local CLI policy."""
 
-        self._assert_remote_admission(owner_id=req.owner_id, agent_id=req.agent_id)
+        self._assert_remote_admission(owner_id=req.owner_id, agent_id=req.agent_id, _remote_config_snapshot=_remote_config_snapshot)
         try:
             agent, revision = await self.agent_service.validate_agent_selection(
                 agent_id=req.agent_id,
@@ -1393,6 +3007,17 @@ class CLIDevelopmentSessionService:
             raise CLIDevelopmentSessionConflict(
                 "Requested AgentRevision is stale", code="agent_revision_stale"
             )
+        delegate_worker_marker = _validate_delegate_worker_context(
+            delegate_worker_marker,
+            req,
+            agent_id=agent_id,
+            revision_id=revision_id,
+        )
+        if delegate_worker_marker is not None and req.agent_revision_id != revision_id:
+            raise CLIDevelopmentSessionConflict(
+                "managed worker sessions require an exact AgentRevision pin",
+                code="delegate_worker_revision_pin_required",
+            )
         pin_turn_binding = getattr(self.agent_service, "pin_turn_binding", None)
         if not callable(pin_turn_binding):
             raise CLIDevelopmentSessionUnavailable(
@@ -1404,9 +3029,8 @@ class CLIDevelopmentSessionService:
                 session_id=session_id,
                 agent=agent,
                 revision=revision,
-                config=self.config,
+                config=self.config if _remote_config_snapshot is None else _remote_config_snapshot,
                 created_by=req.owner_id,
-                execution_profile_id=req.execution_profile_id,
             )
             route = _assert_route(expected_snapshot, provider=MUSE_PROVIDER, model=None, effort=None)
             role_context = (
@@ -1431,6 +3055,7 @@ class CLIDevelopmentSessionService:
             revision_id=revision_id,
             project_id=req.project_id,
             capabilities=REMOTE_SESSION_CAPABILITIES,
+            managed_backend=True,
         )
         context_tuple = self._context_tuple(
             owner_id=req.owner_id,
@@ -1447,6 +3072,8 @@ class CLIDevelopmentSessionService:
             execution_target=MUSE_EXECUTION_TARGET,
         )
         context_tuple["agent_revision_id"] = revision_id
+        if delegate_worker_marker is not None:
+            context_tuple["delegate_worker"] = dict(delegate_worker_marker)
         # Muse has no local native session handle.  The shared context tuple
         # keeps the legacy local default; remove it only for this remote lane.
         context_tuple.pop("native_state", None)
@@ -1475,9 +3102,11 @@ class CLIDevelopmentSessionService:
             "allowed_capabilities": list(REMOTE_SESSION_CAPABILITIES),
             "route": route,
         }
-        if req.execution_profile_id is not None:
-            context_tuple["execution_profile_id"] = req.execution_profile_id
-            deployment_material["execution_profile_id"] = req.execution_profile_id
+        if delegate_worker_marker is not None:
+            context_tuple["delegate_worker"] = delegate_worker_marker
+            deployment_material["delegate_worker_scope_sha256"] = delegate_worker_marker[
+                "workspace_scope_sha256"
+            ]
         if role_context is not None:
             context_tuple.update(
                 {
@@ -1501,6 +3130,7 @@ class CLIDevelopmentSessionService:
 
         async def validated_receipt(db: Any, row: Any) -> dict[str, Any]:
             current = self._context(row)
+            _assert_delegate_worker_receipt(current, delegate_worker_marker)
             if (
                 getattr(row, "deleted_at", None) is not None
                 or str(getattr(row, "user_id", "")) != req.owner_id
@@ -1521,8 +3151,6 @@ class CLIDevelopmentSessionService:
                 str(current.get("agent_id") or "") != agent_id
                 or str(current.get("agent_revision_id") or "") != revision_id
                 or str(getattr(row, "agent_id", "") or "") != agent_id
-                or str(current.get("execution_profile_id") or "")
-                != str(req.execution_profile_id or "")
                 or str(current.get("role_context_mode") or "raw")
                 != req.role_context_mode
                 or str(current.get("role_context_sha256") or "")
@@ -1541,7 +3169,6 @@ class CLIDevelopmentSessionService:
             bound_route = _assert_route(
                 binding, provider=MUSE_PROVIDER, model=None, effort=None
             )
-            _assert_binding_selection(binding, req.execution_profile_id)
             if role_context is not None:
                 _build_pinned_role_context(binding, current)
             binding_id = str(
@@ -1599,8 +3226,7 @@ class CLIDevelopmentSessionService:
                 agent_revision_id=revision_id,
                 actor_user_id=req.owner_id,
                 actor_role=req.actor_role,
-                config=self.config,
-                execution_profile_id=req.execution_profile_id,
+                config=self.config if _remote_config_snapshot is None else _remote_config_snapshot,
             )
             if str(_binding_value(binding, "agent_revision_id", "")) != revision_id:
                 raise CLIDevelopmentSessionConflict(
@@ -1610,7 +3236,6 @@ class CLIDevelopmentSessionService:
             bound_route = _assert_route(
                 binding, provider=MUSE_PROVIDER, model=None, effort=None
             )
-            _assert_binding_selection(binding, req.execution_profile_id)
             if role_context is not None:
                 _build_pinned_role_context(binding, context_tuple)
             binding_id = str(
@@ -1675,9 +3300,49 @@ class CLIDevelopmentSessionService:
         finally:
             await self._close(db)
 
-    async def create_session(self, request: Any = None, **kwargs: Any) -> dict[str, Any]:
+    async def create_session(self, request: Any = None, *, _remote_config_snapshot: Any = None, **kwargs: Any) -> dict[str, Any]:
+        delegate_worker_marker = _typed_delegate_worker_context(
+            kwargs.pop("_delegate_worker_context", None)
+        )
         req = CreateCLIDevelopmentSessionRequest.from_value(request, **kwargs)
+        worker_marker = delegate_worker_marker
+        if worker_marker is not None:
+            expected_provider = {
+                "codex": "codex-cli",
+                "antigravity": "antigravity-cli",
+                "claude": "claude-cli",
+                "grok": "grok-cli",
+                "muse": MUSE_PROVIDER,
+            }.get(str(worker_marker.get("kind") or ""))
+            scope_value = worker_marker.get("workspace_scope")
+            expected_session_key = f"delegate-worker:{worker_marker.get('dialogue_id')}"
+            actual_session_key = str(req.idempotency_key)
+            idempotency_key_matches = actual_session_key == expected_session_key or bool(
+                re.fullmatch(
+                    re.escape(expected_session_key) + r":resume:[1-9][0-9]{0,8}",
+                    actual_session_key,
+                )
+            )
+            if (
+                req.owner_id != str(worker_marker.get("owner_id") or "")
+                or req.agent_id != str(worker_marker.get("agent_id") or "")
+                or str(req.agent_revision_id or "")
+                != str(worker_marker.get("agent_revision_id") or "")
+                or req.provider != expected_provider
+                or not isinstance(scope_value, Mapping)
+                or worker_marker.get("workspace_scope_sha256") != _json_hash(scope_value)
+                or tuple(req.allowed_capabilities) != tuple(worker_marker.get("capabilities") or ())
+                or not idempotency_key_matches
+            ):
+                raise CLIDevelopmentSessionInvalid(
+                    "delegate worker context does not match the pinned session request",
+                    code="delegate_worker_context_invalid",
+                )
         wire_fingerprint = self._wire_create_fingerprint(req)
+        if worker_marker is not None:
+            wire_fingerprint = _json_hash(
+                {"request_fingerprint": wire_fingerprint, "delegate_worker": worker_marker}
+            )
         session_id = self._session_identity(req.owner_id, req.idempotency_key)
         # A committed ready receipt is returned from its wire identity before
         # re-resolving mutable deployment policy/Agent state.  This is the
@@ -1692,6 +3357,7 @@ class CLIDevelopmentSessionService:
                     raise CLIDevelopmentSessionConflict("session idempotency key is tombstoned", code="session_idempotency_conflict")
                 if str(getattr(existing, "user_id", "")) != req.owner_id:
                     raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different request", code="session_idempotency_conflict")
+                _assert_delegate_worker_receipt(current, delegate_worker_marker)
                 # Managed contexts need a freshly resolved immutable Revision
                 # and digest before replay. Muse also resolves its server-owned
                 # route and binding atomically before returning a receipt.
@@ -1709,10 +3375,13 @@ class CLIDevelopmentSessionService:
         finally:
             await self._close(early_db)
         if req.provider == MUSE_PROVIDER:
+            _remote_config_snapshot = await self._resolve_remote_config_snapshot(_remote_config_snapshot)
             return await self._create_remote_session(
                 req,
                 session_id=session_id,
                 wire_fingerprint=wire_fingerprint,
+                delegate_worker_marker=delegate_worker_marker,
+                _remote_config_snapshot=_remote_config_snapshot,
             )
         policy, cwd = self._policy_for_request(owner_id=req.owner_id, agent_id=req.agent_id, working_directory=req.working_directory)
         permission_mode = self._resolve_permission_mode(
@@ -1754,6 +3423,17 @@ class CLIDevelopmentSessionService:
                 "Exact AgentRevision admission is unavailable",
                 code="agent_revision_pin_unavailable",
             )
+        delegate_worker_marker = _validate_delegate_worker_context(
+            delegate_worker_marker,
+            req,
+            agent_id=agent_id,
+            revision_id=revision_id,
+        )
+        if delegate_worker_marker is not None and effective_revision_id != revision_id:
+            raise CLIDevelopmentSessionConflict(
+                "managed worker sessions require an exact AgentRevision pin",
+                code="delegate_worker_revision_pin_required",
+            )
         # Build the expected immutable snapshot once. bind_session_agent will
         # create the persisted row and is checked again after the lock.
         role_context: AgentRoleContext | None = None
@@ -1764,7 +3444,6 @@ class CLIDevelopmentSessionService:
                 revision=revision,
                 config=self.config,
                 created_by=req.owner_id,
-                execution_profile_id=req.execution_profile_id,
             )
             route = _assert_route(expected_snapshot, provider=req.provider, model=req.model, effort=req.effort)
             if req.role_context_mode == "agent_role":
@@ -1777,17 +3456,20 @@ class CLIDevelopmentSessionService:
         except CLIDevelopmentSessionError:
             raise
         except ConversationAgentValidationError as exc:
-            code = str(getattr(exc, "code", "") or "")
-            if req.execution_profile_id is not None and code.startswith("agent_execution_profile_"):
-                raise CLIDevelopmentSessionInvalid("ExecutionProfile selection is not allowed", code=code) from None
             raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
         except Exception as exc:
             raise CLIDevelopmentSessionConflict("Agent route is unavailable", code="agent_route_unavailable") from exc
-        if req.allowed_capabilities != CLI_DEVELOPMENT_CAPABILITIES and req.provider not in {"claude", "claude-cli", "claudecode"}:
+        if (
+            req.allowed_capabilities != CLI_DEVELOPMENT_CAPABILITIES
+            and req.provider not in {"claude", "claude-cli", "claudecode"}
+            and worker_marker is None
+        ):
             raise CLIDevelopmentSessionInvalid("narrowed capabilities are only enforceable for the Claude provider", code="allowed_capabilities_unsupported_provider")
         authority_revision_id = effective_revision_id or revision_id
-        authority = await self._resolve_authority(agent_id=agent_id, revision_id=authority_revision_id, project_id=req.project_id, capabilities=req.allowed_capabilities)
+        authority = await self._resolve_authority(agent_id=agent_id, revision_id=authority_revision_id, project_id=req.project_id, capabilities=req.allowed_capabilities, managed_backend=delegate_worker_marker is not None)
         context_tuple = self._context_tuple(owner_id=req.owner_id, agent_id=agent_id, provider=req.provider, model=req.model, effort=req.effort, working_directory=cwd, idempotency_key=req.idempotency_key, project_id=req.project_id, permission_mode=permission_mode, title=req.title, allowed_capabilities=req.allowed_capabilities)
+        if worker_marker is not None:
+            context_tuple["delegate_worker"] = worker_marker
         context_tuple["provider_cache_root"] = self._provider_cache_root(policy, req.provider)
         context_tuple["wire_request_fingerprint"] = wire_fingerprint
         deployment_material = {
@@ -1803,9 +3485,6 @@ class CLIDevelopmentSessionService:
             "allowed_capabilities": list(req.allowed_capabilities),
             "provider_cache_root": context_tuple["provider_cache_root"],
         }
-        if req.execution_profile_id is not None:
-            context_tuple["execution_profile_id"] = req.execution_profile_id
-            deployment_material["execution_profile_id"] = req.execution_profile_id
         if effective_revision_id is not None:
             context_tuple["agent_revision_id"] = revision_id
             deployment_material["agent_revision_id"] = revision_id
@@ -1830,6 +3509,12 @@ class CLIDevelopmentSessionService:
         context_tuple["route"] = route
         context_tuple["policy"] = policy.to_diagnostic(cwd=cwd, owner_id=req.owner_id)
         context_tuple["authority"] = authority
+        if delegate_worker_marker is not None:
+            context_tuple["delegate_worker"] = delegate_worker_marker
+            deployment_material["delegate_worker_scope_sha256"] = delegate_worker_marker[
+                "workspace_scope_sha256"
+            ]
+            context_tuple["deployment_fingerprint"] = _json_hash(deployment_material)
         context = {CLI_DEVELOPMENT_CONTEXT_KEY: context_tuple}
 
         async def exact_receipt_binding(db: Any, row: Any, current: Mapping[str, Any]) -> Any:
@@ -1861,7 +3546,6 @@ class CLIDevelopmentSessionService:
             exact_route = _assert_route(
                 exact_binding, provider=req.provider, model=req.model, effort=req.effort
             )
-            _assert_binding_selection(exact_binding, req.execution_profile_id)
             if role_context is not None:
                 _build_pinned_role_context(exact_binding, current)
             exact_binding_id = str(
@@ -1889,9 +3573,10 @@ class CLIDevelopmentSessionService:
             existing = (await db.execute(select(ConversationSession).where(ConversationSession.id == session_id).with_for_update())).scalars().first()
             if existing is not None:
                 current = self._context(existing)
+                _assert_delegate_worker_receipt(current, delegate_worker_marker)
                 if str(getattr(existing, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
                     raise CLIDevelopmentSessionConflict("session idempotency key belongs to another request", code="session_idempotency_conflict")
-                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id", "role_context_mode", "role_context_sha256"):
+                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "role_context_mode", "role_context_sha256"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
                 if effective_revision_id is not None:
@@ -1925,7 +3610,6 @@ class CLIDevelopmentSessionService:
                         actor_user_id=req.owner_id,
                         actor_role=req.actor_role,
                         expected_agent_id=str(existing.agent_id) if existing.agent_id else None,
-                        **_execution_profile_kwargs(current.get("execution_profile_id")),
                     )
                     binding = getattr(bind_result, "binding", None)
                     await self._close(db)
@@ -1936,7 +3620,6 @@ class CLIDevelopmentSessionService:
                     if binding is None:
                         raise CLIDevelopmentSessionConflict("immutable Agent binding is unavailable", code="agent_binding_required")
                 _assert_route(binding, provider=req.provider, model=req.model, effort=req.effort)
-                _assert_binding_selection(binding, current.get("execution_profile_id"))
                 if role_context is not None:
                     _build_pinned_role_context(binding, current)
                 binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
@@ -1979,7 +3662,6 @@ class CLIDevelopmentSessionService:
                     actor_user_id=req.owner_id,
                     actor_role=req.actor_role,
                     config=self.config,
-                    execution_profile_id=req.execution_profile_id,
                 )
                 exact_route = _assert_route(
                     exact_binding,
@@ -1987,7 +3669,6 @@ class CLIDevelopmentSessionService:
                     model=req.model,
                     effort=req.effort,
                 )
-                _assert_binding_selection(exact_binding, req.execution_profile_id)
                 if role_context is not None:
                     _build_pinned_role_context(exact_binding, context_tuple)
                 binding_id = str(
@@ -2051,9 +3732,10 @@ class CLIDevelopmentSessionService:
                 if winner is None:
                     raise exc
                 current = self._context(winner)
+                _assert_delegate_worker_receipt(current, delegate_worker_marker)
                 if str(getattr(winner, "user_id", "")) != req.owner_id or current.get("idempotency_digest") != context_tuple["idempotency_digest"] or not self._wire_create_fingerprint_matches(req, current, wire_fingerprint):
                     raise CLIDevelopmentSessionConflict("session idempotency key conflict", code="session_idempotency_conflict")
-                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "execution_profile_id", "role_context_mode", "role_context_sha256"):
+                for fixed_key in ("agent_id", "provider", "model", "effort", "working_directory", "project_id", "permission_mode", "role_context_mode", "role_context_sha256"):
                     if str(current.get(fixed_key) or "") != str(context_tuple.get(fixed_key) or ""):
                         raise CLIDevelopmentSessionConflict("session idempotency key was reused with a different fixed route", code="session_idempotency_conflict")
                 if effective_revision_id is not None:
@@ -2069,7 +3751,6 @@ class CLIDevelopmentSessionService:
         try:
             result = await self.agent_service.bind_session_agent(
                 session_id=str(session_id), agent_id=agent_id, actor_user_id=req.owner_id, actor_role=req.actor_role, expected_agent_id=None,
-                **_execution_profile_kwargs(req.execution_profile_id),
             )
         except Exception as exc:
             raise CLIDevelopmentSessionForbidden("Agent binding could not be persisted", code="agent_binding_denied") from exc
@@ -2077,7 +3758,6 @@ class CLIDevelopmentSessionService:
         if binding is None:
             raise CLIDevelopmentSessionConflict("immutable Agent binding is missing", code="agent_binding_required")
         bound_route = _assert_route(binding, provider=req.provider, model=req.model, effort=req.effort)
-        _assert_binding_selection(binding, req.execution_profile_id)
         if role_context is not None:
             _build_pinned_role_context(binding, context_tuple)
         binding_id = str(_binding_value(binding, "binding_id") or _binding_value(binding, "id") or "")
@@ -2104,6 +3784,39 @@ class CLIDevelopmentSessionService:
         context = self._context(row)
         remote = self._is_remote_context(context)
         remote_fields = self._remote_result_fields(run, work) if remote else {}
+        remote_projection: dict[str, Any] = {}
+        if remote:
+            authorized_scope_record = None
+            summary = getattr(work, "result_summary_json", None)
+            summary = summary if isinstance(summary, Mapping) else {}
+            plan_receipt = summary.get("muse_tool_loop_scope")
+            if isinstance(plan_receipt, Mapping) and plan_receipt.get("mode") == "authorized_scope":
+                authorized_scope_record = await self._muse_authorized_scope_for_context(
+                    db,
+                    context=context,
+                    owner_id=owner_id,
+                    session_id=str(getattr(row, "id", "") or ""),
+                    binding_id=str(context.get("binding_id") or ""),
+                )
+            remote_projection = {
+                "turn_status": remote_fields.get("turn_status"),
+                "delivery": remote_fields.get("delivery"),
+                "history_observation": remote_fields.get("history_observation"),
+                "remote_reconnect": _remote_reconnect_receipt_projection(context),
+                "cli_failure": self._remote_cli_failure_projection(
+                    row=row, run=run, work=work, context=context, owner_id=owner_id,
+                ),
+            }
+            tool_loop_diagnostics = self._muse_tool_loop_diagnostics(
+                row=row,
+                run=run,
+                work=work,
+                context=context,
+                owner_id=owner_id,
+                authorized_scope_record=authorized_scope_record,
+            )
+            if tool_loop_diagnostics is not None:
+                remote_projection["muse_tool_loop_diagnostics"] = tool_loop_diagnostics
         delivery = remote_fields.get("delivery")
         policy_projection = (
             {
@@ -2116,6 +3829,15 @@ class CLIDevelopmentSessionService:
                 cwd=context.get("working_directory"), owner_id=owner_id
             )
         )
+        run_projection = run.to_dict() if run is not None else None
+        work_projection = work.to_safe_dict() if work is not None else None
+        if remote:
+            run_projection = self._sanitize_cause_in_result_projection(
+                run_projection, result_key="result",
+            )
+            work_projection = self._sanitize_cause_in_result_projection(
+                work_projection, result_key="result_summary_json",
+            )
         return {
             "session_id": str(row.id),
             "owner_id": owner_id,
@@ -2134,20 +3856,13 @@ class CLIDevelopmentSessionService:
             "sandbox": remote_fields.get("sandbox") or "trusted_windows",
             "role_delivery": dict(delivery) if isinstance(delivery, Mapping) else None,
             "cancel_semantics": "local_stop_only_remote_unconfirmed" if remote else "local_provider_stop_requested",
-            **(
-                {
-                    "turn_status": remote_fields.get("turn_status"),
-                    "delivery": remote_fields.get("delivery"),
-                }
-                if remote
-                else {}
-            ),
+            **remote_projection,
             "status": self._status_from_rows(context, run, work),
             "created": created,
             "policy": policy_projection,
             "native_state": None if remote else context.get("native_state", "unknown"),
-            "run": run.to_dict() if run is not None else None,
-            "work": work.to_safe_dict() if work is not None else None,
+            "run": run_projection,
+            "work": work_projection,
         }
 
     async def get_session(self, session_id: Any, *, owner_id: str) -> dict[str, Any]:
@@ -2178,12 +3893,18 @@ class CLIDevelopmentSessionService:
         send_key: str,
         key_digest: str,
         request_fingerprint: str,
+        delegate_worker_limits: Mapping[str, Any] | None = None,
+        delegate_worker_audit: Mapping[str, Any] | None = None,
+        borrowed: bool = False,
+        trigger_message: ConversationMessage | None = None,
+        _remote_config_snapshot: Any = None,
     ) -> dict[str, Any]:
         """Create a remote Work item while the session row is locked."""
 
         self._assert_remote_admission(
             owner_id=request.owner_id,
             agent_id=str(context.get("agent_id") or row.agent_id or ""),
+            _remote_config_snapshot=_remote_config_snapshot,
         )
         run, work = await self._load_latest(db, row.id)
         current_status = self._status_from_rows(context, run, work)
@@ -2227,14 +3948,14 @@ class CLIDevelopmentSessionService:
         route = _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
         role_mapping = self._managed_role_mapping(binding, context)
         pinned_caps = REMOTE_SESSION_CAPABILITIES
-        await self._resolve_authority(
-            agent_id=str(context.get("agent_id") or row.agent_id or ""),
-            revision_id=str(context.get("agent_revision_id") or ""),
-            project_id=context.get("project_id"),
-            capabilities=pinned_caps,
-        )
+        await self._resolve_remote_backend_execution(db, row, context, _remote_config_snapshot=_remote_config_snapshot)
         existing_message = (await db.execute(select(ConversationMessage).where(ConversationMessage.session_id == row.id, ConversationMessage.client_message_id == send_key).with_for_update())).scalars().first()
-        if existing_message is not None:
+        if trigger_message is not None:
+            if existing_message is not None and existing_message is not trigger_message:
+                raise CLIDevelopmentSessionConflict("send key belongs to another message", code="send_idempotency_conflict")
+            trigger_message.message_metadata = {**(trigger_message.message_metadata or {}), "cli_development": True, "execution_target": MUSE_EXECUTION_TARGET}
+            trigger_message_id = trigger_message.id
+        elif existing_message is not None:
             if existing_message.content != request.content:
                 raise CLIDevelopmentSessionConflict("send key was reused with different raw content", code="send_idempotency_conflict")
             trigger_message_id = existing_message.id
@@ -2268,7 +3989,6 @@ class CLIDevelopmentSessionService:
             "local_filesystem": False,
             "sandbox": "remote_uncontrolled",
         }
-        manifest.update(_binding_selection_manifest_fields(binding, context.get("execution_profile_id")))
         if role_pins is not None:
             manifest["role_context"] = dict(role_pins)
         manifest_hash = _json_hash(manifest)
@@ -2282,8 +4002,26 @@ class CLIDevelopmentSessionService:
             "binding_snapshot_hash": context.get("binding_snapshot_hash"),
             "remote_target_key": sid,
         }
+        if delegate_worker_audit is not None:
+            remote_run_metadata["delegate_worker"] = copy.deepcopy(
+                dict(delegate_worker_audit)
+            )
+            manifest["delegate_worker"] = copy.deepcopy(
+                dict(delegate_worker_audit)
+            )
+        if request.muse_tool_loop_opt_in:
+            remote_run_metadata["muse_tool_loop_opt_in"] = True
+        worker_session_marker = context.get("delegate_worker")
+        if delegate_worker_limits is not None:
+            if not isinstance(worker_session_marker, Mapping):
+                raise CLIDevelopmentSessionForbidden(
+                    "delegate worker session marker is missing",
+                    code="delegate_worker_context_missing",
+                )
+            remote_run_metadata["delegate_worker_limits"] = dict(delegate_worker_limits)
         if role_pins is not None:
             remote_run_metadata["role_context"] = dict(role_pins)
+        manifest_hash = _json_hash(manifest)
         run = AgentRun(
             id=run_id,
             root_run_id=run_id,
@@ -2321,6 +4059,14 @@ class CLIDevelopmentSessionService:
             "binding_id": context.get("binding_id"),
             "binding_snapshot_hash": context.get("binding_snapshot_hash"),
         }
+        if delegate_worker_audit is not None:
+            work_metadata["delegate_worker"] = copy.deepcopy(
+                dict(delegate_worker_audit)
+            )
+        if request.muse_tool_loop_opt_in:
+            work_metadata["muse_tool_loop_opt_in"] = True
+        if delegate_worker_limits is not None:
+            work_metadata["delegate_worker_limits"] = dict(delegate_worker_limits)
         if role_mapping is not None:
             # Keep role text out of durable Work/Run projections.  The common
             # remote adapter reconstructs it from the immutable Agent binding
@@ -2335,6 +4081,16 @@ class CLIDevelopmentSessionService:
                     "role_context_sha256",
                 )
             }
+        timeout_value = (
+            delegate_worker_limits.get("timeout_seconds")
+            if isinstance(delegate_worker_limits, Mapping)
+            else None
+        )
+        work_deadline = (
+            self._clock() + timedelta(seconds=int(timeout_value))
+            if isinstance(timeout_value, int) and not isinstance(timeout_value, bool)
+            else None
+        )
         work = AgentWorkItem(
             source_type=REMOTE_SESSION_SOURCE_TYPE,
             source_id=str(run_id),
@@ -2347,6 +4103,7 @@ class CLIDevelopmentSessionService:
             required_capabilities_json=list(pinned_caps),
             execution_adapter=MUSE_REMOTE_ADAPTER_KEY,
             max_attempts=1,
+            deadline=work_deadline,
             state="pending",
             attempt_count=0,
             concurrency_key=f"conversation:{row.id}",
@@ -2369,36 +4126,165 @@ class CLIDevelopmentSessionService:
         queued_sequence = self._allocate_event_sequences(row, 1)[0]
         db.add(AgentRunEvent(run_id=run_id, sequence=1, event_type="run.queued", status="queued", message="Muse remote turn queued", payload={"source": REMOTE_SESSION_SOURCE_TYPE, "execution_target": MUSE_EXECUTION_TARGET, "cli_session_sequence": queued_sequence}, created_at=self._clock()))
         db.add(AgentWorkEvent(work_item_id=work.id, sequence=1, event_type="work.queued", from_state=None, to_state="pending", status="pending", actor_kind="service", actor_service_key="aoitalk.system", agent_run_id=run_id, payload_json={"source": REMOTE_SESSION_SOURCE_TYPE, "execution_target": MUSE_EXECUTION_TARGET}, created_at=self._clock()))
-        await db.commit()
+        if borrowed:
+            await db.flush()
+        else:
+            await db.commit()
         return {"accepted": True, "created": True, "session_id": sid, "run_id": str(run_id), "work_item_id": str(work.id), "status": "queued", "execution_target": MUSE_EXECUTION_TARGET, "local_filesystem": False, "sandbox": "remote_uncontrolled", "run": run.to_dict(), "work": work.to_safe_dict()}
 
-    async def send(self, session_id: Any, request: Any = None, **kwargs: Any) -> dict[str, Any]:
+    async def send(
+        self, session_id: Any, request: Any = None, *, _db_session: Any = None,
+        _trigger_message: ConversationMessage | None = None, _remote_config_snapshot: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Admit a turn; a borrowed session remains entirely owned by the caller."""
         sid = _safe_uuid(session_id)
         if sid is None:
             raise CLIDevelopmentSessionInvalid("invalid session_id", code="invalid_session_id")
+        delegate_worker_limits = _typed_delegate_worker_limits(
+            kwargs.pop("_delegate_worker_limits", None)
+        )
+        worker_limits_marker = delegate_worker_limits
         req = SendCLIDevelopmentSessionRequest.from_value(request, **kwargs)
-        db = await self._session()
+        borrowed = _db_session is not None
+        if _trigger_message is not None and not borrowed:
+            raise CLIDevelopmentSessionInvalid("trigger message requires a borrowed session", code="invalid_trigger_message")
+        db = _db_session if borrowed else await self._session()
         try:
             row = (await db.execute(select(ConversationSession).where(ConversationSession.id == uuid.UUID(sid), ConversationSession.deleted_at.is_(None)).with_for_update())).scalars().first()
             if row is None:
                 raise CLIDevelopmentSessionNotFound()
             if str(row.user_id) != req.owner_id:
                 raise CLIDevelopmentSessionForbidden("session owner mismatch", code="session_owner_mismatch")
+            if _trigger_message is not None:
+                if (
+                    not isinstance(_trigger_message, ConversationMessage)
+                    or object_session(_trigger_message) is not db.sync_session
+                    or _trigger_message in db.sync_session.deleted
+                    or _trigger_message.session_id != row.id
+                    or _trigger_message.content != req.content
+                    or _trigger_message.id is None
+                    or not isinstance(_trigger_message.message_metadata, Mapping)
+                ):
+                    raise CLIDevelopmentSessionInvalid("invalid trigger message", code="invalid_trigger_message")
+                await db.flush()
             context = self._context(row)
             if not context or str(context.get("schema_version")) != str(CLI_DEVELOPMENT_SCHEMA_VERSION):
                 raise CLIDevelopmentSessionConflict("CLI session context is invalid", code="cli_session_context_invalid")
+            raw_worker_marker = context.get("delegate_worker")
+            if raw_worker_marker is not None and not isinstance(raw_worker_marker, Mapping):
+                raise CLIDevelopmentSessionUnavailable(
+                    "managed worker session marker is invalid",
+                    code="delegate_worker_context_invalid",
+                )
+            delegate_worker_audit = _validate_delegate_worker_limits(
+                raw_worker_marker if isinstance(raw_worker_marker, Mapping) else None,
+                delegate_worker_limits,
+            )
+            if raw_worker_marker is not None and str(raw_worker_marker.get("owner_id") or "") != req.owner_id:
+                raise CLIDevelopmentSessionForbidden(
+                    "managed worker owner mismatch",
+                    code="delegate_worker_owner_mismatch",
+                )
+            worker_context = context.get("delegate_worker")
+            if worker_limits_marker is not None:
+                if not isinstance(worker_context, Mapping):
+                    raise CLIDevelopmentSessionConflict(
+                        "delegate worker session marker is missing",
+                        code="delegate_worker_context_missing",
+                    )
+                if (
+                    worker_limits_marker.get("schema_version") != 1
+                    or str(worker_limits_marker.get("dialogue_id") or "")
+                    != str(worker_context.get("dialogue_id") or "")
+                    or str(worker_limits_marker.get("workspace_scope_sha256") or "")
+                    != str(worker_context.get("workspace_scope_sha256") or "")
+                ):
+                    raise CLIDevelopmentSessionConflict(
+                        "delegate worker limits differ from its prepared session",
+                        code="delegate_worker_limits_mismatch",
+                    )
+                from ..memory.models import AgentDialogue
+
+                worker_dialogue = await db.get(
+                    AgentDialogue,
+                    uuid.UUID(str(worker_limits_marker["dialogue_id"])),
+                )
+                auth = (
+                    worker_dialogue.authorization_json
+                    if worker_dialogue is not None
+                    and isinstance(worker_dialogue.authorization_json, Mapping)
+                    else {}
+                )
+                authorized_worker = auth.get("delegate_worker")
+                if (
+                    worker_dialogue is None
+                    or str(worker_dialogue.worker_session_id) != sid
+                    or str(worker_dialogue.owner_user_id) != req.owner_id
+                    or not isinstance(authorized_worker, Mapping)
+                    or dict(authorized_worker.get("workspace_scope") or {})
+                    != dict(worker_context.get("workspace_scope") or {})
+                    or str(authorized_worker.get("workspace_scope_sha256") or "")
+                    != str(worker_context.get("workspace_scope_sha256") or "")
+                    or str(authorized_worker.get("kind") or "")
+                    != str(worker_context.get("kind") or "")
+                ):
+                    raise CLIDevelopmentSessionForbidden(
+                        "delegate worker limits do not match the current Dialogue",
+                        code="delegate_worker_dialogue_binding_invalid",
+                    )
+                authorized_budget = (
+                    authorized_worker.get("budgets")
+                    if isinstance(authorized_worker.get("budgets"), Mapping)
+                    else auth.get("budget")
+                )
+                aggregate_budget = auth.get("budget")
+                if isinstance(authorized_budget, Mapping):
+                    supplied_budgets = worker_limits_marker.get("budgets") or {}
+                    for key in ("max_tokens", "max_cost_micros", "max_attempts"):
+                        expected = authorized_budget.get(key)
+                        supplied = supplied_budgets.get(key) if isinstance(supplied_budgets, Mapping) else None
+                        if expected is not None and int(expected) != int(supplied or 0):
+                            raise CLIDevelopmentSessionForbidden(
+                                "delegate worker budget differs from its session reservation",
+                                code="delegate_worker_budget_mismatch",
+                            )
+                        aggregate = aggregate_budget.get(key) if isinstance(aggregate_budget, Mapping) else None
+                        if expected is not None and aggregate is not None and int(expected) > int(aggregate):
+                            raise CLIDevelopmentSessionForbidden(
+                                "delegate worker budget exceeds its Dialogue ceiling",
+                                code="delegate_worker_budget_exceeds_dialogue",
+                            )
+            if req.muse_tool_loop_opt_in and not self._is_remote_context(context):
+                raise CLIDevelopmentSessionConflict(
+                    "Muse scoped tool loop is only available on muse-remote sessions",
+                    code="muse_tool_loop_provider_mismatch",
+                )
             # Deduplication is the first send decision after owner/context
             # validation. A completed/failed receipt with the same key must
             # be replayable; state checks apply only to a new key.
             send_key = req.send_key  # preserve exact identity; no strip
             key_digest = _sha256(send_key)
-            request_fingerprint = _sha256(req.content)
+            request_fingerprint = _sha256(
+                req.content
+                if not req.muse_tool_loop_opt_in
+                else "muse-scoped-tool-loop-v1\x00" + req.content
+            )
+            if worker_limits_marker is not None:
+                request_fingerprint = _json_hash(
+                    {
+                        "request_fingerprint": request_fingerprint,
+                        "delegate_worker_limits": worker_limits_marker,
+                    }
+                )
             existing = (await db.execute(select(AgentRun).where(AgentRun.session_id == row.id, AgentRun.user_id == req.owner_id, AgentRun.client_message_key == key_digest).with_for_update())).scalars().first()
             if existing is not None:
+                if _trigger_message is not None and existing.trigger_message_id != _trigger_message.id:
+                    raise CLIDevelopmentSessionConflict("send key belongs to another message", code="send_idempotency_conflict")
                 if existing.request_fingerprint != request_fingerprint:
                     raise CLIDevelopmentSessionConflict("send key was reused with different raw content", code="send_idempotency_conflict")
                 return {"accepted": True, "created": False, "session_id": sid, "run": existing.to_dict(), "run_id": str(existing.id), "status": self._status_from_rows(context, existing, await db.get(AgentWorkItem, existing.work_item_id) if existing.work_item_id else None)}
             if self._is_remote_context(context):
+                _remote_config_snapshot = await self._resolve_remote_config_snapshot(_remote_config_snapshot)
                 return await self._send_remote_locked(
                     db,
                     row,
@@ -2408,6 +4294,11 @@ class CLIDevelopmentSessionService:
                     send_key=send_key,
                     key_digest=key_digest,
                     request_fingerprint=request_fingerprint,
+                    delegate_worker_limits=worker_limits_marker,
+                    delegate_worker_audit=delegate_worker_audit,
+                    borrowed=borrowed,
+                    trigger_message=_trigger_message,
+                    _remote_config_snapshot=_remote_config_snapshot,
                 )
             current_status = self._status_from_rows(context, *(await self._load_latest(db, row.id)))
             if current_status in {"disconnected", "interrupted", "cancelling", "failed"}:
@@ -2445,9 +4336,14 @@ class CLIDevelopmentSessionService:
             if role_context_pins is not None:
                 _build_pinned_role_context(binding, context)
             pinned_caps = pinned_cli_capabilities(context)
-            await self._resolve_authority(agent_id=str(context.get("agent_id") or row.agent_id), revision_id=str(context.get("agent_revision_id") or ""), project_id=context.get("project_id"), capabilities=pinned_caps)
+            await self._resolve_authority(agent_id=str(context.get("agent_id") or row.agent_id), revision_id=str(context.get("agent_revision_id") or ""), project_id=context.get("project_id"), capabilities=pinned_caps, managed_backend=await self._verified_managed_backend(db, row, context))
             existing_message = (await db.execute(select(ConversationMessage).where(ConversationMessage.session_id == row.id, ConversationMessage.client_message_id == send_key).with_for_update())).scalars().first()
-            if existing_message is not None:
+            if _trigger_message is not None:
+                if existing_message is not None and existing_message is not _trigger_message:
+                    raise CLIDevelopmentSessionConflict("send key belongs to another message", code="send_idempotency_conflict")
+                _trigger_message.message_metadata = {**_trigger_message.message_metadata, "cli_development": True}
+                trigger_message_id = _trigger_message.id
+            elif existing_message is not None:
                 if existing_message.content != req.content:
                     raise CLIDevelopmentSessionConflict("send key was reused with different raw content", code="send_idempotency_conflict")
                 trigger_message_id = existing_message.id
@@ -2464,11 +4360,20 @@ class CLIDevelopmentSessionService:
                 row.development_status = "working"
             run_id = uuid.uuid4()
             manifest = {"schema_version": 2, "agent_id": str(context.get("agent_id") or row.agent_id), "agent_revision_id": str(context.get("agent_revision_id") or ""), "work_item_id": None, "source": CLI_SESSION_SOURCE_TYPE, "capabilities": list(pinned_caps), "route_snapshot": {"operator": dict(route)}}
-            manifest.update(_binding_selection_manifest_fields(binding, context.get("execution_profile_id")))
+            if delegate_worker_audit is not None:
+                manifest["delegate_worker"] = copy.deepcopy(
+                    dict(delegate_worker_audit)
+                )
             if role_context_pins is not None:
                 manifest["role_context"] = dict(role_context_pins)
             manifest_hash = _json_hash(manifest)
             cli_run_metadata = {"schema_version": CLI_DEVELOPMENT_SCHEMA_VERSION, "send_key_digest": key_digest, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "approval_policy_source": "provider_native_default_unknown" if str(context.get("permission_mode") or "native_default") == "native_default" else "explicit_deployment_policy", "execution_lane": policy.execution_lane, "working_directory_fingerprint": _sha256(cwd), "provider_cache_root_fingerprint": _sha256(str(context.get("provider_cache_root") or "")), "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}
+            if worker_limits_marker is not None:
+                cli_run_metadata["delegate_worker_limits"] = dict(worker_limits_marker)
+            if delegate_worker_audit is not None:
+                cli_run_metadata["delegate_worker"] = copy.deepcopy(
+                    dict(delegate_worker_audit)
+                )
             if role_context_pins is not None:
                 cli_run_metadata["role_context"] = dict(role_context_pins)
             run = AgentRun(id=run_id, root_run_id=run_id, session_id=row.id, trigger_message_id=trigger_message_id, agent_id=uuid.UUID(str(context.get("agent_id") or row.agent_id)), agent_revision_id=uuid.UUID(str(context.get("agent_revision_id"))), user_id=req.owner_id, client_message_id=send_key, client_message_key=key_digest, request_fingerprint=request_fingerprint, run_type=CLI_SESSION_SOURCE_TYPE, status="queued", provider=str(context.get("provider") or ""), model=str(context.get("model") or ""), generation_profile="assisted_work", work_item_attempt=1, objective="", title="", result={}, validation={}, run_metadata={"cli_development": cli_run_metadata}, resolved_execution_manifest=manifest, execution_manifest_hash=manifest_hash, created_at=self._clock(), updated_at=self._clock(), last_event_at=self._clock())
@@ -2476,9 +4381,25 @@ class CLIDevelopmentSessionService:
             await db.flush()
             resource_key = f"conversation:{row.id}"
             work_metadata = {"owner_id": req.owner_id, "send_key_digest": key_digest, "provider": run.provider, "model": run.model, "effort": str(context.get("effort") or ""), "permission_mode": str(context.get("permission_mode") or "native_default"), "execution_lane": policy.execution_lane, "binding_id": context.get("binding_id"), "binding_snapshot_hash": context.get("binding_snapshot_hash")}
+            if worker_limits_marker is not None:
+                work_metadata["delegate_worker_limits"] = dict(worker_limits_marker)
+            timeout_value = (
+                worker_limits_marker.get("timeout_seconds")
+                if isinstance(worker_limits_marker, Mapping)
+                else None
+            )
+            work_deadline = (
+                self._clock() + timedelta(seconds=int(timeout_value))
+                if isinstance(timeout_value, int) and not isinstance(timeout_value, bool)
+                else None
+            )
+            if delegate_worker_audit is not None:
+                work_metadata["delegate_worker"] = copy.deepcopy(
+                    dict(delegate_worker_audit)
+                )
             if role_context_pins is not None:
                 work_metadata["role_context"] = dict(role_context_pins)
-            work =AgentWorkItem(source_type=CLI_SESSION_SOURCE_TYPE, source_id=str(run_id), source_revision=str(context.get("agent_revision_id") or ""), intent_key=CLI_SESSION_ADAPTER_KEY, domain=CLI_DEVELOPMENT_DOMAIN, conversation_session_id=row.id, assigned_agent_id=run.agent_id, agent_revision_id=run.agent_revision_id, required_capabilities_json=list(pinned_caps), execution_adapter=CLI_SESSION_ADAPTER_KEY, max_attempts=1, state="pending", attempt_count=0, concurrency_key=resource_key, metadata_json=work_metadata, created_at=self._clock(), updated_at=self._clock())
+            work =AgentWorkItem(source_type=CLI_SESSION_SOURCE_TYPE, source_id=str(run_id), source_revision=str(context.get("agent_revision_id") or ""), intent_key=CLI_SESSION_ADAPTER_KEY, domain=CLI_DEVELOPMENT_DOMAIN, conversation_session_id=row.id, assigned_agent_id=run.agent_id, agent_revision_id=run.agent_revision_id, required_capabilities_json=list(pinned_caps), execution_adapter=CLI_SESSION_ADAPTER_KEY, max_attempts=1, deadline=work_deadline, state="pending", attempt_count=0, concurrency_key=resource_key, metadata_json=work_metadata, created_at=self._clock(), updated_at=self._clock())
             db.add(work)
             await db.flush()
             run.work_item_id = work.id
@@ -2494,9 +4415,14 @@ class CLIDevelopmentSessionService:
             queued_sequence = self._allocate_event_sequences(row, 1)[0]
             db.add(AgentRunEvent(run_id=run_id, sequence=1, event_type="run.queued", status="queued", message="CLI session turn queued", payload={"source": CLI_SESSION_SOURCE_TYPE, "cli_session_sequence": queued_sequence}, created_at=self._clock()))
             db.add(AgentWorkEvent(work_item_id=work.id, sequence=1, event_type="work.queued", from_state=None, to_state="pending", status="pending", actor_kind="service", actor_service_key="aoitalk.system", agent_run_id=run_id, payload_json={"source": CLI_SESSION_SOURCE_TYPE}, created_at=self._clock()))
-            await db.commit()
+            if borrowed:
+                await db.flush()
+            else:
+                await db.commit()
             return {"accepted": True, "created": True, "session_id": sid, "run_id": str(run_id), "work_item_id": str(work.id), "status": "queued", "run": run.to_dict(), "work": work.to_safe_dict()}
         except IntegrityError as exc:
+            if borrowed:
+                raise
             await self._rollback_async(db)
             if not _is_unique_integrity_error(exc):
                 raise CLIDevelopmentSessionStorageError("CLI send could not be persisted", code="send_storage_error") from None
@@ -2505,13 +4431,14 @@ class CLIDevelopmentSessionService:
                 winner = (await probe.execute(select(AgentRun).where(AgentRun.session_id == uuid.UUID(sid), AgentRun.user_id == req.owner_id, AgentRun.client_message_key == _sha256(req.send_key)).limit(1))).scalars().first()
                 if winner is None:
                     raise CLIDevelopmentSessionConflict("send idempotency race could not be reconciled", code="send_idempotency_unavailable")
-                if winner.request_fingerprint != _sha256(req.content):
+                if winner.request_fingerprint != request_fingerprint:
                     raise CLIDevelopmentSessionConflict("send key was reused with different raw content", code="send_idempotency_conflict")
                 return {"accepted": True, "created": False, "session_id": sid, "run_id": str(winner.id), "status": "queued", "run": winner.to_dict()}
             finally:
                 await self._close(probe)
         finally:
-            await self._close(db)
+            if not borrowed:
+                await self._close(db)
 
     async def list_events(self, session_id: Any, *, owner_id: str, after_cursor: str | None = None, cursor: str | None = None, limit: int = 100) -> dict[str, Any]:
         sid = _safe_uuid(session_id)
@@ -2613,6 +4540,705 @@ class CLIDevelopmentSessionService:
         finally:
             await self._close(db)
 
+    async def _reconcile_remote_history_on_reconnect(
+        self, session_id: str, *, owner_id: str, _remote_config_snapshot: Any = None
+    ) -> dict[str, Any]:
+        """Read provider history for the exact uncertain Muse turn and settle it once."""
+
+        snapshot = await self._resolve_remote_config_snapshot(_remote_config_snapshot)
+        lock = await _remote_history_reconciliation_lock(session_id)
+        async with lock:
+            db = await self._session()
+            try:
+                row = await db.get(ConversationSession, uuid.UUID(session_id))
+                if (
+                    row is None
+                    or row.deleted_at is not None
+                    or str(row.user_id) != owner_id
+                ):
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "binding_mismatch",
+                    }
+                context = self._context(row)
+                if not self._is_remote_context(context):
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "binding_mismatch",
+                    }
+                run, work = await self._load_latest(db, row.id)
+                raw_remote = (
+                    row.context.get(MUSE_REMOTE_CONTEXT_KEY)
+                    if isinstance(row.context, Mapping)
+                    else None
+                )
+                raw_binding = (
+                    raw_remote.get("binding")
+                    if isinstance(raw_remote, Mapping)
+                    and isinstance(raw_remote.get("binding"), Mapping)
+                    else raw_remote
+                )
+                if not isinstance(raw_binding, Mapping):
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "binding_mismatch",
+                    }
+
+                run_result = (
+                    run.result if isinstance(getattr(run, "result", None), Mapping) else {}
+                )
+                work_result = (
+                    work.result_summary_json
+                    if isinstance(getattr(work, "result_summary_json", None), Mapping)
+                    else {}
+                )
+                work_metadata = (
+                    work.metadata_json
+                    if isinstance(getattr(work, "metadata_json", None), Mapping)
+                    else {}
+                )
+                run_metadata = (
+                    run.run_metadata
+                    if isinstance(getattr(run, "run_metadata", None), Mapping)
+                    else {}
+                )
+                run_cli_metadata = (
+                    run_metadata.get("cli_development")
+                    if isinstance(run_metadata.get("cli_development"), Mapping)
+                    else {}
+                )
+                tool_loop_opt_in = _matching_muse_tool_loop_opt_in(
+                    work_metadata, run_cli_metadata
+                )
+                if tool_loop_opt_in is None:
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "tool_loop_metadata_mismatch",
+                    }
+                if (
+                    run is not None
+                    and work is not None
+                    and str(run.status or "") == "succeeded"
+                    and str(work.state or "") == "succeeded"
+                    and run_result.get("remote_history_reconciled") is True
+                    and work_result.get("remote_history_reconciled") is True
+                    and not raw_binding.get("current_turn_nonce")
+                    and not raw_binding.get("current_run_id")
+                    and str(raw_binding.get("state") or "") == "bound"
+                    and raw_binding.get("safe_to_send") is True
+                ):
+                    durable_message = (
+                        await db.execute(
+                            select(ConversationMessage).where(
+                                ConversationMessage.session_id == row.id,
+                                ConversationMessage.client_message_id
+                                == f"muse-assistant:{run.id}",
+                            )
+                        )
+                    ).scalars().first()
+                    if (
+                        durable_message is not None
+                        and str(run_result.get("assistant_message_id") or "")
+                        == str(durable_message.id)
+                        and str(
+                            run_result.get("provider_assistant_message_id") or ""
+                        )
+                        == str(
+                            (durable_message.message_metadata or {}).get(
+                                "provider_message_id"
+                            )
+                            or ""
+                        )
+                    ):
+                        return {
+                            "reconciled": True,
+                            "history_reconciled": True,
+                            "reconciliation_diagnostic": "confirmed",
+                        }
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "settlement_conflict",
+                    }
+
+                raw_nonce = raw_binding.get("current_turn_nonce")
+                if raw_nonce is not None and not isinstance(raw_nonce, str):
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "recovery_state_ineligible",
+                    }
+                nonce = str(raw_nonce or "").strip()
+                if not nonce:
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "no_pending_nonce",
+                    }
+
+                if run is None or work is None:
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "recovery_state_ineligible",
+                    }
+                agent_id = str(context.get("agent_id") or row.agent_id or "")
+                revision_id = str(context.get("agent_revision_id") or "")
+                expected_binding_id = str(context.get("binding_id") or "")
+                expected_binding_hash = str(context.get("binding_snapshot_hash") or "")
+                attempt = int(getattr(work, "attempt_count", 0) or 0)
+                recovery_error_code = str(run.error or "")
+                work_event = (
+                    await db.execute(
+                        select(AgentWorkEvent)
+                        .where(
+                            AgentWorkEvent.work_item_id == work.id,
+                            AgentWorkEvent.event_type == "work.uncertain",
+                            AgentWorkEvent.to_state == "uncertain",
+                            AgentWorkEvent.agent_run_id == run.id,
+                            AgentWorkEvent.safe_error_code.in_(
+                                (
+                                    str(MuseErrorCode.SEND_RESPONSE_UNCORRELATED),
+                                    _MUSE_CLI_PROCESS_FAILED,
+                                )
+                            ),
+                        )
+                        .order_by(desc(AgentWorkEvent.sequence))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                run_event = (
+                    await db.execute(
+                        select(AgentRunEvent)
+                        .where(
+                            AgentRunEvent.run_id == run.id,
+                            AgentRunEvent.event_type == "cli.disconnected",
+                            AgentRunEvent.status == "disconnected",
+                        )
+                        .order_by(desc(AgentRunEvent.sequence))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                run_event_payload = (
+                    run_event.payload
+                    if isinstance(getattr(run_event, "payload", None), Mapping)
+                    else {}
+                )
+                binding_identity_matches = (
+                    str(raw_binding.get("owner_id") or "") == owner_id
+                    and str(raw_binding.get("agent_id") or "") == agent_id
+                    and str(raw_binding.get("revision_id") or "") == revision_id
+                    and str(raw_binding.get("remote_target_key") or "") == session_id
+                    and str(raw_binding.get("current_run_id") or "") == str(run.id)
+                )
+                recovery_state_matches = (
+                    str(run.status or "") == "failed"
+                    and str(work.state or "") == "uncertain"
+                    and str(work.outcome_classification or "") == "uncertain"
+                    and _remote_recovery_error_matches(
+                        run_error=run.error,
+                        work_error=work.safe_error_code,
+                        binding=raw_binding,
+                        result_summary=work_result,
+                    )
+                    and attempt > 0
+                    and int(getattr(run, "work_item_attempt", 0) or 0) == attempt
+                    and getattr(work, "active_agent_run_id", None)
+                    in (None, run.id)
+                    and str(run.work_item_id or "") == str(work.id)
+                    and str(work.conversation_session_id or "") == session_id
+                    and str(run.session_id or "") == session_id
+                    and str(run.user_id or "") == owner_id
+                    and str(run.agent_id or "") == agent_id
+                    and str(run.agent_revision_id or "") == revision_id
+                    and str(work.assigned_agent_id or "") == agent_id
+                    and str(work.agent_revision_id or "") == revision_id
+                    and str(run.run_type or "") == REMOTE_SESSION_SOURCE_TYPE
+                    and str(work.source_type or "") == REMOTE_SESSION_SOURCE_TYPE
+                    and str(work.execution_adapter or "") == MUSE_REMOTE_ADAPTER_KEY
+                    and str(work.source_id or "") == str(run.id)
+                    and str(work.source_revision or "") == revision_id
+                    and work_metadata.get("owner_id") == owner_id
+                    and work_metadata.get("remote_target_key") == session_id
+                    and str(work_metadata.get("binding_id") or "")
+                    == expected_binding_id
+                    and str(work_metadata.get("binding_snapshot_hash") or "")
+                    == expected_binding_hash
+                    and str(run_cli_metadata.get("binding_id") or "")
+                    == expected_binding_id
+                    and str(run_cli_metadata.get("binding_snapshot_hash") or "")
+                    == expected_binding_hash
+                    and str(run_cli_metadata.get("remote_target_key") or "")
+                    == session_id
+                    and binding_identity_matches
+                    and work_event is not None
+                    and _remote_uncertain_event_matches(
+                        work_event,
+                        run_id=run.id,
+                        attempt=attempt,
+                        error_code=recovery_error_code,
+                    )
+                    and run_event is not None
+                    and str(run_event_payload.get("error_code") or "")
+                    == recovery_error_code
+                )
+                latest_run, latest_work = await self._load_latest(db, row.id)
+                if (
+                    not recovery_state_matches
+                    or latest_run is None
+                    or latest_work is None
+                    or str(latest_run.id) != str(run.id)
+                    or str(latest_work.id) != str(work.id)
+                ):
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "recovery_state_ineligible",
+                    }
+
+                self._assert_remote_admission(owner_id=owner_id, agent_id=agent_id, _remote_config_snapshot=snapshot)
+                binding = await self._binding_for_row(db, row)
+                _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+                role_mapping = self._managed_role_mapping(binding, context)
+                await self._resolve_remote_backend_execution(db, row, context, _remote_config_snapshot=snapshot)
+                if tool_loop_opt_in:
+                    existing_observation = run_result.get(
+                        "muse_tool_loop_history_observation"
+                    )
+                    if existing_observation is not None:
+                        observation_matches = bool(
+                            isinstance(existing_observation, Mapping)
+                            and existing_observation.get("schema_version") == 1
+                            and existing_observation.get("status")
+                            == "tool_loop_recovery_required"
+                            and existing_observation.get("run_id") == str(run.id)
+                            and existing_observation.get("work_item_id")
+                            == str(work.id)
+                            and existing_observation.get("binding_id")
+                            == expected_binding_id
+                            and existing_observation.get("binding_snapshot_hash")
+                            == expected_binding_hash
+                            and existing_observation.get("turn_nonce_sha256")
+                            == _sha256(nonce)
+                            and isinstance(
+                                existing_observation.get(
+                                    "provider_assistant_message_id"
+                                ),
+                                str,
+                            )
+                            and isinstance(
+                                existing_observation.get("assistant_text_sha256"),
+                                str,
+                            )
+                        )
+                        if not observation_matches:
+                            return {
+                                "reconciled": False,
+                                "history_reconciled": False,
+                                "reconciliation_diagnostic": "history_observation_conflict",
+                            }
+                        return {
+                            "reconciled": False,
+                            "history_reconciled": False,
+                            "history_observed": True,
+                            "reconciliation_diagnostic": "tool_loop_recovery_required",
+                            "history_observation": dict(existing_observation),
+                        }
+                metadata: dict[str, Any] = {
+                    "owner_id": owner_id,
+                    "agent_id": agent_id,
+                    "agent_revision_id": revision_id,
+                    "execution_target": MUSE_EXECUTION_TARGET,
+                    "provider": MUSE_PROVIDER,
+                    "remote_target_key": session_id,
+                    "current_run_id": str(run.id),
+                }
+                if role_mapping is not None:
+                    metadata["managed_role_context"] = role_mapping
+                claim = {
+                    "work_item_id": str(work.id),
+                    "source_type": REMOTE_SESSION_SOURCE_TYPE,
+                    "source_id": str(run.id),
+                    "source_revision": revision_id,
+                    "intent_key": str(work.intent_key or MUSE_REMOTE_ADAPTER_KEY),
+                    "domain": str(work.domain or CLI_DEVELOPMENT_DOMAIN),
+                    "assigned_agent_id": agent_id,
+                    "agent_revision_id": revision_id,
+                    "execution_adapter": MUSE_REMOTE_ADAPTER_KEY,
+                    "required_capabilities": list(REMOTE_SESSION_CAPABILITIES),
+                    "conversation_session_id": session_id,
+                    "metadata": metadata,
+                }
+                authority = {
+                    "owner_id": owner_id,
+                    "agent_id": agent_id,
+                    "revision_id": revision_id,
+                    "remote_target_key": session_id,
+                    "required_capabilities": list(REMOTE_SESSION_CAPABILITIES),
+                    "allowed_adapters": [MUSE_REMOTE_ADAPTER_KEY],
+                    "allowed_targets": [MUSE_EXECUTION_TARGET],
+                }
+                recovery_nonce = nonce
+                run_id = str(run.id)
+                work_id = str(work.id)
+                await self._close(db)
+                db = None
+            except Exception:
+                return {
+                    "reconciled": False,
+                    "history_reconciled": False,
+                    "reconciliation_diagnostic": "authority_unavailable",
+                }
+            finally:
+                if db is not None:
+                    await self._close(db)
+
+            try:
+                adapter = self._get_remote_adapter(_remote_config_snapshot=snapshot)
+                reconcile = getattr(adapter, "reconcile", None)
+                if not callable(reconcile):
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "reconciliation_diagnostic": "history_unavailable",
+                    }
+                outcome = await reconcile(
+                    claim,
+                    authority=authority,
+                    preserve_binding=True,
+                )
+            except Exception:
+                return {
+                    "reconciled": False,
+                    "history_reconciled": False,
+                    "reconciliation_diagnostic": "history_unavailable",
+                }
+            outcome_metadata = (
+                outcome.metadata
+                if isinstance(getattr(outcome, "metadata", None), Mapping)
+                else {}
+            )
+            diagnostic = str(
+                outcome_metadata.get("reconciliation_diagnostic") or ""
+            )
+            allowed_diagnostics = {
+                "confirmed",
+                "history_unavailable",
+                "history_nonterminal",
+                "history_unconfirmed",
+                "binding_mismatch",
+                "authority_unavailable",
+                "binding_persist_failed",
+                "recovery_state_ineligible",
+                "no_pending_nonce",
+            }
+            if diagnostic not in allowed_diagnostics:
+                code = str(getattr(outcome, "error_code", "") or "")
+                diagnostic = (
+                    "authority_unavailable"
+                    if code
+                    in {
+                        str(MuseErrorCode.CURRENT_AUTH_MISMATCH),
+                        str(MuseErrorCode.CREDENTIAL_UNAVAILABLE),
+                        str(MuseErrorCode.REMOTE_AUTHENTICATION_FAILED),
+                        str(MuseErrorCode.REMOTE_TARGET_DISABLED),
+                        str(MuseErrorCode.REMOTE_VM_UNBOUND),
+                    }
+                    else "history_unconfirmed"
+                )
+            result = (
+                outcome.result
+                if isinstance(getattr(outcome, "result", None), Mapping)
+                else {}
+            )
+            history_confirmed = bool(
+                str(getattr(outcome, "classification", "")) == "succeeded"
+                and outcome_metadata.get("history_reconciled") is True
+                and diagnostic == "confirmed"
+                and isinstance(result.get("assistant_text"), str)
+                and bool(result.get("assistant_text"))
+                and isinstance(result.get("assistant_message_id"), str)
+                and bool(result.get("assistant_message_id"))
+            )
+            if not history_confirmed:
+                return {
+                    "reconciled": False,
+                    "history_reconciled": False,
+                    "reconciliation_diagnostic": diagnostic,
+                }
+            if tool_loop_opt_in:
+                observation = await self._record_muse_tool_loop_history_observation(
+                    session_id=session_id,
+                    run_id=run_id,
+                    work_item_id=work_id,
+                    owner_id=owner_id,
+                    recovery_nonce=recovery_nonce,
+                    binding_id=expected_binding_id,
+                    binding_snapshot_hash=expected_binding_hash,
+                    _remote_config_snapshot=snapshot,
+                    assistant_text=str(result.get("assistant_text") or ""),
+                    provider_message_id=str(
+                        result.get("assistant_message_id") or ""
+                    ),
+                )
+                if observation.get("recorded") is not True:
+                    return {
+                        "reconciled": False,
+                        "history_reconciled": False,
+                        "history_observed": False,
+                        "reconciliation_diagnostic": str(
+                            observation.get("reconciliation_diagnostic")
+                            or "history_observation_unavailable"
+                        ),
+                    }
+                return {
+                    "reconciled": False,
+                    "history_reconciled": False,
+                    "history_observed": True,
+                    "reconciliation_diagnostic": "tool_loop_recovery_required",
+                    "history_observation": observation["history_observation"],
+                }
+            delivery = result.get("delivery")
+            try:
+                receipt = await self.record_remote_reconciliation_result(
+                    session_id=session_id,
+                    run_id=run_id,
+                    work_item_id=work_id,
+                    owner_id=owner_id,
+                    recovery_nonce=recovery_nonce,
+                    assistant_text=str(result.get("assistant_text") or ""),
+                    assistant_message_id=str(
+                        result.get("assistant_message_id") or ""
+                    ),
+                    assistant_text_truncated=(
+                        result.get("assistant_text_truncated") is True
+                    ),
+                    assistant_text_original_length=(
+                        result.get("assistant_text_original_length")
+                    ),
+                    delivery=delivery if isinstance(delivery, Mapping) else None,
+                )
+            except Exception:
+                return {
+                    "reconciled": False,
+                    "history_reconciled": True,
+                    "reconciliation_diagnostic": "settlement_unavailable",
+                }
+            if receipt.get("discarded"):
+                return {
+                    "reconciled": False,
+                    "history_reconciled": True,
+                    "reconciliation_diagnostic": "settlement_conflict",
+                }
+            return {
+                "reconciled": True,
+                "history_reconciled": True,
+                "reconciliation_diagnostic": "confirmed",
+            }
+
+    async def _record_muse_tool_loop_history_observation(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        work_item_id: str,
+        owner_id: str,
+        recovery_nonce: str,
+        binding_id: str,
+        binding_snapshot_hash: str,
+        assistant_text: str,
+        provider_message_id: str,
+        _remote_config_snapshot: Any = None,
+    ) -> dict[str, Any]:
+        """Persist a correlated reply receipt without settling opted-in Work."""
+
+        snapshot = await self._resolve_remote_config_snapshot(_remote_config_snapshot)
+        db = await self._session()
+        try:
+            row = (
+                await db.execute(
+                    select(ConversationSession)
+                    .where(ConversationSession.id == uuid.UUID(session_id))
+                    .with_for_update()
+                )
+            ).scalars().first()
+            run = await db.get(AgentRun, uuid.UUID(run_id))
+            work = await db.get(AgentWorkItem, uuid.UUID(work_item_id))
+            if (
+                row is None
+                or row.deleted_at is not None
+                or str(row.user_id) != owner_id
+                or run is None
+                or work is None
+                or str(run.user_id or "") != owner_id
+                or str(run.session_id or "") != session_id
+                or str(run.id) != run_id
+                or str(run.work_item_id or "") != work_item_id
+                or str(run.run_type or "") != REMOTE_SESSION_SOURCE_TYPE
+                or str(work.id) != work_item_id
+                or str(work.conversation_session_id or "") != session_id
+                or str(work.source_type or "") != REMOTE_SESSION_SOURCE_TYPE
+                or str(work.source_id or "") != run_id
+                or str(work.execution_adapter or "") != MUSE_REMOTE_ADAPTER_KEY
+                or str(run.status or "") != "failed"
+                or str(work.state or "") != "uncertain"
+                or str(work.outcome_classification or "") != "uncertain"
+                or work.cancelled_at is not None
+                or getattr(work, "active_agent_run_id", None) not in (None, run.id)
+            ):
+                return {
+                    "recorded": False,
+                    "reconciliation_diagnostic": "recovery_state_ineligible",
+                }
+
+            latest_run, latest_work = await self._load_latest(db, row.id)
+            context = self._context(row)
+            raw_remote = (
+                row.context.get(MUSE_REMOTE_CONTEXT_KEY)
+                if isinstance(row.context, Mapping)
+                else None
+            )
+            raw_binding = (
+                raw_remote.get("binding")
+                if isinstance(raw_remote, Mapping)
+                and isinstance(raw_remote.get("binding"), Mapping)
+                else raw_remote
+            )
+            work_metadata = (
+                work.metadata_json
+                if isinstance(work.metadata_json, Mapping)
+                else {}
+            )
+            run_metadata = (
+                run.run_metadata
+                if isinstance(run.run_metadata, Mapping)
+                else {}
+            )
+            run_cli_metadata = (
+                run_metadata.get("cli_development")
+                if isinstance(run_metadata.get("cli_development"), Mapping)
+                else {}
+            )
+            if (
+                latest_run is None
+                or latest_work is None
+                or str(latest_run.id) != run_id
+                or str(latest_work.id) != work_item_id
+                or _matching_muse_tool_loop_opt_in(work_metadata, run_cli_metadata)
+                is not True
+                or not isinstance(raw_binding, Mapping)
+                or str(raw_binding.get("current_turn_nonce") or "")
+                != recovery_nonce
+                or str(raw_binding.get("current_run_id") or "") != run_id
+                or str(raw_binding.get("owner_id") or "") != owner_id
+                or str(raw_binding.get("agent_id") or "")
+                != str(context.get("agent_id") or row.agent_id or "")
+                or str(raw_binding.get("revision_id") or "")
+                != str(context.get("agent_revision_id") or "")
+                or str(raw_binding.get("remote_target_key") or "") != session_id
+                or str(run.agent_id or "")
+                != str(context.get("agent_id") or row.agent_id or "")
+                or str(run.agent_revision_id or "")
+                != str(context.get("agent_revision_id") or "")
+                or str(work.assigned_agent_id or "")
+                != str(context.get("agent_id") or row.agent_id or "")
+                or str(work.agent_revision_id or "")
+                != str(context.get("agent_revision_id") or "")
+                or str(work.source_revision or "")
+                != str(context.get("agent_revision_id") or "")
+                or int(getattr(work, "attempt_count", 0) or 0) <= 0
+                or int(getattr(run, "work_item_attempt", 0) or 0)
+                != int(getattr(work, "attempt_count", 0) or 0)
+                or not _remote_recovery_error_matches(
+                    run_error=run.error,
+                    work_error=work.safe_error_code,
+                    binding=raw_binding,
+                    result_summary=work.result_summary_json,
+                )
+                or str(context.get("binding_id") or "") != binding_id
+                or str(context.get("binding_snapshot_hash") or "")
+                != binding_snapshot_hash
+                or str(work_metadata.get("owner_id") or "") != owner_id
+                or str(work_metadata.get("remote_target_key") or "")
+                != session_id
+                or str(work_metadata.get("binding_id") or "") != binding_id
+                or str(work_metadata.get("binding_snapshot_hash") or "")
+                != binding_snapshot_hash
+                or str(run_cli_metadata.get("binding_id") or "") != binding_id
+                or str(run_cli_metadata.get("binding_snapshot_hash") or "")
+                != binding_snapshot_hash
+                or str(run_cli_metadata.get("remote_target_key") or "")
+                != session_id
+            ):
+                return {
+                    "recorded": False,
+                    "reconciliation_diagnostic": "binding_mismatch",
+                }
+
+            agent_id = str(context.get("agent_id") or row.agent_id or "")
+            revision_id = str(context.get("agent_revision_id") or "")
+            self._assert_remote_admission(owner_id=owner_id, agent_id=agent_id, _remote_config_snapshot=snapshot)
+            binding = await self._binding_for_row(db, row)
+            _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
+            await self._resolve_remote_backend_execution(db, row, context, _remote_config_snapshot=snapshot)
+
+            receipt_identity = {
+                "schema_version": 1,
+                "status": "tool_loop_recovery_required",
+                "run_id": run_id,
+                "work_item_id": work_item_id,
+                "binding_id": binding_id,
+                "binding_snapshot_hash": binding_snapshot_hash,
+                "turn_nonce_sha256": _sha256(recovery_nonce),
+                "provider_assistant_message_id": provider_message_id,
+                "assistant_text_sha256": _sha256(assistant_text),
+                "assistant_text_length": len(assistant_text),
+                "tool_dispatch": "not_attempted",
+                "tool_receipts": "not_modified",
+                "work_budget": "original_deadline_preserved",
+            }
+            run_result = run.result if isinstance(run.result, Mapping) else {}
+            existing = run_result.get("muse_tool_loop_history_observation")
+            if isinstance(existing, Mapping):
+                if any(existing.get(key) != value for key, value in receipt_identity.items()):
+                    return {
+                        "recorded": False,
+                        "reconciliation_diagnostic": "history_observation_conflict",
+                    }
+                return {
+                    "recorded": True,
+                    "history_observation": dict(existing),
+                }
+
+            observed_at = self._clock()
+            receipt = {
+                **receipt_identity,
+                "observed_at": (
+                    observed_at.isoformat()
+                    if hasattr(observed_at, "isoformat")
+                    else str(observed_at)
+                ),
+            }
+            run.result = {
+                **dict(run_result),
+                "muse_tool_loop_history_observation": receipt,
+            }
+            run.updated_at = observed_at
+            await db.commit()
+            return {"recorded": True, "history_observation": receipt}
+        except Exception:
+            await self._rollback_async(db)
+            return {
+                "recorded": False,
+                "reconciliation_diagnostic": "authority_unavailable",
+            }
+        finally:
+            await self._close(db)
+
     async def reconnect(self, session_id: Any, *, owner_id: str) -> dict[str, Any]:
         sid = _safe_uuid(session_id)
         if sid is None:
@@ -2628,10 +5254,24 @@ class CLIDevelopmentSessionService:
             context = self._context(row)
             run, work = await self._load_latest(db, row.id)
             if self._is_remote_context(context):
-                # Muse has no local native session handle or trusted Windows
-                # filesystem.  Reconnect only rechecks the immutable Agent
-                # binding, current authority and the durable remote binding
-                # state; it never exposes a thread ID or credentials.
+                # Close the read session before the bounded provider history
+                # read and its independent row-locked settlement transaction.
+                await self._close(db)
+                db = None
+                snapshot = await self._resolve_remote_config_snapshot()
+                reconciliation = await self._reconcile_remote_history_on_reconnect(
+                    sid, owner_id=owner, _remote_config_snapshot=snapshot
+                )
+                db = await self._session()
+                row = await db.get(ConversationSession, uuid.UUID(sid))
+                if row is None or row.deleted_at is not None:
+                    raise CLIDevelopmentSessionNotFound()
+                if str(row.user_id) != owner:
+                    raise CLIDevelopmentSessionForbidden(
+                        "session owner mismatch", code="session_owner_mismatch"
+                    )
+                context = self._context(row)
+                run, work = await self._load_latest(db, row.id)
                 status = self._status_from_rows(context, run, work)
                 authority_valid = False
                 remote_state = "unbound"
@@ -2658,15 +5298,11 @@ class CLIDevelopmentSessionService:
                     self._assert_remote_admission(
                         owner_id=owner,
                         agent_id=str(context.get("agent_id") or row.agent_id or ""),
+                        _remote_config_snapshot=snapshot,
                     )
                     binding = await self._binding_for_row(db, row)
                     _assert_route(binding, provider=MUSE_PROVIDER, model=None, effort=None)
-                    await self._resolve_authority(
-                        agent_id=str(context.get("agent_id") or row.agent_id or ""),
-                        revision_id=str(context.get("agent_revision_id") or ""),
-                        project_id=context.get("project_id"),
-                        capabilities=REMOTE_SESSION_CAPABILITIES,
-                    )
+                    await self._resolve_remote_backend_execution(db, row, context, _remote_config_snapshot=snapshot)
                     authority_valid = True
                 except Exception:
                     authority_valid = False
@@ -2690,7 +5326,23 @@ class CLIDevelopmentSessionService:
                     "safe_to_send": safe_to_send,
                     "run_id": str(run.id) if run else None,
                     "work_item_id": str(work.id) if work else None,
-                    "reconciled": True,
+                    "reconciled": bool(reconciliation.get("reconciled")),
+                    "history_reconciled": bool(
+                        reconciliation.get("history_reconciled")
+                    ),
+                    "history_observed": bool(
+                        reconciliation.get("history_observed")
+                    ),
+                    "history_observation": reconciliation.get(
+                        "history_observation"
+                    )
+                    or self._remote_result_fields(run, work).get(
+                        "history_observation"
+                    ),
+                    "reconciliation_diagnostic": str(
+                        reconciliation.get("reconciliation_diagnostic")
+                        or "history_unconfirmed"
+                    ),
                     **self._remote_result_fields(run, work),
                 }
             native = "absent"
@@ -2731,6 +5383,7 @@ class CLIDevelopmentSessionService:
                     revision_id=str(context.get("agent_revision_id") or ""),
                     project_id=context.get("project_id"),
                     capabilities=pinned_cli_capabilities(context),
+                    managed_backend=await self._verified_managed_backend(db, row, context),
                 )
                 authority_valid = bool(current_cwd)
             except Exception:
@@ -2746,6 +5399,171 @@ class CLIDevelopmentSessionService:
                 )
             )
             return {"session_id": sid, "status": status, "native_handle": native, "native_session_id": native_id, "safe_to_send": safe_to_send, "run_id": str(run.id) if run else None, "work_item_id": str(work.id) if work else None, "reconciled": True}
+        finally:
+            await self._close(db)
+
+    async def _locked_owned_session_row(self, db: Any, sid: str, owner: str) -> Any:
+        row = (
+            await db.execute(
+                select(ConversationSession)
+                .where(ConversationSession.id == uuid.UUID(sid))
+                .with_for_update()
+            )
+        ).scalars().first()
+        if row is None or getattr(row, "deleted_at", None) is not None:
+            raise CLIDevelopmentSessionNotFound()
+        if str(row.user_id) != owner:
+            raise CLIDevelopmentSessionForbidden(
+                "session owner mismatch", code="session_owner_mismatch"
+            )
+        return row
+
+    @staticmethod
+    def _store_cli_context(row: Any, context: Mapping[str, Any]) -> None:
+        next_context = copy.deepcopy(row.context) if isinstance(row.context, Mapping) else {}
+        next_context[CLI_DEVELOPMENT_CONTEXT_KEY] = dict(context)
+        row.context = next_context
+
+    async def begin_remote_reconnect_receipt(
+        self, session_id: Any, *, owner_id: str
+    ) -> dict[str, Any] | None:
+        """Durably record that one owner reconnect attempt was accepted.
+
+        The receipt replaces only the previous bounded receipt.  It does not
+        touch the Muse binding, provider nonce, Run/Work rows or safe_to_send.
+        Non-remote sessions return ``None``.
+        """
+
+        sid = _safe_uuid(session_id)
+        if sid is None:
+            raise CLIDevelopmentSessionInvalid("invalid session_id", code="invalid_session_id")
+        owner = _identifier(owner_id, field_name="owner_id")
+        db = await self._session()
+        try:
+            row = await self._locked_owned_session_row(db, sid, owner)
+            context = self._context(row)
+            if not self._is_remote_context(context):
+                return None
+            try:
+                previous = max(0, int(context.get(REMOTE_RECONNECT_SEQUENCE_KEY, 0) or 0))
+            except (TypeError, ValueError):
+                previous = 0
+            receipt = {key: None for key in _REMOTE_RECONNECT_RECEIPT_FIELDS}
+            receipt.update(
+                {
+                    "schema_version": REMOTE_RECONNECT_RECEIPT_SCHEMA_VERSION,
+                    "attempt_id": str(uuid.uuid4()),
+                    "attempt_sequence": previous + 1,
+                    "state": "started",
+                    "terminal": False,
+                    "started_at": _iso(self._clock()),
+                }
+            )
+            context[REMOTE_RECONNECT_SEQUENCE_KEY] = previous + 1
+            context[REMOTE_RECONNECT_RECEIPT_KEY] = receipt
+            self._store_cli_context(row, context)
+            await db.commit()
+            return dict(receipt)
+        except Exception:
+            await self._rollback_async(db)
+            raise
+        finally:
+            await self._close(db)
+
+    @staticmethod
+    def _remote_reconnect_terminal_fields(
+        state: str, result: Any, error: BaseException | None
+    ) -> tuple[str, dict[str, Any]]:
+        if state == "completed" and not isinstance(result, Mapping):
+            return "failed", {
+                "error_type": None,
+                "error_code": "invalid_reconnect_result",
+            }
+        if state != "completed":
+            return state, _receipt_error_fields(error)
+        reconciled = result.get("reconciled") is True
+        history_reconciled = result.get("history_reconciled") is True
+        history_observed = result.get("history_observed") is True
+        observation_present = isinstance(result.get("history_observation"), Mapping)
+        if history_reconciled:
+            history_outcome = "reconciled"
+        elif history_observed or observation_present:
+            history_outcome = "observed"
+        else:
+            history_outcome = "not_reconciled"
+        return "completed", {
+            "history_outcome": history_outcome,
+            "reconciled": reconciled,
+            "history_reconciled": history_reconciled,
+            "history_observed": history_observed,
+            "history_observation_present": observation_present,
+            "reconciliation_diagnostic": _receipt_token(
+                result.get("reconciliation_diagnostic"), _REMOTE_RECONNECT_DIAGNOSTICS
+            ),
+            "session_status": _receipt_token(
+                result.get("status"), CLI_DEVELOPMENT_STATUSES
+            ),
+            "remote_binding_state": _receipt_token(result.get("remote_binding_state")),
+            "run_id": _safe_uuid(result.get("run_id")),
+            "work_item_id": _safe_uuid(result.get("work_item_id")),
+            "error_type": None,
+            "error_code": None,
+        }
+
+    async def complete_remote_reconnect_receipt(
+        self,
+        session_id: Any,
+        *,
+        owner_id: str,
+        attempt_id: Any,
+        outcome: str,
+        result: Any = None,
+        error: BaseException | None = None,
+    ) -> bool:
+        """Settle the started receipt for ``attempt_id`` exactly once.
+
+        A completion for an attempt that is no longer the latest receipt, or
+        that is already terminal, is ignored so a stale/slow attempt never
+        overwrites a newer attempt.  Returns whether the receipt was written.
+        """
+
+        sid = _safe_uuid(session_id)
+        attempt = _safe_uuid(attempt_id)
+        if sid is None or attempt is None:
+            return False
+        owner = _identifier(owner_id, field_name="owner_id")
+        requested = outcome if outcome in REMOTE_RECONNECT_TERMINAL_STATES else "failed"
+        state, fields = self._remote_reconnect_terminal_fields(requested, result, error)
+        db = await self._session()
+        try:
+            try:
+                row = await self._locked_owned_session_row(db, sid, owner)
+            except (CLIDevelopmentSessionNotFound, CLIDevelopmentSessionForbidden):
+                return False
+            context = self._context(row)
+            current = context.get(REMOTE_RECONNECT_RECEIPT_KEY)
+            if (
+                not isinstance(current, Mapping)
+                or current.get("attempt_id") != attempt
+                or current.get("state") != "started"
+            ):
+                return False
+            receipt = {key: current.get(key) for key in _REMOTE_RECONNECT_RECEIPT_FIELDS}
+            receipt.update(fields)
+            receipt.update(
+                {
+                    "state": state,
+                    "terminal": True,
+                    "finished_at": _iso(self._clock()),
+                }
+            )
+            context[REMOTE_RECONNECT_RECEIPT_KEY] = receipt
+            self._store_cli_context(row, context)
+            await db.commit()
+            return True
+        except Exception:
+            await self._rollback_async(db)
+            raise
         finally:
             await self._close(db)
 
@@ -2822,6 +5640,36 @@ class CLIDevelopmentSessionService:
         finally:
             await self._close(db)
 
+    async def record_remote_reconciliation_result(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        work_item_id: str,
+        owner_id: str,
+        recovery_nonce: str,
+        assistant_text: str,
+        assistant_message_id: str,
+        assistant_text_truncated: bool = False,
+        assistant_text_original_length: int | None = None,
+        delivery: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically settle one history-confirmed uncertain Muse turn."""
+
+        return await self._record_execution_result(
+            session_id=session_id,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            classification="succeeded",
+            assistant_text=assistant_text,
+            assistant_message_id=assistant_message_id,
+            assistant_text_truncated=assistant_text_truncated,
+            assistant_text_original_length=assistant_text_original_length,
+            _recovery_nonce=recovery_nonce,
+            _recovery_owner_id=owner_id,
+            _remote_delivery=delivery,
+        )
+
     async def record_execution_result(
         self,
         *,
@@ -2831,6 +5679,7 @@ class CLIDevelopmentSessionService:
         classification: str,
         output: str | None = None,
         assistant_text: str | None = None,
+        usage: Mapping[str, Any] | None = None,
         assistant_message_id: str | None = None,
         assistant_text_truncated: bool = False,
         assistant_text_original_length: int | None = None,
@@ -2838,15 +5687,72 @@ class CLIDevelopmentSessionService:
         error_message: str | None = None,
         native_state: str | None = None,
         native_scope_key: str | None = None,
+        delegate_worker_usage: Mapping[str, Any] | None = None,
+        delegate_worker_result: Mapping[str, Any] | None = None,
         lease_owner: str | None = None,
         lease_token: str | None = None,
         attempt: int | None = None,
+        cli_failure_diagnostic: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a normal provider result under the ordinary late-result fence."""
+
+        return await self._record_execution_result(
+            session_id=session_id,
+            run_id=run_id,
+            work_item_id=work_item_id,
+            classification=classification,
+            output=output,
+            assistant_text=assistant_text,
+            usage=usage,
+            assistant_message_id=assistant_message_id,
+            assistant_text_truncated=assistant_text_truncated,
+            assistant_text_original_length=assistant_text_original_length,
+            error_code=error_code,
+            error_message=error_message,
+            native_state=native_state,
+            native_scope_key=native_scope_key,
+            delegate_worker_usage=delegate_worker_usage,
+            delegate_worker_result=delegate_worker_result,
+            lease_owner=lease_owner,
+            lease_token=lease_token,
+            attempt=attempt,
+            cli_failure_diagnostic=cli_failure_diagnostic,
+        )
+
+    async def _record_execution_result(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        work_item_id: str,
+        classification: str,
+        output: str | None = None,
+        assistant_text: str | None = None,
+        usage: Mapping[str, Any] | None = None,
+        assistant_message_id: str | None = None,
+        assistant_text_truncated: bool = False,
+        assistant_text_original_length: int | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        native_state: str | None = None,
+        native_scope_key: str | None = None,
+        delegate_worker_usage: Mapping[str, Any] | None = None,
+        delegate_worker_result: Mapping[str, Any] | None = None,
+        lease_owner: str | None = None,
+        lease_token: str | None = None,
+        attempt: int | None = None,
+        cli_failure_diagnostic: Mapping[str, Any] | None = None,
+        _recovery_nonce: str | None = None,
+        _recovery_owner_id: str | None = None,
+        _remote_delivery: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Persist provider evidence after the backend worker has drained.
 
         The adapter calls this only after ``execute_prompt`` returned (or its
         cancellation cleanup completed).  A coordinator may later settle the
-        Work/Run fence; this method never upgrades an already-cancelled Run.
+        Work/Run fence; the ordinary path never upgrades an already-settled
+        Run.  The private recovery arguments are supplied only by the separate
+        reconnect reconciliation entry point above.
         """
 
         db = await self._session()
@@ -2861,6 +5767,17 @@ class CLIDevelopmentSessionService:
                 raise CLIDevelopmentSessionNotFound()
             context = self._context(row)
             remote = self._is_remote_context(context)
+            safe_cli_failure = (
+                sanitize_cli_failure_diagnostic(cli_failure_diagnostic)
+                if remote
+                else None
+            )
+            safe_delegate_worker_result = _safe_delegate_worker_result(
+                delegate_worker_result
+            )
+            safe_delegate_worker_usage = _safe_delegate_worker_usage_receipt(
+                delegate_worker_usage
+            )
             expected_source = REMOTE_SESSION_SOURCE_TYPE if remote else CLI_SESSION_SOURCE_TYPE
             expected_adapter = MUSE_REMOTE_ADAPTER_KEY if remote else CLI_SESSION_ADAPTER_KEY
             run_source_type = getattr(run, "run_type", None)
@@ -2892,10 +5809,232 @@ class CLIDevelopmentSessionService:
                     "work_item_id": str(wid),
                     "reason": "binding_mismatch",
                 }
+            recovering_remote = _recovery_nonce is not None
+            if recovering_remote:
+                remote_binding_context = (
+                    row.context.get(MUSE_REMOTE_CONTEXT_KEY)
+                    if isinstance(row.context, Mapping)
+                    else None
+                )
+                remote_binding = (
+                    remote_binding_context.get("binding")
+                    if isinstance(remote_binding_context, Mapping)
+                    and isinstance(remote_binding_context.get("binding"), Mapping)
+                    else remote_binding_context
+                )
+                run_result = (
+                    run.result if isinstance(getattr(run, "result", None), Mapping) else {}
+                )
+                work_result = (
+                    work.result_summary_json
+                    if isinstance(getattr(work, "result_summary_json", None), Mapping)
+                    else {}
+                )
+                # A second reconnect can arrive after the first transaction
+                # committed but before its HTTP response reached the caller.
+                # The durable receipt plus deterministic message identity is
+                # sufficient evidence to return idempotently.
+                if (
+                    remote
+                    and str(run.status or "") == "succeeded"
+                    and str(work.state or "") == "succeeded"
+                    and run_result.get("remote_history_reconciled") is True
+                    and work_result.get("remote_history_reconciled") is True
+                    and isinstance(remote_binding, Mapping)
+                    and not remote_binding.get("current_turn_nonce")
+                    and not remote_binding.get("current_run_id")
+                    and str(remote_binding.get("state") or "") == "bound"
+                    and remote_binding.get("safe_to_send") is True
+                ):
+                    existing = (
+                        await db.execute(
+                            select(ConversationMessage).where(
+                                ConversationMessage.session_id == sid,
+                                ConversationMessage.client_message_id
+                                == f"muse-assistant:{rid}",
+                            )
+                        )
+                    ).scalars().first()
+                    expected_provider_id = str(assistant_message_id or "").strip()
+                    if (
+                        existing is not None
+                        and str(existing.content or "") == str(assistant_text or "")
+                        and str(
+                            (existing.message_metadata or {}).get(
+                                "provider_message_id"
+                            )
+                            or ""
+                        )
+                        == expected_provider_id
+                    ):
+                        await db.rollback()
+                        return {
+                            "status": "completed",
+                            "run_id": str(rid),
+                            "work_item_id": str(wid),
+                            "assistant_message_id": run_result.get(
+                                "assistant_message_id"
+                            ),
+                            "provider_assistant_message_id": expected_provider_id,
+                            "history_reconciled": True,
+                            "idempotent": True,
+                        }
+                latest_run, latest_work = await self._load_latest(db, sid)
+                recovery_error_code = str(run.error or "")
+                recovery_run_event = (
+                    await db.execute(
+                        select(AgentRunEvent)
+                        .where(
+                            AgentRunEvent.run_id == rid,
+                            AgentRunEvent.event_type == "cli.disconnected",
+                            AgentRunEvent.status == "disconnected",
+                        )
+                        .order_by(desc(AgentRunEvent.sequence))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                recovery_work_event = (
+                    await db.execute(
+                        select(AgentWorkEvent)
+                        .where(
+                            AgentWorkEvent.work_item_id == wid,
+                            AgentWorkEvent.event_type == "work.uncertain",
+                            AgentWorkEvent.to_state == "uncertain",
+                            AgentWorkEvent.agent_run_id == run.id,
+                            AgentWorkEvent.safe_error_code.in_(
+                                (
+                                    str(MuseErrorCode.SEND_RESPONSE_UNCORRELATED),
+                                    _MUSE_CLI_PROCESS_FAILED,
+                                )
+                            ),
+                        )
+                        .order_by(desc(AgentWorkEvent.sequence))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                run_event_payload = (
+                    recovery_run_event.payload
+                    if isinstance(
+                        getattr(recovery_run_event, "payload", None), Mapping
+                    )
+                    else {}
+                )
+                recovery_work_metadata = (
+                    work.metadata_json
+                    if isinstance(getattr(work, "metadata_json", None), Mapping)
+                    else {}
+                )
+                recovery_run_metadata = (
+                    run.run_metadata
+                    if isinstance(getattr(run, "run_metadata", None), Mapping)
+                    else {}
+                )
+                recovery_run_cli_metadata = (
+                    recovery_run_metadata.get("cli_development")
+                    if isinstance(
+                        recovery_run_metadata.get("cli_development"), Mapping
+                    )
+                    else {}
+                )
+                eligible_recovery = (
+                    remote
+                    and isinstance(_recovery_nonce, str)
+                    and bool(_recovery_nonce)
+                    and str(_recovery_owner_id or "")
+                    == str(getattr(row, "user_id", "") or "")
+                    and str(getattr(run, "user_id", "") or "")
+                    == str(_recovery_owner_id or "")
+                    and str(run.status or "") == "failed"
+                    and str(work.state or "") == "uncertain"
+                    and str(work.outcome_classification or "") == "uncertain"
+                    and _remote_recovery_error_matches(
+                        run_error=run.error,
+                        work_error=work.safe_error_code,
+                        binding=remote_binding,
+                        result_summary=work_result,
+                    )
+                    and int(work.attempt_count or 0) > 0
+                    and int(run.work_item_attempt or 0)
+                    == int(work.attempt_count or 0)
+                    and getattr(work, "active_agent_run_id", None) in (None, run.id)
+                    and str(run.work_item_id or "") == str(work.id)
+                    and str(run.session_id or "") == str(row.id)
+                    and str(work.conversation_session_id or "") == str(row.id)
+                    and str(latest_run.id if latest_run is not None else "")
+                    == str(run.id)
+                    and str(latest_work.id if latest_work is not None else "")
+                    == str(work.id)
+                    and str(work.execution_adapter or "") == MUSE_REMOTE_ADAPTER_KEY
+                    and str(work.source_type or "") == REMOTE_SESSION_SOURCE_TYPE
+                    and str(work.source_id or "") == str(run.id)
+                    and str(work.source_revision or "")
+                    == str(context.get("agent_revision_id") or "")
+                    and str(run.run_type or "") == REMOTE_SESSION_SOURCE_TYPE
+                    and str(run.agent_id or "")
+                    == str(context.get("agent_id") or row.agent_id or "")
+                    and str(run.agent_revision_id or "")
+                    == str(context.get("agent_revision_id") or "")
+                    and str(work.assigned_agent_id or "")
+                    == str(context.get("agent_id") or row.agent_id or "")
+                    and str(work.agent_revision_id or "")
+                    == str(context.get("agent_revision_id") or "")
+                    and recovery_work_metadata.get("owner_id")
+                    == str(_recovery_owner_id or "")
+                    and recovery_work_metadata.get("remote_target_key")
+                    == str(sid)
+                    and str(recovery_work_metadata.get("binding_id") or "")
+                    == str(context.get("binding_id") or "")
+                    and str(
+                        recovery_work_metadata.get("binding_snapshot_hash") or ""
+                    )
+                    == str(context.get("binding_snapshot_hash") or "")
+                    and str(recovery_run_cli_metadata.get("binding_id") or "")
+                    == str(context.get("binding_id") or "")
+                    and str(
+                        recovery_run_cli_metadata.get("binding_snapshot_hash") or ""
+                    )
+                    == str(context.get("binding_snapshot_hash") or "")
+                    and str(
+                        recovery_run_cli_metadata.get("remote_target_key") or ""
+                    )
+                    == str(row.id)
+                    and isinstance(remote_binding, Mapping)
+                    and str(remote_binding.get("owner_id") or "")
+                    == str(_recovery_owner_id or "")
+                    and str(remote_binding.get("agent_id") or "")
+                    == str(context.get("agent_id") or row.agent_id or "")
+                    and str(remote_binding.get("revision_id") or "")
+                    == str(context.get("agent_revision_id") or "")
+                    and str(remote_binding.get("remote_target_key") or "")
+                    == str(row.id)
+                    and str(remote_binding.get("current_turn_nonce") or "")
+                    == _recovery_nonce
+                    and str(remote_binding.get("current_run_id") or "")
+                    == str(run.id)
+                    and recovery_run_event is not None
+                    and recovery_work_event is not None
+                    and _remote_uncertain_event_matches(
+                        recovery_work_event,
+                        run_id=run.id,
+                        attempt=int(work.attempt_count or 0),
+                        error_code=recovery_error_code,
+                    )
+                    and str(run_event_payload.get("error_code") or "")
+                    == recovery_error_code
+                )
+                if not eligible_recovery or lease_owner is not None or lease_token is not None or attempt is not None:
+                    await db.rollback()
+                    return {
+                        "discarded": True,
+                        "status": "interrupted",
+                        "run_id": str(rid),
+                        "work_item_id": str(wid),
+                        "reason": "recovery_fence_lost",
+                    }
             # A cancelled/settled Work owns the terminal fence.  Provider
             # threads may finish after an async cancellation, but their late
             # plaintext must never become a new assistant message.
-            if (
+            if not recovering_remote and (
                 str(work.active_agent_run_id) != str(run.id)
                 or str(run.work_item_id) != str(work.id)
                 or str(run.status or "") in {"succeeded", "failed", "cancelled"}
@@ -2929,15 +6068,35 @@ class CLIDevelopmentSessionService:
                 normalized = "uncertain"
             else:
                 normalized = "failed"
+            if recovering_remote and normalized != "succeeded":
+                await db.rollback()
+                return {
+                    "discarded": True,
+                    "status": "interrupted",
+                    "run_id": str(rid),
+                    "work_item_id": str(wid),
+                    "reason": "recovery_fence_lost",
+                }
+            safe_worker_usage = _safe_delegate_worker_usage(usage)
             output_content = ""
             output_message_id = None
             provider_message_id = None
             truncated_original_length = None
+            remote_artifact_complete: bool | None = None
             if normalized == "succeeded":
                 if remote:
                     # Only the provider adapter's confirmed-correlation
                     # fields are accepted.  Never infer a reply from an
                     # arbitrary outcome field or an uncertain history read.
+                    if run.trigger_message_id is None:
+                        await db.rollback()
+                        return {
+                            "discarded": True,
+                            "status": "interrupted",
+                            "run_id": str(rid),
+                            "work_item_id": str(wid),
+                            "reason": "remote_reply_unconfirmed",
+                        }
                     provider_message_id = str(assistant_message_id or "").strip()
                     output_content = str(assistant_text or "")
                     try:
@@ -2949,16 +6108,19 @@ class CLIDevelopmentSessionService:
                     except (TypeError, ValueError, OverflowError):
                         provided_original_length = None
                     truncated_original_length = (
-                        max(len(output_content), provided_original_length)
+                        provided_original_length
                         if assistant_text_truncated
                         and provided_original_length is not None
+                        and provided_original_length >= len(output_content)
                         else None
                     )
+                    remote_artifact_complete = not assistant_text_truncated
                     if (
                         not provider_message_id
                         or len(provider_message_id) > 512
                         or any(ord(char) < 0x20 for char in provider_message_id)
                         or not output_content
+                        or len(output_content) > MAX_MUSE_OUTPUT_CHARS
                         or (assistant_text_truncated and truncated_original_length is None)
                     ):
                         await db.rollback()
@@ -2967,7 +6129,11 @@ class CLIDevelopmentSessionService:
                             "status": "interrupted",
                             "run_id": str(rid),
                             "work_item_id": str(wid),
-                            "reason": "remote_reply_unconfirmed",
+                            "reason": (
+                                "remote_reply_over_limit"
+                                if len(output_content) > MAX_MUSE_OUTPUT_CHARS
+                                else "remote_reply_unconfirmed"
+                            ),
                         }
                 # The durable assistant message is the only transcript copy;
                 # Run/Work metadata carries its identity and no raw output.
@@ -2984,6 +6150,8 @@ class CLIDevelopmentSessionService:
                     if (
                         existing_provider_id != provider_message_id
                         or str(message.content or "") != output_content
+                        or str(message.parent_message_id or "")
+                        != str(run.trigger_message_id)
                     ):
                         await db.rollback()
                         return {
@@ -3006,6 +6174,7 @@ class CLIDevelopmentSessionService:
                             {
                                 "execution_target": MUSE_EXECUTION_TARGET,
                                 "provider_message_id": provider_message_id,
+                                "assistant_artifact_complete": remote_artifact_complete,
                             }
                         )
                         if assistant_text_truncated:
@@ -3013,18 +6182,55 @@ class CLIDevelopmentSessionService:
                             message_metadata[
                                 "assistant_text_original_length"
                             ] = truncated_original_length
-                    message = ConversationMessage(id=uuid.uuid4(), session_id=sid, role="assistant", content=(output_content if remote else str(output or "")), client_message_id=assistant_key, sender_type="agent", sender_id=str(run.agent_id), message_metadata=message_metadata, created_at=self._clock(), updated_at=self._clock(), is_active_branch=True, branch_index=0)
+                    message = ConversationMessage(
+                        id=uuid.uuid4(),
+                        session_id=sid,
+                        parent_message_id=(run.trigger_message_id if remote else None),
+                        role="assistant",
+                        content=output_content if remote else str(output or ""),
+                        client_message_id=assistant_key,
+                        sender_type="agent",
+                        sender_id=str(run.agent_id),
+                        message_metadata=message_metadata,
+                        created_at=self._clock(),
+                        updated_at=self._clock(),
+                        is_active_branch=True,
+                        branch_index=0,
+                    )
                     db.add(message)
                     row.message_count = int(row.message_count or 0) + 1
                 # New messages are still pending when autoflush is disabled.
                 # Use this exact message for both persistence and output ranges.
                 output_content = str(message.content or "")
                 output_message_id = str(message.id)
+                if safe_delegate_worker_result is not None:
+                    refs = list(safe_delegate_worker_result.get("artifact_refs") or [])
+                    refs.append(f"conversation_message:{output_message_id}")
+                    safe_delegate_worker_result["artifact_refs"] = list(
+                        dict.fromkeys(str(item)[:512] for item in refs if isinstance(item, str))
+                    )[:64]
+                remote_delivery = (
+                    _safe_remote_delivery(_remote_delivery)
+                    if recovering_remote and remote
+                    else None
+                )
                 run.result = {
                     "assistant_message_id": output_message_id,
                     **(
+                        {
+                            "usage": safe_delegate_worker_usage or {}
+                        }
+                        if isinstance(delegate_worker_usage, Mapping)
+                        else {}
+                    ),
+                    **(
                         {"provider_assistant_message_id": provider_message_id}
                         if remote and provider_message_id
+                        else {}
+                    ),
+                    **(
+                        {"assistant_artifact_complete": remote_artifact_complete}
+                        if remote
                         else {}
                     ),
                     **(
@@ -3035,13 +6241,59 @@ class CLIDevelopmentSessionService:
                         if remote and assistant_text_truncated
                         else {}
                     ),
+                    **(
+                        {
+                            "turn_status": "confirmed",
+                            "delivery": remote_delivery,
+                            "remote_history_reconciled": True,
+                        }
+                        if recovering_remote
+                        else {}
+                    ),
                 }
-                run.validation = {"provider_output_persisted": True}
+                run.validation = {
+                    "provider_output_persisted": True,
+                    **(
+                        {"assistant_artifact_complete": remote_artifact_complete}
+                        if remote
+                        else {}
+                    ),
+                    **({"remote_history_reconciled": True} if recovering_remote else {}),
+                }
                 work.result_summary = (
                     "Muse remote turn completed"
                     if remote
                     else "CLI session turn completed"
                 )
+                if recovering_remote:
+                    work.state = "succeeded"
+                    work.outcome_classification = "succeeded"
+                    work.active_agent_run_id = None
+                    work.lease_owner = None
+                    work.lease_token = None
+                    work.lease_expires_at = None
+                    work.safe_error_code = None
+                    work.blocker_code = None
+                    work.escalation_reason = None
+                    work.not_before = None
+                    work.next_attempt_at = None
+                    work.completed_at = self._clock()
+                    work.updated_at = self._clock()
+                    work.result_summary_json = {
+                        "execution_target": MUSE_EXECUTION_TARGET,
+                        "local_filesystem": False,
+                        "sandbox": "remote_uncontrolled",
+                        "turn_status": "confirmed",
+                        "send_attempted": True,
+                        "send_attempted_known": True,
+                        "acceptance": "acceptance_confirmed",
+                        "safe_to_send": True,
+                        "delivery": remote_delivery,
+                        "assistant_artifact_complete": remote_artifact_complete,
+                        "assistant_message_id": output_message_id,
+                        "provider_assistant_message_id": provider_message_id,
+                        "remote_history_reconciled": True,
+                    }
                 target_status = "completed"
             elif normalized == "awaiting_approval":
                 target_status = "waiting_approval"
@@ -3053,7 +6305,26 @@ class CLIDevelopmentSessionService:
                 target_status = "interrupted" if "interrupt" in str(error_code or "").lower() else "disconnected"
             else:
                 target_status = "failed"
-            if str(run.status or "") not in {"cancelled", "succeeded", "failed"}:
+            if safe_delegate_worker_usage is not None:
+                run_result = dict(run.result) if isinstance(run.result, Mapping) else {}
+                run_result["usage"] = safe_delegate_worker_usage
+                run.result = run_result
+                work_result = dict(work.result_summary_json) if isinstance(work.result_summary_json, Mapping) else {}
+                work_result["usage"] = safe_delegate_worker_usage
+                work.result_summary_json = work_result
+            if safe_delegate_worker_result is not None:
+                run_result = dict(run.result) if isinstance(run.result, Mapping) else {}
+                run_result["delegate_worker_result"] = safe_delegate_worker_result
+                run.result = run_result
+                work_result = dict(work.result_summary_json) if isinstance(work.result_summary_json, Mapping) else {}
+                work_result["delegate_worker_result"] = safe_delegate_worker_result
+                work.result_summary_json = work_result
+            if recovering_remote:
+                run.status = "succeeded"
+                run.error = None
+                run.updated_at = self._clock()
+                run.ended_at = self._clock()
+            elif str(run.status or "") not in {"cancelled", "succeeded", "failed"}:
                 if target_status == "completed":
                     run.status = "succeeded"
                 elif target_status == "cancelled":
@@ -3063,6 +6334,14 @@ class CLIDevelopmentSessionService:
                 else:
                     run.status = "failed"
                 run.error = str(error_message or error_code or "")[:4000] or None
+                if safe_cli_failure is not None:
+                    run_result = (
+                        dict(run.result)
+                        if isinstance(getattr(run, "result", None), Mapping)
+                        else {}
+                    )
+                    run_result["cli_failure_diagnostic"] = safe_cli_failure
+                    run.result = run_result
                 run.updated_at = self._clock()
                 run.ended_at = self._clock() if target_status in CLI_DEVELOPMENT_TERMINAL_STATUSES else None
             context["status"] = target_status
@@ -3071,8 +6350,87 @@ class CLIDevelopmentSessionService:
             if native_scope_key:
                 context["native_scope_key"] = str(native_scope_key)[:128]
             next_context = copy.deepcopy(row.context) if isinstance(row.context, Mapping) else {}
+            if recovering_remote:
+                remote_context = next_context.get(MUSE_REMOTE_CONTEXT_KEY)
+                remote_binding = (
+                    remote_context.get("binding")
+                    if isinstance(remote_context, Mapping)
+                    and isinstance(remote_context.get("binding"), Mapping)
+                    else remote_context
+                )
+                if (
+                    not isinstance(remote_binding, Mapping)
+                    or str(remote_binding.get("current_turn_nonce") or "")
+                    != _recovery_nonce
+                    or str(remote_binding.get("current_run_id") or "")
+                    != str(run.id)
+                ):
+                    await db.rollback()
+                    return {
+                        "discarded": True,
+                        "status": "interrupted",
+                        "run_id": str(rid),
+                        "work_item_id": str(wid),
+                        "reason": "recovery_fence_lost",
+                    }
+                settled_binding = copy.deepcopy(dict(remote_binding))
+                settled_binding.pop("current_turn_nonce", None)
+                settled_binding.pop("current_run_id", None)
+                try:
+                    settled_binding["turn_count"] = max(
+                        0, int(settled_binding.get("turn_count", 0) or 0)
+                    ) + 1
+                except (TypeError, ValueError, OverflowError):
+                    settled_binding["turn_count"] = 1
+                settled_binding["state"] = "bound"
+                settled_binding["safe_to_send"] = True
+                if isinstance(remote_context, Mapping) and isinstance(
+                    remote_context.get("binding"), Mapping
+                ):
+                    updated_remote_context = copy.deepcopy(dict(remote_context))
+                    updated_remote_context["binding"] = settled_binding
+                    next_context[MUSE_REMOTE_CONTEXT_KEY] = updated_remote_context
+                else:
+                    next_context[MUSE_REMOTE_CONTEXT_KEY] = settled_binding
             next_context[CLI_DEVELOPMENT_CONTEXT_KEY] = context
             row.context = next_context
+            if isinstance(context.get("delegate_worker"), Mapping):
+                worker_result = {
+                    **(safe_delegate_worker_result or {}),
+                    "assistant_message_id": output_message_id,
+                    "assistant_text_sha256": _sha256(output_content),
+                    "assistant_text_length": len(output_content),
+                    "classification": normalized,
+                }
+                if safe_worker_usage is not None:
+                    worker_result["usage"] = {**(worker_result.get("usage") or {}), **safe_worker_usage}
+                run_result = (
+                    dict(run.result)
+                    if isinstance(getattr(run, "result", None), Mapping)
+                    else {}
+                )
+                run_result["delegate_worker_result"] = worker_result
+                if safe_worker_usage is not None:
+                    run_result["usage"] = {**(run_result.get("usage") or {}), **safe_worker_usage}
+                run.result = run_result
+                work_metadata = (
+                    dict(work.metadata_json)
+                    if isinstance(getattr(work, "metadata_json", None), Mapping)
+                    else {}
+                )
+                work_metadata["delegate_worker_result"] = copy.deepcopy(
+                    worker_result
+                )
+                work.metadata_json = work_metadata
+                work_result = (
+                    dict(work.result_summary_json)
+                    if isinstance(getattr(work, "result_summary_json", None), Mapping)
+                    else {}
+                )
+                work_result["delegate_worker_result"] = copy.deepcopy(
+                    worker_result
+                )
+                work.result_summary_json = work_result
             row.development_status = "working" if target_status in {"queued", "running"} else "waiting_for_user"
             # Output remains encrypted in ConversationMessage.  Run events
             # carry only a bounded pointer/range so event collection can
@@ -3100,6 +6458,10 @@ class CLIDevelopmentSessionService:
                     }
                     if remote and provider_message_id:
                         chunk_payload["provider_assistant_message_id"] = provider_message_id
+                    if remote and remote_artifact_complete is not None:
+                        chunk_payload["assistant_artifact_complete"] = (
+                            remote_artifact_complete
+                        )
                     if remote and assistant_text_truncated:
                         chunk_payload["assistant_text_truncated"] = True
                         chunk_payload[
@@ -3113,8 +6475,12 @@ class CLIDevelopmentSessionService:
                 "error_code": str(error_code or "")[:96],
                 "cli_session_sequence": feed_sequences[-1],
             }
+            if remote and safe_cli_failure is not None:
+                tail_payload["cli_failure_diagnostic"] = safe_cli_failure
             if remote and provider_message_id:
                 tail_payload["provider_assistant_message_id"] = provider_message_id
+            if remote and remote_artifact_complete is not None:
+                tail_payload["assistant_artifact_complete"] = remote_artifact_complete
             if remote and assistant_text_truncated and truncated_original_length is not None:
                 tail_payload["assistant_text_truncated"] = True
                 tail_payload[
@@ -3123,6 +6489,37 @@ class CLIDevelopmentSessionService:
             if error_message:
                 tail_payload["error_message"] = str(error_message)[:1024]
             db.add(AgentRunEvent(run_id=run.id, sequence=next_sequence, event_type=f"cli.{target_status}", status=target_status, message=str(error_message)[:1024] if error_message else None, payload=tail_payload, created_at=self._clock()))
+            if recovering_remote:
+                work_tail = (
+                    await db.execute(
+                        select(AgentWorkEvent)
+                        .where(AgentWorkEvent.work_item_id == work.id)
+                        .order_by(desc(AgentWorkEvent.sequence))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                next_work_sequence = int(
+                    getattr(work_tail, "sequence", 0) or 0
+                ) + 1
+                db.add(
+                    AgentWorkEvent(
+                        work_item_id=work.id,
+                        sequence=next_work_sequence,
+                        event_type="work.succeeded",
+                        from_state="uncertain",
+                        to_state="succeeded",
+                        status="succeeded",
+                        actor_kind="service",
+                        actor_service_key="aoitalk.system",
+                        agent_run_id=run.id,
+                        payload_json={
+                            "classification": "succeeded",
+                            "remote_history_reconciled": True,
+                            "attempt": int(work.attempt_count or 0),
+                        },
+                        created_at=self._clock(),
+                    )
+                )
             await db.commit()
             receipt_dict: dict[str, Any] = {
                 "status": target_status,
@@ -3138,11 +6535,16 @@ class CLIDevelopmentSessionService:
                 receipt_dict["provider_assistant_message_id"] = run.result.get(
                     "provider_assistant_message_id"
                 )
+                receipt_dict["assistant_artifact_complete"] = run.result.get(
+                    "assistant_artifact_complete"
+                )
                 if run.result.get("assistant_text_truncated") is True:
                     receipt_dict["assistant_text_truncated"] = True
                     receipt_dict["assistant_text_original_length"] = run.result.get(
                         "assistant_text_original_length"
                     )
+                if run.result.get("remote_history_reconciled") is True:
+                    receipt_dict["history_reconciled"] = True
             if error_message:
                 receipt_dict["error_message"] = str(error_message)[:1024]
             return receipt_dict
@@ -3194,8 +6596,8 @@ class CLIDevelopmentSessionService:
                 # the provider adapter only receives a local stop signal and
                 # must never claim that the remote side was cancelled.
                 try:
-                    remote_adapter = self._get_remote_adapter()
-                    cancel_remote = getattr(remote_adapter, "cancel", None)
+                    work_adapter = getattr(self, "_muse_work_adapter", None)
+                    cancel_remote = getattr(work_adapter, "abort_work", None)
                     if callable(cancel_remote):
                         value = cancel_remote(str(work.id))
                         if inspect.isawaitable(value):
@@ -3355,6 +6757,7 @@ class CLIDevelopmentSessionService:
         )
 
         self.coordinator = coordinator
+        _register_shared_cli_development_session_service(self)
         self.session_store = session_store or self.session_store
         adapter = register_cli_session_work(
             coordinator,
@@ -3362,10 +6765,31 @@ class CLIDevelopmentSessionService:
             backend_factory=backend_factory,
             session_store=self.session_store,
         )
-        register_muse_remote_session_work(
+
+        async def authorized_scope_source(
+            identity: Any,
+            *,
+            session_id: str,
+            binding_id: str,
+        ) -> Mapping[str, Any] | None:
+            # The callback receives only the identity derived from the pinned
+            # Agent binding.  The approved scope itself is read from the
+            # server-owned store; no request/model field can supply a grant.
+            db = await self._session()
+            try:
+                return await self._read_active_muse_authorized_scope(
+                    db,
+                    identity,
+                    session_id=session_id,
+                    binding_id=binding_id,
+                )
+            finally:
+                await self._close(db)
+
+        self._muse_work_adapter = register_muse_remote_session_work(
             coordinator,
             self,
-            remote_adapter=self._get_remote_adapter(),
+            authorized_scope_source=authorized_scope_source,
         )
         return adapter
 

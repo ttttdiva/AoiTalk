@@ -5,6 +5,7 @@ import { AppSelect } from "@/components/ui/app-select";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PersonalDraftPanel } from "./personal-draft-panel";
+import { PersonalLedgerAgentPanels } from "./personal-ledger-agent-panels";
 import { PersonalReminderPanel } from "./personal-reminder-panel";
 import {
   addWrite,
@@ -71,6 +72,8 @@ export function PersonalLedgerPanel() {
   const [confirmingDiscard, setConfirmingDiscard] = useState(false);
   // 書き込みは成功したが一覧の更新に失敗した状態。再送ではなく再読み込みだけを促す。
   const [stale, setStale] = useState(false);
+  const [draftRefresh, setDraftRefresh] = useState(0);
+  const [evidenceRefresh, setEvidenceRefresh] = useState(0);
 
   const [dlSubject, setDlSubject] = useState("");
   const [dlDate, setDlDate] = useState("");
@@ -232,7 +235,8 @@ export function PersonalLedgerPanel() {
           日付はご自身で確認した値を入力してください。法令上の期限や更新間隔は自動計算しません。
         </p>
       </header>
-      <PersonalDraftPanel onMaterialized={() => refresh()} />
+      <PersonalDraftPanel onMaterialized={() => refresh()} onEvidenceSaved={() => setEvidenceRefresh((value) => value + 1)} refreshRequest={draftRefresh} />
+      <PersonalLedgerAgentPanels refreshRequest={evidenceRefresh} onProposed={() => setDraftRefresh((value) => value + 1)} />
       <PersonalReminderPanel />
       {message && (
         <div role="status" className="rounded border p-2">

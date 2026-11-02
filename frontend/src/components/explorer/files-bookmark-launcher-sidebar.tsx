@@ -80,6 +80,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useIncrementalSearch } from "@/hooks/use-incremental-search";
 import {
+  filesSidebarBrowseScopeKey,
   getFilesSidebarServerSnapshot,
   getFilesSidebarSnapshot,
   subscribeFilesSidebar,
@@ -88,6 +89,7 @@ import {
   bookmarkOwnerFromItem as resolveBookmarkOwner,
   bookmarkOwnerKey,
   classifyBookmarkTarget,
+  parseCanonicalProjectBookmarkPath,
   projectExplorerBookmarks,
   sameBookmarkOwner as ownersMatch,
   withBookmarkOwner,
@@ -354,7 +356,9 @@ export function FilesBookmarkLauncherSidebar() {
   const {
     currentPath,
     browseData,
+    browseDataScopeKey,
     loading,
+    error: filesError,
     filerTab,
     focusedItemPath,
     editingFilePath,
@@ -485,12 +489,25 @@ export function FilesBookmarkLauncherSidebar() {
   // that listing happens to be beneath the canonical Project/User root. An
   // authorized absolute directory is a valid Files target and must be able to
   // receive Ctrl+D while its path is outside `scopeRoot`.
-  const scopeReady = !loading && !!browseData &&
-    normalizeScopePath(browseData.current_path) === normalizeScopePath(currentPath) &&
-    // Preserve the stale Project/Space transition guard for canonical virtual
-    // paths, while allowing a successfully loaded absolute directory to be
-    // bookmarked from the Project Files tab.
-    (isAbsolutePath(currentPath) || isPathInFilesScope(currentPath));
+  const scopeReady = !!browseData &&
+    browseDataScopeKey === filesSidebarBrowseScopeKey(scopeKey, scopeRoot) &&
+    // Readiness only proves that the displayed listing belongs to the current
+    // Files scope.  The target path is checked against that scope below.  A
+    // loaded parent listing (for example `_projects`) can contain a valid
+    // same-Space Project target even though the listing path is above the
+    // selected Project's canonical scopeRoot.
+    normalizeScopePath(browseData.current_path) === normalizeScopePath(currentPath);
+  const reportListingUnavailable = useCallback(() => {
+    if (loading) {
+      reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
+    } else if (filesError) {
+      reportSidebarGuard("Filesの一覧を取得できませんでした。再読み込み後にもう一度お試しください");
+    } else if (browseData && browseDataScopeKey !== filesSidebarBrowseScopeKey(scopeKey, scopeRoot)) {
+      reportSidebarGuard("Filesの保存先が切り替わったため、一覧の更新後にもう一度お試しください");
+    } else {
+      reportSidebarGuard("Filesの一覧を確認できません。再読み込み後にもう一度お試しください");
+    }
+  }, [browseData, browseDataScopeKey, filesError, loading, scopeKey, scopeRoot]);
 
   const reloadLaunchers = useCallback(async () => {
     if (!launcherEnabled) {
@@ -672,6 +689,7 @@ export function FilesBookmarkLauncherSidebar() {
           filerTab,
           scopeRoot,
           includePersonalAbsolute: true,
+          includePersonalUnscoped: isAdmin,
           includeEmptyFolders: emptyFolderDisplayOwner !== null,
           emptyFolderOwner: emptyFolderDisplayOwner ?? undefined,
         },
@@ -689,7 +707,7 @@ export function FilesBookmarkLauncherSidebar() {
         allOwnedBookmarks.filter((row) => visibleItems.has(row.item)),
       );
     },
-    [allOwnedBookmarks, bookmarkScope, canonicalScopeProjectId, emptyFolderDisplayOwner, filerTab, filesTargetProjectId, isRemoteWorkspace, scopeRoot, spaceProjectIds],
+    [allOwnedBookmarks, bookmarkScope, canonicalScopeProjectId, emptyFolderDisplayOwner, filerTab, filesTargetProjectId, isAdmin, isRemoteWorkspace, scopeRoot, spaceProjectIds],
   );
   const bookmarkOwnerMap = useMemo(() => {
     const byObject = new Map<ExplorerBookmark, ExplorerBookmarkScope>();
@@ -902,7 +920,7 @@ export function FilesBookmarkLauncherSidebar() {
       return false;
     }
     if (!scopeReady) {
-      reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
+      reportListingUnavailable();
       return false;
     }
     // Registration is still restricted to the currently loaded authorized
@@ -919,17 +937,18 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarGuard("この場所はブックマーク登録の対象外です");
       return false;
     }
-    const owner = ownerForTargetPath(path);
-    if (!owner) {
-      reportSidebarGuard("この場所はブックマーク登録の対象外です");
+    // A folder determines the destination collection; root registration keeps
+    // the existing target-based selection. The API authorizes both the target
+    // and the destination, including the shared Space boundary.
+    const parentRow = parentId ? allOwnedBookmarks.find((row) => row.item.id === parentId) : null;
+    if (parentId && (!parentRow || !isExplorerBookmarkFolder(parentRow.item))) {
+      reportSidebarGuard("ブックマークの親フォルダが見つかりません");
       return false;
     }
-    if (parentId !== undefined) {
-      const parentRow = allOwnedBookmarks.find((row) => row.item.id === parentId);
-      if (!parentRow || !ownersMatch(owner, parentRow.owner)) {
-        reportSidebarGuard("異なる所有者のブックマーク階層へは登録できません");
-        return false;
-      }
+    const owner = parentRow?.owner ?? ownerForTargetPath(path) ?? { scope: "personal" };
+    if (parentRow?.owner.scope === "shared" && (isAbsolutePath(path) || path.toLowerCase().startsWith("remote://"))) {
+      reportSidebarGuard("この場所は共有ブックマークに登録できません");
+      return false;
     }
     const fallbackName = path.split(/[\\/|]/).filter(Boolean).pop() || "Item";
     const duplicate = ownedRowsForOwner(owner).some(
@@ -990,7 +1009,7 @@ export function FilesBookmarkLauncherSidebar() {
     } finally {
       bookmarkRequestsInFlightRef.current.delete(requestKey);
     }
-  }, [allOwnedBookmarks, browseData, canUseGenericBookmarks, isAdmin, ownerForTargetPath, ownedRowsForOwner, refreshBookmarksForOwner, scopeReady]);
+  }, [allOwnedBookmarks, browseData, canUseGenericBookmarks, isAdmin, ownerForTargetPath, ownedRowsForOwner, refreshBookmarksForOwner, reportListingUnavailable, scopeReady]);
 
   useEffect(() => {
     const handleBookmarkRequest = (event: Event) => {
@@ -1152,12 +1171,12 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarGuard("このFilesタブではランチャー登録を利用できません");
       return false;
     }
-    if (!isPathInFilesScope(path) || !browseData?.files.some((file) => file.path === path)) {
-      reportSidebarGuard("このファイルはランチャー登録の対象外です");
+    if (!scopeReady) {
+      reportListingUnavailable();
       return false;
     }
-    if (!scopeReady) {
-      reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
+    if (!isPathInFilesScope(path) || !browseData?.files.some((file) => file.path === path)) {
+      reportSidebarGuard("このファイルはランチャー登録の対象外です");
       return false;
     }
     if (launchers.some((item) => item.path === path)) return false;
@@ -1173,7 +1192,7 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarError("ランチャー登録に失敗しました", error);
       return false;
     }
-  }, [bookmarkScope, browseData?.files, isPathInFilesScope, launchers, launcherEnabled, reloadLaunchers, scopeReady]);
+  }, [bookmarkScope, browseData?.files, isPathInFilesScope, launchers, launcherEnabled, reloadLaunchers, reportListingUnavailable, scopeReady]);
 
   const removeItem = useCallback(async (item: SidebarItem) => {
     try {
@@ -1303,6 +1322,7 @@ export function FilesBookmarkLauncherSidebar() {
 
   const runBookmark = useCallback((bookmark: ExplorerBookmark) => {
     const owner = ownerForBookmark(bookmark);
+    const projectId = parseCanonicalProjectBookmarkPath(bookmark.path)?.projectId;
     void executeExplorerBookmark(bookmark, {
       closeEditor,
       navigate,
@@ -1317,11 +1337,12 @@ export function FilesBookmarkLauncherSidebar() {
       // Personal external bookmarks are valid local targets even while a
       // remote/same-Space Project remains selected. Calling the Project
       // selector for them would reject the absolute path before navigation.
-      selectProjectForPath: owner.scope === "shared" ? selectProjectForPath : undefined,
+      selectProjectForPath: owner.scope === "shared" && projectId && sameSpaceProjectIdSet.has(projectId)
+        ? selectProjectForPath : undefined,
     }).catch((error: unknown) => {
       reportSidebarError("ブックマークを開けませんでした", error);
     });
-  }, [closeEditor, navigate, ownerForBookmark, selectProjectForPath]);
+  }, [closeEditor, navigate, ownerForBookmark, sameSpaceProjectIdSet, selectProjectForPath]);
 
   const runLauncher = useCallback((launcher: ExplorerLauncher) => {
     void (async () => {
@@ -1556,14 +1577,11 @@ export function FilesBookmarkLauncherSidebar() {
     }
     const paths = parseDroppedPaths(event);
     if (paths.length === 0) return;
-    if (!browseData) {
-      reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
-      return;
-    }
     if (!scopeReady) {
-      reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
+      reportListingUnavailable();
       return;
     }
+    if (!browseData) return;
     const directoryByPath = new Map(browseData.directories.map((entry) => [entry.path, entry]));
     const fileByPath = new Map(browseData.files.map((entry) => [entry.path, entry]));
     const allBookmarkTargets = paths.every(
@@ -1583,7 +1601,7 @@ export function FilesBookmarkLauncherSidebar() {
     } else if (activeTab === "launchers" && allFiles && launcherEnabled) {
       await Promise.all(paths.map((path) => addLauncher(path, browseData.files.find((entry) => entry.path === path)?.name)));
     }
-  }, [activeTab, addBookmark, addLauncher, browseData, canUseGenericBookmarks, launcherEnabled, moveBookmarkToParent, scopeReady]);
+  }, [activeTab, addBookmark, addLauncher, browseData, canUseGenericBookmarks, launcherEnabled, moveBookmarkToParent, reportListingUnavailable, scopeReady]);
 
   const onItemContextMenu = (event: MouseEvent, item: SidebarItem) => {
     event.preventDefault();

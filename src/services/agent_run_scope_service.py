@@ -52,6 +52,17 @@ class ParentRunScopeMismatchError(UntrustedParentScopeError):
 class InteractiveAgentRunScopeDenied(AgentRunScopeServiceError):
     """Raised when a Chat Agent cannot obtain a fresh native-run proof."""
 
+    code = "agent_run_scope_denied"
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        candidate = str(code or self.code).strip().casefold()
+        self.code = (
+            candidate
+            if re.fullmatch(r"[a-z0-9_]{1,96}", candidate)
+            else "agent_run_scope_denied"
+        )
+
 
 _INTERACTIVE_ACTIVE_RUN_STATES = frozenset({"queued", "running", "waiting", "active"})
 _INTERACTIVE_WORK_STATE = "running"
@@ -977,7 +988,10 @@ async def issue_interactive_agent_run_scope(
             )
         )
         if "workspace_read" not in declared_capabilities:
-            raise InteractiveAgentRunScopeDenied("AgentRevision has no workspace_read capability")
+            raise InteractiveAgentRunScopeDenied(
+                "AgentRevision has no workspace_read capability",
+                code="agent_run_scope_capability_missing_workspace_read",
+            )
 
         if authority_resolver is None:
             try:
@@ -1096,7 +1110,8 @@ async def issue_interactive_agent_run_scope(
         requested_provider = _canonical_provider(provider_id)
         if requested_provider and requested_provider != persisted_provider:
             raise InteractiveAgentRunScopeDenied(
-                "requested native provider does not match the persisted AgentRun provider"
+                "requested native provider does not match the persisted AgentRun provider",
+                code="agent_run_scope_provider_mismatch",
             )
         provider = persisted_provider
         native_allowed = provider.endswith("-cli") or provider in {

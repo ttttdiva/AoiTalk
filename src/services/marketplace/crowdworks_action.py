@@ -9,6 +9,7 @@ class CrowdWorksPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     search_urls: list[str] = Field(min_length=1, max_length=20)
+    tick_interval_minutes: StrictInt = Field(default=2, ge=1, le=30)
     scan_interval_minutes: StrictInt = Field(default=30, ge=5, le=1440)
     max_pages_per_scan: StrictInt = Field(default=3, ge=1, le=20)
     max_opportunities_per_scan: StrictInt = Field(default=100, ge=1, le=500)
@@ -17,11 +18,11 @@ class CrowdWorksPolicy(BaseModel):
     min_profit_per_hour: StrictFloat = Field(default=0.0, ge=-1000000000.0, le=1000000000.0)
     currency: str = Field(default="JPY", pattern=r"^[A-Z]{3}$")
     # Deprecated legacy override.  The canonical model source is the Agent's
-    # exact AgentRevision -> Agent Team -> Execution Profile -> Subagent route.
+    # exact AgentRevision -> v2 role route.
     # These fields are honoured only for the evaluation/application phases of
-    # an Agent still on the ``manual`` (標準モデル) profile and are ignored as
-    # soon as the Agent selects a Team Execution Profile.  Fulfillment never
-    # uses them.  Kept so existing Policy revisions stay valid.
+    # an Agent with a legacy policy revision. They are ignored for v2 role
+    # routes and fulfillment never uses them. Kept so existing Policy
+    # revisions stay readable.
     llm_provider: str | None = Field(default=None, max_length=64)
     llm_model: str | None = Field(default=None, max_length=255)
     llm_effort: str | None = Field(default=None, max_length=32)
@@ -65,7 +66,13 @@ class CrowdWorksApplicationPayload(BaseModel):
 
 
 def normalize_policy(value):
-    return CrowdWorksPolicy.model_validate(value).model_dump()
+    normalized = CrowdWorksPolicy.model_validate(value).model_dump()
+    # Existing immutable policy revisions predate the short tick cadence.
+    # Preserve their hash-equivalent constraints until a new revision stores
+    # the additive field explicitly.
+    if isinstance(value, dict) and "tick_interval_minutes" not in value:
+        normalized.pop("tick_interval_minutes", None)
+    return normalized
 
 
 def normalize_payload(value, policy):

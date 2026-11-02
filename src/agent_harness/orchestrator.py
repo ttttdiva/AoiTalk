@@ -472,11 +472,12 @@ class AgentHarnessOrchestrator:
                     caller_cancelled = True
                 if cleanup_workspace:
                     try:
-                        maybe_cleanup = self.workspace_manager.remove_for(
-                            entry.work_item.identifier
+                        maybe_cleanup = _workspace_remove(
+                            self.workspace_manager,
+                            entry.work_item.identifier,
+                            owner_id=_workspace_owner_id(entry.work_item),
                         )
-                        if inspect.isawaitable(maybe_cleanup):
-                            await maybe_cleanup
+                        await _maybe_await(maybe_cleanup)
                     except Exception:
                         # Workspace cleanup failure must not leave the task or
                         # claim stuck, nor prevent later runs from stopping.
@@ -670,14 +671,43 @@ class AgentHarnessOrchestrator:
                     f"invalid Enterprise harness resource limits: {exc}",
                 )
                 return
+        workspace_owner_id = _workspace_owner_id(item)
+        workspace_run_id = _workspace_run_id(item, attempt_number)
         try:
-            workspace, _created = self.workspace_manager.create_for(item.identifier)
+            workspace, created = _workspace_create(
+                self.workspace_manager,
+                item.identifier,
+                owner_id=workspace_owner_id,
+                run_id=workspace_run_id,
+            )
             # Harness hooks are deployment-owned control-plane configuration,
             # not model-provided commands.  Keep the established setup flow in
             # both profiles; agent-generated commands still use the sandbox.
             self.workspace_manager.run_before_run(workspace)
             prompt = render_prompt(self.workflow, issue=item, attempt=attempt_number)
         except Exception as exc:
+            if "workspace" in locals():
+                try:
+                    await _workspace_release(
+                        self.workspace_manager,
+                        item.identifier,
+                        owner_id=workspace_owner_id,
+                        run_id=workspace_run_id,
+                    )
+                    if locals().get("created"):
+                        await _maybe_await(
+                            _workspace_remove(
+                                self.workspace_manager,
+                                item.identifier,
+                                owner_id=workspace_owner_id,
+                                run_id=workspace_run_id,
+                            )
+                        )
+                except Exception:
+                    logger.exception(
+                        "Agent harness workspace cleanup failed after dispatch preparation for %s",
+                        item.identifier,
+                    )
             self._schedule_retry(item, attempt_number, str(exc))
             return
 
@@ -697,6 +727,7 @@ class AgentHarnessOrchestrator:
             entry.codex_total_tokens += max(0, int(usage.get("total_tokens") or 0))
 
         async def run_attempt():
+            issued_scope = None
             try:
                 if Features.is_enterprise():
                     # Enterprise autonomous runs must never fall through to
@@ -712,17 +743,18 @@ class AgentHarnessOrchestrator:
                         build_autonomous_agent_harness_scope,
                     )
 
-                    run_id = f"agent-harness-{uuid.uuid4().hex}"
+                    scope_run_id = f"agent-harness-{uuid.uuid4().hex}"
                     if enterprise_limits is None:  # pragma: no cover - guarded above
                         raise RuntimeError("Enterprise resource limits were not issued")
                     upper_scope = build_autonomous_agent_harness_scope(
                         workspace_path=workspace,
                         harness_workspace_root=self.settings.workspace_root,
                         resource_limits=enterprise_limits,
-                        run_id=run_id,
+                        run_id=scope_run_id,
                         audit_id=f"agent-harness:{item.identifier}:{attempt_number}",
                         network_capability=enterprise_network,
                     )
+                    issued_scope = upper_scope
                     scope = upper_scope.to_agent_run_scope()
                     with harness_execution_scope_context(upper_scope), run_scope_context(
                         scope
@@ -742,9 +774,42 @@ class AgentHarnessOrchestrator:
                     on_event=on_event,
                 )
             finally:
-                maybe_cleanup = self.workspace_manager.run_after_run(workspace)
-                if inspect.isawaitable(maybe_cleanup):
-                    await maybe_cleanup
+                try:
+                    maybe_cleanup = self.workspace_manager.run_after_run(workspace)
+                    if inspect.isawaitable(maybe_cleanup):
+                        await maybe_cleanup
+                finally:
+                    try:
+                        await _workspace_release(
+                            self.workspace_manager,
+                            item.identifier,
+                            owner_id=workspace_owner_id,
+                            run_id=workspace_run_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Agent harness workspace claim release failed for %s",
+                            item.identifier,
+                            exc_info=True,
+                        )
+                    # The scope service records the exact directory identity
+                    # for scratch it created.  Release it after the terminal
+                    # hook on success, failure, cancellation, and retry; a
+                    # non-empty, replaced, reparse, or unknown-owner path is
+                    # retained by the identity-aware helper.
+                    if issued_scope is not None:
+                        try:
+                            from ..services.harness_execution_scope_service import (
+                                release_created_scratch_roots,
+                            )
+
+                            release_created_scratch_roots(issued_scope)
+                        except Exception:
+                            logger.debug(
+                                "Agent harness scratch cleanup failed for %s",
+                                item.identifier,
+                                exc_info=True,
+                            )
 
         task = asyncio.create_task(
             run_attempt(),
@@ -946,6 +1011,91 @@ class AgentHarnessOrchestrator:
         if entry.provider_session_id != normalized:
             entry.turn_count += 1
             entry.provider_session_id = normalized
+
+
+def _workspace_owner_id(item: WorkItem) -> str:
+    value = getattr(item, "work_item_id", None) or getattr(item, "id", None)
+    return str(value or getattr(item, "identifier", "work-item"))
+
+
+def _workspace_run_id(item: WorkItem, attempt: int) -> str:
+    return f"agent-harness:{_workspace_owner_id(item)}:attempt-{int(attempt)}:{uuid.uuid4().hex}"
+
+
+def _workspace_call(
+    method: Any,
+    identifier: str,
+    *,
+    owner_id: str | None = None,
+    run_id: str | None = None,
+) -> Any:
+    """Pass ownership kwargs only to managers that expose the new seam."""
+
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(method).parameters
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    except (TypeError, ValueError):
+        parameters = {}
+        accepts_var_kwargs = False
+    if owner_id is not None and (accepts_var_kwargs or "owner_id" in parameters):
+        kwargs["owner_id"] = owner_id
+    if run_id is not None and (accepts_var_kwargs or "run_id" in parameters):
+        kwargs["run_id"] = run_id
+    return method(identifier, **kwargs)
+
+
+def _workspace_create(
+    manager: Any,
+    identifier: str,
+    *,
+    owner_id: str,
+    run_id: str,
+) -> Any:
+    return _workspace_call(
+        getattr(manager, "create_for"),
+        identifier,
+        owner_id=owner_id,
+        run_id=run_id,
+    )
+
+
+def _workspace_remove(
+    manager: Any,
+    identifier: str,
+    *,
+    owner_id: str | None = None,
+    run_id: str | None = None,
+) -> Any:
+    return _workspace_call(
+        getattr(manager, "remove_for"),
+        identifier,
+        owner_id=owner_id,
+        run_id=run_id,
+    )
+
+
+async def _workspace_release(
+    manager: Any,
+    identifier: str,
+    *,
+    owner_id: str,
+    run_id: str,
+) -> None:
+    method = getattr(manager, "release_for", None)
+    if not callable(method):
+        return
+    await _maybe_await(
+        _workspace_call(
+            method,
+            identifier,
+            owner_id=owner_id,
+            run_id=run_id,
+        )
+    )
 
 
 def sort_work_items_for_dispatch(items: list[WorkItem]) -> list[WorkItem]:

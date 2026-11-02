@@ -22,6 +22,8 @@ from .utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 logger = logging.getLogger(__name__)
 GLOBAL_CONFIG_KEY = "global"
+# Identity-only marker for a dotted key that must not exist during a CAS.
+APP_CONFIG_MISSING = object()
 
 
 class AppConfigSnapshotUnavailable(RuntimeError):
@@ -296,6 +298,10 @@ _LEGACY_AUTOFILLED_DEFAULTS: tuple[tuple[tuple[str, ...], Any], ...] = (
     # OpenRouter tool use shipped default-off.  A stored ``false`` without the
     # explicit-user marker is that generated value and follows the new default.
     (("openrouter", "enable_tools"), False),
+    # Browser operation ran through a PC Bridge by default.  It now runs on this
+    # server (local); a stored "bridge" was only the generated default, since the
+    # settings API never exposed browser.backend.
+    (("browser", "backend"), "bridge"),
 )
 
 # The retired compact OpenAI model identifier must not survive in the persisted
@@ -463,7 +469,9 @@ OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE = "user"
 # seeds.  Keep a small schema marker in the JSON config so the one-time repair
 # is idempotent and an explicitly customized value can be distinguished from a
 # value that has already passed through the repair.
-APP_CONFIG_SCHEMA_VERSION = 2
+APP_CONFIG_SCHEMA_VERSION = 3
+AGENT_RUNTIME_REMOVAL_MIGRATION_ID = "agent_runtime_v2_removal"
+AGENT_RUNTIME_REMOVAL_SCHEMA_VERSION = 3
 LEGACY_REVIEW_MAX_ROUNDS_DEFAULT = 120
 REVIEW_MAX_ROUNDS_SCHEMA_VERSION = 2
 LEGACY_AGENTIC_COMPLETION_DEFAULTS: Dict[str, Any] = {
@@ -493,6 +501,86 @@ def _config_schema_version(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, parsed)
+
+
+def _migrate_retired_agent_runtime_config(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Archive and remove the retired Team/Profile configuration branches.
+
+    The archive is made from the decrypted value and is encrypted again by the
+    caller together with the rest of ``app_config_settings``.  Keeping the
+    snapshot inside the same JSON document means the existing field encryption
+    and API secret masking continue to apply to historical values as well.
+
+    This is intentionally independent from the old Agent Team schema migration:
+    the latter must never be allowed to recreate a Team after this marker has
+    been written.  A stable migration id makes the operation safe to repeat if
+    a process is restarted after reading an already migrated row.
+    """
+
+    migrated = copy.deepcopy(value)
+    if not isinstance(migrated, dict):
+        migrated = {}
+
+    legacy_team = migrated.get("agent_team")
+    legacy_profiles = migrated.get("execution_profiles")
+    routing_profiles = migrated.get("routing_profiles")
+    free_team = (
+        routing_profiles.get("free-team")
+        if isinstance(routing_profiles, dict)
+        else None
+    )
+    legacy_free_team_profiles = (
+        free_team.get("llm_profiles") if isinstance(free_team, dict) else None
+    )
+    has_legacy_branch = (
+        "agent_team" in migrated
+        or "execution_profiles" in migrated
+        or isinstance(free_team, dict) and "llm_profiles" in free_team
+    )
+
+    snapshots = migrated.get("legacy_snapshots")
+    if has_legacy_branch and not isinstance(snapshots, dict):
+        snapshots = {}
+        migrated["legacy_snapshots"] = snapshots
+    if has_legacy_branch and AGENT_RUNTIME_REMOVAL_MIGRATION_ID not in snapshots:
+        snapshot: dict[str, Any] = {}
+        if "agent_team" in migrated:
+            snapshot["agent_team"] = copy.deepcopy(legacy_team)
+        if "execution_profiles" in migrated:
+            snapshot["execution_profiles"] = copy.deepcopy(legacy_profiles)
+        if isinstance(free_team, dict) and "llm_profiles" in free_team:
+            snapshot["routing_profiles"] = {
+                "free-team": {
+                    "llm_profiles": copy.deepcopy(legacy_free_team_profiles),
+                }
+            }
+        snapshots[AGENT_RUNTIME_REMOVAL_MIGRATION_ID] = snapshot
+
+    # Preserve the old privacy migration before dropping the Team envelope.
+    # Its values are included in the archive above and its independent policy
+    # branch remains available to current runtime code.
+    if isinstance(legacy_team, dict):
+        migrated = _migrate_external_model_privacy(migrated)
+    migrated.pop("agent_team", None)
+    migrated.pop("execution_profiles", None)
+    if isinstance(routing_profiles, dict):
+        current_routing = migrated.get("routing_profiles")
+        current_free_team = (
+            current_routing.get("free-team")
+            if isinstance(current_routing, dict)
+            else None
+        )
+        if isinstance(current_free_team, dict):
+            current_free_team.pop("llm_profiles", None)
+
+    # A schema marker is useful even when a particular old branch was absent:
+    # it prevents a later seed/default merge from reintroducing the removed
+    # branch during the same startup sequence.
+    migrated["app_config_schema_version"] = max(
+        AGENT_RUNTIME_REMOVAL_SCHEMA_VERSION,
+        _config_schema_version(migrated),
+    )
+    return migrated
 
 
 def _migrate_legacy_autofilled_defaults(
@@ -582,10 +670,47 @@ def _migrate_legacy_autofilled_defaults(
             # directly instead of going through ``_fill_missing_defaults``.
             if "review_max_rounds" in stored_agentic:
                 migrated["app_config_schema_version"] = max(
-                    APP_CONFIG_SCHEMA_VERSION,
-                    _config_schema_version(seed),
+                    REVIEW_MAX_ROUNDS_SCHEMA_VERSION,
+                    _config_schema_version(value),
                 )
 
+    return migrated
+
+
+_LEGACY_EMPLOYEE_OPERATOR_DESCRIPTION = "管理者が設定した自動化と電話受付を担当する。"
+_LEGACY_EMPLOYEE_OPERATOR_INSTRUCTIONS = (
+    "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、"
+    "電話転送には許可されたdestination_keyだけを使う。"
+)
+
+
+def _migrate_employee_operator_telephony_text(
+    value: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Replace only the exact retired builtin Employee Operator text."""
+
+    migrated = copy.deepcopy(value)
+    agent_team = migrated.get("agent_team")
+    subagents = agent_team.get("subagents") if isinstance(agent_team, dict) else None
+    employee_operator = (
+        subagents.get("employee_operator")
+        if isinstance(subagents, dict)
+        else None
+    )
+    if not isinstance(employee_operator, dict):
+        return migrated
+
+    try:
+        from .services.agent_team_v3 import AGENT_TEAM_SUBAGENT_CATALOG
+
+        current_builtin = AGENT_TEAM_SUBAGENT_CATALOG["employee_operator"]
+        if employee_operator.get("description") == _LEGACY_EMPLOYEE_OPERATOR_DESCRIPTION:
+            employee_operator["description"] = current_builtin["description"]
+        if employee_operator.get("instructions") == _LEGACY_EMPLOYEE_OPERATOR_INSTRUCTIONS:
+            employee_operator["instructions"] = current_builtin["instructions"]
+    except (ImportError, KeyError):
+        # Keep configuration loading available during partial bootstrap.
+        logger.debug("Employee Operator text migration deferred", exc_info=True)
     return migrated
 
 
@@ -601,10 +726,18 @@ def _migrate_agent_team_v2_config(value: Dict[str, Any]) -> Dict[str, Any]:
     missing Team/Subagent/Profile (so user deletions remain deleted).
     """
 
+    # P5 archives and removes the Team/Profile envelope.  From that schema
+    # onward this compatibility helper must be a no-op; invoking the old
+    # converter here would seed a fresh Team on every startup.
+    if _config_schema_version(value) >= AGENT_RUNTIME_REMOVAL_SCHEMA_VERSION:
+        return copy.deepcopy(value)
+
     try:
         from .services.agent_team_v2_migration import migrate_agent_team_config
 
-        return migrate_agent_team_config(value)
+        return _migrate_employee_operator_telephony_text(
+            migrate_agent_team_config(value)
+        )
     except Exception:
         # Config loading must remain available even when an optional service
         # import is unavailable during bootstrap.  Keep a minimal canonical
@@ -619,12 +752,33 @@ def _migrate_agent_team_v2_config(value: Dict[str, Any]) -> Dict[str, Any]:
             "teams": copy.deepcopy(raw.get("teams")) if isinstance(raw.get("teams"), dict) else {},
             "subagents": copy.deepcopy(raw.get("subagents")) if isinstance(raw.get("subagents"), dict) else {},
         }
-        return result
+        return _migrate_employee_operator_telephony_text(result)
 
 
 # Compatibility name for callers that previously reached the private v2
 # helper.  Both paths now produce the same canonical schema-v3 envelope.
 _migrate_agent_team_v3_config = _migrate_agent_team_v2_config
+
+
+def _migrate_app_config_value(
+    value: Dict[str, Any], *, seed: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    """Apply app-config migrations in their ownership order.
+
+    The P5 archive must run before obsolete-branch pruning and before the old
+    Team converter.  Otherwise either the historical snapshot would lose
+    fields or the converter could recreate a Team from a missing branch.
+    """
+
+    migrated = _migrate_retired_agent_runtime_config(value)
+    migrated = _migrate_external_model_privacy(migrated)
+    migrated = _prune_obsolete_app_config(migrated)
+    migrated = _migrate_shared_integrations(migrated)
+    migrated = _migrate_writing_model_routing(migrated)
+    migrated = _migrate_agent_team_v2_config(migrated)
+    if seed is not None:
+        migrated = _migrate_legacy_autofilled_defaults(migrated, seed)
+    return migrated
 
 
 def _db_deps():
@@ -662,13 +816,7 @@ def load_app_config_sync(
             else None
         )
     ) or copy.deepcopy(canonical_seed)
-    seed = _migrate_agent_team_v2_config(
-        _migrate_writing_model_routing(
-            _migrate_shared_integrations(
-                _migrate_external_model_privacy(_prune_obsolete_app_config(seed))
-            )
-        )
-    )
+    seed = _migrate_app_config_value(seed)
     # Legacy YAML/seed overrides can carry the retired compact model too.  Do
     # this before a first-use DB insert so a fresh row is never seeded with it.
     seed = _migrate_legacy_compact_models(seed, canonical_seed)
@@ -698,25 +846,13 @@ def load_app_config_sync(
             )
             if encrypted_value != stored_value:
                 row.value = copy.deepcopy(encrypted_value)
-                session.commit()
                 stored_value = encrypted_value
 
             stored_decrypted = decrypt_json_secret_leaves(
                 stored_value,
                 aad_prefix="app_config_settings.value",
             )
-            value = _migrate_legacy_autofilled_defaults(
-                _migrate_agent_team_v2_config(
-                    _migrate_writing_model_routing(
-                        _migrate_shared_integrations(
-                            _migrate_external_model_privacy(
-                                _prune_obsolete_app_config(stored_decrypted)
-                            )
-                        )
-                    )
-                ),
-                seed,
-            )
+            value = _migrate_app_config_value(stored_decrypted, seed=seed)
             merged = _fill_missing_defaults(value, seed)
             if merged != stored_decrypted:
                 row.value = encrypt_json_secret_leaves(
@@ -780,13 +916,7 @@ def load_app_config_snapshot_sync(
             else fallback
         )
     ) or copy.deepcopy(canonical_seed)
-    seed = _migrate_agent_team_v2_config(
-        _migrate_writing_model_routing(
-            _migrate_shared_integrations(
-                _migrate_external_model_privacy(_prune_obsolete_app_config(seed))
-            )
-        )
-    )
+    seed = _migrate_app_config_value(seed)
     seed = _migrate_legacy_compact_models(seed, canonical_seed)
 
     try:
@@ -803,15 +933,7 @@ def load_app_config_snapshot_sync(
                     stored_value,
                     aad_prefix="app_config_settings.value",
                 )
-                value = _migrate_agent_team_v2_config(
-                    _migrate_writing_model_routing(
-                        _migrate_shared_integrations(
-                            _migrate_external_model_privacy(
-                                _prune_obsolete_app_config(decrypted)
-                            )
-                        )
-                    )
-                )
+                value = _migrate_app_config_value(decrypted)
                 result = _fill_missing_defaults(value, seed)
 
         # Match Config's deployment-environment credential/path precedence
@@ -871,13 +993,7 @@ def save_app_config_sync(config: Dict[str, Any]) -> bool:
             )
             config = dict(config)
             config["openrouter"] = openrouter
-        config = _migrate_agent_team_v2_config(
-            _migrate_writing_model_routing(
-                _migrate_shared_integrations(
-                    _migrate_external_model_privacy(_prune_obsolete_app_config(config))
-                )
-            )
-        )
+        config = _migrate_app_config_value(config)
         config = _migrate_legacy_compact_models(config, load_default_config())
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
         _ensure_table()
@@ -905,6 +1021,24 @@ def save_app_config_sync(config: Dict[str, Any]) -> bool:
         return False
 
 
+def load_stored_app_config_sync() -> Dict[str, Any]:
+    """Read the stored logical configuration for a subsequent CAS update.
+
+    Unlike the runtime snapshot, this does not merge defaults or environment
+    overrides, so its values match the row compared by update_app_config_keys_sync.
+    """
+    _, get_database_manager, AppConfigSetting = _db_deps()
+    _ensure_table()
+    with get_database_manager().get_sync_session() as session:
+        row = session.get(AppConfigSetting, GLOBAL_CONFIG_KEY)
+        if row is None or not isinstance(row.value, dict):
+            return {}
+        value = decrypt_json_secret_leaves(
+            copy.deepcopy(row.value), aad_prefix="app_config_settings.value"
+        )
+        return value if isinstance(value, dict) else {}
+
+
 def update_app_config_key_sync(key: str, value: Any) -> bool:
     """Update one dotted config key in the stored DB JSON."""
 
@@ -923,6 +1057,8 @@ def update_app_config_keys_sync(
     is not overwritten by an older full-config snapshot.  When
     ``expected_values`` is supplied, every dotted key must still equal its
     expected value under the same lock or no change is committed.
+    APP_CONFIG_MISSING requires the key to be absent; None still requires
+    a present JSON null.
     """
 
     if not isinstance(changes, dict):
@@ -969,15 +1105,7 @@ def update_app_config_keys_sync(
                 )
                 row = session.execute(statement).scalar_one_or_none()
                 if row is None:
-                    config = _migrate_agent_team_v2_config(
-                        _migrate_writing_model_routing(
-                            _migrate_shared_integrations(
-                                _migrate_external_model_privacy(
-                                    _prune_obsolete_app_config(load_default_config())
-                                )
-                            )
-                        )
-                    )
+                    config = _migrate_app_config_value(load_default_config())
                 else:
                     stored_value = row.value if isinstance(row.value, dict) else {}
                     config = decrypt_json_secret_leaves(
@@ -995,7 +1123,8 @@ def update_app_config_keys_sync(
                             current_value = missing
                             break
                         current_value = current_value[part]
-                    if current_value is missing or current_value != expected:
+                    if (current_value is not missing if expected is APP_CONFIG_MISSING
+                            else current_value is missing or current_value != expected):
                         session.rollback()
                         return False
 
@@ -1032,6 +1161,11 @@ def update_app_config_keys_sync(
                 # compact model is no longer accepted even when supplied by a
                 # stale client.  Normalize after applying the whole patch so a
                 # simultaneous provider+model update resolves consistently.
+                # Preserve the narrow patch semantics for an existing row:
+                # archive the retired branches and prune obsolete keys, but do
+                # not backfill every current seed default into an unrelated
+                # operator patch.
+                config = _migrate_retired_agent_runtime_config(config)
                 config = _prune_obsolete_app_config(config)
                 config = _migrate_legacy_compact_models(config, load_default_config())
                 encrypted = encrypt_json_secret_leaves(

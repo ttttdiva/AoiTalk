@@ -16,6 +16,30 @@ let activeRestartOverlay: RestartOverlay | null = null;
 type RestartWaitResult = "ready" | "timeout";
 type HealthSnapshot = { ready: boolean; bootId: string | null };
 
+const RESTART_REFUSAL_MESSAGES: Record<string, string> = {
+  operation_busy:
+    "会話またはエージェント処理中のため再起動を保留しました。処理完了後に再試行してください。",
+  restart_pending:
+    "再起動要求を確認中です。しばらく待ってから状態を確認してください。",
+  busy_state_timeout:
+    "処理中の作業を確認できなかったため、再起動を保留しました。",
+  busy_state_unknown:
+    "処理中の作業を確認できなかったため、再起動を保留しました。",
+  restart_unavailable: "再起動を開始できませんでした。状態を確認して再試行してください。",
+};
+
+async function restartRefusalMessage(response: Response): Promise<string | null> {
+  if (response.status !== 409 && response.status !== 503) return null;
+  try {
+    const payload = (await response.json()) as { error?: unknown };
+    return typeof payload.error === "string"
+      ? RESTART_REFUSAL_MESSAGES[payload.error] ?? null
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 type RestartWaitOptions = {
   checkHealth?: () => Promise<HealthSnapshot>;
   sleep?: (delayMs: number) => Promise<void>;
@@ -90,7 +114,14 @@ export async function waitForBackendRestart(
 }
 
 function createRestartOverlay() {
+  const previousFocus =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const overlay = document.createElement("div");
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", "管理サーバーの再起動");
+  overlay.dataset.restartOverlay = "true";
+  overlay.dataset.state = "running";
   overlay.style.cssText = [
     "position:fixed",
     "inset:0",
@@ -122,6 +153,7 @@ function createRestartOverlay() {
   const retryButton = document.createElement("button");
   retryButton.type = "button";
   retryButton.textContent = "再起動を再試行";
+  retryButton.dataset.restartRetry = "true";
   retryButton.style.cssText = [
     "display:none",
     "border:1px solid rgba(255,255,255,0.7)",
@@ -132,11 +164,46 @@ function createRestartOverlay() {
     "cursor:pointer",
   ].join(";");
 
-  panel.append(status, retryButton);
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.textContent = "閉じる";
+  closeButton.setAttribute("aria-label", "再起動状態画面を閉じる");
+  closeButton.dataset.restartClose = "true";
+  closeButton.style.cssText = [
+    "display:none",
+    "border:1px solid rgba(255,255,255,0.7)",
+    "border-radius:6px",
+    "background:transparent",
+    "padding:8px 16px",
+    "color:#fff",
+    "cursor:pointer",
+  ].join(";");
+
+  panel.append(status, retryButton, closeButton);
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
 
-  return { status, retryButton };
+  const result = {
+    root: overlay,
+    status,
+    retryButton,
+    closeButton,
+    dismissible: false,
+    previousFocus,
+  };
+  retryButton.onclick = () => {
+    if (!result.dismissible || activeRestartPromise) return;
+    void startRestartAttempt(result);
+  };
+  closeButton.onclick = () => {
+    if (!result.dismissible || activeRestartOverlay !== result) return;
+    result.root.remove();
+    activeRestartOverlay = null;
+    if (result.previousFocus?.isConnected) {
+      result.previousFocus.focus({ preventScroll: true });
+    }
+  };
+  return result;
 }
 
 function getRestartOverlay(): RestartOverlay {
@@ -147,12 +214,45 @@ function getRestartOverlay(): RestartOverlay {
   return activeRestartOverlay;
 }
 
-async function runRestartAttempt({ status, retryButton }: RestartOverlay) {
-  retryButton.disabled = true;
-  retryButton.style.display = "none";
-  status.textContent = "現在のサービスを確認しています...";
+function isCurrentRestartOverlay(overlay: RestartOverlay): boolean {
+  return activeRestartOverlay === overlay && overlay.root.isConnected;
+}
+
+function setRestartStatus(overlay: RestartOverlay, message: string): void {
+  if (!isCurrentRestartOverlay(overlay)) return;
+  overlay.status.textContent = message;
+}
+
+function showRestartFailure(
+  overlay: RestartOverlay,
+  message: string,
+  state: "refused" | "failed" | "timeout",
+): void {
+  if (!isCurrentRestartOverlay(overlay)) return;
+  overlay.root.dataset.state = state;
+  overlay.status.textContent = message;
+  overlay.dismissible = true;
+  overlay.retryButton.disabled = false;
+  overlay.retryButton.style.display = "block";
+  overlay.closeButton.style.display = "block";
+  overlay.closeButton.focus({ preventScroll: true });
+}
+
+function prepareRestartAttempt(overlay: RestartOverlay): void {
+  if (!isCurrentRestartOverlay(overlay)) return;
+  overlay.root.dataset.state = "running";
+  overlay.dismissible = false;
+  overlay.retryButton.disabled = true;
+  overlay.retryButton.style.display = "none";
+  overlay.closeButton.style.display = "none";
+  overlay.status.textContent = "現在のサービスを確認しています...";
+}
+
+async function runRestartAttempt(overlay: RestartOverlay) {
+  prepareRestartAttempt(overlay);
   const previousHealth = await checkBackendHealth();
-  status.textContent = "再起動を要求しています...";
+  if (!isCurrentRestartOverlay(overlay)) return;
+  setRestartStatus(overlay, "再起動を要求しています...");
 
   try {
     const response = await fetch("/api/python-proxy/admin/restart", {
@@ -160,41 +260,55 @@ async function runRestartAttempt({ status, retryButton }: RestartOverlay) {
       credentials: "include",
       signal: AbortSignal.timeout(RESTART_REQUEST_TIMEOUT_MS),
     });
+    const refusal = await restartRefusalMessage(response);
+    if (!isCurrentRestartOverlay(overlay)) return;
+    if (refusal) {
+      showRestartFailure(overlay, refusal, "refused");
+      return;
+    }
     const ambiguouslyAccepted = [502, 503, 504].includes(response.status);
     if (!response.ok && !ambiguouslyAccepted) {
-      status.textContent = `再起動を開始できませんでした（HTTP ${response.status}）。`;
-      retryButton.disabled = false;
-      retryButton.style.display = "block";
+      showRestartFailure(
+        overlay,
+        `再起動を開始できませんでした（HTTP ${response.status}）。`,
+        "failed",
+      );
       return;
     }
   } catch {
     // 再起動開始直後の切断やproxy timeoutでも、health監視で結果を確認する。
   }
 
-  status.textContent = "サービスの起動完了を確認しています...";
+  if (!isCurrentRestartOverlay(overlay)) return;
+  setRestartStatus(overlay, "サービスの起動完了を確認しています...");
   const result = await waitForBackendRestart({
     previousBootId: previousHealth.bootId,
     initiallyDown: !previousHealth.ready,
   });
+  if (!isCurrentRestartOverlay(overlay)) return;
   if (result === "ready") {
-    status.textContent = "再起動が完了しました。再読み込みします...";
+    setRestartStatus(overlay, "再起動が完了しました。再読み込みします...");
     window.location.reload();
     return;
   }
 
-  status.textContent =
-    "300秒以内に復帰を確認できませんでした。ページは保持しています。状態を確認して再試行してください。";
-  retryButton.disabled = false;
-  retryButton.style.display = "block";
+  showRestartFailure(
+    overlay,
+    "300秒以内に復帰を確認できませんでした。ページは保持しています。状態を確認して再試行してください。",
+    "timeout",
+  );
 }
 
-function startRestartAttempt(): Promise<void> {
+function startRestartAttempt(overlay?: RestartOverlay): Promise<void> {
   if (activeRestartPromise) {
     return activeRestartPromise;
   }
 
-  const overlay = getRestartOverlay();
-  const attempt = runRestartAttempt(overlay);
+  const attemptOverlay = overlay ?? getRestartOverlay();
+  prepareRestartAttempt(attemptOverlay);
+  const attempt = Promise.resolve().then(() =>
+    runRestartAttempt(attemptOverlay),
+  );
   activeRestartPromise = attempt;
   attempt.then(
     () => {
@@ -213,11 +327,8 @@ function startRestartAttempt(): Promise<void> {
  * 認可チェックは行わないため、呼び出し側で admin 判定を済ませること。
  */
 export function performAdminRestart(): Promise<void> {
-  const overlay = getRestartOverlay();
-  overlay.retryButton.onclick = () => {
-    void startRestartAttempt();
-  };
-  return startRestartAttempt();
+  if (activeRestartPromise) return activeRestartPromise;
+  return startRestartAttempt(getRestartOverlay());
 }
 
 async function checkAndRestart() {

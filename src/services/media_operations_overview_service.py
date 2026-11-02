@@ -410,12 +410,37 @@ class MediaOperationsOverviewService(MediaOperationsContentService):
         limit: int | None,
         order_column: Any | None = None,
     ) -> list[Any]:
-        condition = await self._scope_condition(
-            session,
-            actor,
-            model,
-            project_id=project_id,
-        )
+        if model is ExternalActionAttempt:
+            action_scope = await self._scope_condition(
+                session,
+                actor,
+                ExternalAction,
+                project_id=project_id,
+            )
+            visible_action_ids = select(ExternalAction.id).where(
+                action_scope,
+                ExternalAction.owner_user_id == ExternalActionAttempt.owner_user_id,
+            )
+            condition = ExternalActionAttempt.action_id.in_(visible_action_ids)
+        elif model is ExternalActionReceipt:
+            action_scope = await self._scope_condition(
+                session,
+                actor,
+                ExternalAction,
+                project_id=project_id,
+            )
+            visible_action_ids = select(ExternalAction.id).where(
+                action_scope,
+                ExternalAction.owner_user_id == ExternalActionReceipt.owner_user_id,
+            )
+            condition = ExternalActionReceipt.action_id.in_(visible_action_ids)
+        else:
+            condition = await self._scope_condition(
+                session,
+                actor,
+                model,
+                project_id=project_id,
+            )
         statement = select(model).where(condition)
         if order_column is not None:
             statement = statement.order_by(order_column.desc(), model.id.desc())

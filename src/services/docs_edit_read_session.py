@@ -92,6 +92,8 @@ def edit_read_scope_binding(
     turn_project_id: UUID | None,
     allowed_node_ids: set[UUID] | None,
     context_binding: str,
+    scope_anchor_ids: tuple[UUID, ...] | None = None,
+    personal_scope: bool = False,
 ) -> str:
     """Hash every input that can change the edit projection's scope.
 
@@ -100,6 +102,15 @@ def edit_read_scope_binding(
     accepted by the mutation path.
     """
 
+    scope_ids = (
+        sorted(str(value) for value in scope_anchor_ids)
+        if scope_anchor_ids is not None
+        else (
+            sorted(str(value) for value in allowed_node_ids)
+            if allowed_node_ids is not None
+            else None
+        )
+    )
     payload = [
         str(actor_id),
         str(root_id),
@@ -108,9 +119,8 @@ def edit_read_scope_binding(
         int(page_chars),
         str(turn_project_id or ""),
         str(context_binding or ""),
-        sorted(str(value) for value in allowed_node_ids)
-        if allowed_node_ids is not None
-        else None,
+        scope_ids,
+        bool(personal_scope),
     ]
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -202,6 +212,10 @@ class DocsEditReadSessionService:
         page_chars: int,
         start: int,
         fingerprint: str | None,
+        personal_scope: bool = False,
+        scope_anchor_ids: tuple[UUID, ...] | None = None,
+        scope_canonical_seed_ids: tuple[UUID, ...] = (),
+        scope_related_seed_ids: tuple[UUID, ...] = (),
     ) -> dict:
         """Rebuild one page without ever trusting a client-provided offset."""
 
@@ -220,6 +234,10 @@ class DocsEditReadSessionService:
                 page_chars=page_chars,
                 include_manifest=True,
                 record_only=False,
+                personal_scope=personal_scope,
+                scope_anchor_ids=scope_anchor_ids,
+                scope_canonical_seed_ids=scope_canonical_seed_ids,
+                scope_related_seed_ids=scope_related_seed_ids,
             )
         except (ValueError, PermissionError) as exc:
             # A changed projection produces a public cursor error in the
@@ -288,6 +306,10 @@ class DocsEditReadSessionService:
         turn_project_id: UUID | None,
         current_revision: tuple[int, int],
         request_cursor: str,
+        personal_scope: bool,
+        scope_anchor_ids: tuple[UUID, ...] | None,
+        scope_canonical_seed_ids: tuple[UUID, ...],
+        scope_related_seed_ids: tuple[UUID, ...],
     ) -> dict:
         """Replay the exact prior page after a lost response."""
 
@@ -305,6 +327,10 @@ class DocsEditReadSessionService:
             page_chars=row.page_chars,
             start=row.last_page_start,
             fingerprint=row.read_fingerprint,
+            personal_scope=personal_scope,
+            scope_anchor_ids=scope_anchor_ids,
+            scope_canonical_seed_ids=scope_canonical_seed_ids,
+            scope_related_seed_ids=scope_related_seed_ids,
         )
         if await revision(self.session, row.library_id) != current_revision:
             raise DocsConflict("Docs changed during page replay; restart the edit read")
@@ -343,6 +369,10 @@ class DocsEditReadSessionService:
         cursor: str,
         scope_binding: str,
         mutation_binding: str | None = None,
+        personal_scope: bool = False,
+        scope_anchor_ids: tuple[UUID, ...] | None = None,
+        scope_canonical_seed_ids: tuple[UUID, ...] = (),
+        scope_related_seed_ids: tuple[UUID, ...] = (),
     ) -> dict:
         """Deliver/advance or safely replay one edit-read page.
 
@@ -449,6 +479,10 @@ class DocsEditReadSessionService:
                 turn_project_id=turn_project_id,
                 current_revision=current_revision,
                 request_cursor=cursor,
+                personal_scope=personal_scope,
+                scope_anchor_ids=scope_anchor_ids,
+                scope_canonical_seed_ids=scope_canonical_seed_ids,
+                scope_related_seed_ids=scope_related_seed_ids,
             )
 
         # No row exists: build the first page before inserting protocol state,
@@ -464,6 +498,10 @@ class DocsEditReadSessionService:
                 page_chars=page_chars,
                 start=0,
                 fingerprint=None,
+                personal_scope=personal_scope,
+                scope_anchor_ids=scope_anchor_ids,
+                scope_canonical_seed_ids=scope_canonical_seed_ids,
+                scope_related_seed_ids=scope_related_seed_ids,
             )
             row = DocsEditReadSession(
                 actor_id=actor_id,
@@ -496,6 +534,10 @@ class DocsEditReadSessionService:
                 page_chars=row.page_chars,
                 start=start,
                 fingerprint=row.read_fingerprint,
+                personal_scope=personal_scope,
+                scope_anchor_ids=scope_anchor_ids,
+                scope_canonical_seed_ids=scope_canonical_seed_ids,
+                scope_related_seed_ids=scope_related_seed_ids,
             )
 
         # A writer may commit while the projection is being rebuilt.  Do not

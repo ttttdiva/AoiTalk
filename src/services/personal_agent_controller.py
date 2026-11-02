@@ -17,16 +17,16 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.orm import selectinload
 
+from ..memory.models import Agent, AgentRevision
 from ..memory.models.conversations import AgentExecutionBinding, ConversationSession
 from .agent_authority import AgentAuthorityResolver, AuthorityDecision
 from .agent_model_routing import (
     AgentModelRoute,
     AgentModelRouteError,
-    AgentRoutingPins,
-    resolve_agent_subagent_route,
+    resolve_agent_role_route,
 )
 from .conversation_agent_service import (
     AgentExecutionBindingSnapshot,
@@ -57,8 +57,6 @@ from .personal_ledger_service import (
     PersonalLedgerService,
 )
 from .turn_context import get_turn_context, reset_turn_context, set_turn_context
-
-PERSONAL_ADAPTER_SUBAGENT_ID = "personal_private_adapter"
 
 _CAPABILITY_BY_OPERATION = {
     "deadline.state": ("personal-firearms-admin", "personal_deadline_read"),
@@ -139,9 +137,6 @@ class PersonalAgentExecution:
             self.binding_snapshot.snapshot_hash,
             self.route.agent_id,
             self.route.agent_revision_id,
-            self.route.agent_team_id,
-            self.route.execution_profile_id,
-            self.route.acting_subagent_id,
             self.route.role,
             self.route.provider,
             self.route.model,
@@ -229,6 +224,111 @@ class PersonalAgentExecutionResolver:
         finally:
             await session.close()
 
+    async def list_owner_sessions(
+        self,
+        *,
+        owner_id: str,
+        profile_id: str,
+    ) -> list[dict[str, Any]]:
+        """List only this owner's active private sessions on a current personal binding."""
+        owner = self._uuid(owner_id, "invalid_owner")
+        from .agent_identity_service import AgentIdentityService
+
+        personal_agents = await AgentIdentityService(
+            self.db_manager
+        ).list_personal_adapter_agents(owner_user_id=owner)
+        revisions_by_agent = {
+            UUID(str(item["agent_id"])): UUID(str(item["agent_revision_id"]))
+            for item in personal_agents
+            if item.get("profile_id") == profile_id
+        }
+        if not revisions_by_agent:
+            return []
+
+        session = await self._session()
+        try:
+            current_revision_id = (
+                select(AgentRevision.id)
+                .where(AgentRevision.agent_id == Agent.id)
+                .order_by(desc(AgentRevision.version), desc(AgentRevision.id))
+                .limit(1)
+                .correlate(Agent)
+                .scalar_subquery()
+            )
+            current_binding_revision_id = (
+                select(AgentExecutionBinding.agent_revision_id)
+                .where(
+                    AgentExecutionBinding.session_id == ConversationSession.id,
+                    AgentExecutionBinding.agent_id == ConversationSession.agent_id,
+                )
+                .order_by(
+                    desc(AgentExecutionBinding.created_at),
+                    desc(AgentExecutionBinding.id),
+                )
+                .limit(1)
+                .correlate(ConversationSession)
+                .scalar_subquery()
+            )
+            current_personal_bindings = or_(
+                *(
+                    and_(
+                        ConversationSession.agent_id == agent_id,
+                        current_revision_id == revision_id,
+                        current_binding_revision_id == revision_id,
+                    )
+                    for agent_id, revision_id in revisions_by_agent.items()
+                )
+            )
+            rows = (
+                (
+                    await session.execute(
+                        select(ConversationSession)
+                        .join(Agent, Agent.id == ConversationSession.agent_id)
+                        .options(selectinload(ConversationSession.participants))
+                        .where(
+                            Agent.created_by == owner,
+                            Agent.state == "active",
+                            ConversationSession.user_id == str(owner),
+                            ConversationSession.deleted_at.is_(None),
+                            ConversationSession.is_active.is_(True),
+                            ConversationSession.agent_id.in_(revisions_by_agent),
+                            ConversationSession.is_group_chat.is_(False),
+                            ConversationSession.project_id.is_(None),
+                            ConversationSession.app_id.is_(None),
+                            ConversationSession.app_target_id.is_(None),
+                            ConversationSession.parent_session_id.is_(None),
+                            current_personal_bindings,
+                        )
+                        .order_by(
+                            desc(ConversationSession.last_activity).nullslast(),
+                            desc(ConversationSession.session_start).nullslast(),
+                            desc(ConversationSession.id),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    self._verify_private_participants(row, owner)
+                except PersonalAgentControllerError:
+                    continue
+                candidates.append(
+                    {
+                        "id": str(row.id),
+                        "user_id": str(row.user_id),
+                        "agent_id": str(row.agent_id),
+                        "agent_binding_updated_at": row.agent_binding_updated_at,
+                        "title": str(row.title or ""),
+                        "character_name": str(row.character_name or ""),
+                    }
+                )
+            return candidates
+        finally:
+            await session.close()
+
     async def _latest_binding(self, session_id: UUID, agent_id: UUID) -> AgentExecutionBinding:
         session = await self._session()
         try:
@@ -299,26 +399,16 @@ class PersonalAgentExecutionResolver:
         ):
             raise PersonalAgentControllerError("personal_agent_binding_changed", 409)
 
-        pins = AgentRoutingPins(
-            agent_id=binding.agent_id,
-            agent_revision_id=binding.agent_revision_id,
-            agent_team_id=binding.agent_team_id,
-            execution_profile_id=binding.execution_profile_id,
-            allowed_subagent_ids=binding.allowed_subagent_ids,
-            route_snapshot=binding.route_snapshot,
-        )
         try:
-            route = resolve_agent_subagent_route(
+            route = resolve_agent_role_route(
                 self.config,
-                pins,
-                PERSONAL_ADAPTER_SUBAGENT_ID,
-                role="operator",
+                binding.routing_pins(),
+                "operator",
             )
         except AgentModelRouteError as exc:
             raise PersonalAgentControllerError("personal_operator_route_unavailable", 403) from exc
         if (
-            route.acting_subagent_id != PERSONAL_ADAPTER_SUBAGENT_ID
-            or route.role != "operator"
+            route.role != "operator"
             or route.agent_id != binding.agent_id
             or route.agent_revision_id != binding.agent_revision_id
             or route.backend != "api"
@@ -487,7 +577,7 @@ class PersonalAgentController:
             return db_manager.get_session()
 
         ledger = PersonalLedgerService(session_factory)
-        drafts = PersonalDraftService(ledger)
+        drafts = PersonalDraftService(session_factory)
         ledger_tools = PersonalAgentTools(ledger, drafts, enabled=True)
 
         runtime = PersonalAgentRuntime(enabled=True)
@@ -540,6 +630,17 @@ class PersonalAgentController:
             }
             for profile in PERSONAL_AGENT_PROFILES
         ]
+
+    async def list_owner_sessions(
+        self,
+        *,
+        owner_id: str,
+        profile_id: str,
+    ) -> list[dict[str, Any]]:
+        return await self.execution_resolver.list_owner_sessions(
+            owner_id=owner_id,
+            profile_id=profile_id,
+        )
 
     @staticmethod
     def _validate_arguments(operation: str, arguments: Any) -> dict[str, Any]:
@@ -598,7 +699,7 @@ class PersonalAgentController:
         if (
             not current.authority.allowed
             or current.required_capability not in current.authority.capabilities
-            or current.route.acting_subagent_id != PERSONAL_ADAPTER_SUBAGENT_ID
+            or current.route.role != "operator"
             or current.base_url != initial.base_url
         ):
             raise LedgerPermissionError("current personal Agent authority denied")
@@ -634,7 +735,6 @@ class PersonalAgentController:
             or initial.binding_snapshot.agent_revision_id != initial.agent_revision_id
             or initial.binding_snapshot.agent_id != initial.agent_id
             or initial.binding_snapshot.binding_id != initial.binding_id
-            or initial.route.acting_subagent_id != PERSONAL_ADAPTER_SUBAGENT_ID
             or initial.route.role != "operator"
             or initial.authority.allowed is not True
             or capability not in initial.authority.capabilities
@@ -749,7 +849,6 @@ def build_personal_agent_controller(server: Any) -> PersonalAgentController:
 
 
 __all__ = [
-    "PERSONAL_ADAPTER_SUBAGENT_ID",
     "PersonalAgentController",
     "PersonalAgentControllerError",
     "PersonalAgentExecution",

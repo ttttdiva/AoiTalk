@@ -23,6 +23,12 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
+from ...services.free_team_defaults import (
+    OPENROUTER_DEFAULT_FREE_DAILY_TIER,
+    OPENROUTER_FREE_DAILY_TIERS,
+    OPENROUTER_SAFETY_MARGIN_REQUESTS,
+)
+
 from .base import Base, _encrypted_text_property
 
 
@@ -112,6 +118,10 @@ class FreeTeamCredentialProfile(Base):
     def configured(self) -> bool:
         if self.authentication_type == "cli":
             return bool(self.cli_auth_reference)
+        # This legacy OpenAI row is only an FK target. Avoid even projecting
+        # its old encrypted key; routing uses the shared OpenAI client key.
+        if self.id == "openai-complimentary":
+            return False
         return bool(self.api_key or (self.environment_variable and os.getenv(self.environment_variable)))
 
     def to_safe_dict(self) -> dict[str, Any]:
@@ -177,6 +187,11 @@ class FreeTeamQuotaPool(Base):
     def provider_sync_delta(self) -> Decimal:
         observed = Decimal(self.provider_observed_usage or 0)
         state = self.provider_sync_state or {}
+        if state.get("source") == "openai_usage_api":
+            # This source is the absolute organization total. Admission compares
+            # it with local+reserved usage as a maximum; it is not an additive
+            # external delta.
+            return Decimal("0")
         try:
             delta = Decimal(str(state["external_delta"]))
             if state.get("schema_version") == 1 and Decimal(str(state["observed_total"])) == observed and delta.is_finite() and delta >= 0:
@@ -195,24 +210,140 @@ class FreeTeamQuotaPool(Base):
                    OPENAI_SAFETY_TOKENS if self.id in OPENAI_DAILY_QUOTA_GROUPS else Decimal("0"))
 
     @property
-    def daily_cap(self) -> Decimal:
+    def provider_observed_limit(self) -> Decimal | None:
+        if self.id != "openrouter-free-rpd":
+            return None
+        state = self.provider_sync_state or {}
+        if state.get("source") != "openrouter_key_api":
+            return None
+        try:
+            value = Decimal(str(state.get("provider_limit")))
+        except Exception:
+            return None
+        return value if value.is_finite() and value >= 1 else None
+
+    def daily_cap_for_tier(
+        self,
+        usage_tier: str | None = None,
+        *,
+        openrouter_free_tier: int | None = None,
+    ) -> Decimal:
         limit = Decimal(self.limit_value or 0)
         if self.id in OPENAI_DAILY_QUOTA_GROUPS:
-            from ...services.pricing.free_tier import FREE_TIER_LIMITS
-            limit = min(limit, Decimal(FREE_TIER_LIMITS["tier_3_plus"][OPENAI_DAILY_QUOTA_GROUPS[self.id]]))
+            from ...services.pricing.free_tier import free_tier_limit_for_group
+
+            limit = min(
+                limit,
+                Decimal(
+                    free_tier_limit_for_group(
+                        OPENAI_DAILY_QUOTA_GROUPS[self.id], usage_tier
+                    )
+                ),
+            )
+            # Keep the official OpenAI safety reserve identical in projections
+            # and admission, independent of the persisted pool's old tier.
+            safety_margin = max(
+                Decimal(self.safety_margin_units or 0),
+                limit * Decimal(self.safety_margin_ratio or 0),
+                OPENAI_SAFETY_TOKENS,
+            )
+            return max(Decimal("0"), limit - safety_margin)
+        elif self.id == "openrouter-free-rpd":
+            if openrouter_free_tier is not None:
+                try:
+                    selected_tier = int(openrouter_free_tier)
+                except (TypeError, ValueError, OverflowError):
+                    selected_tier = OPENROUTER_DEFAULT_FREE_DAILY_TIER
+                if selected_tier not in OPENROUTER_FREE_DAILY_TIERS:
+                    selected_tier = OPENROUTER_DEFAULT_FREE_DAILY_TIER
+                local_cap = self.configured_daily_cap
+                provider_limit = Decimal(selected_tier)
+                observed_limit = self.provider_observed_limit
+                if observed_limit is not None:
+                    provider_limit = min(provider_limit, observed_limit)
+                provider_cap = max(
+                    Decimal("0"),
+                    provider_limit - Decimal(OPENROUTER_SAFETY_MARGIN_REQUESTS),
+                )
+                return min(local_cap, provider_cap)
+            observed_limit = self.provider_observed_limit
+            if observed_limit is not None:
+                limit = min(limit, observed_limit)
         return max(Decimal("0"), limit - self.safety_margin)
 
     @property
-    def available(self) -> Decimal:
+    def configured_daily_cap(self) -> Decimal:
+        limit = Decimal(self.limit_value or 0)
+        if self.id in OPENAI_DAILY_QUOTA_GROUPS:
+            from ...services.pricing.free_tier import free_tier_max_limit_for_group
+
+            limit = min(
+                limit,
+                Decimal(
+                    free_tier_max_limit_for_group(
+                        OPENAI_DAILY_QUOTA_GROUPS[self.id]
+                    )
+                ),
+            )
+            safety_margin = max(
+                Decimal(self.safety_margin_units or 0),
+                limit * Decimal(self.safety_margin_ratio or 0),
+                OPENAI_SAFETY_TOKENS,
+            )
+            return max(Decimal("0"), limit - safety_margin)
+        return max(Decimal("0"), limit - self.safety_margin)
+
+    @property
+    def daily_cap(self) -> Decimal:
+        # A model accessed without application settings must use the safe tier.
+        return self.daily_cap_for_tier()
+
+    def available_for_tier(
+        self,
+        usage_tier: str | None = None,
+        *,
+        openrouter_free_tier: int | None = None,
+    ) -> Decimal:
         return max(
             Decimal("0"),
-            self.daily_cap
+            self.daily_cap_for_tier(
+                usage_tier,
+                openrouter_free_tier=openrouter_free_tier,
+            )
             - Decimal(self.consumed or 0)
             - Decimal(self.reserved or 0)
-            - self.provider_sync_delta
+            - self.provider_sync_delta,
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    @property
+    def provider_managed_cap(self) -> bool:
+        return (
+            self.id in {"gemini-free-rpm", "gemini-free-tpm", "gemini-free-rpd"}
+            and self.credential_profile_id == "gemini-free"
+            and self.metric_type == self.id.removeprefix("gemini-free-")
+            and isinstance(self.reset_policy, dict)
+            and self.reset_policy.get("local_cap_mode") == "provider"
+        )
+
+    @property
+    def available(self) -> Decimal:
+        return self.available_for_tier()
+
+    def to_dict(
+        self,
+        *,
+        openai_usage_tier: str | None = None,
+        openrouter_free_tier: int | None = None,
+    ) -> dict[str, Any]:
+        daily_cap = self.daily_cap_for_tier(
+            openai_usage_tier,
+            openrouter_free_tier=openrouter_free_tier,
+        )
+        configured_daily_cap = self.configured_daily_cap
+        available = self.available_for_tier(
+            openai_usage_tier,
+            openrouter_free_tier=openrouter_free_tier,
+        )
         return {
             "id": self.id,
             "credential_profile_id": self.credential_profile_id,
@@ -220,11 +351,12 @@ class FreeTeamQuotaPool(Base):
             "limit": _number(self.limit_value),
             "consumed": _number(self.consumed),
             "reserved": _number(self.reserved),
-            "available": _number(self.available),
-            "daily_cap": _number(self.daily_cap),
-            "configured_daily_cap": _number(self.daily_cap),
+            "available": None if self.provider_managed_cap else _number(available),
+            "availability_state": "provider_managed" if self.provider_managed_cap else "local",
+            "daily_cap": _number(daily_cap),
+            "configured_daily_cap": _number(configured_daily_cap),
             "model_group": OPENAI_DAILY_QUOTA_GROUPS.get(self.id),
-            "stop_reason": self.status if self.status != "active" else ("budget_exhausted" if self.available <= 0 else ""),
+            "stop_reason": self.status if self.status != "active" else ("budget_exhausted" if not self.provider_managed_cap and available <= 0 else ""),
             "safety_margin_ratio": _number(self.safety_margin_ratio),
             "safety_margin_units": _number(self.safety_margin_units),
             "window_start": _iso(self.window_start),
@@ -232,6 +364,7 @@ class FreeTeamQuotaPool(Base):
             "reset_policy": _safe_public_mapping(self.reset_policy or {}),
             "last_provider_sync_at": _iso(self.last_provider_sync_at),
             "provider_observed_usage": _number(self.provider_observed_usage),
+            "provider_observed_limit": _number(self.provider_observed_limit),
             "provider_external_delta": _number(self.provider_sync_delta),
             "status": self.status,
         }

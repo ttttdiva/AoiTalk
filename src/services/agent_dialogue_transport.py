@@ -20,17 +20,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from sqlalchemy import desc, func, or_, select, update
+from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 
 from ..memory.database import get_database_manager
 from ..memory.models import (
     Agent,
     AgentDialogue,
+    AgentDelegation,
     AgentDialogueDelivery,
     AgentDialogueInput,
     AgentDialogueReservation,
     AgentDialogueUsage,
+    AgentPrivateRoot,
     AgentRevision,
     AgentRun,
     AgentRunEvent,
@@ -42,6 +44,7 @@ from ..memory.models import (
     User,
 )
 from .agent_dialogue_projection import project_dialogue
+from .agent_delegate_policy import revision_has_new_delegate_policy
 from .agent_work_runtime import (
     AgentWorkCoordinator,
     ExecutionOutcome,
@@ -58,9 +61,52 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ACTIVE_RUN_STATES = frozenset({"queued", "running", "awaiting_approval", "uncertain"})
 _ACTIVE_WORK_STATES = frozenset({"pending", "claimed", "running", "awaiting_approval", "uncertain"})
 _TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
-_SAFE_TERMINAL_FAILURE_PREFIXES = ("agent_route_", "interactive_admission_")
+_TERMINAL_DIALOGUE_STATES = frozenset(
+    {"succeeded", "failed", "cancelled", "expired"}
+)
+# Keep this aligned with AgentDialogueService's active ledger states. Unknown
+# values fail closed along with the model's terminal states.
+_ACTIVE_DIALOGUE_STATES = frozenset({"queued", "running", "waiting", "blocked"})
+_SAFE_TERMINAL_FAILURE_PREFIXES = (
+    "agent_route_", "interactive_admission_", "dialogue_source_human_",
+    "dialogue_worker_provenance_",
+)
+
+
+def _is_safe_terminal_failure_code(code: str) -> bool:
+    return code.startswith(_SAFE_TERMINAL_FAILURE_PREFIXES) or code in {
+        "dialogue_worker_run_invalid", "dialogue_worker_run_not_found",
+    }
+
 _BLOCKED_AUTHORITY_PREFIX = "interactive_admission_authority_"
 _PERMANENT_DIALOGUE_ADMISSION_PREFIXES = ("dialogue_answer_root_",)
+# Only codes defined by the receiver admission contract may enter a receipt.
+_RECEIVER_ADMISSION_CODES = frozenset({
+    "agent_binding_changed", "dialogue_root_project_forbidden",
+    "dialogue_project_scope_conflict", "dialogue_receiver_project_forbidden",
+    "dialogue_control_revision_changed", "dialogue_project_hint_invalid",
+    "dialogue_delivery_provenance_incomplete", "dialogue_source_message_body_unavailable",
+    "dialogue_source_run_mismatch", "dialogue_delivery_receiver_invalid",
+    "dialogue_delivery_source_invalid", "dialogue_authorization_invalid",
+    "dialogue_event_predecessor_provenance_invalid", "dialogue_event_causation_missing",
+    "dialogue_event_causation_invalid", "dialogue_pending_input_provenance_mismatch",
+    "dialogue_trigger_mismatch", "worker_scope_authorization_invalid",
+    "dialogue_turn_budget_exhausted", "dialogue_attempt_budget_exhausted",
+    "dialogue_token_budget_exhausted", "dialogue_cost_budget_exhausted",
+})
+
+
+def _receiver_admission_code(error: BaseException) -> str | None:
+    # Import locally: agent_run_service also imports this module.
+    from .agent_dialogue_budget import DialogueBudgetError
+    from .agent_run_service import AgentChatAdmissionError, DispatchConflictError
+
+    if not isinstance(error, (AgentChatAdmissionError, DispatchConflictError, DialogueBudgetError)):
+        return None
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) and code in _RECEIVER_ADMISSION_CODES else None
+
+
 _ANSWER_RECOVERY_BUDGET_FAILURE_CODES = frozenset(
     {
         "dialogue_turn_budget_exhausted",
@@ -69,6 +115,10 @@ _ANSWER_RECOVERY_BUDGET_FAILURE_CODES = frozenset(
         "dialogue_cost_budget_exhausted",
     }
 )
+
+
+def _generic_agent_dialogue_revision(revision: Any) -> bool:
+    return revision_has_new_delegate_policy(revision)
 
 
 class DialogueDispatchBridgeProtocol:
@@ -210,6 +260,20 @@ def _run_work_state_matches(run: Any, work: Any) -> bool:
     if status in _ACTIVE_RUN_STATES:
         return state in _ACTIVE_WORK_STATES
     return False
+
+
+def _run_succeeded_work_settling(run: Any, work: Any) -> bool:
+    """The Run committed success first; its linked Work settles right after.
+
+    A delivery sent by that Run is still valid in this window, and a Work
+    whose settlement was lost must not strand the delivery either.
+    """
+
+    return (
+        _text(_field(run, "status"), 32).casefold() == "succeeded"
+        and _text(_field(work, "state"), 32).casefold() in {"claimed", "running"}
+        and _same_uuid(_field(work, "active_agent_run_id"), _field(run, "id"))
+    )
 
 
 def _blocked_authority_shape(run: Any, work: Any) -> str | None:
@@ -551,8 +615,8 @@ class AgentDialogueTransport:
         return dialogue
 
     async def _validate_dialogue(self, session: Any, dialogue: Any, expected_revision: int) -> None:
-        if _text(_field(dialogue, "state")).casefold() in {"cancelled", "expired", "deleted"}:
-            raise DialogueTransportError("dialogue_not_active")
+        if _text(_field(dialogue, "state"), 32).casefold() not in _ACTIVE_DIALOGUE_STATES:
+            raise DialogueTransportError("dialogue_terminal")
         owner_uuid = _uuid(_field(dialogue, "owner_user_id"), "owner_user_id")
         root = await session.get(ConversationSession, _uuid(_field(dialogue, "root_session_id"), "root_session_id"))
         worker = await session.get(ConversationSession, _uuid(_field(dialogue, "worker_session_id"), "worker_session_id"))
@@ -1213,6 +1277,502 @@ class AgentDialogueTransport:
     enqueue = enqueue_delivery
     admit_delivery = enqueue_delivery
 
+    async def _origin_delegations(self, session: Any, dialogue: Any, incoming: Any) -> list[Any]:
+        # JSON comparison is deliberately performed in Python for SQLite and
+        # PostgreSQL parity; the indexed delegator bounds the candidate set.
+        await session.flush()
+        rows = (await session.scalars(select(AgentDelegation).where(
+            AgentDelegation.delegator_agent_id == dialogue.worker_agent_id,
+            AgentDelegation.delegator_revision_id == dialogue.worker_agent_revision_id,
+        ).execution_options(populate_existing=True))).all()
+        return [row for row in rows if isinstance(row.source_actor_json, dict)
+                and row.source_actor_json.get("source_run_id") == str(incoming.receiver_run_id)
+                and row.source_actor_json.get("source_work_item_id") == str(incoming.receiver_work_item_id)
+                and row.source_actor_json.get("source_session_id") == str(dialogue.worker_session_id)]
+
+    async def _origin_media_work(self, session: Any, dialogue: Any, incoming: Any) -> list[Any]:
+        await session.flush()
+        rows = (await session.scalars(select(AgentWorkItem).where(
+            AgentWorkItem.parent_work_item_id == incoming.receiver_work_item_id,
+            AgentWorkItem.source_type == "media.generation.plan",
+        ).execution_options(populate_existing=True))).all()
+        source = {"version": 1, "source_run_id": str(incoming.receiver_run_id),
+            "source_work_item_id": str(incoming.receiver_work_item_id),
+            "source_session_id": str(dialogue.worker_session_id),
+            "source_agent_id": str(dialogue.worker_agent_id),
+            "source_revision_id": str(dialogue.worker_agent_revision_id),
+            "inherited_user_id": str(dialogue.owner_user_id)}
+        return [row for row in rows if isinstance(row.metadata_json, dict)
+                and isinstance(row.metadata_json.get("team_media_origin"), dict)
+                and all(row.metadata_json["team_media_origin"].get(k) == v for k, v in source.items())]
+
+    async def _media_siblings_settled(self, session: Any, dialogue: Any, incoming: Any, current: Any, service: Any) -> bool:
+        from .agent_team_media_dialogue_return import validate_team_media_return_message
+        from .agent_team_media_terminal_outcome import validate_team_media_outcome_message
+        for sibling in await self._origin_media_work(session, dialogue, incoming):
+            if current is not None and sibling.id == current.id:
+                continue
+            prefix = f"team-media-return:{sibling.id}:"
+            candidates = (await session.scalars(select(AgentDialogueDelivery).where(
+                AgentDialogueDelivery.dialogue_id == dialogue.id,
+                or_(AgentDialogueDelivery.idempotency_key.startswith(prefix),
+                    AgentDialogueDelivery.idempotency_key.startswith(f"team-media-outcome:{sibling.id}:")),
+                AgentDialogueDelivery.state.notin_(("failed", "cancelled", "expired")),
+            ))).all()
+            if not candidates:
+                return False
+            for candidate in candidates:
+                message = await session.get(ConversationMessage, candidate.source_message_id)
+                metadata = message.message_metadata if message and isinstance(message.message_metadata, Mapping) else {}
+                validator = validate_team_media_outcome_message if "agent_team_media_outcome" in metadata else validate_team_media_return_message
+                await validator(session, service, dialogue, candidate, message, config=self.config)
+        return True
+
+    async def _delegation_siblings_settled(self, session: Any, dialogue: Any, incoming: Any, order: Any, service: Any, *, current_media: Any = None) -> bool:
+        from .agent_delegation_terminal_outcome import validate_delegation_outcome_message
+        from .agent_delegation_dialogue_return import validate_delegation_return_message
+
+        for sibling in await self._origin_delegations(session, dialogue, incoming):
+            if order is not None and sibling.id == order.id:
+                continue
+            if sibling.completed_at is not None:
+                prefix = f"delegation-return:{sibling.id}:{sibling.round}:"
+                deliveries = (await session.scalars(select(AgentDialogueDelivery).where(
+                    AgentDialogueDelivery.dialogue_id == dialogue.id,
+                    AgentDialogueDelivery.idempotency_key.startswith(prefix),
+                    AgentDialogueDelivery.state.notin_(("failed", "cancelled", "expired")),
+                ))).all()
+                if deliveries:
+                    for delivery in deliveries:
+                        message = await session.get(ConversationMessage, delivery.source_message_id)
+                        await validate_delegation_return_message(session, service, dialogue, delivery, message)
+                    continue
+            key = f"delegation-outcome:{sibling.id}:{sibling.round}:{dialogue.control_revision}"
+            delivery = await self._existing(session, dialogue.id, key)
+            if delivery is None or delivery.state in {"failed", "cancelled", "expired"}:
+                return False
+            message = await session.get(ConversationMessage, delivery.source_message_id)
+            await validate_delegation_outcome_message(session, service, dialogue, delivery, message)
+        return await self._media_siblings_settled(session, dialogue, incoming, current_media, service)
+
+    async def enqueue_delegation_return(self, order_id: str, *, session: Any) -> dict[str, Any]:
+        """Admit a proved artifact as host workflow data in the caller transaction."""
+        from .agent_delegation_dialogue_return import resolve_delegation_return, validate_delegation_return_message
+        from .agent_delegation_service import AgentDelegationService
+
+        order = await session.get(AgentDelegation, _uuid(order_id, "order_id"))
+        if order is None:
+            raise DialogueTransportError("delegation_order_not_found")
+        source = order.source_actor_json if isinstance(order.source_actor_json, dict) else {}
+        dialogue_id = await session.scalar(select(AgentDialogue.id).where(
+            AgentDialogue.worker_session_id == _uuid(source.get("source_session_id"), "source_session_id")))
+        if dialogue_id is None:
+            raise DialogueTransportError("delegation_dialogue_not_found")
+        dialogue = await self._lock_dialogue(session, dialogue_id)
+        # All sibling orders share this lock. Acquire it before any order row
+        # lock so concurrent discoveries cannot deadlock across siblings.
+        await session.flush()
+        order = await session.scalar(select(AgentDelegation).where(
+            AgentDelegation.id == order.id).with_for_update().execution_options(populate_existing=True))
+        if order is None:
+            raise DialogueTransportError("delegation_order_not_found")
+        service = AgentDelegationService(self._db_manager, config=self.config)
+        if dialogue.state == "succeeded":
+            prefix = f"delegation-return:{order.id}:{order.round}:"
+            candidates = (await session.scalars(select(AgentDialogueDelivery).where(
+                AgentDialogueDelivery.dialogue_id == dialogue.id,
+                AgentDialogueDelivery.idempotency_key.startswith(prefix),
+                AgentDialogueDelivery.state == "acked",
+            ))).all()
+            for existing in candidates:
+                message = await session.get(ConversationMessage, existing.source_message_id)
+                projection = await validate_delegation_return_message(session, service, dialogue, existing, message)
+                artifact = projection.as_dict()["return_artifact"]
+                if existing.idempotency_key == f"{prefix}{artifact['id']}:{dialogue.control_revision}":
+                    return {**self._projection(existing), "idempotent": True}
+            raise DialogueTransportConflict("delegation_return_replay_invalid")
+        projection = await resolve_delegation_return(session, service, order)
+        envelope = projection.as_dict()
+        artifact = envelope["return_artifact"]
+        incoming = await session.get(AgentDialogueDelivery, _uuid(envelope["incoming_delivery_id"], "incoming_delivery_id"))
+        key = f"delegation-return:{order.id}:{order.round}:{artifact['id']}:{dialogue.control_revision}"
+        existing = await self._existing(session, dialogue.id, key)
+        if existing is not None:
+            message = await session.get(ConversationMessage, existing.source_message_id)
+            await validate_delegation_return_message(session, service, dialogue, existing, message)
+            if (int(existing.depth or 0) != int(incoming.depth or 0) + 1
+                    or int(existing.sequence or 0) <= int(incoming.sequence or 0)
+                    or existing.deadline != dialogue.deadline):
+                raise DialogueTransportConflict("delegation_return_idempotency_conflict")
+            return {**self._projection(existing), "idempotent": True}
+        kind = "response" if await self._delegation_siblings_settled(session, dialogue, incoming, order, service) else "event"
+        now = self._now()
+        depth = int(incoming.depth or 0) + 1
+        if depth > min(MAX_DEPTH, int(dialogue.max_depth or MAX_DEPTH)):
+            raise DialogueTransportError("dialogue_depth_exceeded")
+        available = now
+        if await self._session_busy(session, dialogue.root_session_id):
+            available += timedelta(seconds=1)
+        if dialogue.deadline is not None and available > dialogue.deadline:
+            raise DialogueTransportError("delivery_deadline_expired")
+        message = ConversationMessage(id=uuid.uuid4(), session_id=dialogue.worker_session_id,
+            role="system", sender_type="system", content=projection.body,
+            message_metadata={"agent_delegation_return": {"version": 1, "order_id": str(order.id)}})
+        delivery = AgentDialogueDelivery(id=uuid.uuid4(), dialogue_id=dialogue.id,
+            source_session_id=dialogue.worker_session_id, source_agent_id=dialogue.worker_agent_id,
+            source_agent_revision_id=dialogue.worker_agent_revision_id,
+            source_run_id=_uuid(artifact["run_id"], "source_run_id"),
+            source_work_item_id=_uuid(artifact["work_item_id"], "source_work_item_id"), source_message_id=message.id,
+            receiver_session_id=dialogue.root_session_id, receiver_agent_id=dialogue.root_agent_id,
+            receiver_agent_revision_id=dialogue.root_agent_revision_id, kind=kind,
+            state="pending" if available > now else "available", sequence=await self._next_sequence(session, dialogue.id),
+            causation_id=str(incoming.id), depth=depth, expected_control_revision=dialogue.control_revision,
+            idempotency_key=key, request_digest=projection.sha256, available_at=available,
+            deadline=dialogue.deadline, attempt_count=0, created_at=now, updated_at=now)
+        session.add_all([message, delivery])
+        await session.flush()
+        await validate_delegation_return_message(session, service, dialogue, delivery, message)
+        work = await self._transport_work(session, dialogue, delivery, available)
+        delivery.transport_work_item_id = work.id
+        return {**self._projection(delivery), "transport_work_item_id": str(work.id), "idempotent": False}
+
+    async def enqueue_team_media_return(self, producer_work_item_id: str, *, session: Any) -> dict[str, Any] | None:
+        """Publish a proved media result in the caller's transaction."""
+        from .agent_delegation_service import AgentDelegationService
+        from .agent_team_media_dialogue_return import resolve_team_media_return, validate_team_media_return_message
+
+        producer_id = _uuid(producer_work_item_id, "producer_work_item_id")
+        producer = await session.get(AgentWorkItem, producer_id)
+        origin = (producer.metadata_json or {}).get("team_media_origin") if producer and isinstance(producer.metadata_json, dict) else None
+        if not isinstance(origin, dict):
+            raise DialogueTransportError("team_media_origin_invalid")
+        dialogue_id = await session.scalar(select(AgentDialogue.id).where(
+            AgentDialogue.worker_session_id == _uuid(origin.get("source_session_id"), "source_session_id")))
+        if dialogue_id is None:
+            raise DialogueTransportError("team_media_dialogue_not_found")
+        dialogue = await self._lock_dialogue(session, dialogue_id)
+        await session.flush()
+        producer = await session.scalar(select(AgentWorkItem).where(AgentWorkItem.id == producer_id)
+            .with_for_update().execution_options(populate_existing=True))
+        source_run = await session.get(AgentRun, _uuid(origin.get("source_run_id"), "source_run_id"), populate_existing=True)
+        run_metadata = source_run.run_metadata if source_run and isinstance(source_run.run_metadata, dict) else {}
+        source_dialogue = run_metadata.get("agent_dialogue") or {}
+        if not isinstance(source_dialogue, dict):
+            raise DialogueTransportError("team_media_origin_invalid")
+        incoming_id = _uuid(source_dialogue.get("delivery_id"), "delivery_id")
+        incoming_locked = await session.scalar(select(AgentDialogueDelivery).where(
+            AgentDialogueDelivery.id == incoming_id).with_for_update().execution_options(populate_existing=True))
+        if incoming_locked is None or incoming_locked.dialogue_id != dialogue.id:
+            raise DialogueTransportError("team_media_origin_invalid")
+        service = AgentDelegationService(self._db_manager, config=self.config)
+        terminal = dialogue.state in {"succeeded", "failed", "cancelled", "blocked"}
+        projection = await resolve_team_media_return(session, service, producer_work_item_id=str(producer_id),
+            config=self.config, allow_acked_replay=terminal)
+        if projection is None:
+            return None
+        envelope = projection.as_dict()
+        incoming = await session.get(AgentDialogueDelivery, _uuid(envelope["incoming_delivery_id"], "incoming_delivery_id"))
+        key = f"team-media-return:{producer_id}:{projection.sha256}:{dialogue.control_revision}"
+        existing = await self._existing(session, dialogue.id, key)
+        if existing is not None:
+            message = await session.get(ConversationMessage, existing.source_message_id)
+            await validate_team_media_return_message(session, service, dialogue, existing, message, allow_acked_replay=terminal, config=self.config)
+            return {**self._projection(existing), "idempotent": True}
+        if terminal:
+            raise DialogueTransportConflict("team_media_return_replay_invalid")
+        # Until the leader's incoming delivery is acknowledged it can still
+        # create sibling Work, so no final response can safely be selected.
+        if incoming.state != "acked":
+            raise DialogueTransportConflict("team_media_return_origin_not_acked")
+        settled = await self._delegation_siblings_settled(
+            session, dialogue, incoming, None, service, current_media=producer)
+        # An earlier response may have been queued while the leader was
+        # still running. Keep it as the sole final response; this result is
+        # an event which that response must wait for and aggregate.
+        previous_response = await session.scalar(select(AgentDialogueDelivery.id).where(
+            AgentDialogueDelivery.dialogue_id == dialogue.id,
+            AgentDialogueDelivery.causation_id == str(incoming.id),
+            AgentDialogueDelivery.kind == "response",
+            AgentDialogueDelivery.state.notin_(("failed", "cancelled", "expired")),
+        ).limit(1))
+        kind = "response" if settled and previous_response is None else "event"
+        now = self._now()
+        depth = int(incoming.depth or 0) + 1
+        if depth > min(MAX_DEPTH, int(dialogue.max_depth or MAX_DEPTH)):
+            raise DialogueTransportError("dialogue_depth_exceeded")
+        available = now + timedelta(seconds=1) if await self._session_busy(session, dialogue.root_session_id) else now
+        if dialogue.deadline is not None and available > dialogue.deadline:
+            raise DialogueTransportError("delivery_deadline_expired")
+        message = ConversationMessage(id=uuid.uuid4(), session_id=dialogue.worker_session_id,
+            role="system", sender_type="system", content=projection.body,
+            message_metadata={"agent_team_media_return": {"version": 1, "producer_work_item_id": str(producer_id)}})
+        delivery = AgentDialogueDelivery(id=uuid.uuid4(), dialogue_id=dialogue.id,
+            source_session_id=dialogue.worker_session_id, source_agent_id=dialogue.worker_agent_id,
+            source_agent_revision_id=dialogue.worker_agent_revision_id,
+            source_run_id=incoming.receiver_run_id, source_work_item_id=incoming.receiver_work_item_id,
+            source_message_id=message.id, receiver_session_id=dialogue.root_session_id,
+            receiver_agent_id=dialogue.root_agent_id, receiver_agent_revision_id=dialogue.root_agent_revision_id,
+            kind=kind, state="pending" if available > now else "available",
+            sequence=await self._next_sequence(session, dialogue.id), causation_id=str(incoming.id), depth=depth,
+            expected_control_revision=dialogue.control_revision, idempotency_key=key, request_digest=projection.sha256,
+            available_at=available, deadline=dialogue.deadline, attempt_count=0, created_at=now, updated_at=now)
+        session.add_all([message, delivery])
+        await session.flush()
+        await validate_team_media_return_message(session, service, dialogue, delivery, message, config=self.config)
+        work = await self._transport_work(session, dialogue, delivery, available)
+        delivery.transport_work_item_id = work.id
+        return {**self._projection(delivery), "transport_work_item_id": str(work.id), "idempotent": False}
+
+    async def enqueue_team_media_outcome(self, producer_work_item_id: str, *, session: Any) -> dict[str, Any] | None:
+        """Publish a proved media result in the caller's transaction."""
+        from .agent_delegation_service import AgentDelegationService
+        from .agent_team_media_terminal_outcome import resolve_team_media_terminal_outcome, validate_team_media_outcome_message
+
+        producer_id = _uuid(producer_work_item_id, "producer_work_item_id")
+        producer = await session.get(AgentWorkItem, producer_id)
+        origin = (producer.metadata_json or {}).get("team_media_origin") if producer and isinstance(producer.metadata_json, dict) else None
+        if not isinstance(origin, dict):
+            raise DialogueTransportError("team_media_origin_invalid")
+        dialogue_id = await session.scalar(select(AgentDialogue.id).where(
+            AgentDialogue.worker_session_id == _uuid(origin.get("source_session_id"), "source_session_id")))
+        if dialogue_id is None:
+            raise DialogueTransportError("team_media_dialogue_not_found")
+        dialogue = await self._lock_dialogue(session, dialogue_id)
+        await session.flush()
+        producer = await session.scalar(select(AgentWorkItem).where(AgentWorkItem.id == producer_id)
+            .with_for_update().execution_options(populate_existing=True))
+        source_run = await session.get(AgentRun, _uuid(origin.get("source_run_id"), "source_run_id"), populate_existing=True)
+        run_metadata = source_run.run_metadata if source_run and isinstance(source_run.run_metadata, dict) else {}
+        source_dialogue = run_metadata.get("agent_dialogue") or {}
+        if not isinstance(source_dialogue, dict):
+            raise DialogueTransportError("team_media_origin_invalid")
+        incoming_id = _uuid(source_dialogue.get("delivery_id"), "delivery_id")
+        incoming_locked = await session.scalar(select(AgentDialogueDelivery).where(
+            AgentDialogueDelivery.id == incoming_id).with_for_update().execution_options(populate_existing=True))
+        if incoming_locked is None or incoming_locked.dialogue_id != dialogue.id:
+            raise DialogueTransportError("team_media_origin_invalid")
+        service = AgentDelegationService(self._db_manager, config=self.config)
+        terminal = dialogue.state in {"succeeded", "failed", "cancelled", "blocked"}
+        projection = await resolve_team_media_terminal_outcome(session, service, producer_work_item_id=str(producer_id),
+            config=self.config, allow_acked_replay=terminal)
+        if projection is None:
+            return None
+        envelope = projection.as_dict()
+        incoming = await session.get(AgentDialogueDelivery, _uuid(envelope["incoming_delivery_id"], "incoming_delivery_id"))
+        key = f"team-media-outcome:{producer_id}:{envelope['result']['evidence']['work_item_id']}:{envelope['result']['evidence']['attempt']}:{projection.sha256}:{dialogue.control_revision}"
+        existing = await self._existing(session, dialogue.id, key)
+        if existing is not None:
+            message = await session.get(ConversationMessage, existing.source_message_id)
+            await validate_team_media_outcome_message(session, service, dialogue, existing, message, allow_acked_replay=terminal, config=self.config)
+            return {**self._projection(existing), "idempotent": True}
+        if terminal:
+            raise DialogueTransportConflict("team_media_outcome_replay_invalid")
+        # Until the leader's incoming delivery is acknowledged it can still
+        # create sibling Work, so no final response can safely be selected.
+        if incoming.state != "acked":
+            raise DialogueTransportConflict("team_media_outcome_origin_not_acked")
+        settled = await self._delegation_siblings_settled(
+            session, dialogue, incoming, None, service, current_media=producer)
+        # An earlier response may have been queued while the leader was
+        # still running. Keep it as the sole final response; this result is
+        # an event which that response must wait for and aggregate.
+        previous_response = await session.scalar(select(AgentDialogueDelivery.id).where(
+            AgentDialogueDelivery.dialogue_id == dialogue.id,
+            AgentDialogueDelivery.causation_id == str(incoming.id),
+            AgentDialogueDelivery.kind == "response",
+            AgentDialogueDelivery.state.notin_(("failed", "cancelled", "expired")),
+        ).limit(1))
+        kind = "response" if settled and previous_response is None else "event"
+        now = self._now()
+        depth = int(incoming.depth or 0) + 1
+        if depth > min(MAX_DEPTH, int(dialogue.max_depth or MAX_DEPTH)):
+            raise DialogueTransportError("dialogue_depth_exceeded")
+        available = now + timedelta(seconds=1) if await self._session_busy(session, dialogue.root_session_id) else now
+        if dialogue.deadline is not None and available > dialogue.deadline:
+            raise DialogueTransportError("delivery_deadline_expired")
+        message = ConversationMessage(id=uuid.uuid4(), session_id=dialogue.worker_session_id,
+            role="system", sender_type="system", content=projection.body,
+            message_metadata={"agent_team_media_outcome": {"version": 1, "producer_work_item_id": str(producer_id)}})
+        delivery = AgentDialogueDelivery(id=uuid.uuid4(), dialogue_id=dialogue.id,
+            source_session_id=dialogue.worker_session_id, source_agent_id=dialogue.worker_agent_id,
+            source_agent_revision_id=dialogue.worker_agent_revision_id,
+            source_run_id=incoming.receiver_run_id, source_work_item_id=incoming.receiver_work_item_id,
+            source_message_id=message.id, receiver_session_id=dialogue.root_session_id,
+            receiver_agent_id=dialogue.root_agent_id, receiver_agent_revision_id=dialogue.root_agent_revision_id,
+            kind=kind, state="pending" if available > now else "available",
+            sequence=await self._next_sequence(session, dialogue.id), causation_id=str(incoming.id), depth=depth,
+            expected_control_revision=dialogue.control_revision, idempotency_key=key, request_digest=projection.sha256,
+            available_at=available, deadline=dialogue.deadline, attempt_count=0, created_at=now, updated_at=now)
+        session.add_all([message, delivery])
+        await session.flush()
+        await validate_team_media_outcome_message(session, service, dialogue, delivery, message, config=self.config)
+        work = await self._transport_work(session, dialogue, delivery, available)
+        delivery.transport_work_item_id = work.id
+        return {**self._projection(delivery), "transport_work_item_id": str(work.id), "idempotent": False}
+
+    async def enqueue_delegation_outcome(self, order_id: str, *, session: Any) -> dict[str, Any]:
+        """Enqueue a proved negative outcome in the caller's transaction."""
+        from .agent_delegation_service import AgentDelegationService
+        from .agent_delegation_terminal_outcome import (
+            delegation_descendants_settled, resolve_delegation_terminal_outcome, validate_delegation_outcome_message,
+        )
+
+        order = await session.get(AgentDelegation, _uuid(order_id, "order_id"))
+        if order is None:
+            raise DialogueTransportError("delegation_order_not_found")
+        source = order.source_actor_json if isinstance(order.source_actor_json, dict) else {}
+        dialogue_id = await session.scalar(select(AgentDialogue.id).where(
+            AgentDialogue.worker_session_id == _uuid(source.get("source_session_id"), "source_session_id")))
+        if dialogue_id is None:
+            raise DialogueTransportError("delegation_dialogue_not_found")
+        dialogue = await self._lock_dialogue(session, dialogue_id)
+        await session.flush()
+        order = await session.scalar(select(AgentDelegation).where(
+            AgentDelegation.id == order.id).with_for_update().execution_options(populate_existing=True))
+        if order is None:
+            raise DialogueTransportError("delegation_order_not_found")
+        service = AgentDelegationService(self._db_manager, config=self.config)
+        if not await delegation_descendants_settled(session, service, order):
+            raise DialogueTransportConflict("delegation_outcome_not_ready")
+        projection = await resolve_delegation_terminal_outcome(session, service, order)
+        if projection is None or "outcome" not in projection.as_dict():
+            raise DialogueTransportConflict("delegation_outcome_not_ready")
+        envelope = projection.as_dict()
+        incoming = await session.get(AgentDialogueDelivery, _uuid(envelope["incoming_delivery_id"], "incoming_delivery_id"))
+        key = f"delegation-outcome:{order.id}:{order.round}:{dialogue.control_revision}"
+        existing = await self._existing(session, dialogue.id, key)
+        if existing is not None:
+            message = await session.get(ConversationMessage, existing.source_message_id)
+            await validate_delegation_outcome_message(session, service, dialogue, existing, message)
+            if (int(existing.depth or 0) != int(incoming.depth or 0) + 1
+                    or int(existing.sequence or 0) <= int(incoming.sequence or 0)
+                    or existing.deadline != dialogue.deadline):
+                raise DialogueTransportConflict("delegation_outcome_idempotency_conflict")
+            return {**self._projection(existing), "idempotent": True}
+        kind = "response" if await self._delegation_siblings_settled(session, dialogue, incoming, order, service) else "event"
+        now = self._now()
+        depth = int(incoming.depth or 0) + 1
+        if depth > min(MAX_DEPTH, int(dialogue.max_depth or MAX_DEPTH)):
+            raise DialogueTransportError("dialogue_depth_exceeded")
+        available = now
+        if await self._session_busy(session, dialogue.root_session_id):
+            available += timedelta(seconds=1)
+        if dialogue.deadline is not None and available > dialogue.deadline:
+            raise DialogueTransportError("delivery_deadline_expired")
+        message = ConversationMessage(id=uuid.uuid4(), session_id=dialogue.worker_session_id,
+            role="system", sender_type="system", content=projection.body,
+            message_metadata={"agent_delegation_outcome": {"version": 1, "order_id": str(order.id), "round": order.round}})
+        session.add(message)
+        await session.flush()
+        delivery = AgentDialogueDelivery(id=uuid.uuid4(), dialogue_id=dialogue.id,
+            source_session_id=dialogue.worker_session_id, source_agent_id=dialogue.worker_agent_id,
+            source_agent_revision_id=dialogue.worker_agent_revision_id,
+            source_run_id=incoming.receiver_run_id, source_work_item_id=incoming.receiver_work_item_id,
+            source_message_id=message.id, receiver_session_id=dialogue.root_session_id,
+            receiver_agent_id=dialogue.root_agent_id, receiver_agent_revision_id=dialogue.root_agent_revision_id,
+            kind=kind, state="pending" if available > now else "available",
+            sequence=await self._next_sequence(session, dialogue.id), causation_id=str(incoming.id), depth=depth,
+            expected_control_revision=dialogue.control_revision, idempotency_key=key, request_digest=projection.sha256,
+            available_at=available, deadline=dialogue.deadline, attempt_count=0, created_at=now, updated_at=now)
+        session.add(delivery)
+        await session.flush()
+        await validate_delegation_outcome_message(session, service, dialogue, delivery, message)
+        work = await self._transport_work(session, dialogue, delivery, available)
+        delivery.transport_work_item_id = work.id
+        return {**self._projection(delivery), "transport_work_item_id": str(work.id), "idempotent": False}
+
+    async def recover_native_outcome(self, dialogue_id: str, delivery_id: str, *,
+                                     owner_user_id: str, expected_control_revision: int,
+                                     session: Any) -> dict[str, Any]:
+        """Redrive one unconsumed native negative outcome in the caller transaction.
+
+        CW invokes this only after normal load has identified the dead letter.
+        The fixed key is both the immutable audit link and the replay bound.
+        """
+        dialogue = await self._lock_dialogue(session, _uuid(dialogue_id, "dialogue_id"))
+        if dialogue.owner_user_id != _uuid(owner_user_id, "owner_user_id"):
+            raise DialogueTransportConflict("native_outcome_owner_mismatch")
+        await self._validate_dialogue(session, dialogue, expected_control_revision)
+        old = await session.scalar(select(AgentDialogueDelivery).where(
+            AgentDialogueDelivery.id == _uuid(delivery_id, "delivery_id"),
+            AgentDialogueDelivery.dialogue_id == dialogue.id).with_for_update())
+        if old is None:
+            raise DialogueTransportConflict("native_outcome_delivery_missing")
+        message = await session.get(ConversationMessage, old.source_message_id)
+        metadata = message.message_metadata if message is not None and isinstance(message.message_metadata, Mapping) else {}
+        if (not old.idempotency_key.startswith("delegation-outcome:") or
+                "agent_delegation_outcome" not in metadata or
+                any(k in metadata for k in ("agent_team_media_outcome", "agent_team_media_return", "agent_delegation_return"))):
+            raise DialogueTransportConflict("native_outcome_subtype_required")
+        marker = metadata.get("agent_delegation_outcome")
+        if (not isinstance(marker, Mapping) or old.idempotency_key !=
+                f"delegation-outcome:{marker.get('order_id')}:{marker.get('round')}:{expected_control_revision}"):
+            raise DialogueTransportConflict("native_outcome_original_required")
+        work = await session.scalar(select(AgentWorkItem).where(
+            AgentWorkItem.id == old.transport_work_item_id).with_for_update())
+        if (work is None or work.state != "dead_letter" or work.source_type != SOURCE_TYPE
+                or work.execution_adapter != EXECUTION_ADAPTER or str(work.source_id) != str(old.id)
+                or work.source_revision != old.request_digest
+                or work.intent_key != f"dialogue_handoff:{old.idempotency_key}"
+                or work.conversation_session_id != old.receiver_session_id
+                or work.assigned_agent_id is not None or work.agent_revision_id is not None
+                or work.safe_error_code != "dialogue_handoff_failed"
+                or int(work.attempt_count or 0) < int(work.max_attempts or 1)
+                or work.active_agent_run_id is not None or work.lease_owner is not None
+                or work.lease_token is not None or work.lease_expires_at is not None
+                or not self._transport_metadata_matches_delivery(work.metadata_json or {}, dialogue=dialogue, delivery=old)
+                or old.state not in {"pending", "available"}
+                or old.receiver_run_id is not None or old.receiver_work_item_id is not None
+                or old.receiver_message_id is not None or old.response_digest is not None
+                or old.expected_control_revision != expected_control_revision
+                or (old.deadline is not None and old.deadline <= self._now())):
+            raise DialogueTransportConflict("native_outcome_not_unconsumed_dead_letter")
+        receiver = old.receiver_session_id
+        for statement in (
+            select(AgentRun.id).where(AgentRun.session_id == receiver, or_(
+                AgentRun.client_message_id == old.idempotency_key,
+                AgentRun.run_metadata["agent_dialogue"]["delivery_id"].as_string() == str(old.id))),
+            select(AgentWorkItem.id).where(AgentWorkItem.id != work.id,
+                AgentWorkItem.conversation_session_id == receiver,
+                AgentWorkItem.metadata_json["agent_dialogue"]["delivery_id"].as_string() == str(old.id)),
+            select(ConversationMessage.id).where(ConversationMessage.session_id == receiver,
+                or_(ConversationMessage.client_message_id == f"agent-dialogue:{old.id}",
+                    ConversationMessage.message_metadata["agent_dialogue_delivery_id"].as_string() == str(old.id))),
+            select(ConversationDispatchOutbox.run_id).where(ConversationDispatchOutbox.session_id == receiver, or_(
+                ConversationDispatchOutbox.client_message_id == old.idempotency_key,
+                ConversationDispatchOutbox.payload["agent_dialogue_delivery_id"].as_string() == str(old.id))),
+        ):
+            if await session.scalar(statement.limit(1)) is not None:
+                raise DialogueTransportConflict("native_outcome_receiver_exists")
+        await self._validate_delivery_source(session, dialogue, old)
+        key = f"native-outcome-recovery-v1:{old.id}"
+        existing = await self._existing(session, dialogue.id, key)
+        if existing is not None:
+            await self._validate_delivery_source(session, dialogue, existing)
+            if (existing.source_message_id != old.source_message_id or existing.causation_id != old.causation_id
+                    or existing.request_digest != old.request_digest or existing.transport_work_item_id is None):
+                raise DialogueTransportConflict("native_outcome_recovery_binding_mismatch")
+            return {**self._projection(existing), "transport_work_item_id": str(existing.transport_work_item_id), "idempotent": True}
+        now = self._now()
+        available = now + timedelta(seconds=1) if await self._session_busy(session, receiver) else now
+        if old.deadline is not None and available >= old.deadline:
+            raise DialogueTransportConflict("native_outcome_deadline_expired")
+        new = AgentDialogueDelivery(id=uuid.uuid4(), dialogue_id=dialogue.id,
+            source_session_id=old.source_session_id, source_agent_id=old.source_agent_id,
+            source_agent_revision_id=old.source_agent_revision_id, source_run_id=old.source_run_id,
+            source_work_item_id=old.source_work_item_id, source_message_id=old.source_message_id,
+            receiver_session_id=old.receiver_session_id, receiver_agent_id=old.receiver_agent_id,
+            receiver_agent_revision_id=old.receiver_agent_revision_id, kind=old.kind,
+            state="pending" if available > now else "available", sequence=await self._next_sequence(session, dialogue.id),
+            causation_id=old.causation_id, depth=old.depth, expected_control_revision=old.expected_control_revision,
+            idempotency_key=key, request_digest=old.request_digest, available_at=available,
+            deadline=old.deadline, attempt_count=0, created_at=now, updated_at=now)
+        session.add(new)
+        await session.flush()
+        await self._validate_delivery_source(session, dialogue, new)
+        new_work = await self._transport_work(session, dialogue, new, available)
+        return {**self._projection(new), "transport_work_item_id": str(new_work.id), "idempotent": False}
+
     async def enqueue_worker_return(
         self,
         *,
@@ -1480,6 +2040,602 @@ class AgentDialogueTransport:
     async def settle_transport(self, claim: WorkClaim | Mapping[str, Any], outcome: Any) -> dict[str, Any] | None:
         return await self.coordinator.settle_transport(claim, outcome, source_ok=True)
 
+    async def terminalize_stale_control_delivery(
+        self,
+        *,
+        dialogue_id: str,
+        delivery_id: str,
+        owner_user_id: str,
+        actor_kind: str,
+        actor_user_id: str | None,
+        expected_state: str,
+        expected_control_revision: int,
+        idempotency_key: str,
+        actor_service_key: str | None = None,
+        session: Any | None = None,
+    ) -> dict[str, Any]:
+        """Terminalize one stale, provably undispatched control delivery.
+
+        This operation only changes the Delivery row and appends a Work audit
+        event. It never creates or dispatches a Run, Work, message, or outbox.
+        Human callers pass an already owner-authorized transaction from
+        ``AgentDialogueService``; the periodic reconciler uses the same proof
+        with the fixed system actor.
+        """
+
+        dialogue_uuid = _uuid(dialogue_id, "dialogue_id")
+        delivery_uuid = _uuid(delivery_id, "delivery_id")
+        owner_uuid = _uuid(owner_user_id, "owner_user_id")
+        normalized_actor = _text(actor_kind, 16).casefold()
+        key = _text(idempotency_key, 128)
+        if expected_state != "pending":
+            raise DialogueTransportConflict("stale_control_delivery_expected_state_invalid")
+        if not key or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", key):
+            raise DialogueTransportConflict("stale_control_delivery_idempotency_key_invalid")
+        if normalized_actor not in {"human", "service"}:
+            raise DialogueTransportConflict("stale_control_delivery_actor_invalid")
+        if normalized_actor == "human":
+            actor_uuid = _uuid(actor_user_id, "actor_user_id")
+            if actor_uuid != owner_uuid or actor_service_key is not None:
+                raise DialogueTransportConflict("stale_control_delivery_owner_required")
+        else:
+            actor_uuid = None
+            if actor_user_id is not None or actor_service_key != "aoitalk.system":
+                raise DialogueTransportConflict("stale_control_delivery_service_actor_invalid")
+
+        owns = session is None
+        db = session or await self._session()
+        try:
+            result = await self._terminalize_stale_control_delivery_in_session(
+                db,
+                dialogue_id=dialogue_uuid,
+                delivery_id=delivery_uuid,
+                owner_user_id=owner_uuid,
+                actor_kind=normalized_actor,
+                actor_user_id=actor_uuid,
+                actor_service_key=actor_service_key,
+                expected_state=expected_state,
+                expected_control_revision=expected_control_revision,
+                idempotency_key=key,
+            )
+            if owns:
+                await db.commit()
+            return result
+        except Exception:
+            if owns:
+                await self._rollback(db)
+            raise
+        finally:
+            if owns:
+                await self._close(db)
+
+    async def _terminalize_stale_control_delivery_in_session(
+        self,
+        session: Any,
+        *,
+        dialogue_id: uuid.UUID,
+        delivery_id: uuid.UUID,
+        owner_user_id: uuid.UUID,
+        actor_kind: str,
+        actor_user_id: uuid.UUID | None,
+        actor_service_key: str | None,
+        expected_state: str,
+        expected_control_revision: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        try:
+            dialogue = (
+                await session.execute(
+                    select(AgentDialogue)
+                    .where(AgentDialogue.id == dialogue_id)
+                    .execution_options(populate_existing=True)
+                    .with_for_update(nowait=True)
+                )
+            ).scalars().first()
+            delivery = (
+                await session.execute(
+                    select(AgentDialogueDelivery)
+                    .where(
+                        AgentDialogueDelivery.id == delivery_id,
+                        AgentDialogueDelivery.dialogue_id == dialogue_id,
+                    )
+                    .execution_options(populate_existing=True)
+                    .with_for_update(nowait=True)
+                )
+            ).scalars().first()
+        except Exception as exc:
+            raise DialogueTransportConflict("stale_control_delivery_busy") from exc
+        if dialogue is None or delivery is None:
+            raise DialogueTransportConflict("stale_control_delivery_not_found")
+
+        current_control_revision = int(dialogue.control_revision or 0)
+        request_digest_value = sha256_digest(
+            json.dumps(
+                {
+                    "dialogue_id": str(dialogue_id),
+                    "delivery_id": str(delivery_id),
+                    "expected_state": expected_state,
+                    "expected_control_revision": int(expected_control_revision),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        mutation_fingerprint = sha256_digest(
+            f"stale-control-delivery:{delivery_id}:{idempotency_key}"
+        )
+
+        transport_id = _uuid(
+            delivery.transport_work_item_id,
+            "transport_work_item_id",
+        )
+        transport_work = None
+        if transport_id is not None:
+            try:
+                transport_work = (
+                    await session.execute(
+                        select(AgentWorkItem)
+                        .where(AgentWorkItem.id == transport_id)
+                        .execution_options(populate_existing=True)
+                        .with_for_update(nowait=True)
+                    )
+                ).scalars().first()
+            except Exception as exc:
+                raise DialogueTransportConflict("stale_control_delivery_busy") from exc
+        if transport_work is None:
+            raise DialogueTransportConflict("stale_control_delivery_transport_missing")
+
+        # Owner/session/Agent bindings are rechecked in this transaction even
+        # for the background path. Human calls have an additional owner ACL
+        # check in AgentDialogueService before reaching this method.
+        async def locked_row(model: Any, identity: Any) -> Any | None:
+            return (
+                await session.execute(
+                    select(model)
+                    .where(model.id == identity)
+                    .execution_options(populate_existing=True)
+                    .with_for_update(nowait=True)
+                )
+            ).scalars().first()
+
+        try:
+            owner = await locked_row(User, owner_user_id)
+            root_session = await locked_row(ConversationSession, dialogue.root_session_id)
+            worker_session = await locked_row(ConversationSession, dialogue.worker_session_id)
+            root_agent = await locked_row(Agent, dialogue.root_agent_id)
+            worker_agent = await locked_row(Agent, dialogue.worker_agent_id)
+            root_revision = await locked_row(AgentRevision, dialogue.root_agent_revision_id)
+            worker_revision = await locked_row(AgentRevision, dialogue.worker_agent_revision_id)
+            private_root = (
+                await session.execute(
+                    select(AgentPrivateRoot)
+                    .where(
+                        AgentPrivateRoot.session_id == dialogue.root_session_id,
+                        AgentPrivateRoot.purpose == "aoidots",
+                    )
+                    .execution_options(populate_existing=True)
+                    .with_for_update(nowait=True)
+                )
+            ).scalars().first()
+        except Exception as exc:
+            raise DialogueTransportConflict("stale_control_delivery_busy") from exc
+        if (
+            dialogue.owner_user_id != owner_user_id
+            or owner is None
+            or (actor_kind == "human" and not bool(getattr(owner, "is_active", False)))
+            or root_session is None
+            or worker_session is None
+            or root_session.deleted_at is not None
+            or worker_session.deleted_at is not None
+            or root_session.id == worker_session.id
+            or str(root_session.user_id or "") != str(owner_user_id)
+            or str(worker_session.user_id or "") != str(owner_user_id)
+            or root_session.agent_id not in (None, dialogue.root_agent_id)
+            or worker_session.agent_id not in (None, dialogue.worker_agent_id)
+            or (
+                root_session.project_id is not None
+                and not _generic_agent_dialogue_revision(root_revision)
+            )
+            or worker_session.project_id != dialogue.project_id
+            or root_agent is None
+            or worker_agent is None
+            or root_revision is None
+            or worker_revision is None
+            or root_revision.agent_id != dialogue.root_agent_id
+            or worker_revision.agent_id != dialogue.worker_agent_id
+            or (
+                private_root is not None
+                and (
+                    str(private_root.state or "").casefold() != "active"
+                    or private_root.owner_user_id != owner_user_id
+                    or private_root.agent_id != dialogue.root_agent_id
+                    or private_root.session_id != dialogue.root_session_id
+                )
+            )
+        ):
+            raise DialogueTransportConflict("stale_control_delivery_owner_binding_invalid")
+        if (
+            root_session.project_id is not None
+            and _generic_agent_dialogue_revision(root_revision)
+        ):
+            from ..memory.project_repository import ProjectRepository
+
+            if not await ProjectRepository.has_permission(
+                session,
+                root_session.project_id,
+                owner_user_id,
+                "read",
+            ):
+                raise DialogueTransportConflict(
+                    "stale_control_delivery_root_project_access_denied"
+                )
+
+        prior_event = (
+            await session.execute(
+                select(AgentWorkEvent)
+                .where(
+                    AgentWorkEvent.work_item_id == transport_work.id,
+                    AgentWorkEvent.mutation_fingerprint == mutation_fingerprint,
+                )
+                .with_for_update()
+            )
+        ).scalars().first()
+        if prior_event is not None:
+            prior_payload = (
+                prior_event.payload_json
+                if isinstance(prior_event.payload_json, Mapping)
+                else {}
+            )
+            if prior_payload.get("request_digest") != request_digest_value:
+                raise DialogueTransportConflict("stale_control_delivery_idempotency_conflict")
+            if delivery.state != "cancelled":
+                raise DialogueTransportConflict("stale_control_delivery_idempotency_state_invalid")
+            return {
+                "success": True,
+                "dialogue_id": str(dialogue.id),
+                "delivery_id": str(delivery.id),
+                "previous_state": "pending",
+                "state": "cancelled",
+                "expected_control_revision": int(
+                    delivery.expected_control_revision or 0
+                ),
+                "dialogue_control_revision": current_control_revision,
+                "transport_work_item_id": str(transport_work.id),
+                "transport_work_state": str(transport_work.state),
+                "idempotent": True,
+            }
+
+        if (
+            delivery.kind != "control"
+            or delivery.state != expected_state
+            or int(delivery.attempt_count or 0) != 0
+            or delivery.receiver_run_id is not None
+            or delivery.receiver_work_item_id is not None
+            or delivery.receiver_message_id is not None
+            or delivery.available_at is not None
+            or int(delivery.expected_control_revision or 0) >= current_control_revision
+            or int(expected_control_revision) != current_control_revision
+            or str(dialogue.state or "").casefold()
+            not in {"cancelled", "expired", "failed", "succeeded"}
+            or not (
+                delivery.source_session_id == dialogue.root_session_id
+                and delivery.source_agent_id == dialogue.root_agent_id
+                and delivery.source_agent_revision_id == dialogue.root_agent_revision_id
+                and delivery.receiver_session_id == dialogue.worker_session_id
+                and delivery.receiver_agent_id == dialogue.worker_agent_id
+                and delivery.receiver_agent_revision_id == dialogue.worker_agent_revision_id
+            )
+        ):
+            raise DialogueTransportConflict("stale_control_delivery_not_eligible")
+
+        transport_metadata = (
+            transport_work.metadata_json
+            if isinstance(transport_work.metadata_json, Mapping)
+            else {}
+        )
+        if (
+            transport_work.source_type != SOURCE_TYPE
+            or transport_work.execution_adapter != EXECUTION_ADAPTER
+            or str(transport_work.source_id or "") != str(delivery.id)
+            or str(transport_work.source_revision or "") != str(delivery.request_digest or "")
+            or str(transport_work.intent_key or "")
+            != f"dialogue_handoff:{delivery.idempotency_key}"
+            or transport_work.conversation_session_id != dialogue.worker_session_id
+            or transport_work.assigned_agent_id is not None
+            or transport_work.agent_revision_id is not None
+            or transport_work.state != "dead_letter"
+            or int(transport_work.attempt_count or 0) < int(transport_work.max_attempts or 1)
+            or transport_work.safe_error_code != "dialogue_handoff_failed"
+            or transport_work.active_agent_run_id is not None
+            or transport_work.lease_owner is not None
+            or transport_work.lease_token is not None
+            or transport_work.lease_expires_at is not None
+            or transport_work.not_before is not None
+            or transport_work.next_attempt_at is not None
+            or not self._transport_metadata_matches_delivery(
+                transport_metadata,
+                dialogue=dialogue,
+                delivery=delivery,
+            )
+        ):
+            raise DialogueTransportConflict("stale_control_delivery_transport_not_terminal")
+
+        try:
+            source_run = await locked_row(AgentRun, delivery.source_run_id)
+            source_work = await locked_row(AgentWorkItem, delivery.source_work_item_id)
+            source_message = await locked_row(ConversationMessage, delivery.source_message_id)
+        except Exception as exc:
+            raise DialogueTransportConflict("stale_control_delivery_busy") from exc
+        if (
+            source_run is None
+            or source_work is None
+            or source_message is None
+            or source_run.session_id != dialogue.root_session_id
+            or source_run.agent_id != dialogue.root_agent_id
+            or source_run.agent_revision_id != dialogue.root_agent_revision_id
+            or str(source_run.user_id or "") != str(owner_user_id)
+            or str(source_run.run_type or "").casefold() != "chat_turn"
+            or source_run.parent_run_id is not None
+            or source_run.work_item_id != source_work.id
+            or source_work.conversation_session_id != dialogue.root_session_id
+            or source_work.assigned_agent_id != dialogue.root_agent_id
+            or source_work.agent_revision_id != dialogue.root_agent_revision_id
+            or source_work.source_type != "chat_turn"
+            or str(source_work.source_id or "") != str(source_run.id)
+            or str(source_work.source_revision or "")
+            != str(dialogue.root_agent_revision_id)
+            or source_work.intent_key != "interactive_chat"
+            or source_work.execution_adapter != "interactive_chat"
+            or source_work.state not in {"uncertain", "failed", "cancelled", "succeeded", "dead_letter"}
+            or source_work.active_agent_run_id is not None
+            or source_work.lease_owner is not None
+            or source_work.lease_token is not None
+            or source_work.lease_expires_at is not None
+            or source_run.status not in _TERMINAL_RUN_STATES
+            or source_message.session_id != dialogue.root_session_id
+            or str(source_message.role or "").casefold() != "assistant"
+            or str(source_message.sender_type or "").casefold() != "agent"
+            or _text(source_message.sender_id) != str(dialogue.root_agent_id)
+            or source_message.deleted_at is not None
+            or not isinstance(source_message.message_metadata, Mapping)
+            or _text(source_message.message_metadata.get("agent_dialogue_id"))
+            != str(dialogue.id)
+        ):
+            raise DialogueTransportConflict("stale_control_delivery_source_binding_invalid")
+
+        # A committed child Run/Work/outbox/message is proof the handoff crossed
+        # its dispatch boundary. Even if Delivery receiver fields are empty,
+        # any such evidence keeps this operation fail-closed.
+        matching_runs = (
+            await session.execute(
+                select(AgentRun.id)
+                .where(
+                    AgentRun.session_id == dialogue.worker_session_id,
+                    or_(
+                        AgentRun.client_message_id == delivery.idempotency_key,
+                        AgentRun.run_metadata["agent_dialogue"]["delivery_id"].as_string()
+                        == str(delivery.id),
+                    ),
+                )
+                .limit(1)
+            )
+        ).all()
+        matching_work = (
+            await session.execute(
+                select(AgentWorkItem.id)
+                .where(
+                    AgentWorkItem.id != transport_work.id,
+                    AgentWorkItem.conversation_session_id == dialogue.worker_session_id,
+                    AgentWorkItem.metadata_json["agent_dialogue"]["delivery_id"].as_string()
+                    == str(delivery.id),
+                )
+                .limit(1)
+            )
+        ).all()
+        matching_messages = (
+            await session.execute(
+                select(ConversationMessage.id)
+                .where(
+                    ConversationMessage.session_id == dialogue.worker_session_id,
+                    ConversationMessage.message_metadata["agent_dialogue_delivery_id"].as_string()
+                    == str(delivery.id),
+                )
+                .limit(1)
+            )
+        ).all()
+        matching_outboxes = (
+            await session.execute(
+                select(ConversationDispatchOutbox.run_id)
+                .where(
+                    ConversationDispatchOutbox.session_id == dialogue.worker_session_id,
+                    or_(
+                        ConversationDispatchOutbox.client_message_id
+                        == delivery.idempotency_key,
+                        ConversationDispatchOutbox.payload["agent_dialogue_delivery_id"].as_string()
+                        == str(delivery.id),
+                    ),
+                )
+                .limit(1)
+            )
+        ).all()
+        if matching_runs or matching_work or matching_messages or matching_outboxes:
+            raise DialogueTransportConflict("stale_control_delivery_receiver_exists")
+
+        dialogue_observed_state = str(dialogue.state)
+        dialogue_observed_updated_at = dialogue.updated_at
+        delivery_observed_updated_at = delivery.updated_at
+        delivery_observed_revision = int(delivery.expected_control_revision or 0)
+        now = self._now()
+        dialogue_cas = await session.execute(
+            update(AgentDialogue)
+            .where(
+                AgentDialogue.id == dialogue.id,
+                AgentDialogue.owner_user_id == owner_user_id,
+                AgentDialogue.state == dialogue_observed_state,
+                AgentDialogue.control_revision == current_control_revision,
+                AgentDialogue.updated_at == dialogue_observed_updated_at,
+            )
+            .values(updated_at=AgentDialogue.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        if int(getattr(dialogue_cas, "rowcount", 0) or 0) != 1:
+            raise DialogueTransportConflict("stale_control_delivery_dialogue_cas_lost")
+        delivery_cas = await session.execute(
+            update(AgentDialogueDelivery)
+            .where(
+                AgentDialogueDelivery.id == delivery.id,
+                AgentDialogueDelivery.dialogue_id == dialogue.id,
+                AgentDialogueDelivery.kind == "control",
+                AgentDialogueDelivery.state == expected_state,
+                AgentDialogueDelivery.expected_control_revision
+                == delivery_observed_revision,
+                AgentDialogueDelivery.updated_at == delivery_observed_updated_at,
+            )
+            .values(state="cancelled", updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if int(getattr(delivery_cas, "rowcount", 0) or 0) != 1:
+            raise DialogueTransportConflict("stale_control_delivery_cas_lost")
+        delivery.state = "cancelled"
+        delivery.updated_at = now
+
+        event_sequence = int(
+            await session.scalar(
+                select(func.max(AgentWorkEvent.sequence)).where(
+                    AgentWorkEvent.work_item_id == transport_work.id
+                )
+            )
+            or 0
+        ) + 1
+        event_payload = {
+            "dialogue_id": str(dialogue.id),
+            "delivery_id": str(delivery.id),
+            "reason": "stale_control_delivery_terminalized",
+            "delivery_previous_state": expected_state,
+            "delivery_state": "cancelled",
+            "dialogue_control_revision": current_control_revision,
+            "delivery_expected_control_revision": delivery_observed_revision,
+            "request_digest": request_digest_value,
+        }
+        session.add(
+            AgentWorkEvent(
+                id=uuid.uuid4(),
+                work_item_id=transport_work.id,
+                sequence=event_sequence,
+                event_type="dialogue.delivery_terminalized",
+                from_state="dead_letter",
+                to_state="dead_letter",
+                status="dead_letter",
+                actor_kind=actor_kind,
+                actor_id=(
+                    str(actor_user_id)
+                    if actor_kind == "human"
+                    else actor_service_key
+                ),
+                actor_user_id=actor_user_id,
+                actor_service_key=actor_service_key,
+                causation_id=str(delivery.id),
+                causal_depth=int(transport_work.causal_depth or 0),
+                mutation_fingerprint=mutation_fingerprint,
+                safe_error_code="stale_control_delivery_terminalized",
+                message="stale control delivery terminalized",
+                payload_json=event_payload,
+                created_at=now,
+            )
+        )
+        await session.flush()
+        return {
+            "success": True,
+            "dialogue_id": str(dialogue.id),
+            "delivery_id": str(delivery.id),
+            "previous_state": expected_state,
+            "state": "cancelled",
+            "expected_control_revision": delivery_observed_revision,
+            "dialogue_control_revision": current_control_revision,
+            "transport_work_item_id": str(transport_work.id),
+            "transport_work_state": str(transport_work.state),
+            "idempotent": False,
+        }
+
+    async def reconcile_stale_control_deliveries(self, *, limit: int = 16) -> int:
+        """Provider-free periodic closure for the exact stale terminal shape."""
+
+        bounded_limit = max(1, min(int(limit or 1), 64))
+        scan_limit = min(512, max(64, bounded_limit * 8))
+        session = await self._session()
+        try:
+            rows = (
+                await session.execute(
+                    select(
+                        AgentDialogue.id,
+                        AgentDialogueDelivery.id,
+                        AgentDialogue.owner_user_id,
+                        AgentDialogue.control_revision,
+                    )
+                    .join(
+                        AgentDialogueDelivery,
+                        AgentDialogueDelivery.dialogue_id == AgentDialogue.id,
+                    )
+                    .join(
+                        AgentWorkItem,
+                        AgentWorkItem.id
+                        == AgentDialogueDelivery.transport_work_item_id,
+                    )
+                    .where(
+                        AgentDialogueDelivery.kind == "control",
+                        AgentDialogueDelivery.state == "pending",
+                        AgentDialogueDelivery.attempt_count == 0,
+                        AgentDialogueDelivery.receiver_run_id.is_(None),
+                        AgentDialogueDelivery.receiver_work_item_id.is_(None),
+                        AgentDialogueDelivery.receiver_message_id.is_(None),
+                        AgentDialogueDelivery.available_at.is_(None),
+                        AgentDialogueDelivery.expected_control_revision
+                        < AgentDialogue.control_revision,
+                        AgentDialogue.state.in_(
+                            ("cancelled", "expired", "failed", "succeeded")
+                        ),
+                        AgentWorkItem.source_type == SOURCE_TYPE,
+                        AgentWorkItem.execution_adapter == EXECUTION_ADAPTER,
+                        AgentWorkItem.state == "dead_letter",
+                        AgentWorkItem.attempt_count >= AgentWorkItem.max_attempts,
+                        AgentWorkItem.safe_error_code == "dialogue_handoff_failed",
+                        AgentWorkItem.active_agent_run_id.is_(None),
+                        AgentWorkItem.lease_owner.is_(None),
+                        AgentWorkItem.lease_token.is_(None),
+                        AgentWorkItem.lease_expires_at.is_(None),
+                    )
+                    .order_by(AgentDialogueDelivery.updated_at, AgentDialogueDelivery.id)
+                    .limit(scan_limit)
+                )
+            ).all()
+        finally:
+            await self._close(session)
+
+        terminalized = 0
+        for dialogue_id, delivery_id, owner_user_id, control_revision in rows:
+            if terminalized >= bounded_limit:
+                break
+            try:
+                await self.terminalize_stale_control_delivery(
+                    dialogue_id=str(dialogue_id),
+                    delivery_id=str(delivery_id),
+                    owner_user_id=str(owner_user_id),
+                    actor_kind="service",
+                    actor_user_id=None,
+                    actor_service_key="aoitalk.system",
+                    expected_state="pending",
+                    expected_control_revision=int(control_revision),
+                    idempotency_key=(
+                        f"auto-stale-control:{delivery_id}:{int(control_revision)}"
+                    ),
+                )
+            except DialogueTransportError:
+                # Candidate discovery is intentionally advisory. The locked
+                # proof remains authoritative and a changed row stays fenced.
+                continue
+            terminalized += 1
+        return terminalized
+
     @staticmethod
     def _notification_receipt_ack_requested(
         delivery: Any,
@@ -1495,6 +2651,8 @@ class AgentDialogueTransport:
     async def handoff(self, claim: WorkClaim | Mapping[str, Any]) -> dict[str, Any]:
         normalized = self.coordinator._coerce_claim(claim)
         session = await self._session()
+        delivery_kind = ""
+        phase = "claim"
         try:
             work = (
                 await session.execute(
@@ -1572,7 +2730,70 @@ class AgentDialogueTransport:
                 await session.rollback()
                 await self.coordinator.settle_transport(normalized, ExecutionOutcome(classification="succeeded", result_summary="dialogue handoff already committed"))
                 return {**projection, "idempotent": True}
-            await self._validate_dialogue(session, dialogue, int(delivery.expected_control_revision or 0))
+            if _text(delivery.state, 32).casefold() in {
+                "cancelled",
+                "acked",
+                "delivered",
+                "failed",
+            }:
+                await self.coordinator._transition_locked(
+                    session,
+                    work,
+                    "cancelled",
+                    token=work.lease_token,
+                    error_code="dialogue_terminal_delivery_superseded",
+                    error_message="terminal dialogue delivery superseded",
+                )
+                await session.commit()
+                return {
+                    **self._projection(delivery),
+                    "cancelled": True,
+                    "reason_code": "dialogue_terminal_delivery_superseded",
+                }
+            try:
+                await self._validate_dialogue(
+                    session,
+                    dialogue,
+                    int(delivery.expected_control_revision or 0),
+                )
+            except DialogueTransportError as exc:
+                if exc.code != "dialogue_terminal":
+                    raise
+                terminal_status = _text(dialogue.state, 32).casefold()
+                if terminal_status in _TERMINAL_DIALOGUE_STATES:
+                    await self.supersede_terminal_dialogue_deliveries(
+                        dialogue_id=str(dialogue.id),
+                        terminal_status=terminal_status,
+                        session=session,
+                    )
+                # The current delivery can be "available" while its transport
+                # Work is claimed. Ensure this exact claim is terminal even if
+                # it was outside the bulk superseder's eligible shape.
+                if delivery.state in {"pending", "available"}:
+                    now = self._now()
+                    delivery.state = "cancelled"
+                    delivery.available_at = None
+                    delivery.updated_at = now
+                    if _text(work.state, 32).casefold() in {
+                        "pending",
+                        "retry_wait",
+                        "claimed",
+                        "running",
+                    }:
+                        await self.coordinator._transition_locked(
+                            session,
+                            work,
+                            "cancelled",
+                            token=work.lease_token,
+                            error_code="dialogue_terminal_delivery_superseded",
+                            error_message="terminal dialogue delivery superseded",
+                        )
+                await session.commit()
+                return {
+                    **self._projection(delivery),
+                    "cancelled": True,
+                    "reason_code": "dialogue_terminal_delivery_superseded",
+                }
             now = self._now()
             if delivery.deadline is not None and delivery.deadline <= now:
                 delivery.state = "expired"
@@ -1585,9 +2806,47 @@ class AgentDialogueTransport:
                 await session.rollback()
                 await self.coordinator.release_transport(normalized, retry_at=deferred_at)
                 return {**projection, "deferred": True}
+            phase = "source"
             source_message = await session.get(ConversationMessage, delivery.source_message_id)
             if source_message is None or source_message.session_id != delivery.source_session_id:
                 raise DialogueTransportError("source_message_mismatch")
+            source_metadata = source_message.message_metadata if isinstance(source_message.message_metadata, Mapping) else {}
+            if {"agent_delegation_return", "agent_delegation_outcome", "agent_team_media_return", "agent_team_media_outcome"} & source_metadata.keys():
+                await self._validate_delivery_source(session, dialogue, delivery)
+                incoming = await session.get(AgentDialogueDelivery, _uuid(delivery.causation_id, "causation_id"))
+                events = (await session.scalars(select(AgentDialogueDelivery).where(
+                    AgentDialogueDelivery.dialogue_id == dialogue.id,
+                    AgentDialogueDelivery.causation_id == delivery.causation_id,
+                    AgentDialogueDelivery.kind == "event",
+                    AgentDialogueDelivery.id != delivery.id,
+                ))).all()
+                # The original leader must ACK before a host return can close
+                # the dialogue. Earlier artifact events and its progress event
+                # must also be observed before the final response.
+                waiting = incoming is None or incoming.state != "acked"
+                if delivery_kind == "response":
+                    waiting = waiting or any(event.state != "acked" for event in events)
+                    # Work can be admitted after publication while the leader is
+                    # still running. Recheck the bounded sibling set at handoff.
+                    from .agent_delegation_service import AgentDelegationService
+                    order = None
+                    media = None
+                    marker = source_metadata.get("agent_team_media_return") or source_metadata.get("agent_team_media_outcome")
+                    if isinstance(marker, Mapping):
+                        media = await session.get(AgentWorkItem, _uuid(marker.get("producer_work_item_id"), "producer_work_item_id"))
+                    else:
+                        marker = source_metadata.get("agent_delegation_return") or source_metadata.get("agent_delegation_outcome")
+                        if isinstance(marker, Mapping):
+                            order = await session.get(AgentDelegation, _uuid(marker.get("order_id"), "order_id"))
+                    if incoming is not None:
+                        waiting = waiting or not await self._delegation_siblings_settled(
+                            session, dialogue, incoming, order,
+                            AgentDelegationService(self._db_manager, config=self.config), current_media=media)
+                if waiting:
+                    projection = self._projection(delivery)
+                    await session.rollback()
+                    await self.coordinator.release_transport(normalized, retry_at=self._now() + timedelta(seconds=4))
+                    return {**projection, "deferred": True}
             source_run = await session.get(AgentRun, delivery.source_run_id) if delivery.source_run_id else None
             source_work = await session.get(AgentWorkItem, delivery.source_work_item_id) if delivery.source_work_item_id else None
             expected_hash = self._provenance(dialogue, source_run, source_work, source_message)
@@ -1596,10 +2855,17 @@ class AgentDialogueTransport:
             stored_hash = work_metadata.get("provenance_hash")
             if stored_binding_hash and stored_binding_hash != expected_hash:
                 raise DialogueTransportError("source_provenance_conflict")
+            if delivery_kind == "control" and not stored_binding_hash and not stored_hash:
+                # Control work is created directly by the control transaction,
+                # so pin its provenance before the managed receiver is admitted.
+                work.metadata_json = {**work_metadata, "binding_hash": expected_hash,
+                                      "provenance_hash": expected_hash}
+                stored_hash = expected_hash
             bridge = self.dispatch_bridge
             if bridge is None or not callable(getattr(bridge, "dispatch_trusted_agent_dialogue", None)):
                 raise DialogueTransportUnavailable("dialogue_dispatch_bridge_unavailable")
             try:
+                phase = "dispatch"
                 result = await bridge.dispatch_trusted_agent_dialogue(
                     session=session,
                     dialogue=dialogue,
@@ -1627,6 +2893,7 @@ class AgentDialogueTransport:
                 raise DialogueTransportUnavailable(
                     "dialogue_handoff_deferred"
                 ) from exc
+            phase = "receiver_binding"
             if not isinstance(result, Mapping):
                 raise DialogueTransportUnavailable("dialogue_dispatch_bridge_invalid_receipt")
             notification_receipt_ack = self._notification_receipt_ack_requested(
@@ -1653,6 +2920,16 @@ class AgentDialogueTransport:
                 raise DialogueTransportError("receiver_run_agent_binding_mismatch")
             receiver_work_id = _uuid(result.get("receiver_work_item_id") or result.get("work_item_id"), "receiver_work_item_id")
             receiver_message_id = _uuid(result.get("receiver_message_id") or result.get("message_id") or result.get("trigger_message_id"), "receiver_message_id")
+            authorization = dialogue.authorization_json
+            if (
+                delivery_kind in {"request", "control"}
+                and isinstance(authorization, Mapping)
+                and "delegate_worker" in authorization
+            ):
+                await self._validate_prepared_p5_receiver(
+                    session, dialogue, delivery, receiver_run_id, receiver_work_id,
+                    receiver_message_id, provenance_hash=stored_hash or expected_hash,
+                )
             delivery.receiver_run_id, delivery.receiver_work_item_id, delivery.receiver_message_id = receiver_run_id, receiver_work_id, receiver_message_id
             if notification_receipt_ack:
                 receipt_digest = _text(result.get("response_digest"), 64).casefold()
@@ -1662,7 +2939,9 @@ class AgentDialogueTransport:
                 "acked" if notification_receipt_ack else "delivered",
                 now,
             )
+            phase = "commit"
             await session.commit()
+            phase = "settle"
             settled = await self.coordinator.settle_transport(normalized, ExecutionOutcome(classification="succeeded", result_summary="dialogue handoff committed", result={"delivery_id": str(delivery.id), "receiver_run_id": str(receiver_run_id)}), source_ok=True)
             return {
                 **self._projection(delivery),
@@ -1684,6 +2963,19 @@ class AgentDialogueTransport:
             raise
         except Exception as exc:
             await self._rollback(session)
+            from .delegate_worker_runtime import DelegateWorkerRuntimeError
+
+            pending_codes = {
+                "session_binding_unsafe", "session_turn_in_flight", "session_disconnected",
+                "session_interrupted", "session_cancelling", "session_failed",
+                "native_session_unavailable",
+            }
+            if (delivery_kind == "control" and isinstance(exc, DelegateWorkerRuntimeError)
+                    and str(exc) in pending_codes):
+                await self.coordinator.release_transport(
+                    normalized, retry_at=self._now() + timedelta(seconds=4),
+                )
+                raise DialogueTransportUnavailable(str(exc)) from exc
             permanent_code = _permanent_dialogue_admission_code(exc)
             if permanent_code is not None:
                 try:
@@ -1702,6 +2994,7 @@ class AgentDialogueTransport:
                         exc_info=True,
                     )
                 raise DialogueTransportUnavailable(permanent_code) from exc
+            admission_code = _receiver_admission_code(exc) if phase == "dispatch" else None
             # A handoff that reached an unexpected runtime/provider-free
             # exception has consumed a transport attempt.  Do not return it
             # through ``release_transport`` (which intentionally refunds an
@@ -1710,23 +3003,173 @@ class AgentDialogueTransport:
             # bounded attempt accounting; if that settlement is unavailable,
             # the caller still receives the original failure for recovery.
             try:
+                exception_class = type(exc).__name__
+                if not exception_class.isascii() or not exception_class.isidentifier() or len(exception_class) > 80:
+                    exception_class = "Exception"
                 await self.coordinator.settle_transport(
                     normalized,
                     ExecutionOutcome(
                         classification="transient",
                         error_code="dialogue_handoff_failed",
                         error_message="dialogue handoff failed",
+                        result={"diagnostic": {"exception_class": exception_class,
+                                               "phase": phase,
+                                               "component": "agent_dialogue_transport",
+                                               **({"admission_code": admission_code} if admission_code else {})}},
                     ),
                     source_ok=True,
                 )
             except Exception:
                 logger.debug("Failed to settle unexpected dialogue handoff failure", exc_info=True)
-            raise DialogueTransportUnavailable("dialogue_handoff_failed") from exc
+            raise DialogueTransportUnavailable(admission_code or "dialogue_handoff_failed") from exc
         finally:
             await self._close(session)
 
     dispatch = handoff
     handoff_claim = handoff
+
+    async def _validate_prepared_p5_receiver(
+        self, session: Any, dialogue: Any, delivery: Any, receiver_run_id: uuid.UUID,
+        receiver_work_item_id: uuid.UUID, trigger_message_id: uuid.UUID,
+        *, provenance_hash: str | None = None, terminal: bool = False,
+    ) -> AgentWorkItem:
+        """Validate newly admitted CLI receiver rows in the caller's transaction.
+
+        The internal admission must attach ``agent_dialogue`` to the trigger
+        message metadata with dialogue_id, delivery_id, source_message_id and
+        provenance_hash. These values must never come from model output.
+        """
+        from .cli_development_sessions import (
+            CLI_DEVELOPMENT_CONTEXT_KEY, CLI_SESSION_ADAPTER_KEY,
+            CLI_SESSION_SOURCE_TYPE, MUSE_REMOTE_ADAPTER_KEY,
+            REMOTE_SESSION_SOURCE_TYPE, _DELEGATE_WORKER_PROVIDERS,
+            _delegate_worker_audit_marker,
+        )
+
+        dialogue = await session.get(AgentDialogue, dialogue.id)
+        delivery = await session.get(AgentDialogueDelivery, delivery.id)
+        if dialogue is None or delivery is None:
+            raise DialogueTransportError("p5_receiver_binding_mismatch")
+        auth = dialogue.authorization_json
+        marker = auth.get("delegate_worker") if isinstance(auth, Mapping) else None
+        worker_session = await session.get(ConversationSession, dialogue.worker_session_id)
+        run = await session.get(AgentRun, _uuid(receiver_run_id, "receiver_run_id"))
+        work = await session.get(AgentWorkItem, _uuid(receiver_work_item_id, "receiver_work_item_id"))
+        message = await session.get(ConversationMessage, _uuid(trigger_message_id, "trigger_message_id"))
+        context = worker_session.context if worker_session and isinstance(worker_session.context, Mapping) else {}
+        cli = context.get(CLI_DEVELOPMENT_CONTEXT_KEY)
+        cli = cli if isinstance(cli, Mapping) else {}
+        if (
+            not isinstance(marker, Mapping) or not dialogue.authorization_hash
+            or sha256_digest(auth) != dialogue.authorization_hash
+            or not _same_uuid(marker.get("session_id"), dialogue.worker_session_id)
+            or {key: value for key, value in marker.items() if key != "session_id"} != cli.get("delegate_worker")
+            or marker.get("schema_version") != 1
+            or not _same_uuid(marker.get("dialogue_id"), dialogue.id)
+            or str(marker.get("owner_id")) != str(dialogue.owner_user_id)
+            or not _same_uuid(marker.get("agent_id"), dialogue.worker_agent_id)
+            or not _same_uuid(marker.get("agent_revision_id"), dialogue.worker_agent_revision_id)
+            or not isinstance(marker.get("workspace_scope"), Mapping)
+            or sha256_digest(marker["workspace_scope"]) != marker.get("workspace_scope_sha256")
+            or worker_session is None or worker_session.deleted_at is not None
+            or str(worker_session.user_id) != str(dialogue.owner_user_id)
+            or not _same_uuid(worker_session.agent_id, dialogue.worker_agent_id)
+            or not _same_uuid(cli.get("agent_id"), dialogue.worker_agent_id)
+            or not _same_uuid(cli.get("agent_revision_id"), dialogue.worker_agent_revision_id)
+            or marker.get("kind") not in _DELEGATE_WORKER_PROVIDERS
+            or cli.get("provider") != _DELEGATE_WORKER_PROVIDERS.get(marker.get("kind"))
+            or not _same_uuid(delivery.dialogue_id, dialogue.id)
+            or _text(delivery.kind).casefold() not in {"request", "control"}
+            or not _same_uuid(delivery.receiver_session_id, dialogue.worker_session_id)
+            or not _same_uuid(delivery.receiver_agent_id, dialogue.worker_agent_id)
+            or not _same_uuid(delivery.receiver_agent_revision_id, dialogue.worker_agent_revision_id)
+            or (delivery.receiver_run_id is not None and not _same_uuid(delivery.receiver_run_id, receiver_run_id))
+            or (delivery.receiver_work_item_id is not None and not _same_uuid(delivery.receiver_work_item_id, receiver_work_item_id))
+            or (not terminal and delivery.receiver_message_id is not None and not _same_uuid(delivery.receiver_message_id, trigger_message_id))
+            or run is None or work is None or message is None
+        ):
+            raise DialogueTransportError("p5_receiver_binding_mismatch")
+        adapters = {
+            CLI_SESSION_SOURCE_TYPE: CLI_SESSION_ADAPTER_KEY,
+            REMOTE_SESSION_SOURCE_TYPE: MUSE_REMOTE_ADAPTER_KEY,
+        }
+        audit = _delegate_worker_audit_marker(marker)
+        run_meta = run.run_metadata if isinstance(run.run_metadata, Mapping) else {}
+        run_cli = run_meta.get("cli_development")
+        run_cli = run_cli if isinstance(run_cli, Mapping) else {}
+        work_meta = work.metadata_json if isinstance(work.metadata_json, Mapping) else {}
+        manifest = run.resolved_execution_manifest if isinstance(run.resolved_execution_manifest, Mapping) else {}
+        run_audit = run_cli.get("delegate_worker")
+        if not isinstance(run_audit, Mapping):
+            raise DialogueTransportError("p5_receiver_binding_mismatch")
+        attempt = run_audit.get("attempt")
+        expected_audit = {"attempt": attempt, **audit}
+        budgets = marker.get("budgets")
+        if (
+            type(attempt) is not int or not isinstance(budgets, Mapping)
+            or type(budgets.get("max_attempts")) is not int
+            or not 1 <= attempt <= budgets["max_attempts"]
+            or run_audit != expected_audit or work_meta.get("delegate_worker") != expected_audit
+            or manifest.get("delegate_worker") != expected_audit
+            or run.run_type not in adapters or work.source_type != run.run_type
+            or work.execution_adapter != adapters.get(run.run_type)
+            or (run.run_type == REMOTE_SESSION_SOURCE_TYPE) != (marker.get("kind") == "muse")
+            or run.provider != cli.get("provider")
+            or run.parent_run_id is not None
+            or not _same_uuid(run.session_id, dialogue.worker_session_id)
+            or not _same_uuid(run.agent_id, dialogue.worker_agent_id)
+            or not _same_uuid(run.agent_revision_id, dialogue.worker_agent_revision_id)
+            or str(run.user_id) != str(dialogue.owner_user_id)
+            or not _same_uuid(run.work_item_id, work.id)
+            or (not terminal and not _same_uuid(work.active_agent_run_id, run.id))
+            or (terminal and (
+                _text(run.status).casefold() not in _TERMINAL_RUN_STATES
+                or not _run_work_state_matches(run, work)
+                or (work.active_agent_run_id not in (None, "") and not _same_uuid(work.active_agent_run_id, run.id))
+            ))
+            or str(work.source_id) != str(run.id)
+            or not _same_uuid(work.conversation_session_id, dialogue.worker_session_id)
+            or not _same_uuid(work.assigned_agent_id, dialogue.worker_agent_id)
+            or not _same_uuid(work.agent_revision_id, dialogue.worker_agent_revision_id)
+            or str(work_meta.get("owner_id")) != str(dialogue.owner_user_id)
+            or not _same_uuid(run.trigger_message_id, message.id)
+            or not _same_uuid(message.session_id, dialogue.worker_session_id)
+            or message.role != "user" or message.sender_type != "agent"
+            or not _same_uuid(message.sender_id, delivery.source_agent_id) or message.deleted_at is not None
+        ):
+            raise DialogueTransportError("p5_receiver_binding_mismatch")
+        source_run = await session.get(AgentRun, delivery.source_run_id)
+        source_work = await session.get(AgentWorkItem, delivery.source_work_item_id)
+        source_message = await session.get(ConversationMessage, delivery.source_message_id)
+        if terminal:
+            transport_work = await session.get(AgentWorkItem, delivery.transport_work_item_id)
+            transport_meta = transport_work.metadata_json if transport_work is not None and isinstance(transport_work.metadata_json, Mapping) else {}
+            binding_hash = self._provenance(dialogue, source_run, source_work, source_message)
+            if (transport_work is None or str(transport_work.source_id) != str(delivery.id)
+                or transport_meta.get("binding_hash") != binding_hash
+                or not _SHA256.fullmatch(str(transport_meta.get("provenance_hash") or ""))):
+                raise DialogueTransportError("p5_receiver_provenance_mismatch")
+            provenance_hash = transport_meta["provenance_hash"]
+        metadata = message.message_metadata if isinstance(message.message_metadata, Mapping) else {}
+        provenance = metadata.get("agent_dialogue")
+        if (
+            source_run is None or source_work is None or source_message is None
+            or not _same_uuid(source_message.session_id, delivery.source_session_id)
+            or message.content != source_message.content
+            or message.client_message_id != f"agent-dialogue:{delivery.id}"
+            or not isinstance(provenance, Mapping)
+            or not _same_uuid(provenance.get("dialogue_id"), dialogue.id)
+            or not _same_uuid(provenance.get("delivery_id"), delivery.id)
+            or not _same_uuid(provenance.get("source_message_id"), source_message.id)
+            or not _same_uuid(provenance.get("source_session_id"), delivery.source_session_id)
+            or not _same_uuid(provenance.get("source_agent_id"), delivery.source_agent_id)
+            or not _same_uuid(provenance.get("source_agent_revision_id"), delivery.source_agent_revision_id)
+            or not _same_uuid(provenance.get("source_run_id"), source_run.id)
+            or not _same_uuid(provenance.get("source_work_item_id"), source_work.id)
+            or provenance.get("provenance_hash") != (provenance_hash or self._provenance(dialogue, source_run, source_work, source_message))
+        ):
+            raise DialogueTransportError("p5_receiver_provenance_mismatch")
+        return work
 
     async def _validate_receiver_run(
         self,
@@ -1763,6 +3206,15 @@ class AgentDialogueTransport:
             raise DialogueTransportError("receiver_binding_mismatch")
         if strict_delivery and not _same_uuid(delivery.receiver_run_id, receiver_run.id):
             raise DialogueTransportError("receiver_binding_mismatch")
+        auth = dialogue.authorization_json if isinstance(dialogue.authorization_json, Mapping) else {}
+        if kind in {"request", "control"} and isinstance(auth.get("delegate_worker"), Mapping):
+            work_id = requested_work_item_id or _uuid(delivery.receiver_work_item_id, "receiver_work_item_id", required=False)
+            if work_id is None or (strict_delivery and not _same_uuid(delivery.receiver_work_item_id, work_id)):
+                raise DialogueTransportError("receiver_work_binding_mismatch")
+            return await self._validate_prepared_p5_receiver(
+                session, dialogue, delivery, receiver_run.id, work_id,
+                _uuid(receiver_run.trigger_message_id, "trigger_message_id"), terminal=True,
+            )
         receiver_status = _text(getattr(receiver_run, "status", None), 32).casefold()
         if (
             receiver_run is None
@@ -1801,7 +3253,7 @@ class AgentDialogueTransport:
             raise DialogueTransportError("receiver_work_binding_mismatch")
         return work
 
-    async def _validate_delivery_source(self, session: Any, dialogue: Any, delivery: Any) -> Any:
+    async def _validate_delivery_source(self, session: Any, dialogue: Any, delivery: Any, *, allow_acked_replay: bool = False) -> Any:
         """Validate the immutable source side before a terminal callback."""
 
         kind = _text(delivery.kind, 32).casefold()
@@ -1821,6 +3273,42 @@ class AgentDialogueTransport:
         source_run = await session.get(AgentRun, source_run_id)
         source_work = await session.get(AgentWorkItem, source_work_id)
         source_message = await session.get(ConversationMessage, source_message_id)
+        metadata = source_message.message_metadata if source_message is not None and isinstance(source_message.message_metadata, Mapping) else {}
+        if "agent_team_media_outcome" in metadata:
+            from .agent_team_media_terminal_outcome import validate_team_media_outcome_message
+            from .agent_delegation_service import AgentDelegationService
+            await validate_team_media_outcome_message(session, AgentDelegationService(self._db_manager, config=self.config), dialogue, delivery, source_message, allow_acked_replay=allow_acked_replay, config=self.config)
+            return source_run
+        if "agent_team_media_return" in metadata:
+            from .agent_team_media_dialogue_return import validate_team_media_return_message
+            from .agent_delegation_service import AgentDelegationService
+            await validate_team_media_return_message(session, AgentDelegationService(self._db_manager, config=self.config), dialogue, delivery, source_message, allow_acked_replay=allow_acked_replay, config=self.config)
+            return source_run
+        if "agent_delegation_outcome" in metadata:
+            from .agent_delegation_terminal_outcome import validate_delegation_outcome_message
+            from .agent_delegation_service import AgentDelegationService
+            await validate_delegation_outcome_message(session, AgentDelegationService(self._db_manager, config=self.config), dialogue, delivery, source_message, allow_acked_replay=allow_acked_replay)
+            return source_run
+        if "agent_delegation_return" in metadata:
+            from .agent_delegation_dialogue_return import validate_delegation_return_message
+            from .agent_delegation_service import AgentDelegationService
+            await validate_delegation_return_message(session, AgentDelegationService(self._db_manager, config=self.config), dialogue, delivery, source_message)
+            return source_run
+        auth = dialogue.authorization_json if isinstance(dialogue.authorization_json, Mapping) else {}
+        if kind in {"response", "event"} and isinstance(auth.get("delegate_worker"), Mapping):
+            original = await session.get(AgentDialogueDelivery, _uuid(delivery.causation_id, "causation_id", required=False))
+            if (original is None or not _same_uuid(original.dialogue_id, dialogue.id)
+                or _text(original.kind).casefold() not in {"request", "control"}
+                or _text(original.state).casefold() not in {"acked", "failed"}
+                or int(original.expected_control_revision or 0) != int(delivery.expected_control_revision or 0)
+                or not _same_uuid(original.receiver_run_id, source_run_id)
+                or not _same_uuid(original.receiver_work_item_id, source_work_id)
+                or not _same_uuid(original.receiver_message_id, source_message_id)):
+                raise DialogueTransportError("source_provenance_mismatch")
+            await self._validate_delivery_source(session, dialogue, original)
+            await self._validate_receiver_run(session, dialogue, original, source_run, source_work_id, strict_delivery=True)
+            self._validate_terminal_message(dialogue, source_run, source_message, dialogue.worker_agent_id)
+            return source_run
         if (
             source_run is None
             or source_work is None
@@ -1839,6 +3327,7 @@ class AgentDialogueTransport:
             or _text(source_work.execution_adapter).casefold() != "interactive_chat"
             or not (
                 _run_work_state_matches(source_run, source_work)
+                or _run_succeeded_work_settling(source_run, source_work)
                 or await _blocked_authority_proof(session, source_run, source_work)
             )
             or (
@@ -1866,13 +3355,29 @@ class AgentDialogueTransport:
         if message is None or run is None:
             raise DialogueTransportError("receiver_message_mismatch")
         metadata = message.message_metadata if isinstance(message.message_metadata, Mapping) else {}
+        auth = dialogue.authorization_json if isinstance(dialogue.authorization_json, Mapping) else {}
+        p5 = (isinstance(auth.get("delegate_worker"), Mapping)
+              and _same_uuid(run.session_id, dialogue.worker_session_id)
+              and _same_uuid(run.agent_id, dialogue.worker_agent_id))
+        result = run.result if isinstance(run.result, Mapping) else {}
+        client_prefix = {"cli_session_turn": "cli-assistant", "remote_agent_turn": "muse-assistant"}.get(run.run_type)
+        if p5:
+            if (client_prefix is None or not _same_uuid(result.get("assistant_message_id"), message.id)
+                or message.client_message_id != f"{client_prefix}:{run.id}"
+                or str(metadata.get("run_id") or "") != str(run.id)
+                or metadata.get("cli_development") is not True
+                or (run.run_type == "remote_agent_turn" and (
+                    not result.get("provider_assistant_message_id")
+                    or metadata.get("provider_message_id") != result.get("provider_assistant_message_id")
+                    or not _same_uuid(message.parent_message_id, run.trigger_message_id)))):
+                raise DialogueTransportError("receiver_message_mismatch")
         if (
             not _same_uuid(message.session_id, run.session_id)
             or _text(message.role).casefold() != "assistant"
             or _text(message.sender_type).casefold() != "agent"
             or _text(message.sender_id) != str(expected_agent_id)
-            or _text(metadata.get("agent_dialogue_id")) != str(dialogue.id)
-            or _text(metadata.get("agent_run_id")) != str(run.id)
+            or (not p5 and _text(metadata.get("agent_dialogue_id")) != str(dialogue.id))
+            or (not p5 and _text(metadata.get("agent_run_id")) != str(run.id))
             or message.deleted_at is not None
         ):
             raise DialogueTransportError("receiver_message_mismatch")
@@ -1891,7 +3396,7 @@ class AgentDialogueTransport:
             dialogue = await self._lock_dialogue(db_session, delivery.dialogue_id)
             if int(dialogue.control_revision or 0) != int(delivery.expected_control_revision or 0):
                 raise DialogueTransportConflict("late_dialogue_receipt_control_revision")
-            await self._validate_delivery_source(db_session, dialogue, delivery)
+            await self._validate_delivery_source(db_session, dialogue, delivery, allow_acked_replay=True)
             requested_work = _uuid(receiver_work_item_id, "receiver_work_item_id", required=False)
             stored_work = _uuid(
                 delivery.receiver_work_item_id,
@@ -1910,6 +3415,21 @@ class AgentDialogueTransport:
                 effective_work,
             )
             if delivery.state in {"acked", "failed", "cancelled", "expired"}:
+                source = await db_session.get(ConversationMessage, delivery.source_message_id)
+                source_metadata = source.message_metadata if source is not None and isinstance(source.message_metadata, Mapping) else {}
+                if {"agent_delegation_outcome", "agent_team_media_return", "agent_team_media_outcome"} & source_metadata.keys() and delivery.state == "acked":
+                    if (receiver_message_id is not None and not _same_uuid(receiver_message_id, delivery.receiver_message_id)):
+                        raise DialogueTransportError("receiver_message_mismatch")
+                    if digest is not None and digest != delivery.response_digest:
+                        raise DialogueTransportError("response_digest_invalid")
+                    if _text(state, 32).casefold() not in {"succeeded", "acked", "completed"}:
+                        raise DialogueTransportError("receipt_state_conflict")
+                auth = dialogue.authorization_json if isinstance(dialogue.authorization_json, Mapping) else {}
+                if (isinstance(auth.get("delegate_worker"), Mapping)
+                    and _text(delivery.kind).casefold() in {"request", "control"}
+                    and receiver_message_id is not None
+                    and not _same_uuid(receiver_message_id, delivery.receiver_message_id)):
+                    raise DialogueTransportError("receiver_message_mismatch")
                 if owns:
                     await db_session.commit()
                 return {**self._projection(delivery), "idempotent": True}
@@ -1921,6 +3441,12 @@ class AgentDialogueTransport:
             if message is None:
                 raise DialogueTransportError("receiver_message_mismatch")
             self._validate_terminal_message(dialogue, receiver_run, message, expected_agent)
+            auth = dialogue.authorization_json if isinstance(dialogue.authorization_json, Mapping) else {}
+            if (_text(delivery.kind).casefold() in {"request", "control"}
+                and isinstance(auth.get("delegate_worker"), Mapping)):
+                await self.dispatch_bridge.record_typed_worker_usage_in_session(
+                    db_session, run_id=receiver_run.id,
+                )
             delivery.receiver_run_id = receiver_uuid
             delivery.receiver_work_item_id = validated_work.id
             delivery.receiver_message_id = message_uuid
@@ -1933,7 +3459,7 @@ class AgentDialogueTransport:
                     db_session,
                     dialogue,
                     delivery,
-                    kind="event" if state == "input_pending" else "response",
+                    kind="event" if state == "input_pending" or await self._origin_delegations(db_session, dialogue, delivery) or await self._origin_media_work(db_session, dialogue, delivery) else "response",
                     input_id=input_id,
                 )
             elif delivery.state == "failed" and delivery_kind in {"request", "control"}:
@@ -1950,6 +3476,7 @@ class AgentDialogueTransport:
                     source_metadata.get("safe_error_code")
                     and _text(source_metadata.get("safe_error_code"), 96).casefold() != "dialogue_input_pending"
                 )
+            previous_dialogue_state = dialogue.state
             self._apply_receipt_dialogue_state(
                 dialogue,
                 delivery,
@@ -1958,6 +3485,71 @@ class AgentDialogueTransport:
                 event_failure=event_failure,
                 now=self._now(),
             )
+            if (delivery.state == "acked" and delivery_kind == "response"
+                    and _text(state, 32).casefold() in {"succeeded", "acked", "completed"}
+                    and input_id in (None, "")
+                    and previous_dialogue_state not in {"cancelled", "expired"}):
+                dialogue.state = previous_dialogue_state
+                await db_session.flush()
+                # A Root ACK confirms receipt. Reconstruct business outcomes from
+                # this response and already acknowledged siblings, never from LLM text.
+                siblings = (await db_session.scalars(select(AgentDialogueDelivery).where(
+                    AgentDialogueDelivery.dialogue_id == dialogue.id,
+                    AgentDialogueDelivery.causation_id == delivery.causation_id,
+                    AgentDialogueDelivery.expected_control_revision == dialogue.control_revision,
+                    AgentDialogueDelivery.kind == "event",
+                    AgentDialogueDelivery.state == "acked",
+                ))).all()
+                from .agent_delegation_terminal_outcome import validate_delegation_outcome_message
+                from .agent_delegation_service import AgentDelegationService
+                outcomes = []
+                positive = False
+                for candidate in [*siblings, delivery]:
+                    source = await db_session.get(ConversationMessage, candidate.source_message_id)
+                    metadata = source.message_metadata if source is not None and isinstance(source.message_metadata, Mapping) else {}
+                    if "agent_delegation_outcome" in metadata:
+                        proof = await validate_delegation_outcome_message(
+                            db_session, AgentDelegationService(self._db_manager, config=self.config),
+                            dialogue, candidate, source, allow_acked_replay=True,
+                        )
+                        outcomes.extend(cause["outcome"] for cause in proof.as_dict()["causes"])
+                    elif "agent_team_media_outcome" in metadata:
+                        from .agent_team_media_terminal_outcome import validate_team_media_outcome_message
+                        proof = await validate_team_media_outcome_message(
+                            db_session, AgentDelegationService(self._db_manager, config=self.config),
+                            dialogue, candidate, source, allow_acked_replay=True, config=self.config)
+                        outcomes.append(proof.as_dict()["outcome"])
+                    elif "agent_team_media_return" in metadata:
+                        from .agent_team_media_dialogue_return import validate_team_media_return_message
+                        proof = await validate_team_media_return_message(
+                            db_session, AgentDelegationService(self._db_manager, config=self.config),
+                            dialogue, candidate, source, allow_acked_replay=True, config=self.config)
+                        if proof.as_dict()["result"]["accepted"]:
+                            positive = True
+                        else:
+                            outcomes.append("changes_requested")
+                    elif "agent_delegation_return" in metadata:
+                        await self._validate_delivery_source(db_session, dialogue, candidate)
+                        positive = True
+                    elif candidate.id == delivery.id:
+                        positive = True
+                if outcomes:
+                    if "uncertain" in outcomes or "blocked" in outcomes:
+                        dialogue.state = "blocked"
+                    elif not positive and all(outcome == "cancelled" for outcome in outcomes):
+                        dialogue.state = "cancelled"
+                    else:
+                        dialogue.state = "failed"
+                    dialogue.updated_at = self._now()
+                if not outcomes:
+                    dialogue.state = "succeeded"
+            terminal_status = _text(_field(dialogue, "state"), 32).casefold()
+            if terminal_status in _TERMINAL_DIALOGUE_STATES:
+                await self.supersede_terminal_dialogue_deliveries(
+                    dialogue_id=str(dialogue.id),
+                    terminal_status=terminal_status,
+                    session=db_session,
+                )
             if owns:
                 await db_session.commit()
             return {**self._projection(delivery), "dialogue": project_dialogue(dialogue), "response_digest": delivery.response_digest, "response_delivery_id": _id(response.id) if response else None, "idempotent": False}
@@ -2000,7 +3592,7 @@ class AgentDialogueTransport:
             return
         if normalized == "input_pending" or input_id not in (None, ""):
             next_state = "waiting"
-        elif kind == "request":
+        elif kind in {"request", "control"}:
             # The request receipt creates a response/event delivery.  Keep
             # the dialogue admissible until that root delivery is handed off
             # and acknowledged; otherwise the bridge would reject its own
@@ -2627,7 +4219,7 @@ class AgentDialogueTransport:
                     .join(AgentRun, AgentRun.id == AgentDialogueDelivery.receiver_run_id)
                     .join(AgentWorkItem, AgentWorkItem.id == AgentDialogueDelivery.transport_work_item_id)
                     .where(
-                        AgentDialogueDelivery.kind.in_(("request", "control", "response")),
+                        AgentDialogueDelivery.kind.in_(("request", "control", "response", "event")),
                         AgentDialogueDelivery.state == "delivered",
                         AgentDialogueDelivery.receiver_run_id.is_not(None),
                         AgentDialogueDelivery.receiver_work_item_id.is_not(None),
@@ -2661,6 +4253,213 @@ class AgentDialogueTransport:
         recovered += await self.recover_deferred_human_answers(limit=bounded_limit)
         return recovered
 
+    async def supersede_terminal_dialogue_deliveries(
+        self,
+        *,
+        root_session_id: str | None = None,
+        dialogue_id: str | None = None,
+        terminal_status: str | None = None,
+        session: Any | None = None,
+    ) -> int:
+        """Cancel queued deliveries for ended Dialogues.
+
+        ``cancelled`` is the existing terminal Delivery state.  The associated
+        transport Work records the stable reason code through the common Work
+        transition service.  Rows with a committed receiver identity are
+        left alone because they have crossed the handoff boundary already.
+        """
+
+        requested_status = _text(terminal_status, 32).casefold()
+        if requested_status and requested_status not in _TERMINAL_DIALOGUE_STATES:
+            return 0
+        dialogue_uuid = _uuid(dialogue_id, "dialogue_id", required=False)
+        root_session_uuid = _uuid(root_session_id, "root_session_id", required=False)
+        if dialogue_id and dialogue_uuid is None:
+            return 0
+        if root_session_id and root_session_uuid is None:
+            return 0
+        owns = session is None
+        db_session = session or await self._session()
+        try:
+            conditions: list[Any] = [
+                AgentDialogueDelivery.kind.in_(
+                    ("request", "control", "response", "event")
+                ),
+                AgentDialogueDelivery.state.in_(("pending", "available")),
+            ]
+            if dialogue_uuid is not None:
+                conditions.append(AgentDialogue.id == dialogue_uuid)
+                # A canonical status projection may derive a terminal state
+                # from its exact Worker Run/Work before the ledger is folded.
+                # Only that caller supplies terminal_status; otherwise trust
+                # the persisted Dialogue state.
+                if not requested_status:
+                    conditions.append(
+                        AgentDialogue.state.in_(tuple(_TERMINAL_DIALOGUE_STATES))
+                    )
+            else:
+                conditions.append(
+                    AgentDialogue.state.in_(tuple(_TERMINAL_DIALOGUE_STATES))
+                )
+            if root_session_uuid is not None:
+                conditions.append(AgentDialogue.root_session_id == root_session_uuid)
+            rows = list(
+                (
+                    await db_session.execute(
+                        select(AgentDialogueDelivery)
+                        .join(
+                            AgentDialogue,
+                            AgentDialogue.id == AgentDialogueDelivery.dialogue_id,
+                        )
+                        .where(*conditions)
+                        .order_by(
+                            AgentDialogueDelivery.created_at,
+                            AgentDialogueDelivery.id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            now = self._now()
+            terminalized = 0
+            for delivery in rows:
+                observed_updated_at = delivery.updated_at
+                observed_state = str(delivery.state or "")
+                work = None
+                work_state = ""
+                if delivery.transport_work_item_id is not None:
+                    work = (
+                        await db_session.execute(
+                            select(AgentWorkItem)
+                            .where(AgentWorkItem.id == delivery.transport_work_item_id)
+                            .with_for_update()
+                        )
+                    ).scalars().first()
+                    if work is not None:
+                        work_state = _text(work.state, 32).casefold()
+                        if (
+                            _text(work.source_type, 64).casefold() != SOURCE_TYPE
+                            or _text(work.execution_adapter, 64).casefold()
+                            != EXECUTION_ADAPTER
+                            or str(work.source_id or "") != str(delivery.id)
+                            or work.assigned_agent_id is not None
+                            or work.active_agent_run_id is not None
+                        ):
+                            continue
+                changed = await db_session.execute(
+                    update(AgentDialogueDelivery)
+                    .where(
+                        AgentDialogueDelivery.id == delivery.id,
+                        AgentDialogueDelivery.state == observed_state,
+                        AgentDialogueDelivery.updated_at == observed_updated_at,
+                        *(
+                            getattr(AgentDialogueDelivery, field).is_(None)
+                            if getattr(delivery, field) is None
+                            else getattr(AgentDialogueDelivery, field)
+                            == getattr(delivery, field)
+                            for field in (
+                                "receiver_run_id",
+                                "receiver_work_item_id",
+                                "receiver_message_id",
+                            )
+                        ),
+                    )
+                    .values(state="cancelled", available_at=None, updated_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+                if int(getattr(changed, "rowcount", 0) or 0) != 1:
+                    continue
+                delivery.state = "cancelled"
+                delivery.available_at = None
+                delivery.updated_at = now
+                if work is not None:
+                    if work_state in {"pending", "retry_wait", "claimed", "running"}:
+                        await self.coordinator._transition_locked(
+                            db_session,
+                            work,
+                            "cancelled",
+                            token=work.lease_token,
+                            error_code="dialogue_terminal_delivery_superseded",
+                            error_message="terminal dialogue delivery superseded",
+                        )
+                    else:
+                        await self.coordinator._append_event_in_session(
+                            db_session,
+                            work,
+                            event_type="dialogue.delivery_terminalized",
+                            actor_kind="service",
+                            actor_id=self.coordinator.worker_id,
+                            from_state=work_state or None,
+                            to_state=work_state or None,
+                            causation_id=str(delivery.id),
+                            safe_error_code="dialogue_terminal_delivery_superseded",
+                            payload={
+                                "delivery_id": str(delivery.id),
+                                "reason_code": "dialogue_terminal_delivery_superseded",
+                                "delivery_state": "cancelled",
+                            },
+                        )
+                else:
+                    dialogue = await db_session.get(
+                        AgentDialogue, delivery.dialogue_id
+                    )
+                    reason_work_id = (
+                        delivery.source_work_item_id
+                        or getattr(dialogue, "human_work_item_id", None)
+                    )
+                    reason_work = (
+                        await db_session.get(AgentWorkItem, reason_work_id)
+                        if reason_work_id is not None
+                        else None
+                    )
+                    reason_work_state = (
+                        _text(reason_work.state, 32).casefold()
+                        if reason_work is not None
+                        else ""
+                    )
+                    if reason_work is not None and reason_work_state in {
+                        "pending",
+                        "claimed",
+                        "running",
+                        "awaiting_approval",
+                        "blocked",
+                        "retry_wait",
+                        "uncertain",
+                        "succeeded",
+                        "failed",
+                        "cancelled",
+                        "dead_letter",
+                    }:
+                        await self.coordinator._append_event_in_session(
+                            db_session,
+                            reason_work,
+                            event_type="dialogue.delivery_terminalized",
+                            actor_kind="service",
+                            actor_id=self.coordinator.worker_id,
+                            from_state=reason_work_state,
+                            to_state=reason_work_state,
+                            causation_id=str(delivery.id),
+                            safe_error_code="dialogue_terminal_delivery_superseded",
+                            payload={
+                                "delivery_id": str(delivery.id),
+                                "reason_code": "dialogue_terminal_delivery_superseded",
+                                "delivery_state": "cancelled",
+                            },
+                        )
+                terminalized += 1
+            if owns:
+                await db_session.commit()
+            return terminalized
+        except Exception:
+            if owns:
+                await self._rollback(db_session)
+            raise
+        finally:
+            if owns:
+                await self._close(db_session)
+
     async def _close_failed_receiver_delivery(
         self,
         session: Any,
@@ -2688,7 +4487,7 @@ class AgentDialogueTransport:
         safe_error_code = _text(
             getattr(receiver_work, "safe_error_code", None) or getattr(receiver_work, "blocker_code", None)
         ).casefold()
-        if worker_delivery and safe_error_code.startswith(_SAFE_TERMINAL_FAILURE_PREFIXES):
+        if worker_delivery and safe_error_code.startswith(("agent_route_", "interactive_admission_")):
             return None
         try:
             # The input ledger is optional during rolling upgrades.  Keep a
@@ -2723,6 +4522,13 @@ class AgentDialogueTransport:
                 dialogue.state, dialogue.updated_at = "waiting", now
         elif current_dialogue_state not in {"cancelled", "expired", "succeeded", "failed"}:
             dialogue.state, dialogue.updated_at = terminal, now
+        terminal_status = _text(_field(dialogue, "state"), 32).casefold()
+        if terminal_status in _TERMINAL_DIALOGUE_STATES:
+            await self.supersede_terminal_dialogue_deliveries(
+                dialogue_id=str(dialogue.id),
+                terminal_status=terminal_status,
+                session=session,
+            )
         return {
             **self._projection(delivery),
             "dialogue": project_dialogue(dialogue),
@@ -2751,7 +4557,7 @@ class AgentDialogueTransport:
             run = await session.get(AgentRun, _uuid(run_id, "receiver_run_id"))
             if run is None:
                 return None
-            await self._validate_delivery_source(session, dialogue, delivery)
+            await self._validate_delivery_source(session, dialogue, delivery, allow_acked_replay=True)
             receiver_work = await self._validate_receiver_run(
                 session,
                 dialogue,
@@ -2792,6 +4598,11 @@ class AgentDialogueTransport:
                     return None
                 input_id = str(pending_input.id)
                 message = await session.get(ConversationMessage, pending_input.source_message_id)
+            elif worker_delivery and isinstance(dialogue.authorization_json, Mapping) and isinstance(dialogue.authorization_json.get("delegate_worker"), Mapping):
+                result = run.result if isinstance(run.result, Mapping) else {}
+                message_id = _uuid(result.get("assistant_message_id"), "assistant_message_id", required=False)
+                if message_id is not None:
+                    message = await session.get(ConversationMessage, message_id)
             else:
                 # Never select the latest assistant text blindly: a callback
                 # for an older/failed Run can otherwise publish another turn's
@@ -2822,7 +4633,7 @@ class AgentDialogueTransport:
                     _text(run.status).casefold() in {"failed", "cancelled"}
                     and bool(
                         re.fullmatch(r"[a-z][a-z0-9_]{0,95}", safe_error_code)
-                        and safe_error_code.startswith(_SAFE_TERMINAL_FAILURE_PREFIXES)
+                        and _is_safe_terminal_failure_code(safe_error_code)
                     )
                 ):
                     materialized = await self.dispatch_bridge.materialize_agent_dialogue_terminal_failure(

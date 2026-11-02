@@ -401,7 +401,7 @@ function MapContent({ nodes, edges, loading, selectedNodeId, onSelectNode, onSel
       target: edge.target,
       sourceHandle: "out",
       targetHandle: "in",
-      type: edge.relation === "supervision" || edge.relation === "assignment" ? "smoothstep" : "default",
+      type: "default",
       markerEnd: { type: MarkerType.ArrowClosed, color: relation.color, width: 14, height: 14 },
       style: { stroke: relation.color, strokeWidth: highlighted ? 2.5 : edge.relation === "supervision" ? 2 : 1.5, strokeDasharray: relation.dash, opacity: highlightedId ? highlighted ? 1 : 0.15 : 0.75 },
       zIndex: highlighted ? 2 : 0,
@@ -468,6 +468,7 @@ function MapContent({ nodes, edges, loading, selectedNodeId, onSelectNode, onSel
           })}
           {!model.edges.length ? <span className="operations-map-muted">この範囲に取得済みの関係はありません</span> : null}
         </div>
+          <p className="operations-map-hint">記録された関係の表示です。Teamの関係はこのMapの「Team設計」で編集できます。</p>
           <p className="operations-map-hint">ドラッグで移動 · スクロールで拡大・縮小 · 選択・ホバーで直接の関係を強調 · 空白または Esc で選択解除</p>
           <p className="operations-map-hint">全体操作で表示中のカードに合わせて移動・縮小できます。未展開Workは「記録・表示」で追加できます。選択で展開した記録は同じ範囲内で残ります。</p>
           </div></details>

@@ -9,13 +9,17 @@ from typing import List, Optional
 
 import yaml
 
+from src.runtime_release_contract import config_path as runtime_config_path
+
 from .models import HeartbeatDefinition, validate_heartbeat_mode
 from .registry import get_heartbeat_registry, register_heartbeat
 from .security import HeartbeatSecurityError, resolve_heartbeat_yaml_path, validate_heartbeat_name
 
 logger = logging.getLogger(__name__)
 
-HEARTBEATS_DIR = Path(__file__).resolve().parents[2] / "config" / "heartbeats"
+HEARTBEATS_DIR = runtime_config_path(
+    "config/heartbeats", Path(__file__).resolve().parents[2]
+)
 
 
 def load_heartbeat_from_yaml(path: Path) -> Optional[HeartbeatDefinition]:

@@ -20,6 +20,7 @@ import contextvars
 import hashlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -125,7 +126,7 @@ def _record_generation_docs_resolution(
     """
 
     try:
-        from ..services.agent_team_service import get_current_continuation_state
+        from ..services.runtime_policy_utils import get_current_continuation_state
 
         state = get_current_continuation_state()
         if state is None:
@@ -1194,7 +1195,11 @@ def build_docs_direct_tools() -> list:
                     index=index_telemetry,
                     docs_rag_enabled=semantic_enabled,
                 )
-                logger.debug("docs_search telemetry %s", telemetry.as_dict())
+                telemetry_info = os.getenv("AOITALK_DOCS_SEARCH_TELEMETRY_INFO", "")
+                if telemetry_info.strip().casefold() == "true":
+                    logger.info("docs_search telemetry %s", telemetry.as_dict())
+                else:
+                    logger.debug("docs_search telemetry %s", telemetry.as_dict())
                 render_scope = {"include_parent_titles": docs_scope is None} if hasattr(
                     service, "_query_reference_visible"
                 ) else {}

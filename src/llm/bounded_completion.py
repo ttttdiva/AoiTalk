@@ -14,11 +14,11 @@ from .generation_budget import GenerationBudget
 
 
 def _announce_send(on_send: Any) -> None:
-    """Run the send-evidence callback on the caller's thread, before the private loop exists.
+    """Run send evidence on the caller thread, never on the private loop.
 
-    Its audit write belongs to the caller's loop; run inside the transport's
-    short-lived loop it could be cancelled mid-write when that loop is torn down
-    (leaving a database lock behind) or lost entirely.
+    Audit callbacks stay in the caller's execution context; running one inside
+    the transport's short-lived loop could lose or interrupt its write when
+    that loop is torn down.
     """
 
     if callable(on_send):
@@ -27,6 +27,35 @@ def _announce_send(on_send: Any) -> None:
         except Exception:
             # Diagnostic callbacks must never alter generation behavior.
             pass
+
+
+def _new_async_openai_transport(client: Any, **kwargs: Any) -> AsyncOpenAI:
+    factory = getattr(
+        client,
+        "_aoitalk_bounded_http_client_factory",
+        None,
+    )
+    http_client = factory() if callable(factory) else None
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+    try:
+        transport = AsyncOpenAI(**kwargs)
+    except BaseException:
+        if http_client is not None:
+            close = http_client.aclose()
+            try:
+                asyncio.run(close)
+            except BaseException:
+                close.close()
+        raise
+    record = getattr(
+        client,
+        "_aoitalk_transport_diagnostic_recorder",
+        None,
+    )
+    if http_client is not None and callable(record):
+        record(transport, client_type="AsyncOpenAI")
+    return transport
 
 
 def execute_interruptible_completion(
@@ -41,16 +70,12 @@ def execute_interruptible_completion(
     thread survives this call, and SDK retries cannot escape the task budget.
     """
 
+    execution_started = False
+
     async def execute():
-        remaining = budget.checkpoint()
-        async with AsyncOpenAI(
-            base_url=client.base_url,
-            api_key=client.api_key,
-            organization=client.organization,
-            project=client.project,
-            timeout=remaining,
-            max_retries=0,
-        ) as transport:
+        nonlocal execution_started
+        async with transport:
+            execution_started = True
             budget.checkpoint()
             request = asyncio.create_task(transport.chat.completions.create(**payload))
 
@@ -75,9 +100,28 @@ def execute_interruptible_completion(
                 watchdog.cancel()
                 await asyncio.gather(request, watchdog, return_exceptions=True)
 
-    budget.checkpoint()
-    _announce_send(on_send)
-    return asyncio.run(execute())
+    remaining = budget.checkpoint()
+    transport = _new_async_openai_transport(
+        client,
+        base_url=client.base_url,
+        api_key=client.api_key,
+        organization=client.organization,
+        project=client.project,
+        timeout=remaining,
+        max_retries=0,
+    )
+    try:
+        budget.checkpoint()
+        _announce_send(on_send)
+        return asyncio.run(execute())
+    except BaseException:
+        if not execution_started:
+            close = transport.close()
+            try:
+                asyncio.run(close)
+            except BaseException:
+                close.close()
+        raise
 
 
 _CLOSE_STEP_SECONDS = 2.0
@@ -131,14 +175,30 @@ class InterruptibleStream:
         self._reaper_started = False
         try:
             budget.checkpoint()
-            _announce_send(on_send)
             self._loop = asyncio.new_event_loop()
             self._thread = threading.Thread(target=self._run_loop, name="interruptible-stream", daemon=True)
             self._thread.start()
         except BaseException:
             self._release_lease()
             raise
-        self._await(lambda: self._open(client, payload))
+        try:
+            remaining = budget.checkpoint()
+            self._transport = _new_async_openai_transport(
+                client,
+                base_url=client.base_url,
+                api_key=client.api_key,
+                organization=client.organization,
+                project=client.project,
+                timeout=remaining,
+                max_retries=0,
+            )
+            budget.checkpoint()
+            _announce_send(on_send)
+            self._await(lambda: self._open(payload))
+        except BaseException:
+            if not self._closed:
+                self._shutdown()
+            raise
 
     def _release_lease(self) -> None:
         lease, self._lease = self._lease, None
@@ -151,16 +211,7 @@ class InterruptibleStream:
         finally:
             self._loop.close()
 
-    async def _open(self, client: Any, payload: dict[str, Any]) -> None:
-        remaining = self._budget.checkpoint()
-        self._transport = AsyncOpenAI(
-            base_url=client.base_url,
-            api_key=client.api_key,
-            organization=client.organization,
-            project=client.project,
-            timeout=remaining,
-            max_retries=0,
-        )
+    async def _open(self, payload: dict[str, Any]) -> None:
         self._budget.checkpoint()
         self._stream = await self._transport.chat.completions.create(**payload)
 

@@ -37,6 +37,7 @@ class AgentRunActivityDTO(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None
     error: str | None = None
+    legacy: dict[str, Any] | None = None
     execution_manifest: dict[str, Any] | None = None
     resource_refs: list[dict[str, Any]] = Field(default_factory=list)
 

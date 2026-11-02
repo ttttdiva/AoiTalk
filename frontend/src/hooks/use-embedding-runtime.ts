@@ -72,7 +72,8 @@ export function useEmbeddingRuntime({ canManage = false }: EmbeddingRuntimeOptio
       });
       const body = await response.json() as RuntimeView & Partial<ReleaseResult> & { detail?: string };
       if (!active.current || !manageAllowed.current || request.current?.controller !== controller) return;
-      if (kind === "release" && body.reason && body.reason in RELEASE_MESSAGES) {
+      if (kind === "release" && body.reason && body.reason in RELEASE_MESSAGES
+        && (body.accepted !== true || response.ok)) {
         setStatus(body.status);
         // 拒否（accepted:false）で status が null なのは不在の確認ではない。受理された not_loaded の null だけが確定した不在。
         setLoaded(body.accepted === true || body.status != null);
@@ -81,7 +82,11 @@ export function useEmbeddingRuntime({ canManage = false }: EmbeddingRuntimeOptio
         else setError(note);
         return;
       }
-      if (!response.ok) throw new Error(body.detail || `状態を取得できませんでした (${response.status})`);
+      if (!response.ok) {
+        throw new Error(body.detail || (kind === "release"
+          ? "解放結果を確認できませんでした。状態を更新してください。"
+          : `状態を取得できませんでした (${response.status})`));
+      }
       setStatus(body.status);
       setLoaded(true);
     } catch (cause) {
@@ -211,7 +216,14 @@ export function useEmbeddingRuntime({ canManage = false }: EmbeddingRuntimeOptio
   useEffect(() => {
     if (!canManage) return;
     manageAllowed.current = true;
-    queueMicrotask(() => { void run("status"); });
+    // 権限復帰までに中断した保存や他の管理者の操作で値が変わり得る。再取得前の値で操作させない。
+    settingsRequest.current?.abort();
+    settingsRequest.current = null;
+    queueMicrotask(() => {
+      if (!active.current || !manageAllowed.current) return;
+      setEnabledState(null);
+      void loadSettings(); void run("status");
+    });
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void run("status");
     }, 5000);
@@ -220,14 +232,17 @@ export function useEmbeddingRuntime({ canManage = false }: EmbeddingRuntimeOptio
       window.clearInterval(timer);
       request.current?.controller.abort();
       request.current = null;
+      const interruptedSave = saveRequest.current !== null;
       saveRequest.current?.abort();
       saveRequest.current = null;
       if (active.current) {
+        // 中断してもサーバー側で保存が確定する可能性があり、以前の値を確定値として残せない。
+        if (interruptedSave) setEnabledState(null);
         setStatus(null); setLoaded(false); setPending(null); setError(null); setMessage(null);
         setSaving(false); setSaveError(null); setSaveMessage(null);
       }
     };
-  }, [canManage, run]);
+  }, [canManage, loadSettings, run]);
 
   return { status, loaded, pending, error, message,
     enabled, settingsError, saving, saveError, saveMessage,

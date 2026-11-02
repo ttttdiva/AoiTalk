@@ -40,7 +40,7 @@ export const MOBILE_SETTINGS_ITEMS: readonly MobileSettingsItem[] = [
   { id: "memory", category: "ai", label: "ユーザーメモリ", icon: "database-outline", route: "/(tabs)/settings/memory", keywords: ["メモリ","memory","ユーザー情報"] },
   { id: "notifications", category: "connections", label: "通知・カレンダー", icon: "bell-outline", route: "/(tabs)/settings/notifications", keywords: ["通知","カレンダー","calendar","Google Calendar","予定"] },
   { id: "connection", category: "connections", label: "サーバー / ネットワーク", icon: "lan-connect", route: "/(tabs)/settings/connection", keywords: ["サーバー","ネットワーク","API URL","接続","server","network"] },
-  { id: "mcp", category: "connections", label: "MCP / エージェント", icon: "robot-outline", route: "/(tabs)/settings/mcp", keywords: ["MCP","エージェント","agent","tool","ツール"] },
+  { id: "mcp", category: "connections", label: "MCP / エージェント", icon: "robot-outline", route: "/(tabs)/settings/mcp", keywords: ["MCP","エージェント","agent","tool","ツール","個人Agent","期限","期限候補","候補","日付"] },
   { id: "remote-servers", category: "connections", label: "外部サーバー接続", icon: "server-network", route: "/(tabs)/settings/remote-servers", keywords: ["外部サーバー","remote","server","接続"] },
   { id: "docs-resync", category: "data", label: "Docs再同期", icon: "database-sync-outline", route: "/(tabs)/settings/docs-resync", keywords: ["Docs","同期","再同期","resync","データ"], visible: ({ isAuthenticated }) => isAuthenticated },
   { id: "sync-status", category: "data", label: "同期の状態", icon: "sync", route: "/(tabs)/settings/sync-status", keywords: ["同期","状態","競合","移行","request id","diagnostics"], visible: ({ isAuthenticated }) => isAuthenticated },

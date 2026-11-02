@@ -1,4 +1,4 @@
-"""Conversation session Agent Team selection helpers."""
+"""Conversation session model-route selection helpers."""
 
 from __future__ import annotations
 
@@ -6,12 +6,7 @@ import copy
 import logging
 from typing import Any
 
-from .agent_team_v3 import agent_team_v3_teams
-from .execution_profile_service import (
-    FREE_TEAM_PROFILE_ID,
-    list_team_execution_profiles,
-    resolve_execution_main_route,
-)
+from .model_roles_service import resolve_execution_main_route
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +20,8 @@ _FREE_TEAM_ROUTE = {
     "model": "free-team",
     "effort": "",
 }
-
-_TEAM_MODES = frozenset({"auto", "fixed"})
+FREE_TEAM_PROFILE_ID = "free-team"
 _CONTEXT_KEY = "chat_llm_settings"
-
-
-def _clean_team_id(value: Any) -> str:
-    return str(value or "").strip()
 
 
 def _normalize_main_route_fragment(raw: Any) -> dict[str, str]:
@@ -157,14 +147,8 @@ def session_main_route_override_for_binding(
 
 def default_session_llm_settings() -> dict[str, Any]:
     return {
-        "agent_team_selection": {
-            "mode": "auto",
-            "team_id": "",
-            "loaded_team_ids": [],
-        },
         "main_route": _normalize_main_route_fragment({}),
         "special_routing": _normalize_special_routing({}),
-        "execution_profile_id": "",
     }
 
 
@@ -172,48 +156,19 @@ def _existing_context(context: Any) -> dict[str, Any]:
     return copy.deepcopy(context) if isinstance(context, dict) else {}
 
 
-def normalize_agent_team_selection(raw: Any) -> dict[str, Any]:
-    raw = raw if isinstance(raw, dict) else {}
-    mode = str(raw.get("mode") or "auto").strip().lower()
-    if mode not in _TEAM_MODES:
-        mode = "auto"
-    team_id = _clean_team_id(raw.get("team_id"))
-    loaded = raw.get("loaded_team_ids")
-    loaded_team_ids = []
-    if isinstance(loaded, list):
-        loaded_team_ids = sorted(
-            dict.fromkeys(_clean_team_id(item) for item in loaded if _clean_team_id(item))
-        )
-    return {
-        "mode": mode,
-        "team_id": team_id if mode == "fixed" else "",
-        "loaded_team_ids": loaded_team_ids,
-    }
-
-
 def _has_explicit_session_route(main_route: Any) -> bool:
     route = _normalize_main_route_fragment(main_route if isinstance(main_route, dict) else {})
     return bool(route.get("provider") and route.get("model"))
 
 
-def _normalize_execution_profile_id(raw: Any) -> str:
-    return str(raw or "").strip()
-
-
 def normalize_session_llm_settings(raw: Any) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
-    team = normalize_agent_team_selection(raw.get("agent_team_selection"))
     special = _normalize_special_routing(raw.get("special_routing"))
     if special.get("routing_profile_id") != FREE_TEAM_PROFILE_ID:
         special = _normalize_special_routing({})
-    execution_profile_id = _normalize_execution_profile_id(raw.get("execution_profile_id"))
-    if team.get("mode") != "fixed" or special.get("routing_profile_id") == FREE_TEAM_PROFILE_ID:
-        execution_profile_id = ""
     return {
-        "agent_team_selection": team,
         "main_route": _normalize_main_route_fragment(raw.get("main_route")),
         "special_routing": special,
-        "execution_profile_id": execution_profile_id,
     }
 
 
@@ -230,11 +185,6 @@ def merge_session_llm_settings(context: Any, patch: Any) -> dict[str, Any]:
     current = read_session_llm_settings(root)
     patch = patch if isinstance(patch, dict) else {}
     merged = copy.deepcopy(current)
-    if "agent_team_selection" in patch:
-        team_patch = patch.get("agent_team_selection")
-        team_current = merged["agent_team_selection"]
-        team_next = normalize_agent_team_selection({**team_current, **(team_patch or {})})
-        merged["agent_team_selection"] = team_next
     if "main_route" in patch:
         current_route = merged.get("main_route") if isinstance(merged.get("main_route"), dict) else {}
         route_patch = patch.get("main_route") if isinstance(patch.get("main_route"), dict) else {}
@@ -255,50 +205,8 @@ def merge_session_llm_settings(context: Any, patch: Any) -> dict[str, Any]:
         merged["special_routing"] = _normalize_special_routing(
             {**current_special, **special_patch},
         )
-    if "execution_profile_id" in patch:
-        merged["execution_profile_id"] = _normalize_execution_profile_id(
-            patch.get("execution_profile_id"),
-        )
     root[_CONTEXT_KEY] = normalize_session_llm_settings(merged)
     return root
-
-
-def validate_agent_team_selection(
-    selection: dict[str, Any],
-    config: Any,
-) -> tuple[dict[str, Any], list[str]]:
-    normalized = normalize_agent_team_selection(selection)
-    warnings: list[str] = []
-    teams = {
-        str(team.get("team_id") or ""): team
-        for team in agent_team_v3_teams(config)
-        if str(team.get("team_id") or "").strip()
-    }
-    if normalized["mode"] == "fixed":
-        team_id = normalized["team_id"]
-        team = teams.get(team_id)
-        if not team:
-            warnings.append(f"Unknown or disabled team: {team_id or '(empty)'}")
-            normalized["team_id"] = ""
-            normalized["mode"] = "auto"
-        elif not team.get("enabled", True):
-            warnings.append(f"Team is disabled: {team_id}")
-            normalized["team_id"] = ""
-            normalized["mode"] = "auto"
-    loaded = []
-    for team_id in normalized["loaded_team_ids"]:
-        team = teams.get(team_id)
-        if not team or not team.get("enabled", True):
-            warnings.append(f"Loaded team unavailable: {team_id}")
-            continue
-        activation = team.get("activation") if isinstance(team, dict) else {}
-        mode = str((activation or {}).get("mode") or "always").strip().lower()
-        if mode != "manual":
-            warnings.append(f"Team does not require manual loading: {team_id}")
-            continue
-        loaded.append(team_id)
-    normalized["loaded_team_ids"] = loaded
-    return normalized, warnings
 
 
 def validate_session_llm_settings(
@@ -311,12 +219,6 @@ def validate_session_llm_settings(
     candidate_context = merge_session_llm_settings(context, patch)
     settings = read_session_llm_settings(candidate_context)
     warnings: list[str] = []
-    team, team_warnings = validate_agent_team_selection(
-        settings["agent_team_selection"],
-        config,
-    )
-    warnings.extend(team_warnings)
-    settings["agent_team_selection"] = team
     if "main_route" in patch:
         main_route = (
             settings.get("main_route") if isinstance(settings.get("main_route"), dict) else {}
@@ -407,43 +309,7 @@ def validate_session_llm_settings(
         if raw_id and raw_id != FREE_TEAM_PROFILE_ID:
             warnings.append(f"Unsupported special routing: {raw_id}")
             settings["special_routing"] = _normalize_special_routing({})
-    team = settings.get("agent_team_selection") if isinstance(settings.get("agent_team_selection"), dict) else {}
-    special = settings.get("special_routing") if isinstance(settings.get("special_routing"), dict) else {}
-    execution_profile_id = _normalize_execution_profile_id(
-        settings.get("execution_profile_id"),
-    )
-    if (
-        str(team.get("mode") or "auto") != "fixed"
-        or str(special.get("routing_profile_id") or "") == FREE_TEAM_PROFILE_ID
-    ):
-        settings["execution_profile_id"] = ""
-    elif execution_profile_id:
-        team_id = str(team.get("team_id") or "").strip()
-        profiles = {
-            str(item.get("profile_id") or ""): item
-            for item in list_team_execution_profiles(config, team_id)
-            if str(item.get("profile_id") or "").strip()
-        }
-        selected = profiles.get(execution_profile_id)
-        if selected is None or not selected.get("enabled", True):
-            warnings.append(
-                f"Execution profile unavailable for team {team_id or '(empty)'}: {execution_profile_id}"
-            )
-            settings["execution_profile_id"] = ""
-        else:
-            settings["execution_profile_id"] = execution_profile_id
-    else:
-        settings["execution_profile_id"] = ""
     return settings, warnings
-
-
-def session_loaded_team_ids(settings: dict[str, Any]) -> list[str]:
-    team = settings.get("agent_team_selection") if isinstance(settings, dict) else {}
-    team = team if isinstance(team, dict) else {}
-    loaded = team.get("loaded_team_ids")
-    if isinstance(loaded, list):
-        return list(loaded)
-    return []
 
 
 def resolve_session_effective_main_route(config: Any, settings: dict[str, Any]) -> dict[str, Any]:
@@ -512,26 +378,8 @@ def session_llm_settings_envelope(
 ) -> dict[str, Any]:
     settings = read_session_llm_settings(context)
     effective_main = resolve_session_effective_main_route(config, settings)
-    team = (
-        settings.get("agent_team_selection")
-        if isinstance(settings.get("agent_team_selection"), dict)
-        else {}
-    )
-    team_id = str(team.get("team_id") or "").strip() if str(team.get("mode") or "") == "fixed" else ""
-    team_profiles = [
-        {
-            "profile_id": str(item.get("profile_id") or ""),
-            "name": str(item.get("name") or item.get("profile_id") or ""),
-            "enabled": bool(item.get("enabled", True)),
-        }
-        for item in list_team_execution_profiles(config, team_id)
-        if str(item.get("profile_id") or "").strip()
-    ]
     return {
         "settings": settings,
-        "active_execution_profile_id": str(settings.get("execution_profile_id") or ""),
-        "execution_profiles": team_profiles,
-        "loaded_team_ids": session_loaded_team_ids(settings),
         "effective_main": {
             "provider": effective_main.get("provider"),
             "model": effective_main.get("model"),
@@ -551,7 +399,6 @@ __all__ = [
     "new_chat_llm_defaults_envelope",
     "read_session_llm_settings",
     "resolve_session_effective_main_route",
-    "session_loaded_team_ids",
     "session_llm_settings_envelope",
     "session_main_route_override_for_binding",
     "stamp_new_session_main_route",

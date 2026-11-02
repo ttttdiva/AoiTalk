@@ -1,3 +1,4 @@
+import { measureTaskApi } from "@/lib/server/task-api-measure";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import {
@@ -518,7 +519,7 @@ async function resolveTaskListEffectiveOccurrences(
   return effectiveByTask;
 }
 
-export async function GET(request: NextRequest) {
+async function listTasks(request: NextRequest) {
   const user = await getSession();
   if (!user) {
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
@@ -764,7 +765,7 @@ export async function GET(request: NextRequest) {
   return jsonWithConditional(request, result);
 }
 
-export async function POST(request: NextRequest) {
+async function createTask(request: NextRequest) {
   const user = await getSession();
   if (!user) {
     return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
@@ -909,7 +910,49 @@ export async function POST(request: NextRequest) {
       autoCloseOnDue:
         auto_close_on_due === undefined ? false : Boolean(auto_close_on_due),
     };
-    const task = normalizedParentTaskId
+    const buildResponse = async (tx: Parameters<Parameters<typeof db.transaction>[0]>[0], task: typeof tasks.$inferSelect) => {
+      const result = serializeAutoCloseOnDue(
+        task,
+        taskToSnake(task as unknown as Record<string, unknown>),
+      );
+      result.assignees = normalizedAssigneeIds.map(
+        (userId: string, i: number) => ({
+          id: crypto.randomUUID(),
+          task_id: task.id,
+          user_id: userId,
+          is_primary: i === 0,
+          display_name: userId === user.id ? user.displayName : null,
+          username: userId === user.id ? user.username : null,
+        }),
+      );
+      if (normalizedTagIds.length > 0) {
+        const insertedTags = await tx
+          .select({
+            id: tags.id,
+            spaceId: tags.spaceId,
+            name: tags.name,
+            color: tags.color,
+            createdBy: tags.createdBy,
+            createdAt: tags.createdAt,
+          })
+          .from(taskTags)
+          .innerJoin(tags, eq(taskTags.tagId, tags.id))
+          .where(eq(taskTags.taskId, task.id));
+        result.tags = insertedTags.map((tag) => ({
+          id: tag.id,
+          space_id: tag.spaceId,
+          name: tag.name,
+          color: tag.color,
+          created_by: tag.createdBy,
+          created_at: tag.createdAt,
+        }));
+      } else {
+        result.tags = [];
+      }
+      result.active_time_entry = null;
+      return { task, result };
+    };
+    const { task, result } = normalizedParentTaskId
       ? await db.transaction(async (tx) => {
           // Parent creation and project moves share sorted project advisory
           // locks. Revalidate the parent row while it is locked, then insert
@@ -989,7 +1032,7 @@ export async function POST(request: NextRequest) {
                triggerUserId: user.id,
              });
            }
-           return inserted;
+           return buildResponse(tx, inserted);
         })
       : await db.transaction(async (tx) => {
           await lockTaskProjectIds(tx, [project_id]);
@@ -1041,48 +1084,9 @@ export async function POST(request: NextRequest) {
                triggerUserId: user.id,
              });
            }
-           return inserted;
+           return buildResponse(tx, inserted);
         });
 
-    const result = serializeAutoCloseOnDue(
-      task,
-      taskToSnake(task as unknown as Record<string, unknown>),
-    );
-    result.assignees = normalizedAssigneeIds.map(
-      (userId: string, i: number) => ({
-        id: crypto.randomUUID(),
-        task_id: task.id,
-        user_id: userId,
-        is_primary: i === 0,
-        display_name: userId === user.id ? user.displayName : null,
-        username: userId === user.id ? user.username : null,
-      }),
-    );
-    if (normalizedTagIds.length > 0) {
-      const insertedTags = await db
-        .select({
-          id: tags.id,
-          spaceId: tags.spaceId,
-          name: tags.name,
-          color: tags.color,
-          createdBy: tags.createdBy,
-          createdAt: tags.createdAt,
-        })
-        .from(taskTags)
-        .innerJoin(tags, eq(taskTags.tagId, tags.id))
-        .where(eq(taskTags.taskId, task.id));
-      result.tags = insertedTags.map((tag) => ({
-        id: tag.id,
-        space_id: tag.spaceId,
-        name: tag.name,
-        color: tag.color,
-        created_by: tag.createdBy,
-        created_at: tag.createdAt,
-      }));
-    } else {
-      result.tags = [];
-    }
-    result.active_time_entry = null;
     enqueueAutoSyncGoogleCalendarForTask(task.id, user);
     return NextResponse.json(result);
   } catch (err) {
@@ -1098,4 +1102,12 @@ export async function POST(request: NextRequest) {
     console.error("Task creation error:", err);
     return NextResponse.json({ detail: String(err) }, { status: 500 });
   }
+}
+
+export async function GET(request: NextRequest) {
+  return measureTaskApi("list", () => listTasks(request));
+}
+
+export async function POST(request: NextRequest) {
+  return measureTaskApi("create", () => createTask(request));
 }

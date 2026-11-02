@@ -127,7 +127,8 @@ describe("MediaContentVariantPanel", () => {
     expect(screen.getByLabelText("販売者参照")).toBeInTheDocument();
     await userEvent.click(screen.getByLabelText("AI利用区分"));
     await userEvent.click(await screen.findByRole("option", { name: "一部AI利用" }));
-    expect(screen.getByText(/商品下書きです/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "商品下書きの説明" }));
+    expect(await screen.findByText(/商品下書きです/)).toBeInTheDocument();
     expect(mediaContentApi.createVariant).not.toHaveBeenCalled();
   });
 

@@ -18,6 +18,18 @@ const AUTH_ACTOR_METADATA_KEY = "aoitalk_auth_actor_v1";
 let cachedToken: string | null | undefined;
 let tokenLoadPromise: Promise<string | null> | null = null;
 let tokenRevision = 0;
+let authScopeRevision = 0;
+let knownActor: string | null | undefined;
+const authScopeListeners = new Set<() => void>();
+export const getAuthScopeRevision = (): number => authScopeRevision;
+export function subscribeAuthScope(listener: () => void): () => void {
+  authScopeListeners.add(listener);
+  return () => { authScopeListeners.delete(listener); };
+}
+function invalidateAuthScope(): void {
+  authScopeRevision += 1;
+  authScopeListeners.forEach((listener) => listener());
+}
 let tokenMutationQueue: Promise<void> = Promise.resolve();
 
 function enqueueTokenMutation<T>(mutation: () => Promise<T>): Promise<T> {
@@ -87,6 +99,7 @@ export function saveTokenIfRevision(
 
 /** トークンを削除（ログアウト時） */
 export function removeToken(): Promise<void> {
+  invalidateAuthScope();
   return enqueueTokenMutation(async () => {
     await SecureStore.deleteItemAsync(STORAGE_KEYS.ACCESS_TOKEN);
     tokenRevision += 1;
@@ -127,10 +140,12 @@ export async function saveAuthActor(
   const normalized = normalizeAuthActor(actor);
   const normalizedServer = serverFingerprint.trim();
   if (!normalized || !normalizedServer) throw new Error("認証アカウント情報が不正です");
-  await SecureStore.setItemAsync(
-    AUTH_ACTOR_METADATA_KEY,
-    JSON.stringify({ ...normalized, serverFingerprint: normalizedServer }),
-  );
+  const serialized = JSON.stringify({ ...normalized, serverFingerprint: normalizedServer });
+  const changed = knownActor !== serialized;
+  if (changed) invalidateAuthScope();
+  await SecureStore.setItemAsync(AUTH_ACTOR_METADATA_KEY, serialized);
+  knownActor = serialized;
+  if (changed) invalidateAuthScope();
 }
 
 export type AuthActorReadResult = {
@@ -141,14 +156,16 @@ export type AuthActorReadResult = {
 /** Read actor metadata without exposing credentials; malformed data is absent. */
 export async function readAuthActor(): Promise<AuthActorReadResult> {
   try {
+    const revision = authScopeRevision;
     const raw = await SecureStore.getItemAsync(AUTH_ACTOR_METADATA_KEY);
-    if (!raw) return { readable: true, actor: null };
+    if (!raw) { if (revision === authScopeRevision) knownActor = null; return { readable: true, actor: null }; }
     try {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       const actor = normalizeAuthActor(parsed);
       const serverFingerprint = typeof parsed.serverFingerprint === "string"
         ? parsed.serverFingerprint.trim()
         : "";
+      if (revision === authScopeRevision) knownActor = actor && serverFingerprint ? JSON.stringify({ ...actor, serverFingerprint }) : null;
       return {
         readable: true,
         actor: actor && serverFingerprint
@@ -165,7 +182,10 @@ export async function readAuthActor(): Promise<AuthActorReadResult> {
 
 /** Remove actor metadata when the user explicitly signs out or switches guest. */
 export async function removeAuthActor(): Promise<void> {
+  invalidateAuthScope();
+  knownActor = null;
   await SecureStore.deleteItemAsync(AUTH_ACTOR_METADATA_KEY);
+  invalidateAuthScope();
 }
 
 /** 認証モードを取得 */
@@ -193,7 +213,9 @@ export async function hasStoredToken(): Promise<boolean> {
 
 /** API URLを保存 */
 export async function saveApiUrl(url: string): Promise<void> {
+  invalidateAuthScope();
   await SecureStore.setItemAsync(STORAGE_KEYS.API_URL, normalizeApiUrl(url));
+  invalidateAuthScope();
 }
 
 /** API URLを取得 */
@@ -203,7 +225,9 @@ export async function getApiUrl(): Promise<string | null> {
 
 /** 選択中プロジェクトIDを保存 */
 export async function saveSelectedProjectId(id: string): Promise<void> {
+  invalidateAuthScope();
   await SecureStore.setItemAsync(STORAGE_KEYS.SELECTED_PROJECT_ID, id);
+  invalidateAuthScope();
 }
 
 /** 選択中プロジェクトIDを取得 */
@@ -212,7 +236,9 @@ export async function getSelectedProjectId(): Promise<string | null> {
 }
 
 export async function saveSelectedSpaceId(id: string): Promise<void> {
+  invalidateAuthScope();
   await SecureStore.setItemAsync(STORAGE_KEYS.SELECTED_SPACE_ID, id);
+  invalidateAuthScope();
 }
 
 export async function getSelectedSpaceId(): Promise<string | null> {

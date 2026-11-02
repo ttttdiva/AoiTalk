@@ -710,6 +710,28 @@ class HelperMixin:
                 )
             )
 
+    async def _validate_project_tags(
+        self, session: AsyncSession, *, project_id: UUID, tag_ids: list[UUID]
+    ) -> None:
+        """Lock and validate IDs against the same Space as the tag catalog."""
+        unique_ids = set(tag_ids)
+        if not unique_ids:
+            return
+        project_result = await session.execute(
+            select(Project.space_id).where(Project.id == project_id).with_for_update()
+        )
+        space_id = project_result.scalar_one_or_none()
+        if space_id is None:
+            raise TaskManagementError("Tag not found", status_code=404)
+        result = await session.execute(
+            select(Tag.id)
+            .where(Tag.id.in_(unique_ids), Tag.space_id == space_id)
+            .order_by(Tag.id)
+            .with_for_update()
+        )
+        if set(result.scalars().all()) != unique_ids:
+            raise TaskManagementError("Tag not found", status_code=404)
+
     async def _replace_tags(
         self,
         session: AsyncSession,
@@ -717,6 +739,9 @@ class HelperMixin:
         task: Task,
         tag_ids: list[UUID],
     ) -> None:
+        await self._validate_project_tags(
+            session, project_id=task.project_id, tag_ids=tag_ids
+        )
         await session.execute(delete(TaskTag).where(TaskTag.task_id == task.id))
         seen: set[UUID] = set()
         for tag_id in tag_ids:

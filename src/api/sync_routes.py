@@ -7,7 +7,6 @@ state, and Docs mutations. Remaining tables are pull-only local caches on mobile
 from __future__ import annotations
 
 import base64
-import functools
 import binascii
 import hashlib
 import json
@@ -18,6 +17,7 @@ import secrets
 import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Callable, Literal, Optional
 from uuid import UUID
 
@@ -25,9 +25,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import and_, case, func, literal, or_, select
+from sqlalchemy import and_, case, exists, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from ..memory.models import (
     ConversationMessage,
@@ -37,8 +37,11 @@ from ..memory.models import (
     AgentDialogueInput,
     AgentRun,
     ContentDeletionEvent,
+    KnowledgeNodeSupertag,
+    KnowledgeSupertag,
     KnowledgeNodeShare,
     Project,
+    ProjectMember,
     RecordField,
     RecordRow,
     RecordTable,
@@ -50,21 +53,22 @@ from ..memory.models import (
     TimeEntry,
     KnowledgeNode,
     DocsLibrary,
+    User,
     _session_iso,
     public_session_context,
 )
 from ..memory.project_repository import ProjectRepository
+from ..memory.models.tasks import task_audit_iso
 from ..services.app_storage import get_workspaces_root
 from ..services.docs_graph_service import DocsGraphService
 from ..services.docs_acl import (
-    accessible_project_ids as docs_accessible_project_ids,
+    _project_permission_predicate,
     docs_readable_node_predicate,
     can_read_node,
     library_can_read,
     library_can_write,
 )
 from ..services.task_management_service import TaskManagementError, TaskManagementService
-from ..services.session_llm_runtime import release_session_agent_team_registry
 from ..services.conversation_status import (
     ConversationStatusProjection,
     project_conversation_statuses,
@@ -77,8 +81,8 @@ from ..services.agent_root_lifecycle import (
 )
 from ..services.docs_library_compat import read_docs_library_id
 from ..services.docs_library_compat import with_legacy_docs_library_aliases
-from ..services.docs_workspace import get_project_docs_library
 from ..task_time import DEFAULT_TASK_TIMEZONE
+from ..services.project_permissions import has_effective_project_permission
 from .docs_sync import (
     DOCS_PULL_LIMITS,
     DOCS_SYNC_TABLES,
@@ -91,6 +95,8 @@ from .docs_sync import (
     normalize_docs_body_json,
     pull_cursor_envelope,
     pull_docs_table,
+    pull_docs_project_scope_digests,
+    pull_docs_scope_fast_digests,
     resolve_docs_conflict_library,
 )
 from .routes.tasks._shared import CreateTaskPayload, _parse_timer_datetime
@@ -99,10 +105,33 @@ from .general_sync_digest import (
     pull_general_digest_page,
     valid_general_digest,
 )
+from .general_sync_source_digest import (
+    GENERAL_SOURCE_TOKEN_VERSION,
+    GENERAL_SOURCE_TERMINAL_RECEIPTS_VERSION,
+    GENERAL_ROW_MANIFEST_TABLES,
+    calculate_general_source_digests,
+    general_row_manifest_statement,
+    valid_general_source_digests,
+    _conversation_session_event_expression as _shared_conversation_session_event_expression,
+)
+from .general_message_sync import (
+    GENERAL_MESSAGE_FINGERPRINT_FIELD,
+    GENERAL_MESSAGE_SYNC_VERSION,
+    conversation_message_delta_lower_bound,
+    conversation_message_sync_digest_statement,
+    conversation_message_sync_fingerprint_expression,
+)
 from .uuid_http import parse_uuid_or_400
 from .datetime_utils import parse_utc_naive_datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_session_dialect_name(session: AsyncSession) -> str | None:
+    try:
+        return str(session.get_bind().dialect.name).lower()
+    except Exception:  # noqa: BLE001 - lightweight unit-test sessions may be unbound
+        return None
 
 _SAFE_SYNC_EXCEPTION_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
 _SAFE_SYNC_SQLSTATE_RE = re.compile(r"^[0-9A-Z]{5}$")
@@ -197,6 +226,9 @@ GENERAL_SYNC_PAGE_LIMITS = {
     # Live device data contains multi-megabyte metadata rows; 16 keeps the
     # UTF-16/JSON parse peak below the Android Java-heap growth limit even when
     # a page happens to cluster the largest transcripts.
+    # Message payloads have no hard byte cap. Keep this at 16 rows so several
+    # large encrypted bodies cannot create a multi-megabyte native JSON page;
+    # increase only with a byte-bounded cursor protocol.
     "conversation_messages": 16,
     "record_tables": 100,
     "record_fields": 100,
@@ -226,6 +258,7 @@ class SyncPullPayload(BaseModel):
     """
 
     docs_digests: dict[str, str] = Field(default_factory=dict)
+    docs_fast_digests: dict[str, str] = Field(default_factory=dict)
     docs_cursors: dict[str, str] = Field(default_factory=dict)
     # Optional Docs composite discriminator.  ``project_id`` is meaningful
     # together with ``docs_scope_id`` on the route; non-Docs pull tables keep
@@ -293,6 +326,41 @@ async def _read_pull_docs_digests(request: Request) -> dict[str, str]:
     except Exception:  # noqa: BLE001
         # 不正なボディでも pull 全体は落とさず、従来どおり全量 pull にフォールバックする。
         return {}
+
+
+async def _read_pull_docs_fast_digests(request: Request) -> dict[str, str]:
+    """Read optional row-set receipts used only by upgraded mobile clients."""
+
+    from_query = request.query_params.get("docs_fast_digests")
+    if not from_query:
+        return {}
+    try:
+        return SyncPullPayload.model_validate(
+            {"docs_fast_digests": json.loads(from_query)}
+        ).docs_fast_digests
+    except Exception:  # noqa: BLE001 - invalid receipts fail closed
+        return {}
+
+
+async def _read_pull_docs_fast_digest_bundle(request: Request) -> Optional[str]:
+    """Read the compact v1 row-set receipt bundle from the GET query."""
+
+    value = request.query_params.get("docs_fast_digest_bundle")
+    if value is None or re.fullmatch(r"[a-f0-9]{64}", value) is None:
+        return None
+    return value
+
+
+def _build_docs_fast_digest_bundle(digests: dict[str, str]) -> Optional[str]:
+    """Hash the exact ordered set of per-table Docs row-set receipts."""
+
+    if set(digests) != set(DOCS_SYNC_TABLES):
+        return None
+    if any(re.fullmatch(r"[a-f0-9]{64}", digests[table]) is None
+           for table in DOCS_SYNC_TABLES):
+        return None
+    material = "\n".join(f"{table}:{digests[table]}" for table in DOCS_SYNC_TABLES)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 async def _read_pull_docs_cursors(request: Request) -> dict[str, str]:
@@ -447,6 +515,100 @@ async def _read_pull_general_digests(request: Request) -> dict[str, str]:
     return digests
 
 
+async def _read_pull_general_source_digests(request: Request) -> dict[str, str]:
+    """Read the additive source receipts used by the general-sync fast path."""
+
+    from_query = request.query_params.get("general_source_digests")
+    if from_query is None:
+        return {}
+    try:
+        value = json.loads(from_query)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid general sync source digests") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Invalid general sync source digests")
+    digests = valid_general_source_digests(value, set(GENERAL_SYNC_PAGE_LIMITS))
+    if len(digests) != len(value):
+        raise HTTPException(status_code=400, detail="Invalid general sync source digests")
+    return digests
+
+
+async def _read_pull_general_row_ids(request: Request) -> dict[str, list[UUID]]:
+    raw = request.query_params.get("general_row_ids")
+    if raw is None:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid general row IDs") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Invalid general row IDs")
+    if set(value) - GENERAL_ROW_MANIFEST_TABLES:
+        raise HTTPException(status_code=400, detail="Invalid general row ID table")
+    parsed: dict[str, list[UUID]] = {}
+    total = 0
+    for table, raw_ids in value.items():
+        if not isinstance(raw_ids, list) or len(raw_ids) > 40:
+            raise HTTPException(status_code=400, detail="General row ID limit exceeded")
+        ids: list[UUID] = []
+        for raw_id in raw_ids:
+            if not isinstance(raw_id, str):
+                raise HTTPException(status_code=400, detail="Invalid general row ID")
+            try:
+                entity_id = UUID(raw_id)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid general row ID") from exc
+            if entity_id not in ids:
+                ids.append(entity_id)
+        total += len(ids)
+        if total > 120:
+            raise HTTPException(status_code=400, detail="General row ID limit exceeded")
+        parsed[table] = ids
+    return parsed
+
+
+def _read_pull_general_row_manifest_version(request: Request) -> int:
+    raw = request.query_params.get("general_row_manifest_version", "0")
+    if raw not in ("0", "1"):
+        raise HTTPException(status_code=400, detail="Unsupported general row manifest version")
+    return int(raw)
+
+
+async def _attach_general_row_versions(
+    session: AsyncSession,
+    table: str,
+    payload: dict[str, Any],
+    *,
+    user_id: UUID,
+    project_ids: list[UUID],
+) -> None:
+    ids: list[UUID] = []
+    entries = [
+        *(payload.get("changes") or []),
+        *(payload.get("tombstones") or []),
+    ]
+    for entry in entries:
+        current_version = entry.get("_row_version")
+        if isinstance(current_version, str) and re.fullmatch(r"[a-f0-9]{16}", current_version):
+            continue
+        try:
+            row_id = UUID(str(entry.get("id")))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if row_id not in ids:
+            ids.append(row_id)
+    if not ids:
+        return
+    rows = (await session.execute(general_row_manifest_statement(
+        table, user_id, project_ids, row_ids=ids,
+    ))).all()
+    versions = {str(row.id): str(row.version) for row in rows}
+    for entry in entries:
+        row_id = str(entry.get("id") or "")
+        if row_id in versions:
+            entry["_row_version"] = versions[row_id]
+
+
 def _validate_docs_opaque_token(value: Optional[str], field_name: str) -> Optional[str]:
     """Validate token shape without interpreting its opaque contents."""
 
@@ -463,6 +625,31 @@ def _validate_docs_opaque_token(value: Optional[str], field_name: str) -> Option
     if not token or len(token) > 512 or any(ord(char) < 0x20 for char in token):
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
     return token
+
+
+def _docs_pull_requires_full(
+    *,
+    docs_pagination: bool,
+    current_scope_digest: Optional[str],
+    client_scope_digest: Optional[str],
+    current_scope_revision: Optional[str],
+    client_scope_revision: Optional[str],
+) -> bool:
+    """Keep the paginated Docs delta path behind a verified ACL projection."""
+
+    if not docs_pagination:
+        return False
+    scope_digest_changed = bool(
+        current_scope_digest is not None
+        and client_scope_digest is not None
+        and client_scope_digest != current_scope_digest
+    )
+    scope_revision_unverified = bool(
+        not client_scope_revision
+        or current_scope_revision is None
+        or client_scope_revision != current_scope_revision
+    )
+    return scope_digest_changed or scope_revision_unverified
 
 
 def _parse_datetime(value: Optional[str], field_name: str) -> Optional[datetime]:
@@ -514,10 +701,112 @@ def _ensure_not_stale(
 
 
 async def _accessible_project_ids(session: AsyncSession, user_id: UUID) -> list[UUID]:
-    # Use the shared Project ACL policy rather than raw membership rows.  This
-    # includes project owners and global admins (who need not have a
-    # ProjectMember row), while excluding disabled/read=false memberships.
-    return await docs_accessible_project_ids(session, user_id)
+    # Use the same SQL-native Project ACL predicate as Docs row visibility.
+    # The older helper checked every Project with a separate read/space/member
+    # query, so one mobile pull became O(projects) round trips before it even
+    # started the root Docs request.
+    return list((await session.execute(
+        select(Project.id).where(
+            Project.deleted_at.is_(None),
+            _project_permission_predicate(Project.id, user_id=user_id, required="read"),
+        )
+    )).scalars().all())
+
+
+async def _project_docs_scope_rows(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    project_ids: list[UUID],
+) -> list[tuple[UUID, DocsLibrary, str]]:
+    """Resolve readable Projects and strict Docs pointers with one SQL query."""
+
+    normalized_ids = sorted(set(project_ids), key=str)
+    if not normalized_ids:
+        return []
+    project_node = aliased(KnowledgeNode, name="project_info_node")
+    project_hub = aliased(KnowledgeNode, name="project_info_hub")
+    canonical_tag = exists(
+        select(literal(1))
+        .select_from(KnowledgeNodeSupertag)
+        .join(
+            KnowledgeSupertag,
+            KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+        )
+        .where(
+            KnowledgeNodeSupertag.node_id == project_node.id,
+            KnowledgeSupertag.docs_library_id == DocsLibrary.id,
+            func.btrim(KnowledgeSupertag.system_key) == "project_info",
+        )
+        .correlate(project_node, DocsLibrary)
+    )
+    rows = (
+        await session.execute(
+            select(
+                Project.id,
+                DocsLibrary,
+                Project.owner_id,
+                User.role,
+                ProjectMember.permissions,
+            )
+            .select_from(Project)
+            .join(User, User.id == user_id)
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    ProjectMember.project_id == Project.id,
+                    ProjectMember.user_id == user_id,
+                ),
+            )
+            .join(project_node, project_node.id == Project.knowledge_node_id)
+            .join(DocsLibrary, DocsLibrary.id == project_node.docs_library_id)
+            .join(project_hub, project_hub.id == project_node.parent_id)
+            .where(
+                Project.id.in_(normalized_ids),
+                Project.deleted_at.is_(None),
+                _project_permission_predicate(
+                    Project.id,
+                    user_id=user_id,
+                    required="read",
+                ),
+                project_node.project_id == Project.id,
+                project_node.archived_at.is_(None),
+                project_node.is_explicit_blank.is_not(True),
+                project_node.node_type == "node",
+                func.btrim(project_node.system_key)
+                == func.concat(literal("project_information:"), Project.id),
+                project_node.parent_id.is_not(None),
+                project_node.root_page_id == project_node.parent_id,
+                func.lower(func.btrim(func.coalesce(DocsLibrary.library_type, "personal")))
+                == "personal",
+                DocsLibrary.owner_user_id == Project.owner_id,
+                project_hub.docs_library_id == DocsLibrary.id,
+                project_hub.archived_at.is_(None),
+                project_hub.is_explicit_blank.is_not(True),
+                project_hub.node_type == "node",
+                func.btrim(project_hub.system_key) == "project_information_root",
+                project_hub.parent_id.is_(None),
+                project_hub.project_id.is_(None),
+                or_(
+                    project_hub.root_page_id.is_(None),
+                    project_hub.root_page_id == project_hub.id,
+                ),
+                func.btrim(project_hub.title) == "案件情報",
+                canonical_tag,
+            )
+        )
+    ).all()
+    scopes: list[tuple[UUID, DocsLibrary, str]] = []
+    for project_id, library, owner_id, role, member_permissions in rows:
+        write_access = has_effective_project_permission(
+            user_id=user_id,
+            user_role=role,
+            project_owner_id=owner_id,
+            member_permissions=member_permissions,
+            permission="write",
+        )
+        scopes.append((project_id, library, "write" if write_access else "read"))
+    return sorted(scopes, key=lambda item: str(item[0]))
 
 
 async def _docs_sync_scopes(
@@ -544,34 +833,16 @@ async def _docs_sync_scopes(
         if personal_library is not None
         else {}
     )
-    project_scopes: list[tuple[UUID, DocsLibrary, str]] = []
-    if project_ids:
-        # Project Docs now live in the owner's Personal Library.  A Project
-        # member must still receive a project-scoped entry even though
-        # ``library_can_read`` is (correctly) owner-only for Personal
-        # libraries.  Resolve through the SELECT-only pointer validator so a
-        # stale/malformed project pointer is never advertised.
-        for project_id in sorted(set(project_ids), key=str):
-            try:
-                library = await get_project_docs_library(
-                    session,
-                    project_id=project_id,
-                    actor_user_id=user_id,
-                )
-            except (PermissionError, ValueError):
-                library = None
-            if library is None:
-                continue
-            can_write = await ProjectRepository.has_permission(
-                session,
-                project_id=project_id,
-                user_id=user_id,
-                permission="write",
-            )
-            libraries[library.id] = library
-            project_scopes.append(
-                (project_id, library, "write" if can_write else "read")
-            )
+    # Project Docs now live in the owner's Personal Library. Resolve all
+    # readable Projects and their strict canonical pointers in one read query;
+    # stale or malformed pointers are omitted rather than advertised.
+    project_scopes = await _project_docs_scope_rows(
+        session,
+        user_id=user_id,
+        project_ids=project_ids,
+    )
+    for _, library, _ in project_scopes:
+        libraries[library.id] = library
 
     shared_query = (
         select(DocsLibrary, KnowledgeNodeShare.permission)
@@ -1210,6 +1481,7 @@ async def _pull_tasks(
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
+    row_ids: Optional[list[UUID]] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
@@ -1223,6 +1495,8 @@ async def _pull_tasks(
         )
         .where(Task.project_id.in_(project_ids))
     )
+    if row_ids is not None:
+        stmt = stmt.where(Task.id.in_(row_ids))
     if general_pagination:
         if general_snapshot_at is None:
             raise ValueError("General sync snapshot is missing")
@@ -1372,6 +1646,10 @@ async def _pull_tasks(
         ContentDeletionEvent.project_id.in_(project_ids),
         ContentDeletionEvent.action.in_(("deleted", "purged", "permanent_deleted")),
     )
+    if row_ids is not None:
+        ledger_stmt = ledger_stmt.where(
+            ContentDeletionEvent.entity_id.in_([str(row_id) for row_id in row_ids])
+        )
     if since:
         ledger_stmt = ledger_stmt.where(ContentDeletionEvent.event_at > since)
     if general_pagination:
@@ -1430,6 +1708,7 @@ async def _pull_occurrences(
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
+    row_ids: Optional[list[UUID]] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
@@ -1444,6 +1723,8 @@ async def _pull_occurrences(
         )
         .where(Task.project_id.in_(project_ids))
     )
+    if row_ids is not None:
+        stmt = stmt.where(TaskOccurrence.id.in_(row_ids))
     if general_pagination:
         if general_snapshot_at is None:
             raise ValueError("General sync snapshot is missing")
@@ -1485,6 +1766,7 @@ async def _pull_time_entries(
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
+    row_ids: Optional[list[UUID]] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
@@ -1498,6 +1780,8 @@ async def _pull_time_entries(
         )
         .where(Task.project_id.in_(project_ids))
     )
+    if row_ids is not None:
+        stmt = stmt.where(TimeEntry.id.in_(row_ids))
     if general_pagination:
         if general_snapshot_at is None:
             raise ValueError("General sync snapshot is missing")
@@ -1529,111 +1813,10 @@ async def _pull_time_entries(
     return _split_changes(rows)
 
 
-def _max_datetime_expression(values: list[Any]) -> Any:
-    """Return a NULL-free maximum without expanding a nested CASE tree.
-
-    PostgreSQL's ``GREATEST`` and the SQLite test adapter both ignore NULL
-    arguments, while the explicit ``coalesce`` keeps the behavior consistent
-    for any dialect that does not.  A nested CASE implementation grows
-    exponentially once the status dependency clocks are added and can exceed
-    SQLite's bound-variable limit.
-    """
-
-    normalized = [func.coalesce(value, literal(datetime.min)) for value in values]
-    return func.greatest(*normalized)
-
-
-def _conversation_dependency_event_values() -> list[Any]:
-    """Return status-source clocks correlated to the outer session row.
-
-    Status transitions are intentionally not written back to
-    ``conversation_sessions``.  These scalar aggregates keep the existing
-    session pull contract while making a Run/dialogue-only mutation visible to
-    both the legacy ``since`` poll and bounded general pagination.
-    """
-
-    run_scope = AgentRun.session_id == ConversationSession.id
-    dialogue_scope = or_(
-        AgentDialogue.root_session_id == ConversationSession.id,
-        AgentDialogue.worker_session_id == ConversationSession.id,
-    )
-    input_scope = or_(
-        AgentDialogue.root_session_id == ConversationSession.id,
-        and_(
-            AgentDialogue.worker_session_id == ConversationSession.id,
-            AgentRun.session_id == AgentDialogue.worker_session_id,
-        ),
-    )
-
-    def aggregate(columns: tuple[Any, ...], *, source: Any, where: Any, joins=()) -> Any:
-        statement = select(func.max(_max_datetime_expression(list(columns)))).select_from(source)
-        for join in joins:
-            target, on_clause, isouter = join
-            statement = statement.join(target, on_clause, isouter=isouter)
-        return statement.where(where).correlate(ConversationSession).scalar_subquery()
-
-    return [
-        aggregate(
-            (
-                AgentRun.created_at,
-                AgentRun.updated_at,
-                AgentRun.last_event_at,
-                AgentRun.ended_at,
-            ),
-            source=AgentRun,
-            where=run_scope,
-        ),
-        aggregate(
-            (AgentDialogue.created_at, AgentDialogue.updated_at),
-            source=AgentDialogue,
-            where=dialogue_scope,
-        ),
-        aggregate(
-            (AgentDialogueInput.created_at, AgentDialogueInput.updated_at),
-            source=AgentDialogueInput,
-            where=input_scope,
-            joins=(
-                (
-                    AgentDialogue,
-                    AgentDialogue.id == AgentDialogueInput.dialogue_id,
-                    False,
-                ),
-                (
-                    AgentRun,
-                    AgentRun.id == AgentDialogueInput.source_run_id,
-                    True,
-                ),
-            ),
-        ),
-        aggregate(
-            (
-                ConversationMessage.created_at,
-                ConversationMessage.updated_at,
-                ConversationMessage.deleted_at,
-            ),
-            source=ConversationMessage,
-            where=ConversationMessage.session_id == ConversationSession.id,
-        ),
-    ]
-
-
 def _conversation_session_event_expression() -> Any:
-    """Return one effective mutation clock for session sync.
+    """Use the shared event expression for pulls and row manifests."""
 
-    The dependency clocks are additive.  Existing session timestamps remain in
-    the expression so old rows and read/pin mutations preserve their ordering.
-    """
-
-    values = [
-        ConversationSession.last_activity,
-        ConversationSession.last_read_at,
-        ConversationSession.pin_updated_at,
-        ConversationSession.agent_binding_updated_at,
-        ConversationSession.session_start,
-        ConversationSession.deleted_at,
-    ]
-    values.extend(_conversation_dependency_event_values())
-    return _max_datetime_expression(values)
+    return _shared_conversation_session_event_expression()
 
 
 def _conversation_rows_with_event(result: Any) -> list[ConversationSession]:
@@ -1709,11 +1892,17 @@ async def _pull_conversation_sessions(
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
+    row_ids: Optional[list[UUID]] = None,
+    include_participants: bool = False,
 ) -> dict[str, Any]:
     visibility = _conversation_visibility_filter(user_id, project_ids or [])
 
     def build_statement() -> Any:
         stmt = select(ConversationSession).where(visibility)
+        if include_participants or row_ids is not None:
+            stmt = stmt.options(selectinload(ConversationSession.participants))
+        if row_ids is not None:
+            stmt = stmt.where(ConversationSession.id.in_(row_ids))
         session_event = _conversation_session_event_expression()
         if general_pagination:
             if general_snapshot_at is None:
@@ -1811,6 +2000,8 @@ async def _pull_conversation_sessions(
             ]
         return payload
 
+    if row_ids is not None:
+        return payload
     active_ids_result = await session.execute(
         select(ConversationSession.id).where(
             visibility,
@@ -1830,18 +2021,27 @@ async def _pull_conversation_messages(
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
+    include_sync_fingerprint: bool = False,
 ) -> dict[str, Any]:
     stmt = (
-        select(ConversationMessage)
-        .join(
-            ConversationSession,
-            ConversationMessage.session_id == ConversationSession.id,
+        select(
+            ConversationMessage,
+            conversation_message_sync_fingerprint_expression().label(
+                GENERAL_MESSAGE_FINGERPRINT_FIELD
+            ),
         )
-        .where(_conversation_visibility_filter(user_id, project_ids or []))
+        if include_sync_fingerprint
+        else select(ConversationMessage)
+    ).join(
+        ConversationSession,
+        ConversationMessage.session_id == ConversationSession.id,
+    ).where(
+        _conversation_visibility_filter(user_id, project_ids or [])
     )
     if general_pagination:
         if general_snapshot_at is None:
             raise ValueError("General sync snapshot is missing")
+        stmt = stmt.where(ConversationSession.deleted_at.is_(None))
         stmt = _general_page_statement(
             stmt,
             ConversationMessage,
@@ -1863,15 +2063,33 @@ async def _pull_conversation_messages(
             SYNC_PULL_LIMITS["conversation_messages"]
         )
     result = await session.execute(stmt)
-    rows = list(result.scalars().unique().all())
+    if include_sync_fingerprint:
+        selected = result.unique().all()
+        rows = []
+        for item in selected:
+            row = item[0]
+            setattr(row, GENERAL_MESSAGE_FINGERPRINT_FIELD, item[1])
+            rows.append(row)
+    else:
+        rows = list(result.scalars().unique().all())
     if general_pagination:
-        return _general_page_payload(
+        payload = _general_page_payload(
             rows,
             table="conversation_messages",
             limit=GENERAL_SYNC_PAGE_LIMITS["conversation_messages"],
             splitter=_split_changes,
             event_getter=_row_general_event_at,
         )
+        if include_sync_fingerprint:
+            fingerprints = {
+                str(row.id): getattr(row, GENERAL_MESSAGE_FINGERPRINT_FIELD, None)
+                for row in rows[: GENERAL_SYNC_PAGE_LIMITS["conversation_messages"]]
+            }
+            for item in [*payload["changes"], *payload["tombstones"]]:
+                fingerprint = fingerprints.get(str(item.get("id")))
+                if isinstance(fingerprint, str):
+                    item[GENERAL_MESSAGE_FINGERPRINT_FIELD] = fingerprint
+        return payload
     return _split_changes(rows)
 
 
@@ -2030,6 +2248,8 @@ async def _pull_table(
     general_pagination: bool = False,
     general_cursor: Optional[str] = None,
     general_snapshot_at: Optional[datetime] = None,
+    general_row_ids: Optional[list[UUID]] = None,
+    general_row_manifest: bool = False,
 ) -> dict[str, Any]:
     if table in DOCS_SYNC_TABLES:
         if docs_docs_library_id is None:
@@ -2082,6 +2302,7 @@ async def _pull_table(
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
+            row_ids=general_row_ids,
         )
     if table == "task_occurrences":
         return await _pull_occurrences(
@@ -2091,6 +2312,7 @@ async def _pull_table(
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
+            row_ids=general_row_ids,
         )
     if table == "time_entries":
         return await _pull_time_entries(
@@ -2100,6 +2322,7 @@ async def _pull_table(
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
+            row_ids=general_row_ids,
         )
     if table == "conversation_sessions":
         return await _pull_conversation_sessions(
@@ -2110,6 +2333,8 @@ async def _pull_table(
             general_pagination=general_pagination,
             general_cursor=general_cursor,
             general_snapshot_at=general_snapshot_at,
+            row_ids=general_row_ids,
+            include_participants=general_row_manifest,
         )
     if table == "conversation_messages":
         return await _pull_conversation_messages(
@@ -2284,7 +2509,7 @@ def _task_tombstone_payload(task: Task) -> dict[str, Any]:
     return {
         "id": str(task.id),
         "task_id": str(task.id),
-        "updated_at": _iso(task.updated_at),
+        "updated_at": task_audit_iso(task.updated_at),
         "deleted_at": _iso(task.deleted_at),
         "deletion_batch_id": (
             str(task.deletion_batch_id)
@@ -2633,20 +2858,9 @@ async def _apply_conversation_session_operation(
             if commit:
                 await session.commit()
                 await session.refresh(existing)
-                release_session_agent_team_registry(
-                    str(existing.user_id) if existing.user_id is not None else None,
-                    str(existing.id),
-                )
             else:
                 await session.flush()
                 await session.refresh(existing)
-                after_commit.append(
-                    functools.partial(
-                        release_session_agent_team_registry,
-                        str(existing.user_id) if existing.user_id is not None else None,
-                        str(existing.id),
-                    )
-                )
         payload = _conversation_session_payload(existing)
         payload["idempotent"] = True
         return payload
@@ -3333,8 +3547,11 @@ def create_sync_router(
         general_snapshot_token: Optional[str] = None,
         _auth=Depends(require_auth_dependency),
     ):
+        request_started_at = perf_counter()
         user_id, _ = await _get_current_user(request)
         docs_digests = await _read_pull_docs_digests(request)
+        docs_fast_digests = await _read_pull_docs_fast_digests(request)
+        docs_fast_digest_bundle = await _read_pull_docs_fast_digest_bundle(request)
         docs_cursors = await _read_pull_docs_cursors(request)
         body_snapshot_token = await _read_pull_docs_snapshot_token(request)
         body_scope_revision = await _read_pull_docs_scope_revision(request)
@@ -3342,11 +3559,77 @@ def create_sync_router(
         body_docs_scope_id = await _read_pull_docs_scope_id(request)
         parsed_general_cursors = await _read_pull_general_cursors(request)
         parsed_general_digests = await _read_pull_general_digests(request)
+        include_docs_project_digests = request.query_params.get(
+            "include_docs_project_digests", "0"
+        ).lower() in ("1", "true")
+        docs_fast_digest_version = request.query_params.get(
+            "docs_fast_digest_version", "0"
+        )
+        if docs_fast_digest_version not in ("0", "1"):
+            raise HTTPException(status_code=400, detail="Unsupported Docs fast digest version")
+        include_docs_fast_digests = docs_fast_digest_version == "1"
+        docs_project_fast_baseline = request.query_params.get(
+            "docs_project_fast_baseline", "0"
+        ).lower() in ("1", "true")
         # Like docs_digests, this additive optional protocol is read directly
         # from Request so the existing generated endpoint signature stays intact.
         general_digest_version = request.query_params.get("general_digest_version", "0")
         if general_digest_version not in ("0", str(GENERAL_DIGEST_VERSION)):
             raise HTTPException(status_code=400, detail="Unsupported general sync digest version")
+        general_source_token_version = request.query_params.get(
+            "general_source_token_version", "0"
+        )
+        if general_source_token_version not in (
+            "0", str(GENERAL_SOURCE_TOKEN_VERSION)
+        ):
+            raise HTTPException(status_code=400, detail="Unsupported general source token version")
+        general_source_terminal_receipts = request.query_params.get(
+            "general_source_terminal_receipts", "0"
+        )
+        if general_source_terminal_receipts not in ("0", "1"):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported general source terminal receipts version",
+            )
+        general_row_manifest_enabled = (
+            _read_pull_general_row_manifest_version(request) == 1
+        )
+        parsed_general_row_ids = await _read_pull_general_row_ids(request)
+        parsed_general_source_digests = (
+            await _read_pull_general_source_digests(request)
+            if general_source_token_version == str(GENERAL_SOURCE_TOKEN_VERSION)
+            else {}
+        )
+        general_message_sync_version = request.query_params.get(
+            "general_message_sync_version", "0"
+        )
+        if general_message_sync_version not in (
+            "0", str(GENERAL_MESSAGE_SYNC_VERSION)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported general message sync version",
+            )
+        general_message_sync_digest = request.query_params.get(
+            "general_message_sync_digest"
+        )
+        if general_message_sync_digest is not None and re.fullmatch(
+            r"[a-f0-9]{32}", general_message_sync_digest
+        ) is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid general message sync digest",
+            )
+        general_message_sync_since_raw = request.query_params.get(
+            "general_message_sync_since"
+        )
+        general_message_sync_since = _parse_datetime(
+            general_message_sync_since_raw,
+            "general_message_sync_since",
+        )
+        general_message_sync_full = request.query_params.get(
+            "general_message_sync_full", "0"
+        ).lower() in ("1", "true")
         requested_general_snapshot_token = (
             general_snapshot_token
             or await _read_pull_general_snapshot_token(request)
@@ -3375,6 +3658,8 @@ def create_sync_router(
         unsupported = [table for table in requested if table not in SYNC_TABLES]
         if unsupported:
             raise HTTPException(status_code=400, detail=f"Unsupported tables: {unsupported}")
+        if set(parsed_general_row_ids) - set(requested):
+            raise HTTPException(status_code=400, detail="General row ID table was not requested")
         unsupported_general = [
             table
             for table in parsed_general_cursors
@@ -3398,15 +3683,38 @@ def create_sync_router(
                 and general_digest_version == str(GENERAL_DIGEST_VERSION)
                 and since_dt is None
             )
+            general_source_token_enabled = (
+                general_requested
+                and general_source_token_version == str(GENERAL_SOURCE_TOKEN_VERSION)
+                and since_dt is None
+            )
+            general_source_terminal_receipts_enabled = (
+                general_source_token_enabled
+                and general_source_terminal_receipts == "1"
+            )
+            general_message_sync_enabled = (
+                general_requested
+                and "conversation_messages" in requested
+                and general_message_sync_version == str(GENERAL_MESSAGE_SYNC_VERSION)
+                and _sync_session_dialect_name(session) == "postgresql"
+            )
+            general_message_sync_elapsed_ms = 0.0
+            general_message_sync_not_modified = False
+            general_message_sync_delta = False
+            general_source_not_modified_tables: set[str] = set()
+            general_source_token_starts: dict[str, str] = {}
+            general_source_receipts: dict[str, str] = {}
+            general_source_unstable_tables: set[str] = set()
+            general_source_digest_elapsed_ms = 0.0
             general_snapshot_at: Optional[datetime] = None
             general_snapshot_scope: Optional[str] = None
             # Application timestamps are assigned before the first database
             # write and therefore cannot prove commit ordering.  General v1
             # deliberately keeps the wall-clock page boundary only for
             # bounded traversal; completion never acknowledges it as an
-            # incremental watermark.  Every completed run replays from
-            # ``since=null`` on the next request, which is lossless even when
-            # a writer obtains its XID after page 1 has advanced.
+            # incremental watermark.  Opt-in MVCC source receipts can skip an
+            # unchanged projection.  A missing, changed, or unstable receipt
+            # keeps the lossless full replay path, including late commits.
             general_snapshot_stable = False
             general_watermark: Optional[datetime] = None
             if general_requested:
@@ -3432,8 +3740,9 @@ def create_sync_router(
                     # boundary and replay watermark.
                     server_time = general_snapshot_at
                     general_snapshot_token = requested_general_snapshot_token
-            await ProjectRepository.ensure_user_inbox_setup(session, user_id)
-            await session.commit()
+            if not parsed_general_row_ids:
+                await ProjectRepository.ensure_user_inbox_setup(session, user_id)
+                await session.commit()
             project_ids = await _accessible_project_ids(session, user_id)
             if general_requested:
                 current_general_scope = _general_scope_fingerprint(user_id, project_ids)
@@ -3463,13 +3772,63 @@ def create_sync_router(
                         watermark=general_watermark,
                         stable=general_snapshot_stable,
                     )
+                if general_source_token_enabled:
+                    requested_general_tables = [
+                        table for table in requested
+                        if table in GENERAL_SYNC_PAGE_LIMITS
+                    ]
+                    if requested_general_snapshot_token:
+                        # On a continuation page these are the source receipts
+                        # captured before page one.  Do not replace them with
+                        # current values: a mid-run write must invalidate the
+                        # completed receipt at the terminal page.
+                        if general_source_terminal_receipts_enabled:
+                            # Preserve starts for every projection, including
+                            # tables whose cursor finished on an earlier page.
+                            # Their receipt is not safe to acknowledge until
+                            # the whole multi-table replay reaches its terminal
+                            # page.
+                            general_source_token_starts = dict(
+                                parsed_general_source_digests
+                            )
+                        else:
+                            general_source_token_starts = {
+                                table: parsed_general_source_digests[table]
+                                for table in requested_general_tables
+                                if table in parsed_general_source_digests
+                            }
+                    else:
+                        digest_started_at = perf_counter()
+                        current_source_digests = await calculate_general_source_digests(
+                            session,
+                            user_id=user_id,
+                            project_ids=project_ids,
+                            scope_fingerprint=current_general_scope,
+                        )
+                        general_source_digest_elapsed_ms += (
+                            perf_counter() - digest_started_at
+                        ) * 1000
+                        for table in requested_general_tables:
+                            current_digest = current_source_digests[table]
+                            if parsed_general_source_digests.get(table) == current_digest:
+                                general_source_not_modified_tables.add(table)
+                                general_source_receipts[table] = current_digest
+                            else:
+                                general_source_token_starts[table] = current_digest
             # Docs テーブルが要求された場合のみ library を解決する。
             docs_docs_library_id: Optional[UUID] = None
             docs_project_id: Optional[UUID] = None
+            docs_library_owner_id: Optional[UUID] = None
+            docs_project_scope_ids: list[UUID] = []
+            docs_project_scope_groups: dict[str, list[UUID]] = {}
+            docs_project_scope_revisions: dict[str, str] = {}
             docs_scopes: list[dict[str, Any]] = []
             docs_revision_scopes: list[dict[str, Any]] = []
             docs_acl_entries: list[tuple[Any, Any]] = []
+            docs_project_acl_entries: dict[str, list[tuple[Any, Any]]] | None = None
+            docs_acl_lookup_elapsed_ms = 0.0
             if any(table in DOCS_SYNC_TABLES for table in requested):
+                docs_acl_lookup_started = perf_counter()
                 docs_service = DocsGraphService(session)
                 if docs_scope_id:
                     try:
@@ -3588,6 +3947,7 @@ def create_sync_router(
                 else:
                     library = await docs_service.ensure_library(user_id)
                 docs_docs_library_id = library.id
+                docs_library_owner_id = getattr(library, "owner_user_id", None)
                 personal_library = (
                     library
                     if library.owner_user_id == user_id
@@ -3599,6 +3959,31 @@ def create_sync_router(
                     project_ids=project_ids,
                     personal_library=personal_library,
                 )
+                if docs_project_id is None:
+                    for scope in docs_scopes:
+                        if scope.get("source") != "project" or not scope.get("project_id"):
+                            continue
+                        library_key = str(
+                            scope.get("docs_library_id") or scope.get("workspace_id") or ""
+                        )
+                        if not library_key:
+                            continue
+                        try:
+                            scoped_project_id = UUID(str(scope["project_id"]))
+                        except (TypeError, ValueError):
+                            continue
+                        docs_project_scope_groups.setdefault(library_key, []).append(
+                            scoped_project_id
+                        )
+                    docs_project_scope_groups = {
+                        library_key: sorted(set(project_ids), key=str)
+                        for library_key, project_ids in docs_project_scope_groups.items()
+                    }
+                    docs_project_scope_ids = sorted({
+                        project_id
+                        for project_ids in docs_project_scope_groups.values()
+                        for project_id in project_ids
+                    }, key=str)
                 # The authoritative response advertises the complete active
                 # set, but each cursor/revision must hash only the selected
                 # composite scope.  Otherwise Project A ACL changes would
@@ -3630,6 +4015,8 @@ def create_sync_router(
                     try:
                         acl_stmt = (
                             select(
+                                KnowledgeNode.docs_library_id,
+                                KnowledgeNode.project_id,
                                 KnowledgeNodeShare.node_id,
                                 KnowledgeNodeShare.permission,
                             )
@@ -3639,26 +4026,55 @@ def create_sync_router(
                             )
                             .where(
                                 KnowledgeNodeShare.user_id == user_id,
-                                KnowledgeNode.docs_library_id == docs_docs_library_id,
                             )
                         )
                         if docs_project_id is not None:
                             acl_stmt = acl_stmt.where(
-                                KnowledgeNode.project_id == docs_project_id
+                                KnowledgeNode.docs_library_id == docs_docs_library_id,
+                                KnowledgeNode.project_id == docs_project_id,
+                            )
+                        else:
+                            project_scope_library_ids = {
+                                UUID(library_key)
+                                for library_key in docs_project_scope_groups
+                            }
+                            project_scope_library_ids.add(docs_docs_library_id)
+                            acl_stmt = acl_stmt.where(
+                                KnowledgeNode.docs_library_id.in_(
+                                    sorted(project_scope_library_ids, key=str)
+                                )
                             )
                         acl_rows = await session.execute(acl_stmt)
-                        docs_acl_entries = list(acl_rows.all())
+                        acl_rows_with_projects = list(acl_rows.all())
+                        if docs_project_id is None:
+                            docs_project_acl_entries = {}
+                            for row in acl_rows_with_projects:
+                                if row[0] == docs_docs_library_id:
+                                    docs_acl_entries.append((row[2], row[3]))
+                                if row[1] is None:
+                                    continue
+                                docs_project_acl_entries.setdefault(str(row[1]), []).append(
+                                    (row[2], row[3])
+                                )
+                        else:
+                            docs_acl_entries = [(row[2], row[3]) for row in acl_rows_with_projects]
                     except Exception:  # noqa: BLE001
                         # A rolling deployment may not have the optional
                         # share table yet. The SQL-native pull ACL remains
                         # fail-closed; omit only the additive revision input.
                         docs_acl_entries = []
+                        docs_project_acl_entries = None
                 # Materialize all library metadata before commit; the async
                 # session may expire ORM attributes on commit.
                 await session.commit()
+                docs_acl_lookup_elapsed_ms = round(
+                    (perf_counter() - docs_acl_lookup_started) * 1000,
+                    1,
+                )
             docs_scope_project_ids = (
                 [docs_project_id] if docs_project_id is not None else []
             )
+            docs_scope_revision_started = perf_counter()
             current_docs_scope_digest = (
                 calculate_docs_scope_digest(
                     docs_docs_library_id,
@@ -3667,6 +4083,10 @@ def create_sync_router(
                 )
                 if docs_pagination and docs_docs_library_id is not None
                 else None
+            )
+            docs_scope_revision_elapsed_ms = round(
+                (perf_counter() - docs_scope_revision_started) * 1000,
+                1,
             )
             current_docs_scope_revision = (
                 calculate_docs_scope_revision(
@@ -3765,30 +4185,321 @@ def create_sync_router(
                 current_docs_scope_revision = None
             # A v2 client may have a legacy last-pulled timestamp but no
             # additive ACL revision (and sometimes no per-table digest at all).
-            # Since cannot safely describe ACL-visible historical rows, so the
+            # Since cannot safely describe ACL-visible historical rows, the
             # first revision-less paginated pull must rebuild the visible set.
             # Once the server returns a revision, new clients echo it on
             # continuation and retain the normal since optimization.
-            legacy_docs_without_revision = bool(
-                docs_pagination and not docs_scope_revision
+            # Node digest mismatches may use the bounded ``since`` delta only
+            # after the caller has supplied the current ACL revision.  A
+            # missing or stale revision must rebuild/restart the visible set;
+            # this also keeps old v2 clients on the safe full-pull path.
+            force_docs_full = _docs_pull_requires_full(
+                docs_pagination=docs_pagination,
+                current_scope_digest=current_docs_scope_digest,
+                client_scope_digest=docs_scope_digest,
+                current_scope_revision=current_docs_scope_revision,
+                client_scope_revision=docs_scope_revision,
             )
-            force_docs_full = bool(
-                docs_pagination
-                and current_docs_scope_digest is not None
-                and docs_scope_digest is not None
-                and docs_scope_digest != current_docs_scope_digest
-            ) or legacy_docs_without_revision
+            docs_fast_scope_digests: dict[
+                tuple[str, str | None], dict[str, dict[str, Any]]
+            ] = {}
+            docs_fast_scope_groups: list[
+                tuple[UUID, UUID | None, list[UUID], bool]
+            ] = []
+            docs_fast_digest_started = perf_counter()
+            if (
+                include_docs_fast_digests
+                and docs_pagination
+                and docs_docs_library_id is not None
+                and (docs_scope_id is None or docs_project_id is not None)
+            ):
+                if docs_project_id is not None:
+                    docs_fast_scope_groups.append((
+                        docs_docs_library_id,
+                        docs_library_owner_id,
+                        [docs_project_id],
+                        False,
+                    ))
+                else:
+                    project_ids_by_library = {
+                        library_key: list(grouped_ids)
+                        for library_key, grouped_ids in docs_project_scope_groups.items()
+                    }
+                    project_ids_by_library.setdefault(str(docs_docs_library_id), [])
+                    for library_key, grouped_project_ids in project_ids_by_library.items():
+                        try:
+                            grouped_library_id = UUID(library_key)
+                        except (TypeError, ValueError):
+                            continue
+                        if grouped_library_id == docs_docs_library_id:
+                            grouped_owner_id = docs_library_owner_id
+                        else:
+                            grouped_library = await session.get(DocsLibrary, grouped_library_id)
+                            if grouped_library is None:
+                                continue
+                            grouped_owner_id = getattr(grouped_library, "owner_user_id", None)
+                        docs_fast_scope_groups.append((
+                            grouped_library_id,
+                            grouped_owner_id,
+                            grouped_project_ids,
+                            grouped_library_id == docs_docs_library_id,
+                        ))
+                if docs_fast_scope_groups:
+                    try:
+                        docs_fast_scope_digests = await pull_docs_scope_fast_digests(
+                            session,
+                            user_id=user_id,
+                            scope_groups=docs_fast_scope_groups,
+                        )
+                    except Exception as fast_digest_exc:  # noqa: BLE001 - legacy pull remains the fallback
+                        docs_fast_scope_digests = {}
+                        logger.warning(
+                            "Docs fast digest unavailable: %s",
+                            type(fast_digest_exc).__name__,
+                        )
+                    logger.info(
+                        "Docs fast digest diagnostic %s",
+                        json.dumps(
+                            {
+                                "scope_groups": len(docs_fast_scope_groups),
+                                "scopes": len(docs_fast_scope_digests),
+                                "elapsed_ms": round(
+                                    (perf_counter() - docs_fast_digest_started) * 1000,
+                                    1,
+                                ),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+            fast_scope_key = (
+                str(docs_docs_library_id),
+                str(docs_project_id) if docs_project_id is not None else None,
+            )
+            current_fast_table_digests = docs_fast_scope_digests.get(fast_scope_key, {})
+            current_fast_digests = {
+                table: payload["digest"]
+                for table, payload in current_fast_table_digests.items()
+                if isinstance(payload.get("digest"), str)
+            }
+            current_fast_digest_bundle = _build_docs_fast_digest_bundle(current_fast_digests)
+            fast_digest_matches = (
+                include_docs_fast_digests
+                and set(current_fast_digests) == set(DOCS_SYNC_TABLES)
+                and (
+                    docs_fast_digest_bundle == current_fast_digest_bundle
+                    if docs_fast_digest_bundle is not None
+                    else (
+                        set(docs_fast_digests) == set(DOCS_SYNC_TABLES)
+                        and all(
+                            docs_fast_digests.get(table) == current_fast_digests.get(table)
+                            for table in DOCS_SYNC_TABLES
+                        )
+                    )
+                )
+            )
+            fast_scope_revision_matches = (
+                current_docs_scope_digest is not None
+                and current_docs_scope_revision is not None
+                and docs_scope_digest == current_docs_scope_digest
+                and docs_scope_revision == current_docs_scope_revision
+            )
+            docs_fast_noop = (
+                fast_digest_matches
+                and fast_scope_revision_matches
+                and not force_docs_full
+                and not docs_cursors
+                and docs_reconcile
+                and all(table in requested for table in DOCS_SYNC_TABLES)
+                and not any(table not in DOCS_SYNC_TABLES for table in requested)
+                and (
+                    docs_fast_digest_bundle is not None
+                    or all(bool(docs_digests.get(table)) for table in DOCS_SYNC_TABLES)
+                )
+            )
             pulled = {}
+            docs_table_diagnostics: list[dict[str, Any]] = []
             for table in requested:
+                docs_table_started = perf_counter() if table in DOCS_SYNC_TABLES else None
+                if docs_fast_noop and table in DOCS_SYNC_TABLES:
+                    pulled[table] = {
+                        "changes": [],
+                        "tombstones": [],
+                        "cursor": None,
+                        "authoritative_count": current_fast_table_digests[table]["count"],
+                        # Preserve a legacy echo when one was sent. New clients
+                        # can omit that larger map because the bundle already
+                        # proves the row set unchanged.
+                        "authoritative_digest": docs_digests.get(table),
+                    }
+                    docs_table_diagnostics.append({
+                        "table": table,
+                        "elapsed_ms": 0.0,
+                        "changes": 0,
+                        "authoritative_ids": 0,
+                        "path": "fast_noop",
+                    })
+                    continue
                 table_is_general = general_requested and table in GENERAL_SYNC_PAGE_LIMITS
+                message_sync_table = (
+                    general_message_sync_enabled
+                    and table == "conversation_messages"
+                )
+                if table in general_source_not_modified_tables and not message_sync_table:
+                    pulled[table] = {
+                        "changes": [],
+                        "tombstones": [],
+                        "cursor": None,
+                        "general_source_not_modified": True,
+                    }
+                    continue
                 try:
-                    if table_is_general and general_digest_enabled:
+                    if table in parsed_general_row_ids:
+                        pulled[table] = await _pull_table(
+                            table,
+                            session,
+                            user_id=user_id,
+                            project_ids=project_ids,
+                            since=None,
+                            general_row_ids=parsed_general_row_ids[table],
+                            general_row_manifest=True,
+                        )
+                        await _attach_general_row_versions(
+                            session,
+                            table,
+                            pulled[table],
+                            user_id=user_id,
+                            project_ids=project_ids,
+                        )
+                    elif (
+                        general_row_manifest_enabled
+                        and not requested_general_snapshot_token
+                        and table in GENERAL_ROW_MANIFEST_TABLES
+                        and table in general_source_token_starts
+                    ):
+                        manifest_rows = (await session.execute(
+                            general_row_manifest_statement(table, user_id, project_ids)
+                        )).all()
+                        pulled[table] = {
+                            "changes": [],
+                            "tombstones": [],
+                            "cursor": None,
+                            "row_manifest": [
+                                [str(row.id), str(row.version)] for row in manifest_rows
+                            ],
+                            "row_manifest_source_digest": general_source_token_starts[table],
+                        }
+                    elif message_sync_table:
+                        message_cursor = parsed_general_cursors.get(table)
+                        message_sync_delta = bool(
+                            not general_message_sync_full
+                            and general_message_sync_since is not None
+                            and general_message_sync_digest
+                        )
+                        message_visibility = _conversation_visibility_filter(
+                            user_id, project_ids
+                        )
+                        message_event_expression = _general_event_expression(
+                            ConversationMessage
+                        )
+                        if message_sync_delta and not message_cursor:
+                            digest_started_at = perf_counter()
+                            current_message_digest_row = (
+                                await session.execute(
+                                    conversation_message_sync_digest_statement(
+                                        visibility=message_visibility,
+                                        event_expression=message_event_expression,
+                                        snapshot_at=general_snapshot_at,
+                                        include_authoritative_ids=False,
+                                    )
+                                )
+                            ).one()
+                            general_message_sync_elapsed_ms += (
+                                perf_counter() - digest_started_at
+                            ) * 1000
+                            if (
+                                current_message_digest_row.digest
+                                == general_message_sync_digest
+                            ):
+                                pulled[table] = {
+                                    "changes": [],
+                                    "tombstones": [],
+                                    "cursor": None,
+                                    "general_message_sync_not_modified": True,
+                                    "general_message_sync_digest": str(
+                                        current_message_digest_row.digest
+                                    ),
+                                    "general_message_sync_server_time": _iso(
+                                        general_snapshot_at
+                                    ),
+                                }
+                                general_message_sync_not_modified = True
+                                continue
+                            general_message_sync_delta = True
+                        delta_since = None
+                        if message_sync_delta:
+                            # SQL's existing page predicate is strict (>).
+                            # Subtract one microsecond so all rows equal to the
+                            # five-minute overlap boundary are included.
+                            delta_since = conversation_message_delta_lower_bound(
+                                general_message_sync_since
+                            )
+                        pulled[table] = await _pull_conversation_messages(
+                            session,
+                            user_id,
+                            delta_since,
+                            project_ids=project_ids,
+                            general_pagination=True,
+                            general_cursor=message_cursor,
+                            general_snapshot_at=general_snapshot_at,
+                            include_sync_fingerprint=True,
+                        )
+                        if not pulled[table].get("cursor"):
+                            digest_started_at = perf_counter()
+                            final_message_digest_row = (
+                                await session.execute(
+                                    conversation_message_sync_digest_statement(
+                                        visibility=message_visibility,
+                                        event_expression=message_event_expression,
+                                        snapshot_at=general_snapshot_at,
+                                        include_authoritative_ids=True,
+                                    )
+                                )
+                            ).one()
+                            general_message_sync_elapsed_ms += (
+                                perf_counter() - digest_started_at
+                            ) * 1000
+                            pulled[table]["general_message_sync_digest"] = str(
+                                final_message_digest_row.digest
+                            )
+                            pulled[table]["general_message_sync_server_time"] = _iso(
+                                general_snapshot_at
+                            )
+                            pulled[table]["authoritative_ids"] = [
+                                str(message_id)
+                                for message_id in (
+                                    final_message_digest_row.authoritative_ids or []
+                                )
+                            ]
+                    elif table_is_general and general_digest_enabled:
                         async def pull_general_page(cursor: Optional[str], table_name: str = table):
                             payload = await _pull_table(
                                 table_name, session, user_id=user_id, project_ids=project_ids,
                                 since=None, general_pagination=True,
                                 general_cursor=cursor, general_snapshot_at=general_snapshot_at,
+                                general_row_manifest=general_row_manifest_enabled,
                             )
+                            if (
+                                general_row_manifest_enabled
+                                and table_name in GENERAL_ROW_MANIFEST_TABLES
+                            ):
+                                await _attach_general_row_versions(
+                                    session,
+                                    table_name,
+                                    payload,
+                                    user_id=user_id,
+                                    project_ids=project_ids,
+                                )
                             # Hash exactly FastAPI's wire representation, even
                             # if a serializer leaves a UUID/datetime/Decimal.
                             return jsonable_encoder(payload)
@@ -3825,15 +4536,86 @@ def create_sync_router(
                             general_snapshot_at=(
                                 general_snapshot_at if table_is_general else None
                             ),
+                            general_row_manifest=general_row_manifest_enabled,
+                        )
+                    if (
+                        general_row_manifest_enabled
+                        and table in GENERAL_ROW_MANIFEST_TABLES
+                        and table not in parsed_general_row_ids
+                        and "row_manifest" not in pulled.get(table, {})
+                    ):
+                        await _attach_general_row_versions(
+                            session,
+                            table,
+                            pulled[table],
+                            user_id=user_id,
+                            project_ids=project_ids,
                         )
                 except (ValueError, TypeError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
-                if table not in DOCS_SYNC_TABLES and not table_is_general:
+                if (
+                    table not in DOCS_SYNC_TABLES
+                    and not table_is_general
+                    and table not in parsed_general_row_ids
+                ):
                     pulled[table]["cursor"] = server_time.isoformat()
+                if docs_table_started is not None:
+                    docs_table_diagnostics.append({
+                        "table": table,
+                        "elapsed_ms": round((perf_counter() - docs_table_started) * 1000, 1),
+                        "changes": len(pulled.get(table, {}).get("changes") or []),
+                        "authoritative_ids": len(
+                            pulled.get(table, {}).get("authoritative_ids") or []
+                        ),
+                        "path": "legacy_or_delta",
+                    })
+            if docs_table_diagnostics:
+                logger.info(
+                    "Docs pull table diagnostic %s",
+                    json.dumps(
+                        {
+                            "scope_kind": (
+                                "project" if docs_project_id is not None
+                                else "shared" if docs_scope_id is not None
+                                else "personal"
+                            ),
+                            "fast_noop": docs_fast_noop,
+                            "acl_lookup_ms": docs_acl_lookup_elapsed_ms,
+                            "scope_revision_ms": docs_scope_revision_elapsed_ms,
+                            "elapsed_ms": round(
+                                sum(item["elapsed_ms"] for item in docs_table_diagnostics),
+                                1,
+                            ),
+                            "tables": docs_table_diagnostics,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
             general_has_more = general_requested and any(
                 table in GENERAL_SYNC_PAGE_LIMITS and bool(payload.get("cursor"))
                 for table, payload in pulled.items()
             )
+            if (
+                general_source_token_enabled
+                and not general_has_more
+                and general_source_token_starts
+            ):
+                digest_started_at = perf_counter()
+                terminal_source_digests = await calculate_general_source_digests(
+                    session,
+                    user_id=user_id,
+                    project_ids=project_ids,
+                    scope_fingerprint=current_general_scope,
+                )
+                general_source_digest_elapsed_ms += (
+                    perf_counter() - digest_started_at
+                ) * 1000
+                for table, start_digest in general_source_token_starts.items():
+                    if terminal_source_digests.get(table) == start_digest:
+                        general_source_receipts[table] = start_digest
+                    else:
+                        general_source_unstable_tables.add(table)
             docs_has_more = docs_pagination and any(
                 table in DOCS_SYNC_TABLES and payload.get("cursor")
                 for table, payload in pulled.items()
@@ -3853,15 +4635,322 @@ def create_sync_router(
                 response["general_snapshot_token"] = general_snapshot_token
                 if general_digest_enabled:
                     response["general_digest_version"] = GENERAL_DIGEST_VERSION
+                if general_source_token_enabled:
+                    requested_general_tables = [
+                        table for table in requested
+                        if table in GENERAL_SYNC_PAGE_LIMITS
+                    ]
+                    response["general_source_token_version"] = GENERAL_SOURCE_TOKEN_VERSION
+                    response["general_source_receipts"] = general_source_receipts
+                    response["general_source_token_starts"] = general_source_token_starts
+                    response["general_source_not_modified"] = bool(
+                        requested_general_tables
+                        and all(
+                            table in general_source_not_modified_tables
+                            for table in requested_general_tables
+                        )
+                    )
+                    if general_source_terminal_receipts_enabled:
+                        response["general_source_terminal_receipts_version"] = (
+                            GENERAL_SOURCE_TERMINAL_RECEIPTS_VERSION
+                        )
                 # ``server_time`` remains the immutable page boundary.  The
                 # replay watermark is separate: an unstable run (one that
                 # observed an in-flight transaction before page 1) returns
-                # null so Mobile deliberately replays from a full bootstrap
-                # on the next run rather than risking a late-commit omission.
+                # null instead of acknowledging an application timestamp.
+                # The independent source receipt is only returned when its
+                # start and terminal MVCC row-version aggregates match.
                 response["general_watermark"] = _iso(general_watermark)
                 response["general_has_more"] = bool(general_has_more)
+                if general_message_sync_enabled:
+                    response["general_message_sync_version"] = (
+                        GENERAL_MESSAGE_SYNC_VERSION
+                    )
+                if general_row_manifest_enabled:
+                    response["general_row_manifest_version"] = 1
+                # Safe per-page receipt diagnostics let a coordinator identify
+                # which allow-listed table still has a cursor, without logging
+                # cursor values, row IDs, payloads, or the requested since value.
+                general_table_names = sorted(
+                    table for table in requested if table in GENERAL_SYNC_PAGE_LIMITS
+                )
+                logger.info(
+                    "General sync page diagnostic %s",
+                    json.dumps(
+                        {
+                            "since_present": since_dt is not None,
+                            "snapshot_continuation": bool(requested_general_snapshot_token),
+                            "digest_enabled": general_digest_enabled,
+                            "digest_table_names": sorted(parsed_general_digests),
+                            "cursor_table_names": sorted(parsed_general_cursors),
+                            "pending_table_names": general_table_names,
+                            "source_token_enabled": general_source_token_enabled,
+                            "source_terminal_receipts_enabled": (
+                                general_source_terminal_receipts_enabled
+                            ),
+                            "source_not_modified_table_names": sorted(
+                                general_source_not_modified_tables
+                            ),
+                            "source_token_start_table_names": sorted(
+                                general_source_token_starts
+                            ),
+                            "source_token_unstable_table_names": sorted(
+                                general_source_unstable_tables
+                            ),
+                            "source_receipt_table_names": sorted(
+                                general_source_receipts
+                            ),
+                            "source_digest_elapsed_ms": round(
+                                general_source_digest_elapsed_ms, 1
+                            ),
+                            "message_sync_enabled": general_message_sync_enabled,
+                            "message_sync_since_present": bool(
+                                general_message_sync_since
+                            ),
+                            "message_sync_delta": general_message_sync_delta,
+                            "message_sync_not_modified": (
+                                general_message_sync_not_modified
+                            ),
+                            "message_sync_digest_elapsed_ms": round(
+                                general_message_sync_elapsed_ms, 1
+                            ),
+                            "has_more": bool(general_has_more),
+                            "elapsed_ms": round((perf_counter() - request_started_at) * 1000, 1),
+                            "tables": {
+                                table: {
+                                    "changes": len(pulled.get(table, {}).get("changes") or []),
+                                    "tombstones": len(pulled.get(table, {}).get("tombstones") or []),
+                                    "cursor_present": bool(pulled.get(table, {}).get("cursor")),
+                                    "not_modified": bool(
+                                        pulled.get(table, {}).get("general_not_modified")
+                                    ),
+                                    "message_not_modified": bool(
+                                        pulled.get(table, {}).get(
+                                            "general_message_sync_not_modified"
+                                        )
+                                    ),
+                                }
+                                for table in general_table_names
+                                if table in pulled
+                            },
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
             if docs_scopes:
                 response["docs_scopes"] = docs_scopes
+            if (
+                include_docs_project_digests
+                and docs_pagination
+                and docs_project_id is None
+                and not docs_has_more
+                and not (include_docs_fast_digests and docs_project_fast_baseline)
+                and docs_docs_library_id is not None
+                and docs_project_scope_groups
+            ):
+                project_batch_started = perf_counter()
+                project_scope_digests: dict[str, dict[str, str]] = {}
+                project_batch_table_diagnostics: dict[str, Any] = {}
+                try:
+                    for library_key, grouped_project_ids in docs_project_scope_groups.items():
+                        try:
+                            grouped_library_id = UUID(library_key)
+                        except (TypeError, ValueError):
+                            continue
+                        try:
+                            if grouped_library_id == docs_docs_library_id:
+                                grouped_library_owner_id = docs_library_owner_id
+                            else:
+                                grouped_library = await session.get(
+                                    DocsLibrary, grouped_library_id
+                                )
+                                if grouped_library is None:
+                                    continue
+                                grouped_library_owner_id = getattr(
+                                    grouped_library, "owner_user_id", None
+                                )
+                            group_digests = await pull_docs_project_scope_digests(
+                                session,
+                                docs_library_id=grouped_library_id,
+                                project_ids=grouped_project_ids,
+                                user_id=user_id,
+                                library_owner_id=grouped_library_owner_id,
+                                diagnostics=project_batch_table_diagnostics,
+                            )
+                            project_scope_digests.update(group_digests)
+                        except Exception as group_exc:  # noqa: BLE001 - omit only this group
+                            group_frames = traceback.extract_tb(group_exc.__traceback__)
+                            group_source = group_frames[-1].name if group_frames else "unknown"
+                            logger.warning(
+                                "Docs project digest group unavailable: %s source=%s",
+                                type(group_exc).__name__,
+                                group_source,
+                            )
+                    response["docs_project_digests"] = project_scope_digests
+                    if docs_project_acl_entries is not None:
+                        project_scopes_by_id = {
+                            str(scope.get("project_id")): scope
+                            for scope in docs_scopes
+                            if scope.get("source") == "project"
+                            and scope.get("project_id")
+                        }
+                        for project_scope_id in (
+                            UUID(project_key) for project_key in project_scope_digests
+                        ):
+                            project_scope = project_scopes_by_id.get(str(project_scope_id))
+                            if project_scope is None:
+                                continue
+                            try:
+                                project_library_id = UUID(str(
+                                    project_scope.get("docs_library_id")
+                                    or project_scope.get("workspace_id")
+                                ))
+                            except (TypeError, ValueError):
+                                continue
+                            docs_project_scope_revisions[str(project_scope_id)] = (
+                                calculate_docs_scope_revision(
+                                    project_library_id,
+                                    [project_scope_id],
+                                    [project_scope],
+                                    docs_project_acl_entries.get(
+                                        str(project_scope_id), []
+                                    ),
+                                    scope_project_id=project_scope_id,
+                                )
+                            )
+                        response["docs_project_scope_revisions"] = (
+                            docs_project_scope_revisions
+                        )
+                except Exception as exc:  # noqa: BLE001 - additive optimization fails closed
+                    error_frames = traceback.extract_tb(exc.__traceback__)
+                    source_function = error_frames[-1].name if error_frames else "unknown"
+                    logger.warning(
+                        "Docs project digest batch unavailable: %s source=%s",
+                        type(exc).__name__,
+                        source_function,
+                    )
+                logger.info(
+                    "Docs project digest batch diagnostic %s",
+                    json.dumps(
+                        {
+                            "library_groups": len(docs_project_scope_groups),
+                            "project_scopes": len(docs_project_scope_ids),
+                            "digest_scopes": len(project_scope_digests),
+                            "revision_scopes": len(docs_project_scope_revisions),
+                            "tables": project_batch_table_diagnostics.get("tables", {}),
+                            "elapsed_ms": round(
+                                (perf_counter() - project_batch_started) * 1000, 1
+                            ),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            if (
+                include_docs_fast_digests
+                and docs_pagination
+                and not docs_has_more
+                and docs_fast_scope_digests
+            ):
+                stable_fast_digests = docs_fast_scope_digests
+                fast_digest_stable = docs_fast_noop
+                if not fast_digest_stable:
+                    try:
+                        stable_fast_digests = await pull_docs_scope_fast_digests(
+                            session,
+                            user_id=user_id,
+                            scope_groups=docs_fast_scope_groups,
+                        )
+                        fast_digest_stable = (
+                            docs_fast_scope_digests.keys() == stable_fast_digests.keys()
+                            and all(
+                                docs_fast_scope_digests[scope_key].keys()
+                                == stable_fast_digests[scope_key].keys()
+                                and all(
+                                    docs_fast_scope_digests[scope_key][table].get("digest")
+                                    == stable_fast_digests[scope_key][table].get("digest")
+                                    and docs_fast_scope_digests[scope_key][table].get("count")
+                                    == stable_fast_digests[scope_key][table].get("count")
+                                    for table in docs_fast_scope_digests[scope_key]
+                                )
+                                for scope_key in docs_fast_scope_digests
+                            )
+                        )
+                    except Exception as fast_digest_exc:  # noqa: BLE001 - never block the legacy pull
+                        fast_digest_stable = False
+                        logger.warning(
+                            "Docs fast digest confirmation unavailable: %s",
+                            type(fast_digest_exc).__name__,
+                        )
+                response["docs_fast_digest_stable"] = fast_digest_stable
+                if fast_digest_stable:
+                    scope_receipt = stable_fast_digests.get(fast_scope_key, {})
+                    response["docs_fast_digests"] = {
+                        table: payload["digest"]
+                        for table, payload in scope_receipt.items()
+                    }
+                    if docs_project_id is None and docs_scope_id is None:
+                        response["docs_project_fast_digests"] = {
+                            project_key: {
+                                table: payload["digest"]
+                                for table, payload in project_receipts.items()
+                            }
+                            for (library_key, project_key), project_receipts
+                            in stable_fast_digests.items()
+                            if project_key is not None
+                        }
+                        if docs_project_acl_entries is not None:
+                            project_scopes_by_id = {
+                                str(scope.get("project_id")): scope
+                                for scope in docs_scopes
+                                if scope.get("source") == "project"
+                                and scope.get("project_id")
+                            }
+                            for project_key in response["docs_project_fast_digests"]:
+                                project_scope = project_scopes_by_id.get(project_key)
+                                if project_scope is None:
+                                    continue
+                                try:
+                                    project_library_id = UUID(str(
+                                        project_scope.get("docs_library_id")
+                                        or project_scope.get("workspace_id")
+                                    ))
+                                    project_uuid = UUID(project_key)
+                                except (TypeError, ValueError):
+                                    continue
+                                docs_project_scope_revisions[project_key] = (
+                                    calculate_docs_scope_revision(
+                                        project_library_id,
+                                        [project_uuid],
+                                        [project_scope],
+                                        docs_project_acl_entries.get(project_key, []),
+                                        scope_project_id=project_uuid,
+                                    )
+                                )
+                        if docs_project_scope_revisions:
+                            response["docs_project_scope_revisions"] = (
+                                docs_project_scope_revisions
+                            )
+                logger.info(
+                    "Docs fast digest receipt diagnostic %s",
+                    json.dumps(
+                        {
+                            "stable": fast_digest_stable,
+                            "fast_noop": docs_fast_noop,
+                            "acl_lookup_ms": docs_acl_lookup_elapsed_ms,
+                            "scope_revision_ms": docs_scope_revision_elapsed_ms,
+                            "scope_groups": len(docs_fast_scope_groups),
+                            "scopes": len(stable_fast_digests),
+                            "elapsed_ms": round(
+                                (perf_counter() - docs_fast_digest_started) * 1000,
+                                1,
+                            ),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
             return response
         finally:
             await session.close()

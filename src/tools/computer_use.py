@@ -20,12 +20,12 @@ def build_computer_use_tool(config: Any, *, client=None):
 
     return ToolDefinition(
         name='computer_use',
-        description='設定のPC接続で選択したPCのWindowsを操作する。goalで目的を渡すと画面観測と操作を繰り返す。'
+        description='このサーバーPC(「他のPCの制御」をオンにして選択したPCがあればそのPC)のWindowsを操作する。goalで目的を渡すと画面観測と操作を繰り返す。'
                     'ブラウザDOMはbrowser_agent、Windowsアプリや座標操作はこのツール。'
                     '画面やウィンドウの読み取りだけならcomputer_observeを使う。'
                     'goal省略時はactionを1回実行。observeはウィンドウ・UI要素・画面のURLを返す。'
                     'use_vision=trueは既存の画像認識モデルも利用する。Jevは必須ではない。'
-                    '接続PC未選択・切断時は停止しサーバーPCには切り替えない。',
+                    '他のPCを明示指定して未接続・切断のときは停止し、別のPCには切り替えない。',
         function=execute, is_async=True, owner='computer_use', side_effect='writes', risk='normal',
         supports_parallel=False, timeout_seconds=630,
         parameters=[
@@ -62,11 +62,11 @@ def build_computer_observe_tool(config: Any, *, client=None):
 
     return ToolDefinition(
         name='computer_observe',
-        description='設定のPC接続で選択したPCのWindowsを読み取り専用で1回観測する。'
+        description='このサーバーPC(「他のPCの制御」をオンにして選択したPCがあればそのPC)のWindowsを読み取り専用で1回観測する。'
                     'observeはウィンドウ・UI要素・画面のURL、screenshotは画面、windowsはウィンドウ一覧を返す。'
                     '読み取り専用の依頼にはこのツールを使う。goal、自動操作、前面化、クリック、入力は受け付けない。'
                     '操作が必要な依頼にはcomputer_useを使う。'
-                    '接続PC未選択・切断時は停止しサーバーPCには切り替えない。',
+                    '他のPCを明示指定して未接続・切断のときは停止し、別のPCには切り替えない。',
         function=execute, is_async=True, owner='computer_use', side_effect='none', risk='normal',
         supports_parallel=False, timeout_seconds=630,
         parameters=[

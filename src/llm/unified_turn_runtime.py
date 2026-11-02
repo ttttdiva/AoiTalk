@@ -25,17 +25,17 @@ from ..tools.core import (
     ToolArgumentValidationError,
     ToolPolicyDeniedError,
     argument_correlation,
+    safe_authority_denial,
     safe_argument_rejection,
 )
 from ..tools.registry import ToolRegistry
-from ..services.agent_team_service import (
+from ..services.runtime_policy_utils import (
     ToolFailureCircuitBreaker,
     is_internal_tool_failure_code,
     parse_structured_tool_failure,
     tool_failure_family,
     tool_failure_scope,
 )
-from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
 from ..services.semantic_citation import safe_verified_media_read_url
 from .context_compression import model_tool_result_payload
 from .generation_cancellation import (
@@ -392,6 +392,11 @@ def _command_result_projection(value: Mapping[str, Any]) -> dict[str, Any]:
         elif key == "return_code":
             if isinstance(item, int) and not isinstance(item, bool):
                 result[key] = max(-1_000_000, min(item, 1_000_000))
+            elif item is None:
+                # Preserve the typed unknown exit status for timeouts and
+                # pre-execution failures; omitting it conflates an explicit
+                # null with a legacy payload that never supplied the field.
+                result[key] = None
         elif isinstance(item, (bool, int, float)) or item is None:
             result[key] = item
         elif key in {"job_id", "status"}:
@@ -868,6 +873,8 @@ class UnifiedToolResult:
     argument_rejection: Mapping[str, str] | None = None
     # Fixed framework policy code for a refusal that happened before execution.
     policy_denial: Mapping[str, str] | None = None
+    # Safe authority decision projection for a framework-owned refusal.
+    authority_denial: Mapping[str, Any] | None = None
 
     @property
     def tool_end_argument_rejection(self) -> dict[str, str]:
@@ -888,6 +895,12 @@ class UnifiedToolResult:
         ):
             return {}
         return safe_argument_rejection(self.argument_rejection)
+
+    @property
+    def tool_end_authority_denial(self) -> dict[str, Any]:
+        if self.success or self.executed or self.synthetic:
+            return {}
+        return safe_authority_denial(self.authority_denial)
 
     @property
     def model_output(self) -> str:
@@ -916,6 +929,9 @@ class UnifiedToolResult:
             return ("Error: " if not self.success else "") + fallback
         if self.success:
             return self.output
+        if self.call.tool == "delegate_plan":
+            from ..services.delegation_failure_projection import project_delegate_failure
+            return project_delegate_failure(self.output)
         detail = self._safe_failure_detail()
         return f"Error: {self.error or self.output}" + (f" ({detail})" if detail else "")
 
@@ -1039,6 +1055,7 @@ class UnifiedTurnLedger:
     usage_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     usage_unknown: bool = False
     reserved_tokens: int = 0
+    reserved_input_tokens: int = 0
     reserved_cost_micros: int = 0
     failure: str = ""
     on_result: Callable[[UnifiedToolResult], None] | None = None
@@ -1074,11 +1091,14 @@ class UnifiedTurnLedger:
         tokens: int,
         *,
         total_tokens: int | None = None,
+        output_tokens: int | None = None,
+        input_tokens: int = 0,
         total_cost_micros: int | None = None,
         cost_micros: int = 0,
     ) -> str | None:
-        """Reserve output capacity before a concurrent provider starts.
+        """Reserve output and optional input capacity before a provider starts.
 
+        Input reservations apply only to the total-token limit.
         The check and increment share one lock.  This is the admission fence
         that prevents two parallel nested specialists from observing the same
         stale remainder and both starting an over-budget request.
@@ -1088,12 +1108,23 @@ class UnifiedTurnLedger:
             amount = max(0, int(tokens))
         except (TypeError, ValueError, OverflowError):
             amount = 0
-        if amount <= 0:
+        if amount <= 0 or type(input_tokens) is not int or input_tokens < 0:
             return None
         with self._budget_lock:
             if total_tokens is not None:
                 consumed = int(self.usage.get("total_tokens", 0) or 0)
-                if consumed + int(self.reserved_tokens or 0) + amount > int(total_tokens):
+                if (consumed + int(self.reserved_tokens or 0)
+                        + int(self.reserved_input_tokens or 0) + amount + input_tokens
+                        > int(total_tokens)):
+                    return None
+            if output_tokens is not None:
+                from .agent_runtime import dialogue_provider_observed_output
+                consumed_output = dialogue_provider_observed_output(self)
+                if (
+                    consumed_output is None
+                    or consumed_output + int(self.reserved_tokens or 0) + amount
+                    > int(output_tokens)
+                ):
                     return None
             if total_cost_micros is not None:
                 consumed_cost = int(self.usage.get("cost_micros", 0) or 0)
@@ -1110,12 +1141,14 @@ class UnifiedTurnLedger:
                     return None
             key = self.next_provider_usage_key("reservation")
             self.reserved_tokens += amount
+            self.reserved_input_tokens += input_tokens
             if cost_micros:
                 self.reserved_cost_micros += max(0, int(cost_micros))
             self._remember_provider_reservation(
                 key,
                 amount,
                 max(0, int(cost_micros or 0)),
+                input_tokens,
             )
             return key
 
@@ -1124,7 +1157,7 @@ class UnifiedTurnLedger:
         reservation_key: str | None,
         usage: Mapping[str, Any] | None = None,
     ) -> None:
-        """Release one in-flight output reservation exactly once."""
+        """Release one in-flight reservation exactly once."""
 
         if not reservation_key:
             return
@@ -1137,9 +1170,16 @@ class UnifiedTurnLedger:
                 object.__setattr__(self, "_reservations", reservations)
             reservation = reservations.pop(reservation_key, 0)
             if isinstance(reservation, tuple):
-                amount, cost = reservation
+                if len(reservation) == 3:
+                    amount, cost, input_amount = reservation
+                else:
+                    amount, cost = reservation
+                    input_amount = 0
             else:
-                amount, cost = reservation, 0
+                amount, cost, input_amount = reservation, 0, 0
+            self.reserved_input_tokens = max(
+                0, self.reserved_input_tokens - int(input_amount or 0)
+            )
             self.reserved_tokens = max(0, self.reserved_tokens - int(amount or 0))
             self.reserved_cost_micros = max(
                 0,
@@ -1151,6 +1191,7 @@ class UnifiedTurnLedger:
         key: str,
         amount: int,
         cost_micros: int = 0,
+        input_tokens: int = 0,
     ) -> None:
         with self._budget_lock:
             reservations = getattr(self, "_reservations", None)
@@ -1160,6 +1201,7 @@ class UnifiedTurnLedger:
             reservations[key] = (
                 max(0, int(amount)),
                 max(0, int(cost_micros or 0)),
+                input_tokens,
             )
 
     def record_usage(
@@ -1306,21 +1348,15 @@ class RegistryToolRouter:
         self.client = client
         self.user_input = user_input
         self.enforce_tool_policy = enforce_tool_policy
-        # The breaker is request/turn scoped.  Only schema-v3 Agent Team delegation
-        # turns opt in by default; ordinary chat keeps its historical retry
-        # behavior unless a caller explicitly supplies a breaker.
+        # The breaker is request/turn scoped. Delegate and delegate_worker are
+        # v2 tools, so activation no longer depends on retired Team config.
         if failure_breaker is not None:
             self.failure_breaker = failure_breaker
-        elif (
-            config is not None
-            and agent_team_v3_delegation_enabled(config)
-        ):
+        else:
             self.failure_breaker = ToolFailureCircuitBreaker(
                 max_same_failure=2,
                 failed_tool_budget=8,
             )
-        else:
-            self.failure_breaker = None
         self.no_progress_guard = (
             no_progress_guard
             or current_tool_no_progress_guard()
@@ -1374,7 +1410,17 @@ class RegistryToolRouter:
             failure_group=result.failure_group,
             executed=result.executed,
             synthetic=result.synthetic,
+            authority_denial=result.authority_denial,
         )
+
+    @staticmethod
+    def _dialogue_tool_denial_is_recoverable(call: UnifiedToolCall) -> bool:
+        """An AoiDots coordination tool denied for this role is not a terminal block."""
+
+        from .tool_policy import AGENT_DIALOGUE_COORDINATION_TOOL_NAMES
+
+        name = str(call.tool or "").rsplit(".", 1)[-1].strip().lower()
+        return name in AGENT_DIALOGUE_COORDINATION_TOOL_NAMES or name == "delegate"
 
     @staticmethod
     def _framework_block_result(
@@ -1514,15 +1560,30 @@ class RegistryToolRouter:
         if decision.allowed:
             return None
         observable_name = observable_tool_name(self.registry, call.tool)
-        return self._framework_block_result(
-            UnifiedToolResult(
-                call=call,
-                output=f"Tool execution blocked `{observable_name}`: {decision.reason}",
-                success=False,
-                error="agent_authority_denied",
+        authority_denial = {
+            "code": decision.reason_code or "authority_scope_denied",
+            "tool": (
+                decision.tool_name
+                if decision.tool_name and decision.tool_name != "unknown_tool"
+                else observable_name
             ),
-            source="agent_authority",
+            "capability_families": list(decision.required_capabilities),
+            "layer": decision.decision_layer or "capability_resolver",
+        }
+        denied = UnifiedToolResult(
+            call=call,
+            output=f"Tool execution blocked `{observable_name}`: {decision.reason}",
+            success=False,
+            error="agent_authority_denied",
+            executed=False,
+            authority_denial=authority_denial,
         )
+        if self._dialogue_tool_denial_is_recoverable(call):
+            # The tool did not run.  A model that reaches for a coordination tool
+            # outside its role gets the error back and can continue; the
+            # tool-failure breaker still stops it if it keeps trying.
+            return denied
+        return self._framework_block_result(denied, source="agent_authority")
 
     async def _agent_authority_block_result_async(
         self,
@@ -1572,15 +1633,30 @@ class RegistryToolRouter:
         if decision.allowed:
             return None
         observable_name = observable_tool_name(self.registry, call.tool)
-        return self._framework_block_result(
-            UnifiedToolResult(
-                call=call,
-                output=f"Tool execution blocked `{observable_name}`: {decision.reason}",
-                success=False,
-                error="agent_authority_denied",
+        authority_denial = {
+            "code": decision.reason_code or "authority_scope_denied",
+            "tool": (
+                decision.tool_name
+                if decision.tool_name and decision.tool_name != "unknown_tool"
+                else observable_name
             ),
-            source="agent_authority",
+            "capability_families": list(decision.required_capabilities),
+            "layer": decision.decision_layer or "capability_resolver",
+        }
+        denied = UnifiedToolResult(
+            call=call,
+            output=f"Tool execution blocked `{observable_name}`: {decision.reason}",
+            success=False,
+            error="agent_authority_denied",
+            executed=False,
+            authority_denial=authority_denial,
         )
+        if self._dialogue_tool_denial_is_recoverable(call):
+            # The tool did not run.  A model that reaches for a coordination tool
+            # outside its role gets the error back and can continue; the
+            # tool-failure breaker still stops it if it keeps trying.
+            return denied
+        return self._framework_block_result(denied, source="agent_authority")
 
     def _breaker_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
         breaker = self.failure_breaker
@@ -3272,6 +3348,13 @@ def run_openai_compatible_turn_loop(
     current_tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
     current_content = openai_message_content(assistant_message, message_content)
     ledger = turn_ledger or _ACTIVE_TURN_LEDGER.get() or UnifiedTurnLedger()
+    from .agent_run_budget import (
+        AgentRunBudgetStop,
+        budget_failure_generation_failure,
+        get_agent_run_budget,
+    )
+
+    run_budget = get_agent_run_budget(client, config=config)
     all_results = ledger.results
     display_results = list(all_results)
     terminal_failure: GenerationFailure | None = None
@@ -3279,12 +3362,20 @@ def run_openai_compatible_turn_loop(
     terminal_status_message = ""
 
     def _budget_stop() -> UnifiedTurnResult:
+        failure = budget_failure_generation_failure(
+            run_budget.failure if run_budget is not None else None
+        )
         return UnifiedTurnResult(
-            final_output=CLI_TOOL_LOOP_FAILURE_MESSAGE,
+            final_output=(failure.user_message if failure else CLI_TOOL_LOOP_FAILURE_MESSAGE),
             tool_results=display_results,
             rounds=0,
-            stopped_reason="budget_exhausted",
+            stopped_reason=(
+                run_budget.failure.code
+                if failure is not None and run_budget is not None and run_budget.failure
+                else "budget_exhausted"
+            ),
             audit_tool_results=list(all_results),
+            generation_failure=failure,
         )
 
     def _create_provider_completion(payload: dict[str, Any]) -> Any | None:
@@ -3293,7 +3384,9 @@ def run_openai_compatible_turn_loop(
         response: Any | None = None
         try:
             response = create_completion(payload)
-        except BaseException:
+        except BaseException as error:
+            if isinstance(error, AgentRunBudgetStop):
+                return None
             if after_provider_call is not None:
                 after_provider_call(None)
             raise
@@ -3302,7 +3395,23 @@ def run_openai_compatible_turn_loop(
         # receipt unknown rather than treating the failure as zero spend.
         if after_provider_call is not None:
             after_provider_call(response)
+        if run_budget is not None and run_budget.failure is not None:
+            message = None
+            try:
+                choices = getattr(response, "choices", None) or []
+                message = getattr(choices[0], "message", None) if choices else None
+            except (IndexError, TypeError):
+                message = None
+            pending_calls = list(getattr(message, "tool_calls", None) or [])
+            if pending_calls:
+                run_budget.count_unexecuted_tool_calls(len(pending_calls))
+            return None
         return response
+
+    if run_budget is not None and run_budget.failure is not None:
+        if current_tool_calls:
+            run_budget.count_unexecuted_tool_calls(len(current_tool_calls))
+        return _budget_stop()
 
     def _restore_arguments_for_tool(
         callback: Callable[..., dict[str, Any]],
@@ -3431,6 +3540,15 @@ def run_openai_compatible_turn_loop(
                     raw=raw_call,
                 )
             )
+        allowed_call_count = len(calls)
+        if run_budget is not None:
+            for call_index, _call in enumerate(calls):
+                if not run_budget.record_tool_call():
+                    allowed_call_count = call_index
+                    run_budget.count_unexecuted_tool_calls(
+                        len(calls) - call_index - 1
+                    )
+                    break
         reconciled_outputs: dict[int, str] = {}
         batch_results: dict[str, UnifiedToolResult] = {}
         blocked_reasons = _plan_call_identity_fence(
@@ -3523,6 +3641,21 @@ def run_openai_compatible_turn_loop(
             )
 
         for call_index, call in enumerate(calls):
+            if call_index >= allowed_call_count:
+                terminal_failure = budget_failure_generation_failure(
+                    run_budget.failure if run_budget is not None else None
+                )
+                terminal_reason = (
+                    terminal_failure.kind
+                    if terminal_failure is not None
+                    else "run_budget_exceeded:tool_calls"
+                )
+                terminal_status_message = (
+                    terminal_failure.user_message
+                    if terminal_failure is not None
+                    else "Run全体のツール呼び出し上限に達しました"
+                )
+                break
             blocked_reason = blocked_reasons[call_index]
             if blocked_reason:
                 _fence_call(call, call_index, blocked_reason)
@@ -3614,6 +3747,11 @@ def run_openai_compatible_turn_loop(
                 result,
                 intent_digest=_raw_intent_digest(call.arguments),
             )
+            if run_budget is not None:
+                run_budget.record_tool_outcome(
+                    observable_name,
+                    bool(result.success),
+                )
             if claim_held and settle_hook is not None:
                 # Authoritative outcome is durable before the next call. A
                 # failed settlement leaves the claim pending (uncertain), so
@@ -3671,6 +3809,10 @@ def run_openai_compatible_turn_loop(
                 tool_result_payload["argument_rejection"] = (
                     result.tool_end_argument_rejection
                 )
+            if result.tool_end_authority_denial:
+                tool_result_payload["authority_denial"] = (
+                    result.tool_end_authority_denial
+                )
             tool_result_payload["tool_call_id"] = operation_id
             _emit_sync(
                 event_callback,
@@ -3690,11 +3832,21 @@ def run_openai_compatible_turn_loop(
                 },
             )
 
-            if result.generation_failure is not None or result.turn_terminal:
+            run_failure = run_budget.failure if run_budget is not None else None
+            run_circuit_failure = (
+                budget_failure_generation_failure(run_failure)
+                if getattr(run_failure, "kind", "") == "tool_failure_circuit_open"
+                else None
+            )
+            if (
+                result.generation_failure is not None
+                or result.turn_terminal
+                or run_circuit_failure is not None
+            ):
                 # The framework-owned breaker is terminal for this turn. Keep
                 # remaining provider call IDs in the transcript, but never
                 # execute them or add them to the execution ledger.
-                terminal_failure = result.generation_failure
+                terminal_failure = result.generation_failure or run_circuit_failure
                 terminal_reason = (
                     result.terminal_reason
                     or (terminal_failure.kind if terminal_failure else "tool_terminal")
@@ -3924,6 +4076,13 @@ def run_cli_tool_call_loop(
 ) -> UnifiedTurnResult:
     """Run a CLI backend tool loop with repeated follow-up support."""
 
+    from .agent_run_budget import (
+        budget_failure_generation_failure,
+        get_agent_run_budget,
+    )
+
+    run_budget = get_agent_run_budget(client, config=config)
+
     router = RegistryToolRouter(
         registry,
         log_prefix=log_prefix,
@@ -3938,6 +4097,23 @@ def run_cli_tool_call_loop(
     terminal_failure: GenerationFailure | None = None
     terminal_reason = ""
     terminal_status_message = ""
+
+    def _budget_failure_result() -> UnifiedTurnResult:
+        failure = budget_failure_generation_failure(
+            run_budget.failure if run_budget is not None else None
+        )
+        return UnifiedTurnResult(
+            final_output=(failure.user_message if failure else CLI_TOOL_LOOP_FAILURE_MESSAGE),
+            tool_results=display_results,
+            rounds=0,
+            stopped_reason=(
+                run_budget.failure.code
+                if run_budget is not None and run_budget.failure is not None
+                else "budget_exhausted"
+            ),
+            audit_tool_results=list(all_results),
+            generation_failure=failure,
+        )
 
     # ``max_rounds`` limits *tool executions*, not the follow-up response
     # that is produced after the last tool result.  Keep one parse-only pass
@@ -3954,6 +4130,10 @@ def run_cli_tool_call_loop(
                 audit_tool_results=list(all_results),
             )
         parsed_calls = parse_tool_calls(current_output)
+        if run_budget is not None and run_budget.failure is not None:
+            if parsed_calls:
+                run_budget.count_unexecuted_tool_calls(len(parsed_calls))
+            return _budget_failure_result()
         if not parsed_calls:
             if round_index > max_rounds:
                 continuation_prompt = (
@@ -4027,6 +4207,14 @@ def run_cli_tool_call_loop(
             # The model returned another tool marker after the last permitted
             # round.  Do not execute it; the caller must surface a terminal
             # exhausted state rather than treating the marker as an answer.
+            if run_budget is not None:
+                rejected_calls = cli_tool_calls_from_parsed(parsed_calls)
+                for call_index, _call in enumerate(rejected_calls):
+                    if not run_budget.record_tool_call():
+                        run_budget.count_unexecuted_tool_calls(
+                            len(rejected_calls) - call_index - 1
+                        )
+                        return _budget_failure_result()
             logger.warning(
                 "[%s] CLI tool loop exceeded max rounds with a pending tool call",
                 log_prefix,
@@ -4050,6 +4238,20 @@ def run_cli_tool_call_loop(
             )
             for call in cli_tool_calls_from_parsed(parsed_calls)
         ]
+        allowed_call_count = len(calls)
+        if run_budget is not None:
+            for call_index, _call in enumerate(calls):
+                if not run_budget.record_tool_call():
+                    allowed_call_count = call_index
+                    run_budget.count_unexecuted_tool_calls(
+                        len(calls) - call_index - 1
+                    )
+                    break
+        if (
+            allowed_call_count < len(calls)
+            and _is_redundant_successful_cli_recall(calls, all_results)
+        ):
+            return _budget_failure_result()
         if _is_redundant_successful_cli_recall(calls, all_results):
             final_output = _redundant_cli_recall_final_output(calls, all_results)
             logger.info(
@@ -4070,6 +4272,21 @@ def run_cli_tool_call_loop(
         )
         results: list[UnifiedToolResult] = []
         for call_index, call in enumerate(calls):
+            if call_index >= allowed_call_count:
+                terminal_failure = budget_failure_generation_failure(
+                    run_budget.failure if run_budget is not None else None
+                )
+                terminal_reason = (
+                    run_budget.failure.code
+                    if run_budget is not None and run_budget.failure is not None
+                    else "run_budget_exceeded:tool_calls"
+                )
+                terminal_status_message = (
+                    terminal_failure.user_message
+                    if terminal_failure is not None
+                    else "Run全体のツール呼び出し上限に達しました"
+                )
+                break
             if should_cancel and should_cancel():
                 return UnifiedTurnResult(
                     final_output=current_output,
@@ -4096,6 +4313,11 @@ def run_cli_tool_call_loop(
             result = router.execute(call)
             results.append(result)
             display_results.append(result)
+            if run_budget is not None:
+                run_budget.record_tool_outcome(
+                    observable_name,
+                    bool(result.success),
+                )
             if should_cancel and should_cancel():
                 return UnifiedTurnResult(
                     final_output=current_output,
@@ -4134,11 +4356,26 @@ def run_cli_tool_call_loop(
                             if result.tool_end_argument_rejection
                             else {}
                         ),
+                        **(
+                            {"authority_denial": result.tool_end_authority_denial}
+                            if result.tool_end_authority_denial
+                            else {}
+                        ),
                     },
                 },
             )
-            if result.generation_failure is not None or result.turn_terminal:
-                terminal_failure = result.generation_failure
+            run_failure = run_budget.failure if run_budget is not None else None
+            run_circuit_failure = (
+                budget_failure_generation_failure(run_failure)
+                if getattr(run_failure, "kind", "") == "tool_failure_circuit_open"
+                else None
+            )
+            if (
+                result.generation_failure is not None
+                or result.turn_terminal
+                or run_circuit_failure is not None
+            ):
+                terminal_failure = result.generation_failure or run_circuit_failure
                 terminal_reason = (
                     result.terminal_reason
                     or (terminal_failure.kind if terminal_failure else "tool_terminal")
@@ -4212,6 +4449,8 @@ def run_cli_tool_call_loop(
         )
         success, follow_up_output = execute_follow_up(follow_up)
         if not success:
+            if run_budget is not None and run_budget.failure is not None:
+                return _budget_failure_result()
             logger.error(
                 "[%s] CLI follow-up failed: %s",
                 log_prefix,

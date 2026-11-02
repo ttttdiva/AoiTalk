@@ -10,11 +10,10 @@ import {
   resolveEffectiveProviderId,
 } from "@/lib/llm-provider-visibility";
 import {
-  buildClassDraft, buildProjectAutomationDraft, canonicalAgentTeamConfig, defaultModeForOptions, modelOptionSettings,
+  buildClassDraft, buildProjectAutomationDraft, defaultModeForOptions, modelOptionSettings,
   providerSelection, pyFetch, reasoningEffortOptionsForModel, MODEL_PAGE_SIZE,
   CONNECTION_SETTINGS_PROVIDERS, REASONING_EFFORT_PROVIDERS,
   type LlmEngineResponse, type LlmModelCatalogResponse,
-  type AgentTeamConfig,
   type LlmProviderCatalog, type ModelClassDraft, type ModelRouteSettings,
   type OllamaDeleteResponse, type OllamaPullTask, type ProviderDraft, type ProviderSettingsDraft,
   type SettingsPayload, type SpeechRecognitionSettings, type MageVLSettings,
@@ -38,8 +37,7 @@ export type RoutingSaveScope =
   | "audio"
   | "video"
   | "clip_ingest"
-  | "project_automation"
-  | "agent";
+  | "project_automation";
 
 export function activeLocalRuntimeTaskFromStatus(
   status: LocalRuntimeStatus | null,
@@ -139,8 +137,6 @@ export function useLlmModelSection() {
   const [llamaCppModelRootLoading, setLlamaCppModelRootLoading] = useState(false);
   const [llamaCppModelRootSaving, setLlamaCppModelRootSaving] = useState(false);
   const [llamaCppModelRootError, setLlamaCppModelRootError] = useState<string | null>(null);
-  const [delegationEnabled, setDelegationEnabled] = useState(false);
-  const [orchestrationMode, setOrchestrationMode] = useState<"standard" | "director">("standard");
   const [chatgptWeb, setChatgptWeb] = useState({
     profile_dir: "",
     response_timeout_seconds: 900,
@@ -192,7 +188,6 @@ export function useLlmModelSection() {
   const [projectAutomationProviderIds, setProjectAutomationProviderIds] = useState<string[] | null>(null);
   const [projectAutomationPersistedProvider, setProjectAutomationPersistedProvider] = useState("");
   const [savingRouting, setSavingRouting] = useState(false);
-  const [agentTeamConfig, setAgentTeamConfig] = useState<AgentTeamConfig | null>(null);
 
   const providerOptions = useMemo(
     () =>
@@ -1250,17 +1245,9 @@ export function useLlmModelSection() {
   const showReasoningEffort = REASONING_EFFORT_PROVIDERS.has(provider)
     || (provider === "openai_compatible_local" && selectedReasoningEffortOptions.length > 0);
 
-  const loadAgentTeamSettings = useCallback(async () => {
+  const loadSettings = useCallback(async () => {
     try {
-      const [data, teamResponse] = await Promise.all([
-        pyFetch<SettingsPayload>("/settings"),
-        pyFetch<{ agent_team?: AgentTeamConfig }>("/agent-team/config"),
-      ]);
-      const team = teamResponse.agent_team ?? (
-        data.settings?.agent_team?.schema_version === 3
-          ? data.settings.agent_team as AgentTeamConfig
-          : undefined
-      );
+      const data = await pyFetch<SettingsPayload>("/settings");
       const routing = data.settings?.model_routing;
       const projectAutomationRoute = routing?.classes?.project_automation;
       const projectAutomationProviderSchema =
@@ -1272,14 +1259,11 @@ export function useLlmModelSection() {
             .filter(Boolean)
           : null,
       );
-      setOrchestrationMode(team?.orchestration_mode ?? "standard");
       setChatgptWeb({
         profile_dir: data.settings?.chatgpt_web?.profile_dir ?? "",
         response_timeout_seconds: data.settings?.chatgpt_web?.response_timeout_seconds ?? 900,
         max_rounds_per_turn: data.settings?.chatgpt_web?.max_rounds_per_turn ?? 20,
       });
-      setDelegationEnabled(team?.delegation_enabled ?? false);
-      if (team?.schema_version === 3) setAgentTeamConfig(canonicalAgentTeamConfig(team));
       setExternalPrivacy(data.settings?.external_model_privacy ?? {});
       const loadedCloudAdvisor = data.settings?.cloud_advisor ?? {};
       const loadedCloudAdvisorProviders = cloudAdvisorProviderOptions(
@@ -1343,13 +1327,13 @@ export function useLlmModelSection() {
         projectAutomationRoute?.provider || "",
       );
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Execution Team設定を取得できませんでした");
+      toast.error(error instanceof Error ? error.message : "モデル設定を取得できませんでした");
     }
   }, [providerOptions]);
 
   useEffect(() => {
-    if (expanded) void loadAgentTeamSettings();
-  }, [expanded, loadAgentTeamSettings]);
+    if (expanded) void loadSettings();
+  }, [expanded, loadSettings]);
 
   const deleteOllamaModel = useCallback(async (modelId: string) => {
     if (!modelId || deletingModel) return;
@@ -1558,19 +1542,13 @@ export function useLlmModelSection() {
         await saveSetting("model_routing.media.video_mode", videoMode);
       }
 
-      if (scope === "all" || scope === "agent") {
-        for (const [key, value] of Object.entries(chatgptWeb)) {
-          await saveSetting(`chatgpt_web.${key}`, value);
-        }
-      }
       toast.success("モデル・メディア設定を保存しました");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Execution Team設定を保存できませんでした");
+      toast.error(error instanceof Error ? error.message : "モデル設定を保存できませんでした");
     } finally {
       setSavingRouting(false);
     }
   }, [
-    chatgptWeb,
     classDrafts,
     imageMode,
     mageVl,
@@ -1592,14 +1570,12 @@ export function useLlmModelSection() {
     llamaCppDraft, setLlamaCppDraft, llamaCppError,
     llamaCppModelRootState, llamaCppModelRootLoading, llamaCppModelRootSaving,
     llamaCppModelRootError, saveLlamaCppModelRoot,
-    delegationEnabled, setDelegationEnabled, orchestrationMode, setOrchestrationMode,
     chatgptWeb, setChatgptWeb,
     externalPrivacy, setExternalPrivacy,
     cloudAdvisor, setCloudAdvisor, cloudAdvisorProviderIds,
     imageMode, setImageMode, videoMode, setVideoMode, mageVl, setMageVl, routingDetailsOpen, setRoutingDetailsOpen, modelTab, setModelTab,
     speechRecognition, setSpeechRecognition, classDrafts, setClassDrafts,
     projectAutomationDraft, setProjectAutomationDraft, projectAutomationProviders,
-    agentTeamConfig, setAgentTeamConfig,
     savingRouting, setSavingRouting, selectedProvider, selectedModelId, selectedModel, current,
     providerOptions,
     visionProvider, audioProvider, clipIngestProvider, clipIngestProviders,
@@ -1608,7 +1584,6 @@ export function useLlmModelSection() {
     loadCatalog, saveModelSelection, handleProviderChange, handleModelChange, handleCustomModelChange,
     handleCustomModelConfirm, handleProviderSettingsSave, handleLlamaCppSettingsSave, startPull, percent, hasProviderSettings,
     showConnectionSettings, showReasoningEffort,
-    loadAgentTeamSettings,
     deleteOllamaModel, saveRoutingSettings, saveExternalPrivacySettings,
     saveCloudAdvisorSettings,
   };

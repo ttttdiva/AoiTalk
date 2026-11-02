@@ -60,7 +60,9 @@ const nextConfig: NextConfig = {
     tsconfigPath:
       resolvedDistDir === ".next"
         ? "tsconfig.production.json"
-        : "tsconfig.json",
+        : resolvedDistDir === ".next-staged"
+          ? "tsconfig.staged.json"
+          : "tsconfig.json",
   },
   experimental: {
     proxyClientMaxBodySize: "100mb",

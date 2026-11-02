@@ -45,7 +45,7 @@ from ..services.agent_run_service import (
     reset_current_agent_run_id,
     set_current_agent_run_id,
 )
-from ..services.agent_team_service import (
+from ..services.runtime_policy_utils import (
     ToolFailureCircuitBreaker,
     parse_structured_tool_failure,
     cancelled_tool_terminal_event,
@@ -81,14 +81,16 @@ from .tool_policy import (
     get_current_user_input,
     is_knowledge_search_enabled,
     is_memory_search_enabled,
+    _PERSONAL_DEADLINE_DRAFT_AVAILABILITY_KEY,
     _policy_config_bool,
     agent_team_subagent_capability_reason,
     looks_like_docs_agent_delegation_request,
 )
-from .specialist_delegate import (
-    AgentTeamSubagentDelegationRunner,
-    MediaDelegationRunner,
-)
+from .specialist_delegate import MediaDelegationRunner
+
+# The Team child runner was removed with P5. P3 removes the remaining
+# agent_team_delegate registration and this retired invocation branch.
+AgentTeamSubagentDelegationRunner = None
 from .worker_report import (
     WORKER_REPORT_SCHEMA_VERSION,
     normalize_worker_report,
@@ -118,6 +120,66 @@ _DOCS_ROOT_DELEGATION_COMPLETED: contextvars.ContextVar[bool] = contextvars.Cont
 _ROOT_TOOL_FAILURE_BREAKERS: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "aoitalk_root_tool_failure_breakers", default={}
 )
+
+
+def _discard_child_run_budget_after_settlement(
+    child_run_id: str | None,
+    settlement_result: Any,
+) -> bool:
+    """Drop a child ledger only after its terminal status was persisted."""
+
+    normalized_run_id = str(child_run_id or "").strip()
+    if not normalized_run_id or settlement_result is None:
+        return False
+    from .agent_run_budget import discard_agent_run_budget
+
+    discard_agent_run_budget(normalized_run_id)
+    return True
+
+
+def _budget_failure_tool_call(budget_failure: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a content-free Run budget failure as a synthetic tool receipt."""
+
+    failure = dict(budget_failure)
+    code = str(failure.get("code") or "run_budget_exceeded")
+    kind = str(failure.get("kind") or "unknown")
+    usage_unavailable = kind == "usage_unavailable"
+    failure_field = "run_budget_failure" if usage_unavailable else "budget_exceeded"
+    tool_name = (
+        "run_budget_usage_unavailable"
+        if usage_unavailable
+        else "run_budget_exceeded"
+    )
+    receipt_id = (
+        "run_budget_usage_unavailable_tokens"
+        if usage_unavailable
+        else f"run_budget_exceeded_{kind}"
+    )
+    return {
+        "tool": tool_name,
+        "arguments": {},
+        "result": json.dumps(
+            {
+                "success": False,
+                "error_code": code,
+                failure_field: failure,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "successful": False,
+        "error": code,
+        "tool_call_id": receipt_id,
+        "executed": False,
+        "synthetic": True,
+        failure_field: failure,
+        "metadata": {
+            "error_code": code,
+            failure_field: failure,
+            "executed": False,
+            "synthetic": True,
+        },
+    }
 
 
 def _specialist_child_usage(
@@ -317,6 +379,8 @@ class _BoundedManagedToolExecutionAdapter:
         timeout_seconds: float = 30.0,
     ) -> dict[str, Any]:
         snapshot_path: str | None = None
+        issued_scope = None
+        owns_issued_scope = False
         try:
             enterprise = bool(Features.is_enterprise())
         except Exception:
@@ -404,11 +468,17 @@ class _BoundedManagedToolExecutionAdapter:
                             from ..config import Config
 
                             scope_config = Config()
+                        managed_run_id = f"managed-tool-{uuid4().hex}"
                         upper_scope = build_current_turn_enterprise_scope(
                             config=scope_config,
+                            run_id=managed_run_id,
+                            audit_id=f"managed-tool:{managed_run_id}",
+                            scratch_name=f".harness-scratch-{managed_run_id}",
                         )
                         if not isinstance(upper_scope, HarnessExecutionScope):
                             raise TypeError("invalid trusted HarnessExecutionScope")
+                        issued_scope = upper_scope
+                        owns_issued_scope = True
 
                     expected_lower_scope = upper_scope.to_agent_run_scope()
                     if lower_scope is None:
@@ -497,6 +567,18 @@ class _BoundedManagedToolExecutionAdapter:
                 "timed_out": False,
             }
         finally:
+            if owns_issued_scope and issued_scope is not None:
+                try:
+                    from ..services.harness_execution_scope_service import (
+                        release_created_scratch_roots,
+                    )
+
+                    release_created_scratch_roots(issued_scope)
+                except Exception:
+                    # The release helper is identity/reparse aware and leaves
+                    # anything it cannot prove to be this command's scratch.
+                    # Never mask the command result with cleanup diagnostics.
+                    pass
             if snapshot_path is not None:
                 try:
                     os.unlink(snapshot_path)
@@ -1126,6 +1208,71 @@ def _register_tool_definition(
     return True
 
 
+def register_personal_deadline_current_turn_tool(
+    client: Any,
+    *,
+    handler: Callable[[], Any],
+    activation_enabled: Any,
+    availability_check: Callable[[], str | None],
+) -> bool:
+    """Register the private current-turn personal deadline draft tool.
+
+    The tool is intentionally injected into an already-built provider
+    registry by the private Chat adapter.  It is not part of ordinary runtime
+    registry construction and accepts no model-controlled arguments.
+    """
+
+    if activation_enabled is not True:
+        return False
+
+    registry = getattr(client, "_tool_registry", None)
+    register = getattr(registry, "register", None)
+    if not callable(register) or not callable(handler) or not callable(availability_check):
+        return False
+
+    try:
+        handler_signature = inspect.signature(handler)
+        handler_signature.bind()
+    except (TypeError, ValueError):
+        return False
+    if not (
+        inspect.iscoroutinefunction(handler)
+        or inspect.iscoroutinefunction(getattr(handler, "__call__", None))
+    ):
+        return False
+
+    try:
+        availability = availability_check()
+    except Exception:
+        return False
+    if inspect.isawaitable(availability):
+        close = getattr(availability, "close", None)
+        if callable(close):
+            close()
+        return False
+    if availability is not None:
+        return False
+
+    register(
+        ToolDefinition(
+            name="create_personal_deadline_candidate",
+            description="Create a personal deadline candidate from the current turn.",
+            function=handler,
+            parameters=[],
+            is_async=True,
+            risk="medium",
+            side_effect="writes",
+            requires_approval=False,
+            supports_parallel=False,
+            owner="personal_deadline_draft",
+            availability={
+                _PERSONAL_DEADLINE_DRAFT_AVAILABILITY_KEY: availability_check,
+            },
+        )
+    )
+    return True
+
+
 def _register_search_direct_tools(
     registry: ToolRegistry,
     *,
@@ -1347,6 +1494,44 @@ def _register_operations_direct_tools(registry: ToolRegistry) -> bool:
                 risk="medium" if is_mutation else "low",
                 requires_approval=is_mutation,
                 supports_parallel=bool(is_read),
+            )
+            or registered
+        )
+    return registered
+
+
+def _register_crowdworks_agent_tools(registry: ToolRegistry) -> bool:
+    """Expose the dedicated CrowdWorks read/proposal tool surface."""
+
+    try:
+        from ..tools.crowdworks_agent import CROWDWORKS_AGENT_TOOL_DEFINITIONS
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "CrowdWorks Agent tools could not be loaded",
+            exc_info=True,
+        )
+        return False
+
+    read_names = {
+        "crowdworks_candidates",
+        "crowdworks_profile",
+    }
+    registered = False
+    for tool_def in CROWDWORKS_AGENT_TOOL_DEFINITIONS:
+        is_read = tool_def.name in read_names
+        registered = (
+            _register_tool_definition(
+                registry,
+                tool_def,
+                owner="crowdworks_agent",
+                # Not a workspace mutation: these touch the CrowdWorks site and
+                # Operations records, never a Project workspace lease.
+                side_effect="none" if is_read else "external",
+                risk="low" if is_read else "medium",
+                requires_approval=False,
+                supports_parallel=is_read,
             )
             or registered
         )
@@ -2364,6 +2549,7 @@ def _register_agent_team_delegate_tool(
         instance_route_metadata: dict[int, dict[str, Any]] = {}
         instance_reports: dict[int, dict[str, Any]] = {}
         instance_usage: dict[int, dict[str, Any]] = {}
+        instance_budget_failures: dict[int, dict[str, Any]] = {}
         # インスタンスごとに子 AgentRun を作り、タイムラインから委譲先へ辿れるようにする。
         child_run_ids: dict[int, str] = {}
         breaker_key = f"{parent_agent_run_id or 'no-parent'}:{subagent_id}"
@@ -2534,6 +2720,14 @@ def _register_agent_team_delegate_tool(
             payload["worker_report"] = report
             if index in instance_usage:
                 payload["usage"] = dict(instance_usage[index])
+            if index in instance_budget_failures:
+                budget_failure = instance_budget_failures[index]
+                failure_field = (
+                    "run_budget_failure"
+                    if budget_failure.get("kind") == "usage_unavailable"
+                    else "budget_exceeded"
+                )
+                payload[failure_field] = dict(budget_failure)
             payload["publication"] = report.get(
                 "publication",
                 parent_publication_metadata(parent_run_id=parent_agent_run_id),
@@ -2590,9 +2784,13 @@ def _register_agent_team_delegate_tool(
                 child_run_id = child_run_ids.get(index)
                 if child_run_id and agent_run_service:
                     try:
-                        await agent_run_service.cancel_run(
+                        settlement = await agent_run_service.cancel_run(
                             child_run_id,
                             message=f"{label}-{index} の実行が親委譲のキャンセルで停止しました",
+                        )
+                        _discard_child_run_budget_after_settlement(
+                            child_run_id,
+                            settlement,
                         )
                     except Exception as exc:
                         print(f"[AgentTeam] child run parent-cancel update failed: {exc}")
@@ -2705,6 +2903,8 @@ def _register_agent_team_delegate_tool(
                 set_current_agent_run_id(child_run_id) if child_run_id else None
             )
             try:
+                if AgentTeamSubagentDelegationRunner is None:
+                    raise RuntimeError("agent_team_delegate_retired")
                 runner = AgentTeamSubagentDelegationRunner(
                     runner_config,
                     **runner_kwargs,
@@ -2781,6 +2981,17 @@ def _register_agent_team_delegate_tool(
                         )
                         return f"{label}-{index} delegation error: internal tool failure circuit open"
                 return result
+            except Exception as exc:
+                from .agent_run_budget import (
+                    AgentRunBudgetStop,
+                    safe_budget_failure_payload,
+                )
+
+                if isinstance(exc, AgentRunBudgetStop):
+                    budget_failure = safe_budget_failure_payload(exc.failure)
+                    if budget_failure is not None:
+                        instance_budget_failures[index] = budget_failure
+                raise
             finally:
                 if runner is not None:
                     child_usage = _specialist_child_usage(runner, child_run_id)
@@ -2952,17 +3163,38 @@ def _register_agent_team_delegate_tool(
             }
             if index in instance_usage:
                 report_metadata["usage"] = dict(instance_usage[index])
+            budget_failure = instance_budget_failures.get(index)
+            if budget_failure is not None:
+                failure_field = (
+                    "run_budget_failure"
+                    if budget_failure.get("kind") == "usage_unavailable"
+                    else "budget_exceeded"
+                )
+                report_metadata[failure_field] = dict(budget_failure)
+                report_metadata["error_code"] = str(
+                    budget_failure.get("code") or "run_budget_exceeded"
+                )
             if status == "failed":
                 if child_run_id and agent_run_service:
                     try:
-                        await agent_run_service.fail_run(
+                        failed_result = {
+                            "output": str(result)[:20000],
+                            **report_metadata,
+                        }
+                        if budget_failure is not None:
+                            failed_result[failure_field] = dict(budget_failure)
+                            failed_result["tool_calls"] = [
+                                _budget_failure_tool_call(budget_failure)
+                            ]
+                        settlement = await agent_run_service.fail_run(
                             child_run_id,
                             str(result),
-                            result={
-                                "output": str(result)[:20000],
-                                **report_metadata,
-                            },
+                            result=failed_result,
                             metadata=report_metadata,
+                        )
+                        _discard_child_run_budget_after_settlement(
+                            child_run_id,
+                            settlement,
                         )
                     except Exception as exc:
                         print(f"[AgentTeam] child run fail update failed: {exc}")
@@ -2981,9 +3213,13 @@ def _register_agent_team_delegate_tool(
             elif status == "cancelled":
                 if child_run_id and agent_run_service:
                     try:
-                        await agent_run_service.cancel_run(
+                        settlement = await agent_run_service.cancel_run(
                             child_run_id,
                             message=str(result) or f"{label}-{index} の実行がキャンセルされました",
+                        )
+                        _discard_child_run_budget_after_settlement(
+                            child_run_id,
+                            settlement,
                         )
                     except Exception as exc:
                         print(f"[AgentTeam] child run cancel update failed: {exc}")
@@ -3002,7 +3238,7 @@ def _register_agent_team_delegate_tool(
             else:
                 if child_run_id and agent_run_service:
                     try:
-                        await agent_run_service.complete_run(
+                        settlement = await agent_run_service.complete_run(
                             child_run_id,
                             result={
                                 "output": str(result)[:20000],
@@ -3010,6 +3246,10 @@ def _register_agent_team_delegate_tool(
                             },
                             message=f"{label}-{index} が完了しました",
                             metadata=report_metadata,
+                        )
+                        _discard_child_run_budget_after_settlement(
+                            child_run_id,
+                            settlement,
                         )
                     except Exception as exc:
                         print(f"[AgentTeam] child run complete update failed: {exc}")
@@ -3296,6 +3536,59 @@ def _register_agent_dialogue_tools(registry: ToolRegistry) -> None:
             exc_info=True,
         )
 
+    # External workers share the AgentDialogue lifecycle and audit controls,
+    # but remain a separate model-facing tool.  Keep the builder lazy so
+    # providers that do not install the optional CLI/Muse adapters can still
+    # construct the rest of the runtime registry.
+    try:
+        from ..tools.delegate_worker import build_delegate_worker_tool
+
+        definition = build_delegate_worker_tool()
+        if definition is not None and definition.name not in registry:
+            registry.register(definition)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Agent worker delegation tool could not be registered",
+            exc_info=True,
+        )
+
+
+class _RuntimeToolRegistry(ToolRegistry):
+    """Project the worker kind schema for the current trusted revision."""
+
+    @staticmethod
+    def _project_worker(definition):
+        if definition is None or definition.name != "delegate_worker":
+            return definition
+        from .tool_policy import get_current_agent_tool_scope
+
+        scope = get_current_agent_tool_scope()
+        if not isinstance(scope, dict):
+            return definition
+        ids = scope.get("tool_ids") or ()
+        capabilities = scope.get("capabilities") or ()
+        kinds = [
+            kind for kind, capability in (
+                ("codex", "aoi_tools"), ("antigravity", "aoi_tools"),
+                ("claude", "aoi_tools"), ("grok", "aoi_tools"),
+                ("muse", "remote_agent_delegate"),
+            )
+            if f"delegate_worker:{kind}" in ids and capability in capabilities
+        ]
+        return replace(definition, parameters=[
+            replace(param, enum=kinds, schema={"type": "string", "enum": kinds})
+            if param.name == "kind" else param
+            for param in definition.parameters
+        ])
+
+    def get(self, name):
+        return self._project_worker(super().get(name))
+
+    def get_all(self):
+        return [self._project_worker(item) for item in super().get_all()]
+
 
 def _build_runtime_tool_registry(
     config: Any,
@@ -3319,7 +3612,7 @@ def _build_runtime_tool_registry(
     解決済みの絶対 path を渡すことで、Tool 経由の App 操作が API 側と別 root の
     ロックを取る（= 排他が壊れる）ことを防ぐ。
     """
-    registry = ToolRegistry()
+    registry = _RuntimeToolRegistry()
     # Keep the server-resolved object for authorization/contextual gates even
     # when ``include_project_context`` hides it from the model prompt.
     server_project_context = (
@@ -3363,6 +3656,7 @@ def _build_runtime_tool_registry(
     # it before the legacy ``not config`` return so providers using the default
     # config still receive the same safe tool surface.
     _register_operations_direct_tools(registry)
+    _register_crowdworks_agent_tools(registry)
 
     # Keep deferred App definitions in the provider registry (as Spotify and
     # media packs do), but let the contextual pack gate below decide whether
@@ -3421,20 +3715,8 @@ def _build_runtime_tool_registry(
         config=config,
     )
 
-    # Agent Team（汎用作業系）の公開スイッチ。OFF時はSubagent委譲と
-    # 高度推論を隠す。単独で動く専門エージェントは個別設定に従う。
-    delegation_on = agent_team_v3_delegation_enabled(config)
-
-    if delegation_on:
-        _register_load_agent_team_tool(registry, config=config, client=client)
-        _register_agent_team_delegate_tool(
-            registry,
-            config=config,
-            client=client,
-            project_context=server_project_context,
-            trusted_parent_context=trusted_parent_context,
-            qa_browser_coordinator=qa_browser_coordinator,
-        )
+    # The retired Team tools are no longer registered. P3-owned delegate and
+    # delegate_worker registration remains in their neutral path above.
 
     # Utility lookups are Shared Tools and do not depend on Agent Team
     # delegation being enabled.

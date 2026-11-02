@@ -6,18 +6,115 @@ import Image from "next/image";
 import { Monitor } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AppSelect } from "@/components/ui/app-select";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { HelpPopover } from "@/components/ui/help-popover";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { withBasePath } from "@/lib/base-path";
 import { buildPcBridgeServerUrl } from "@/lib/websocket-url";
 import { SettingsDisclosure } from "./settings-disclosure";
 
+type SettingsPayload = { settings?: { pc_bridge?: { remote_enabled?: unknown } } };
 type Device = { id: string; name: string; online: boolean; edge_connected: boolean; capabilities: string[] };
 type State = { devices: Device[]; selected_device_id: string | null };
-const base = withBasePath("/api/python-proxy/pc-bridge");
+const settingsUrl = withBasePath("/api/python-proxy/settings");
+const bridgeBase = withBasePath("/api/python-proxy/pc-bridge");
+
+async function settingsRequest(path = "", init?: RequestInit) {
+  const response = await fetch(settingsUrl + path, {
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...init?.headers },
+    ...init,
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(typeof error.detail === "string" ? error.detail : `設定を保存できませんでした (${response.status})`);
+  }
+  return response.json();
+}
+
+async function loadRemoteEnabled(): Promise<boolean> {
+  const payload = await settingsRequest() as SettingsPayload;
+  return payload.settings?.pc_bridge?.remote_enabled === true;
+}
+
+export function PcBridgeSettingsSection({ isAdmin = true }: { isAdmin?: boolean }) {
+  const { data: remoteEnabled, error: loadError, mutate } = useSWR<boolean>(
+    "settings/pc-bridge/remote-enabled",
+    loadRemoteEnabled,
+  );
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+
+  async function updateRemoteEnabled(enabled: boolean) {
+    if (saving || remoteEnabled === undefined || !isAdmin) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      await settingsRequest("", {
+        method: "PATCH",
+        body: JSON.stringify({ key: "pc_bridge.remote_enabled", value: enabled, persist: true }),
+      });
+      await mutate(enabled, { revalidate: false });
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "設定を保存できませんでした");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <Card size="sm" className="rounded-xl border-border bg-card py-0" data-settings-surface="pc-bridge-remote">
+        <CardHeader className="border-b border-border/70 px-3 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 space-y-1">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <Monitor className="size-4" />
+                他の PC の制御
+                <HelpPopover label="他の PC の制御">
+                  <p>有効にすると、Bridge exeを起動した別のPCを登録して操作先にできます。</p>
+                  <p>無効にすると、接続中のBridgeを切断します。登録情報は保持されます。</p>
+                </HelpPopover>
+              </CardTitle>
+              <p className="text-xs leading-5 text-muted-foreground">
+                別のPC上のBridgeを操作先として使う設定です。既定ではオフです。
+              </p>
+            </div>
+            <label className="inline-flex shrink-0 cursor-pointer items-center" aria-label="他の PC の制御">
+              <input
+                type="checkbox"
+                role="switch"
+                aria-label="他の PC の制御"
+                className="peer sr-only"
+                checked={remoteEnabled === true}
+                disabled={saving || remoteEnabled === undefined || !isAdmin || Boolean(loadError)}
+                onChange={(event) => void updateRemoteEnabled(event.currentTarget.checked)}
+              />
+              <span aria-hidden="true" className="relative h-5 w-9 rounded-full border border-input bg-muted transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-3.5 after:rounded-full after:bg-background after:shadow after:transition-transform peer-checked:border-primary peer-checked:bg-primary peer-checked:after:translate-x-4 peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+            </label>
+          </div>
+        </CardHeader>
+        {(remoteEnabled !== true || loadError || saveError) && (
+          <CardContent className="space-y-2 px-3 py-3">
+            {loadError ? <p role="alert" className="text-sm text-destructive">「他の PC の制御」の設定を取得できませんでした。</p> : null}
+            {saveError ? <p role="alert" className="break-words text-sm text-destructive">{saveError}</p> : null}
+            {remoteEnabled === undefined && !loadError ? <p role="status" className="text-sm text-muted-foreground">設定を読み込み中です。</p> : null}
+            {remoteEnabled === false && !loadError ? (
+              <p role="status" className="text-sm text-muted-foreground">
+                PC接続はオフです。別のPCを登録するには、この設定をオンにしてください。
+              </p>
+            ) : null}
+          </CardContent>
+        )}
+      </Card>
+      {remoteEnabled === true ? <PcBridgeConnectionSettings /> : null}
+    </>
+  );
+}
 
 async function api(path: string, method = "GET", body?: unknown) {
-  const response = await fetch(base + path, {
+  const response = await fetch(bridgeBase + path, {
     method, credentials: "include", headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -28,7 +125,7 @@ async function api(path: string, method = "GET", body?: unknown) {
   return (await response.json()).result;
 }
 
-export function PcBridgeSettingsSection() {
+function PcBridgeConnectionSettings() {
   const { data, error, mutate, isLoading } = useSWR<State>("pc-bridge/devices", () => api("/devices"), { refreshInterval: 5000 });
   const [name, setName] = useState("");
   const [token, setToken] = useState("");
@@ -52,7 +149,7 @@ export function PcBridgeSettingsSection() {
   async function showScreen() {
     const selected = data?.selected_device_id;
     if (!selected) return;
-    const response = await fetch(`${base}/devices/${selected}/screen`, { credentials: "include", cache: "no-store" });
+    const response = await fetch(`${bridgeBase}/devices/${selected}/screen`, { credentials: "include", cache: "no-store" });
     if (!response.ok) throw new Error("選択したPCの画面を取得できませんでした。Bridgeの接続を確認してください。");
     if (screenRef.current) URL.revokeObjectURL(screenRef.current);
     screenRef.current = URL.createObjectURL(await response.blob());
@@ -72,8 +169,8 @@ export function PcBridgeSettingsSection() {
       </>
     )}
   >
-    <div className="max-w-2xl space-y-3">
-      <a className="text-sm underline" href={`${base}/download`}>AoiTalk-PC-Bridge.exe を取得</a>
+    <div className="w-full min-w-0 space-y-3">
+      <a className="text-sm underline" href={`${bridgeBase}/download`}>AoiTalk-PC-Bridge.exe を取得</a>
       {error && <p role="alert" className="text-sm text-destructive">PC一覧を取得できませんでした。</p>}
       <div className="space-y-1">
         <Label htmlFor="pc-bridge-device">操作するPC</Label>

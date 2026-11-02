@@ -526,6 +526,83 @@ class ContentVariantReadinessResponse(_ContentResponseModel):
     rights: AssessmentProjection | None = None
 
 
+class StockAdoptionRequest(_ContentCommandModel):
+    action: Literal["adopt", "withdraw"]
+    expected_content_item_hash: Sha256
+    expected_version: int = Field(ge=1)
+
+
+class StockFindingEvidenceResponse(_ContentResponseModel):
+    type: Literal["url", "metric_snapshot"]
+    url: str | None = None
+    snapshot_id: str | None = None
+    snapshot_hash: str | None = None
+
+
+class StockFindingResponse(_ContentResponseModel):
+    id: str
+    kind: str
+    statement: str
+    evidence: list[StockFindingEvidenceResponse] = Field(default_factory=list, max_length=20)
+
+
+class StockSelectedOutputResponse(_ContentResponseModel):
+    generation_output_id: str
+    sha256: Sha256
+
+
+class StockVariantResponse(_ContentResponseModel):
+    id: str
+    platform: MediaPlatform
+    revision_id: str | None = None
+    revision_hash: Sha256 | None = None
+    selected_outputs: list[StockSelectedOutputResponse] = Field(default_factory=list, max_length=100)
+    qa_result: str | None = None
+    rights_result: str | None = None
+    blockers: list[str] = Field(default_factory=list, max_length=100)
+
+
+class ContentItemStockDecisionResponse(_ContentResponseModel):
+    id: str
+    content_item_id: str
+    owner_user_id: str
+    project_id: str | None = None
+    sequence: int
+    event_type: Literal["adopt", "withdraw"]
+    from_status: Literal["draft", "ready"]
+    to_status: Literal["draft", "ready"]
+    content_item_version: int
+    content_item_hash: Sha256
+    snapshot: dict[str, Any]
+    actor_id: str | None = None
+    actor_type: Literal["human", "admin"]
+    request_hash: Sha256
+    decision_hash: Sha256
+    prev_event_hash: Sha256 | None = None
+    event_hash: Sha256
+    created_at: str
+
+
+class StockItemResponse(_ContentResponseModel):
+    id: str
+    owner_user_id: str
+    project_id: str | None = None
+    brand_name: str
+    title: str
+    brief: str
+    status: Literal["draft", "ready", "in_progress", "published", "archived"]
+    version: int
+    content_hash: Sha256
+    stock_status: Literal["adopted", "awaiting_adoption", "needs_review"]
+    blockers: list[str] = Field(default_factory=list, max_length=200)
+    findings: list[StockFindingResponse] = Field(default_factory=list, max_length=20)
+    variants: list[StockVariantResponse] = Field(default_factory=list, max_length=100)
+    latest_decision: ContentItemStockDecisionResponse | None = None
+
+
+StockItemListResponse = list[StockItemResponse]
+
+
 class AssessmentProjection(_ContentResponseModel):
     id: str
     content_variant_id: str
@@ -634,6 +711,44 @@ def create_media_operations_content_router(
                 *args,
                 **kwargs,
             ),
+        )
+
+    @router.get(
+        "/stock",
+        response_model=StockItemListResponse,
+        operation_id="media_list_content_item_stock",
+    )
+    async def list_stock_items(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await call("list_stock_items", actor, limit=limit, offset=offset)
+
+    @router.post(
+        "/content-items/{content_item_id}/stock-adoption",
+        response_model=ContentItemStockDecisionResponse,
+        operation_id="media_change_content_item_stock_adoption",
+    )
+    async def change_content_item_stock(
+        content_item_id: str,
+        payload: StockAdoptionRequest,
+        request: Request,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=255),
+        ],
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await call(
+            "change_content_item_stock",
+            actor,
+            content_item_id,
+            **payload.model_dump(mode="json"),
+            idempotency_key=idempotency_key,
         )
 
     @router.get(
@@ -905,6 +1020,7 @@ __all__ = [
     "ContentVariantDetailResponse",
     "ContentVariantListResponse",
     "ContentVariantReadinessResponse",
+    "ContentItemStockDecisionResponse",
     "ContentVariantRevisionCreateRequest",
     "ContentVariantRevisionListResponse",
     "ContentVariantRevisionResponse",
@@ -925,6 +1041,13 @@ __all__ = [
     "RightsRecordCreateRequest",
     "RightsRecordListResponse",
     "RightsRecordResponse",
+    "StockAdoptionRequest",
+    "StockFindingEvidenceResponse",
+    "StockFindingResponse",
+    "StockItemListResponse",
+    "StockItemResponse",
+    "StockSelectedOutputResponse",
+    "StockVariantResponse",
     "XContentPayload",
     "XPostContentPayload",
     "XThreadContentPayload",

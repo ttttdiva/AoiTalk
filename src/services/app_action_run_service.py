@@ -376,6 +376,19 @@ class FileAwareAppActionTransport:
     async def _capture_outputs(self, response: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
         if not isinstance(response, Mapping) or str(response.get("phase") or response.get("status")) not in {"succeeded", "failed"}:
             return response
+        # Start receives the closed payload with the durable Run identity,
+        # while transports also receive some identity fields as top-level
+        # kwargs. Reconciliation supplies the latter directly, but a start
+        # response must not lose run/action scope merely because the transport
+        # method shape has no standalone run_id parameter.
+        payload = kwargs.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        run_id = kwargs.get("run_id") or payload.get("run_id")
+        app_id = kwargs.get("app_id") or payload.get("app_id")
+        action_ref = kwargs.get("action_ref") or payload.get("action_ref")
+        project_id = kwargs.get("project_id")
+        if project_id is None:
+            project_id = payload.get("project_id")
         result = response.get("result")
         outputs = response.get("output_files") if isinstance(response.get("output_files"), list) else (
             result.get("files") if isinstance(result, Mapping) else None
@@ -387,31 +400,36 @@ class FileAwareAppActionTransport:
         try:
             if callable(download):
                 outputs = await download(
-                    run_id=kwargs.get("run_id"),
-                    owner_user_id=kwargs.get("actor_user_id") or kwargs.get("owner_user_id"),
+                    run_id=run_id,
+                    # Output bytes belong to the App execution owner.  The
+                    # actor may be an authorized runner, but using that
+                    # identity here would select the wrong PC Bridge
+                    # connection for delegated runs.  Input staging keeps
+                    # its actor-owned semantics above.
+                    owner_user_id=kwargs.get("owner_user_id"),
                     device_id=kwargs.get("device_id"),
                     machine_id=kwargs.get("machine_id"),
-                    action_ref=kwargs.get("action_ref"),
+                    action_ref=action_ref,
                     outputs=outputs,
                 )
                 metadata = await asyncio.to_thread(
                     self.file_service.capture_outputs,
                     outputs,
-                    run_id=kwargs.get("run_id"),
-                    app_id=kwargs.get("app_id"),
+                    run_id=run_id,
+                    app_id=app_id,
                     owner_user_id=kwargs.get("owner_user_id"),
-                    project_id=kwargs.get("project_id"),
-                    action_id=kwargs.get("action_ref"),
+                    project_id=project_id,
+                    action_id=action_ref,
                 )
                 metadata = [item.to_dict() for item in metadata]
             else:
                 metadata = await capture(
-                    run_id=kwargs.get("run_id"),
-                    app_id=kwargs.get("app_id"),
+                    run_id=run_id,
+                    app_id=app_id,
                     owner_user_id=kwargs.get("owner_user_id"),
-                    project_id=kwargs.get("project_id"),
+                    project_id=project_id,
                     outputs=outputs,
-                    action_ref=kwargs.get("action_ref"),
+                    action_ref=action_ref,
                 )
         except AppActionTransportError:
             raise

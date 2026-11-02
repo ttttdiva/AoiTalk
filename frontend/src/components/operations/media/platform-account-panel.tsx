@@ -238,12 +238,13 @@ function CredentialStatus({
       </span>
     );
   }
+  const expired = credential?.verification_code === "credential_expired";
   return (
     <span
       className="rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground"
-      data-credential-status={credential?.status ?? "not_configured"}
+      data-credential-status={expired ? "expired" : (credential?.status ?? "not_configured")}
     >
-      認証 {statusLabel(credential?.status ?? "not_configured")}
+      認証 {expired ? "期限切れ" : statusLabel(credential?.status ?? "not_configured")}
     </span>
   );
 }

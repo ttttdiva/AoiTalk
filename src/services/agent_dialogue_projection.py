@@ -19,6 +19,9 @@ from .agent_dialogue_budget import project_dialogue_budget
 _MAX_LIST = 64
 _MAX_MAP = 32
 _MAX_TEXT = 512
+_TASK_CANCELLED_STATES = frozenset({"cancelled", "canceled"})
+_TASK_PAUSED_STATES = frozenset({"paused", "on_hold", "blocked"})
+_TASK_RUNNABLE_STATES = frozenset({"todo", "open", "in_progress", "review"})
 _SAFE_REF_FIELDS = {
     "id",
     "dialogue_id",
@@ -92,6 +95,27 @@ def _text(value: Any, *, limit: int = _MAX_TEXT) -> str | None:
     if not text:
         return None
     return text[:limit]
+
+
+def dialogue_task_blocker(
+    task_status: Any,
+    *,
+    missing: bool = False,
+    deleted: bool = False,
+) -> tuple[str, str] | None:
+    """Return the safe Dialogue projection state for an inactive linked Task."""
+
+    if missing or deleted:
+        return "blocked", "task_unavailable"
+    status = (_text(task_status, limit=32) or "").casefold()
+    if status in _TASK_CANCELLED_STATES:
+        return "cancelled", "task_cancelled"
+    if status in _TASK_PAUSED_STATES:
+        reason = "task_paused" if status in {"paused", "on_hold"} else "task_blocked"
+        return "blocked", reason
+    if status in _TASK_RUNNABLE_STATES:
+        return None
+    return "blocked", "task_not_active"
 
 
 def _safe_json(value: Any, *, depth: int = 0) -> Any:
@@ -253,14 +277,35 @@ def _worker_lifecycle_status(
         and expected_control_revision is not None
         and int(expected_control_revision or 0) == int(base_control_revision or 0)
     )
+    run_status = (
+        _text(_value(worker_run, "status", "state"), limit=32).casefold()
+        if worker_run is not None
+        else ""
+    )
+    work_status = (
+        _text(_value(worker_work, "state", "status"), limit=32).casefold()
+        if worker_work is not None
+        else ""
+    )
+    delivery_state = (
+        _text(_value(worker_delivery, "state", "status"), limit=32).casefold()
+        if worker_delivery is not None
+        else ""
+    )
+    delivery_kind = (
+        (_text(_value(worker_delivery, "kind", "type"), limit=32) or "").casefold()
+        if worker_delivery is not None
+        else ""
+    )
+    if has_worker_evidence and delivery_state in {"cancelled", "canceled", "expired"}:
+        if base_status in {"succeeded", "failed", "cancelled", "expired"}:
+            return base_status, "dialogue", base_status
+        terminal = "expired" if delivery_state == "expired" else "cancelled"
+        return terminal, "worker", terminal
     if any(_text(_value(item, "state", "status", default="pending"), limit=24).casefold() == "pending" for item in pending_inputs):
         return "waiting", "worker" if has_worker_evidence else "dialogue", "waiting_for_input"
     if not has_worker_evidence:
         return base_status, "dialogue", base_status
-    run_status = _text(_value(worker_run, "status", "state"), limit=32).casefold() if worker_run is not None else ""
-    work_status = _text(_value(worker_work, "state", "status"), limit=32).casefold() if worker_work is not None else ""
-    delivery_state = _text(_value(worker_delivery, "state", "status"), limit=32).casefold() if worker_delivery is not None else ""
-    delivery_kind = (_text(_value(worker_delivery, "kind", "type"), limit=32) or "").casefold() if worker_delivery is not None else ""
     if work_status in {"blocked", "uncertain"} or run_status in {"blocked", "uncertain"}:
         return "blocked", "worker", "blocked"
     if delivery_kind in {"response", "event"} and (
@@ -305,6 +350,8 @@ def project_dialogue(
     budget_owner: Any | None = None,
     root_agent_name: Any = None,
     worker_agent_name: Any = None,
+    task_blocker: tuple[str, str] | None = None,
+    agent_identity_active: bool | None = None,
 ) -> dict[str, Any]:
     """Build the canonical bounded AgentDialogue response."""
 
@@ -410,7 +457,13 @@ def project_dialogue(
         if refs.get(key) is None:
             refs.pop(key, None)
 
-    input_items = [project_input(item) for item in list(pending_inputs)[:_MAX_LIST]]
+    input_items = [
+        projected
+        for projected in (
+            project_input(item) for item in list(pending_inputs)[:_MAX_LIST]
+        )
+        if projected.get("state") == "pending"
+    ]
     artifact_items = [project_artifact(item) for item in list(artifacts)[:_MAX_LIST]]
     input_items = [item for item in input_items if item.get("id")]
     artifact_items = [item for item in artifact_items if item.get("id") or item.get("artifact_ref")]
@@ -423,6 +476,54 @@ def project_dialogue(
         pending_inputs=input_items,
         base_control_revision=control_revision,
     )
+    worker_run_status = (
+        _text(_value(worker_run, "status", "state"), limit=32).casefold()
+        if worker_run is not None
+        else ""
+    )
+    worker_work_status = (
+        _text(_value(worker_work, "state", "status"), limit=32).casefold()
+        if worker_work is not None
+        else ""
+    )
+    active_worker_execution = worker_run_status in {
+        "queued",
+        "running",
+        "awaiting_approval",
+    } or worker_work_status in {
+        "pending",
+        "claimed",
+        "running",
+        "awaiting_approval",
+        "retry_wait",
+    }
+    task_lifecycle_applied = False
+    task_blocker_state, task_blocker_reason = task_blocker or (None, None)
+    task_controls_blocked = (
+        task_blocker_state in {"blocked", "cancelled"}
+        and not active_worker_execution
+    )
+    identity_controls_blocked = (
+        agent_identity_active is False and not active_worker_execution
+    )
+    if (
+        task_blocker_state in {"blocked", "cancelled"}
+        and status in {"queued", "running", "waiting"}
+        and not active_worker_execution
+    ):
+        status = task_blocker_state
+        status_source = "dialogue"
+        phase = task_blocker_state
+        task_lifecycle_applied = True
+    identity_blocked = (
+        agent_identity_active is False
+        and status in {"queued", "running", "waiting"}
+        and not active_worker_execution
+    )
+    if identity_blocked:
+        status = "blocked"
+        status_source = "dialogue"
+        phase = "blocked"
     allowed_actions: list[str] = []
     if status in {"queued", "running", "waiting", "blocked"}:
         allowed_actions.append("stop")
@@ -432,6 +533,8 @@ def project_dialogue(
         allowed_actions.append("rework")
     if input_items:
         allowed_actions.append("answer")
+    if task_controls_blocked or identity_controls_blocked:
+        allowed_actions = ["stop"] if status in {"queued", "running", "waiting", "blocked"} else []
     human_status = {
         "queued": "Queued",
         "running": "Running",
@@ -447,6 +550,13 @@ def project_dialogue(
     budget = None
     if any(hasattr(value, name) for name in ("max_attempts", "max_tokens", "max_cost_micros", "usage_state")):
         budget = project_dialogue_budget(value, budget_owner=budget_owner)
+    projected_error = safe_error(
+        _value(value, "safe_error_code", "safe_error", "error_code", "error")
+    )
+    if task_lifecycle_applied and task_blocker_reason:
+        projected_error = task_blocker_reason
+    elif identity_blocked and projected_error is None:
+        projected_error = "dialogue_agent_inactive"
     safe = {
         "dialogue_id": dialogue_id,
         "job_status": status,
@@ -463,9 +573,7 @@ def project_dialogue(
         "control_revision": control_revision,
         "pending_inputs": input_items,
         "artifacts": artifact_items,
-        "safe_error": safe_error(
-            _value(value, "safe_error_code", "safe_error", "error_code", "error")
-        ),
+        "safe_error": projected_error,
         "deadline": _time(_value(value, "deadline")),
         "created_at": _time(_value(value, "created_at")),
         "updated_at": _time(_value(value, "updated_at")),

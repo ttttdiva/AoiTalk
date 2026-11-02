@@ -11,9 +11,10 @@ import { acknowledgeLegacyOpInWriter } from "../sync-v3/legacy-migration";
 import { getDb, schema } from '../db/client';
 import type { OutboxEnqueue } from './types';
 import { getToken, getTokenAuthScope } from '../lib/auth';
-import { asc, eq, and, isNull, like, sql } from 'drizzle-orm';
+import { asc, eq, and, gte, isNotNull, isNull, like, lt, or, sql } from 'drizzle-orm';
 import type { OutboxSyncState } from '../stores/sync-status';
 import { assertActiveWriter, type SqliteHandle, type SqliteWriter } from '../db/sqlite-writer';
+import { runForegroundSqliteWrite } from '../db/sqlite-write-coordinator';
 import {
   readSyncV3DeviceStateInWriter,
   writeSyncV3DeviceStateInWriter,
@@ -42,6 +43,47 @@ export type PendingOutboxSnapshot = {
   authScope: string | null;
   docsScopeKey: string | null;
 };
+
+export type OutboxRetryGateReason =
+  | "retryable_below_limit"
+  | "legacy_conflict_reconciliation"
+  | "legacy_task_conflict_reconciliation"
+  | "blocked_reason_present"
+  | "task_conflict_has_snapshot"
+  | "retry_limit_reached";
+
+export type OutboxRetryEligibility = {
+  eligible: boolean;
+  gateReason: OutboxRetryGateReason;
+};
+
+/** Mirrors the legacy sender's current read/reconcile gate. This projection
+ * deliberately returns only a stable reason enum; lastError/payload values
+ * stay inside the repository. */
+export function getOutboxRetryEligibility(row: Pick<PendingOutboxSnapshot,
+  "tableName" | "action" | "retryCount" | "lastError" | "blockedReason" | "conflictPayload">,
+): OutboxRetryEligibility {
+  if (row.blockedReason != null) {
+    return { eligible: false, gateReason: "blocked_reason_present" };
+  }
+  const isConflict = (row.lastError ?? "").startsWith("conflict:");
+  if (row.tableName === "tasks" && isConflict
+    && (row.action !== "update" || row.conflictPayload != null)) {
+    return { eligible: false, gateReason: "task_conflict_has_snapshot" };
+  }
+  if (row.retryCount < 5) {
+    return { eligible: true, gateReason: "retryable_below_limit" };
+  }
+  if (isConflict) {
+    return {
+      eligible: true,
+      gateReason: row.tableName === "tasks"
+        ? "legacy_task_conflict_reconciliation"
+        : "legacy_conflict_reconciliation",
+    };
+  }
+  return { eligible: false, gateReason: "retry_limit_reached" };
+}
 
 /** A conflict reference is always scoped to a known authenticated account. */
 export type OutboxConflictReference = Omit<PendingOutboxSnapshot, 'authScope'> & {
@@ -478,17 +520,7 @@ export async function listPendingOutbox(
     .where(scopePredicate(authScope))
     .orderBy(asc(schema.outbox.createdAt));
   const rows = limit ? await query.limit(limit) : await query;
-  return rows.filter(
-    (row) =>
-      row.authScope === authScope &&
-      row.blockedReason == null &&
-      // Older task conflicts have no captured entity: allow one reconciliation
-      // read, then retain unresolved updates without resending indefinitely.
-      !(row.tableName === 'tasks' && (row.lastError ?? '').startsWith('conflict:')
-        && (row.action !== 'update' || row.conflictPayload != null)) &&
-      (row.retryCount < 5 ||
-        (row.lastError ?? '').startsWith('conflict:')),
-  );
+  return rows.filter((row) => row.authScope === authScope && getOutboxRetryEligibility(row).eligible);
 }
 
 /**
@@ -510,8 +542,7 @@ export async function getOutboxState(
   if (scopedRows.length === 0) return 'empty';
   if (scopedRows.some((row) =>
     row.blockedReason != null
-    || row.retryCount >= 5
-    || (row.lastError ?? '').startsWith('conflict:'),
+    || row.retryCount >= 5,
   )) {
     return 'failed';
   }
@@ -519,6 +550,104 @@ export async function getOutboxState(
     return 'retrying';
   }
   return 'pending';
+}
+
+/** Read only stuck operations for the exact authenticated scope in one query. */
+export async function listStuckOutboxRows(
+  requestedAuthScope: string,
+): Promise<OutboxResolutionReadSnapshot[]> {
+  const authScope = await resolveCurrentAuthScope(requestedAuthScope);
+  if (authScope === null) return [];
+  const rows = await getDb()
+    .select()
+    .from(schema.outbox)
+    .where(and(
+      eq(schema.outbox.authScope, authScope),
+      or(
+        isNotNull(schema.outbox.blockedReason),
+        like(schema.outbox.lastError, 'conflict:%'),
+        sql`lower(coalesce(${schema.outbox.lastError}, '')) LIKE '%not found%'`,
+        gte(schema.outbox.retryCount, 5),
+      ),
+    ))
+    .orderBy(asc(schema.outbox.createdAt));
+  if (await resolveCurrentAuthScope(authScope) !== authScope) return [];
+  return rows
+    .filter((row) => row.authScope === authScope)
+    .map((row) => ({
+      opId: row.opId,
+      tableName: row.tableName,
+      action: row.action,
+      entityId: row.entityId,
+      payload: row.payload,
+      baseUpdatedAt: row.baseUpdatedAt ?? null,
+      basePayload: row.basePayload ?? null,
+      conflictPayload: row.conflictPayload ?? null,
+      retryCount: Number(row.retryCount ?? 0),
+      lastError: row.lastError ?? null,
+      blockedReason: row.blockedReason ?? null,
+      authScope,
+      docsScopeKey: row.docsScopeKey ?? null,
+      createdAt: Number(row.createdAt),
+    }));
+}
+
+/** Persist the exact rejected operation before removing its matching snapshot. */
+/** Internal retention for discarded/adopted device edits. Never shown to users. */
+const OUTBOX_RECORD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Remove one stuck operation. A conflicting edit is kept in the internal
+ * discard log; an edit whose target no longer exists is dropped outright.
+ */
+export async function discardOutboxRow(
+  row: PendingOutboxSnapshot,
+  reason: string,
+  options: { keepRecord: boolean },
+): Promise<boolean> {
+  if (!row.authScope || !reason.trim()) return false;
+  const id = randomId();
+  const discardedAt = new Date().toISOString();
+  return runForegroundSqliteWrite((writer) => getDb().transaction((tx) => {
+    assertActiveWriter(writer);
+    if (options.keepRecord) {
+      tx.insert(schema.outboxDiscardLog).values({
+        id,
+        authScope: row.authScope!,
+        opId: row.opId,
+        tableName: row.tableName,
+        entityId: row.entityId,
+        action: row.action,
+        payload: row.payload,
+        basePayload: row.basePayload == null ? null : JSON.stringify(row.basePayload),
+        conflictPayload: row.conflictPayload == null ? null : JSON.stringify(row.conflictPayload),
+        lastError: row.lastError,
+        reason,
+        discardedAt,
+      }).run();
+    }
+    const removed = removeOutboxOpIfSnapshotInWriter(writer, tx, row.opId, row, {
+      authScope: row.authScope,
+    });
+    if (!removed && options.keepRecord) {
+      tx.delete(schema.outboxDiscardLog).where(eq(schema.outboxDiscardLog.id, id)).run();
+    }
+    return removed;
+  }));
+}
+
+/** Drop internal device-edit records once they pass the retention window. */
+export async function purgeExpiredOutboxRecords(now = Date.now()): Promise<void> {
+  const cutoff = now - OUTBOX_RECORD_RETENTION_MS;
+  await runForegroundSqliteWrite((writer) => getDb().transaction((tx) => {
+    assertActiveWriter(writer);
+    tx.delete(schema.outboxDiscardLog)
+      .where(lt(schema.outboxDiscardLog.discardedAt, new Date(cutoff).toISOString()))
+      .run();
+    tx.delete(schema.outboxResolutionRecords)
+      .where(lt(schema.outboxResolutionRecords.updatedAt, cutoff))
+      .run();
+  }));
 }
 
 export type OutboxDiagnostic = {
@@ -535,6 +664,10 @@ export type OutboxDiagnostic = {
   retryCount: number;
   blockedReason: string | null;
   errorKind: 'conflict' | 'scope' | 'missing_base' | 'missing_entity' | 'server_error' | 'pending';
+  retryEligibility?: 'eligible' | 'blocked' | 'unknown';
+  retryGateReason?: OutboxRetryGateReason | 'unknown';
+  schedulerState?: 'trigger_driven' | 'not_eligible' | 'unknown';
+  nextAttemptAt?: null;
 };
 
 /**
@@ -602,6 +735,7 @@ export async function getOutboxDiagnostics(
     retryCount: schema.outbox.retryCount,
     blockedReason: schema.outbox.blockedReason,
     lastError: schema.outbox.lastError,
+    conflictPayload: schema.outbox.conflictPayload,
   }).from(schema.outbox).where(scopePredicate(authScope)).orderBy(asc(schema.outbox.createdAt));
   // A token can change while SQLite is waiting behind a foreground write.
   if (await resolveCurrentAuthScope(authScope) !== authScope) return [];
@@ -614,13 +748,20 @@ export async function getOutboxDiagnostics(
         : error.startsWith('conflict:') ? 'conflict'
         : row.tableName === 'tasks' && error === 'Task not found' ? 'missing_entity'
         : error ? 'server_error' : 'pending';
+    const retry = getOutboxRetryEligibility(row);
     return { opId: row.opId, tableName: row.tableName, action: row.action,
       entityId: row.entityId, retryCount: row.retryCount,
       docsScopeKey: row.docsScopeKey ?? null,
       baseUpdatedAt: row.baseUpdatedAt ?? null,
       hasBaseSnapshot: Number(row.hasBaseSnapshot ?? 0) !== 0,
       hasConflictSnapshot: Number(row.hasConflictSnapshot ?? 0) !== 0,
-      blockedReason: row.blockedReason, errorKind };
+      blockedReason: null,
+      errorKind,
+      retryEligibility: retry.eligible ? 'eligible' as const : 'blocked' as const,
+      retryGateReason: retry.gateReason,
+      schedulerState: retry.eligible ? 'trigger_driven' as const : 'not_eligible' as const,
+      nextAttemptAt: null,
+    };
   });
 }
 

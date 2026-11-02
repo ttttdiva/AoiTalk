@@ -517,6 +517,12 @@ def openai_web_search_impl(
                     if "unexpected keyword argument" not in str(exc):
                         raise
                     client = OpenAI(api_key=api_key)
+                from ...services.provider_key_attribution_service import (
+                    call_with_provider_key_attribution_sync,
+                    prepare_provider_key_identity,
+                )
+
+                key_identity = prepare_provider_key_identity(api_key)
                 try:
                     request_input = (
                         "あなたはWeb検索アシスタントです。"
@@ -575,7 +581,11 @@ def openai_web_search_impl(
                                 raise PrivacyError(
                                     "privacy protection returned no protected input"
                                 )
-                            return client.responses.create(**dict(protected_payload))
+                            return call_with_provider_key_attribution_sync(
+                                lambda: client.responses.create(**dict(protected_payload)),
+                                identity=key_identity,
+                                consumer_id="openai_web_search",
+                            )
 
                         # Compatibility-only branch for old protect-only
                         # embedding adapters.  Production always takes the
@@ -590,10 +600,14 @@ def openai_web_search_impl(
                             raise PrivacyError(
                                 "privacy protection returned no protected input"
                             )
-                        return client.responses.create(
-                            model=requested_model,
-                            tools=expected_tools,
-                            input=protected_input,
+                        return call_with_provider_key_attribution_sync(
+                            lambda: client.responses.create(
+                                model=requested_model,
+                                tools=expected_tools,
+                                input=protected_input,
+                            ),
+                            identity=key_identity,
+                            consumer_id="openai_web_search",
                         )
 
                     # This is the sole privacy/transport boundary.  In

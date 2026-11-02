@@ -45,6 +45,7 @@ interface ProjectStoreState {
   projects: Project[];
   selectedSpaceId: string | null;
   selectedProjectId: string | null;
+  scopeHydrated: boolean;
   loaded: boolean;
   refreshProjects: (options?: RefreshProjectsOptions) => Promise<void>;
   setSelectedSpaceId: (id: string) => Promise<void>;
@@ -61,6 +62,15 @@ let lastSpaceFullFetchAt: number | undefined;
 // 新しい refresh の開始も古い refresh を無効化するので、reset を伴わない
 // 重複呼び出しでも後勝ちの投影だけが state に反映される。
 let projectRefreshGeneration = 0;
+
+// SecureStore の読み取り中や remote refresh 待ちに行われた明示的な
+// 範囲変更を、後段の restoreSelection が上書きしないための版。
+let projectSelectionRevision = 0;
+
+// SecureStore の選択保存は順序を保ち、古い選択の書き込みが新しい選択の
+// 後から着地しないようにする。保存中の版は refresh の復元を抑止する。
+let projectSelectionPersistenceTail: Promise<void> = Promise.resolve();
+let pendingProjectSelectionPersistenceRevision: number | null = null;
 
 type DbSpace = typeof schema.spaces.$inferSelect;
 
@@ -196,13 +206,54 @@ async function refreshRemoteSpaces(
   });
 }
 
-async function saveProjectSelectionForGeneration(
-  id: string,
+function enqueueProjectSelectionPersistence(
+  revision: number,
+  projectId: string,
+  spaceId: string,
+): Promise<void> {
+  pendingProjectSelectionPersistenceRevision = revision;
+  const operation = projectSelectionPersistenceTail.then(async () => {
+    if (revision !== projectSelectionRevision) return;
+    await saveSelectedProjectId(projectId);
+    if (revision !== projectSelectionRevision) return;
+    await saveSelectedSpaceId(spaceId);
+  });
+  projectSelectionPersistenceTail = operation.then(
+    () => {
+      if (pendingProjectSelectionPersistenceRevision === revision) {
+        pendingProjectSelectionPersistenceRevision = null;
+      }
+    },
+    () => {
+      if (pendingProjectSelectionPersistenceRevision === revision) {
+        pendingProjectSelectionPersistenceRevision = null;
+      }
+    },
+  );
+  return operation;
+}
+
+async function saveSelectionForGeneration(
+  projectId: string,
+  spaceId: string,
   isCurrentGeneration: () => boolean,
+  selectionRevision: number,
 ): Promise<boolean> {
-  if (!isCurrentGeneration()) return false;
-  await saveSelectedProjectId(id);
-  return isCurrentGeneration();
+  if (
+    !isCurrentGeneration() ||
+    selectionRevision !== projectSelectionRevision
+  ) {
+    return false;
+  }
+  await enqueueProjectSelectionPersistence(
+    selectionRevision,
+    projectId,
+    spaceId,
+  );
+  return (
+    isCurrentGeneration() &&
+    selectionRevision === projectSelectionRevision
+  );
 }
 
 export const useProjectStore = create<ProjectStoreState>((set, get) => ({
@@ -210,6 +261,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   projects: [],
   selectedSpaceId: null,
   selectedProjectId: null,
+  scopeHydrated: false,
   loaded: false,
 
   refreshProjects: async (options?: RefreshProjectsOptions) => {
@@ -222,75 +274,198 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         : ++projectRefreshGeneration;
     const isCurrentGeneration = () =>
       generation === projectRefreshGeneration;
+    const refreshSelectionRevision = projectSelectionRevision;
 
     try {
       // ローカル先読みは即時表示。projects/spaces とも SQLite を正とする。
       const token = await getToken();
       if (!isCurrentGeneration()) return;
       const authScope = getTokenAuthScope(token);
-      let list = (await projectsRepo.listLocal()).filter((project) =>
+      let localProjects = await projectsRepo.listLocal();
+      let list = localProjects.filter((project) =>
         isParticipatingProject(project, authScope),
       );
       if (!isCurrentGeneration()) return;
       let spaces = await listLocalSpaces();
       if (!isCurrentGeneration()) return;
-      set({ spaces: participatingScopeSpaces(spaces, list, authScope), projects: list, loaded: true });
+      let visibleSpaces = participatingScopeSpaces(spaces, list, authScope);
 
       const hasToken = Boolean(token);
       if (!isCurrentGeneration()) return;
-      const restoreSelection = async () => {
-        const storedSpaceId = await getSelectedSpaceId();
+      const restoreSelection = async (options: {
+        clearMissingProject: boolean;
+        clearMissingSpace: boolean;
+        publishCatalog?: { spaces: Space[]; projects: Project[] };
+      }) => {
+        const restoreRevision = projectSelectionRevision;
+        const canApply = () =>
+          isCurrentGeneration() &&
+          restoreRevision === projectSelectionRevision &&
+          refreshSelectionRevision === projectSelectionRevision;
         if (!isCurrentGeneration()) return false;
-        const storedId = await getSelectedProjectId();
-        if (!isCurrentGeneration()) return false;
-        const currentProjectId = get().selectedProjectId;
-        const currentSpaceId = get().selectedSpaceId;
-        if (storedSpaceId && get().spaces.find((s) => s.id === storedSpaceId)) {
-          if (currentSpaceId !== storedSpaceId) {
-            set({ selectedSpaceId: storedSpaceId, selectedProjectId: null });
+        const catalogPatch = options.publishCatalog
+          ? {
+              spaces: options.publishCatalog.spaces,
+              projects: options.publishCatalog.projects,
+              loaded: true,
+            }
+          : {};
+        if (
+          pendingProjectSelectionPersistenceRevision === projectSelectionRevision &&
+          refreshSelectionRevision === projectSelectionRevision
+        ) {
+          if (options.publishCatalog && canApply()) {
+            set({ ...catalogPatch, scopeHydrated: true });
           }
           return true;
         }
-        if (storedId && list.find((p) => p.id === storedId)) {
-          if (currentProjectId !== storedId) {
-            set({ selectedProjectId: storedId, selectedSpaceId: null });
+        let storedSpaceId: string | null;
+        let storedId: string | null;
+        try {
+          storedSpaceId = await getSelectedSpaceId();
+          if (!canApply()) return false;
+          storedId = await getSelectedProjectId();
+        } catch {
+          // A SecureStore read failure must not block the canonical catalog
+          // refresh or cause the in-memory selection to be cleared.
+          // 未確定/エラー扱いとし、他scopeデータを勝手に見せないよう scopeHydrated: false を保つ。
+          if (options.publishCatalog && canApply()) {
+            set({ ...catalogPatch, scopeHydrated: false });
           }
-        } else if (!hasToken && storedId === null && !storedSpaceId && list.length > 0) {
+          return false;
+        }
+        if (!canApply()) return false;
+        const currentProjectId = get().selectedProjectId;
+        const currentSpaceId = get().selectedSpaceId;
+        const hasStoredSpace = Boolean(storedSpaceId);
+        const hasStoredProject = Boolean(storedId);
+        const storedSpace = storedSpaceId
+          ? visibleSpaces.find((space) => space.id === storedSpaceId)
+          : undefined;
+        const storedProject = storedId
+          ? list.find((project) => project.id === storedId)
+          : undefined;
+        const storedSpaceIsLocallyExcluded = Boolean(
+          storedSpaceId &&
+          spaces.some((space) => space.id === storedSpaceId) &&
+          !visibleSpaces.some((space) => space.id === storedSpaceId) &&
+          localProjects.some((project) => project.space_id === storedSpaceId),
+        );
+
+        if (storedSpace) {
+          if (currentSpaceId !== storedSpaceId || options.publishCatalog) {
+            set({
+              ...catalogPatch,
+              selectedSpaceId: storedSpaceId,
+              selectedProjectId: null,
+              scopeHydrated: true,
+            });
+          }
+          return true;
+        }
+
+        // A saved Space is the user's more specific scope.  When its local
+        // catalog is incomplete, keep the preference pending instead of
+        // falling back to a different saved Project before canonical refresh.
+        if (
+          hasStoredSpace &&
+          !options.clearMissingSpace &&
+          !storedSpaceIsLocallyExcluded
+        ) {
+          if (options.publishCatalog) {
+            set({
+              ...catalogPatch,
+              selectedSpaceId: null,
+              selectedProjectId: null,
+              scopeHydrated: false,
+            });
+          }
+          return true;
+        }
+
+        if (storedProject) {
+          if (currentProjectId !== storedId || options.publishCatalog) {
+            set({
+              ...catalogPatch,
+              selectedProjectId: storedId,
+              selectedSpaceId: null,
+              scopeHydrated: true,
+            });
+          }
+        } else if (
+          hasStoredProject &&
+          !options.clearMissingProject &&
+          !localProjects.find((project) => project.id === storedId)
+        ) {
+          if (options.publishCatalog) {
+            set({
+              ...catalogPatch,
+              selectedProjectId: null,
+              selectedSpaceId: null,
+              scopeHydrated: false,
+            });
+          }
+          return true;
+        } else if (!hasToken && !hasStoredProject && !hasStoredSpace && list.length > 0) {
           const firstId = list[0].id;
-          if (currentProjectId !== firstId) {
-            set({ selectedProjectId: firstId, selectedSpaceId: null });
+          if (currentProjectId !== firstId || options.publishCatalog) {
+            set({
+              ...catalogPatch,
+              selectedProjectId: firstId,
+              selectedSpaceId: null,
+              scopeHydrated: true,
+            });
             if (
-              !(await saveProjectSelectionForGeneration(
+              !(await saveSelectionForGeneration(
                 firstId,
+                "",
                 isCurrentGeneration,
+                restoreRevision,
               ))
             ) {
               return false;
             }
-            if (!isCurrentGeneration()) return false;
+            if (!canApply()) return false;
           }
-        } else if (currentProjectId !== null || currentSpaceId !== null || storedId || storedSpaceId) {
-          set({ selectedProjectId: null, selectedSpaceId: null });
-          if (
-            !(await saveProjectSelectionForGeneration(
-              "",
-              isCurrentGeneration,
-            ))
-          ) {
-            return false;
+        } else if (
+          currentProjectId !== null ||
+          currentSpaceId !== null ||
+          hasStoredProject ||
+          hasStoredSpace ||
+          options.publishCatalog
+        ) {
+          if (!canApply()) return false;
+          set({
+            ...catalogPatch,
+            selectedProjectId: null,
+            selectedSpaceId: null,
+            scopeHydrated: true,
+          });
+          if (hasStoredProject || hasStoredSpace) {
+            if (
+              !(await saveSelectionForGeneration(
+                "",
+                "",
+                isCurrentGeneration,
+                restoreRevision,
+              ))
+            ) {
+              return false;
+            }
+            if (!canApply()) return false;
           }
-          if (!isCurrentGeneration()) return false;
-          await saveSelectedSpaceId("");
-          if (!isCurrentGeneration()) return false;
         }
         return true;
       };
 
-      if (options?.localOnly) {
-        await restoreSelection();
-        if (!isCurrentGeneration()) return;
-        return;
-      }
+      // ローカルカタログと保存scopeを同時に公開する。
+      // remote 完了を初期描画 gate に戻さず、ローカルで確定できる scope を即時確定する。
+      await restoreSelection({
+        clearMissingProject: !hasToken,
+        clearMissingSpace: !hasToken,
+        publishCatalog: { spaces: visibleSpaces, projects: list },
+      });
+      if (!isCurrentGeneration()) return;
 
       // `online` only describes Internet reachability.  The API can be on the
       // same LAN, so project refreshes use the actual AoiTalk network-path
@@ -322,6 +497,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         (!options?.spacesOnly &&
           shouldRunFullFetch(lastSpaceFullFetchAt, now, false, force));
 
+      let remoteProjects: Project[] | null = null;
+      let remoteSpaces: Space[] | null = null;
+
+      if (options?.localOnly || !canServer || !(projectFetchDue || spaceFetchDue)) {
+        return;
+      }
+
       if (canServer && (projectFetchDue || spaceFetchDue)) {
         const [freshSpaces, freshProjects] = await Promise.all([
           spaceFetchDue
@@ -331,8 +513,11 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
             ? projectsRepo.refresh().catch(() => null)
             : Promise.resolve(null),
         ]);
+        remoteSpaces = freshSpaces;
+        remoteProjects = freshProjects;
         if (!isCurrentGeneration()) return;
         if (freshProjects) {
+          localProjects = freshProjects;
           list = freshProjects.filter((project) =>
             isParticipatingProject(project, authScope),
           );
@@ -345,13 +530,17 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
           lastSpaceFullFetchAt = Date.now();
         }
         if (!isCurrentGeneration()) return;
+        visibleSpaces = participatingScopeSpaces(spaces, list, authScope);
         set({
-          spaces: participatingScopeSpaces(spaces, list, authScope),
+          spaces: visibleSpaces,
           projects: list,
         });
       }
 
-      await restoreSelection();
+      await restoreSelection({
+        clearMissingProject: remoteProjects !== null,
+        clearMissingSpace: remoteSpaces !== null,
+      });
       if (!isCurrentGeneration()) return;
     } catch {
       // Offline / unauthenticated → leave state as-is; UI reads from local cache.
@@ -360,20 +549,26 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   },
 
   setSelectedSpaceId: async (id: string) => {
-    set({ selectedSpaceId: id, selectedProjectId: null });
-    await saveSelectedSpaceId(id);
-    await saveSelectedProjectId("");
+    const selectionRevision = ++projectSelectionRevision;
+    set({ selectedSpaceId: id, selectedProjectId: null, scopeHydrated: true });
+    await enqueueProjectSelectionPersistence(selectionRevision, "", id);
   },
 
   setSelectedProjectId: async (id: string | null) => {
-    set({ selectedProjectId: id, selectedSpaceId: null });
-    await saveSelectedProjectId(id ?? "");
-    await saveSelectedSpaceId("");
+    const selectionRevision = ++projectSelectionRevision;
+    set({ selectedProjectId: id, selectedSpaceId: null, scopeHydrated: true });
+    await enqueueProjectSelectionPersistence(
+      selectionRevision,
+      id ?? "",
+      "",
+    );
   },
 
   reset: () => {
     // 認証遷移では次回のフル取得を強制する。
     projectRefreshGeneration += 1;
+    projectSelectionRevision += 1;
+    pendingProjectSelectionPersistenceRevision = null;
     lastProjectFullFetchAt = undefined;
     lastSpaceFullFetchAt = undefined;
     set({
@@ -381,6 +576,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       projects: [],
       selectedSpaceId: null,
       selectedProjectId: null,
+      scopeHydrated: false,
       loaded: false,
     });
   },

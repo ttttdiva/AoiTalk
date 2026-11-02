@@ -1991,6 +1991,12 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             )
         return authorized_path
 
+    async def _validate_shared_bookmark_target(request: Request, path: str) -> str:
+        raw = str(path or "").strip()
+        if Path(raw).is_absolute() or raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", raw):
+            raise HTTPException(status_code=400, detail="絶対パスは共有Spaceへ登録できません")
+        return await _validate_sidebar_target(request, raw, target="bookmark")
+
     async def _validate_shared_sidebar_target(
         request: Request,
         path: str,
@@ -2000,7 +2006,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
     ) -> str:
         """Validate a target which will be visible to every Space reader.
 
-        A shared row must point to a Project Files object whose canonical
+        A shared Project row must point to a Project Files object whose canonical
         ``Project.space_id`` is the requested Space.  User storage, provider
         virtual paths, absolute/admin paths, and any ambiguous namespace are
         intentionally rejected.  Record Table virtual files are the one
@@ -2077,10 +2083,13 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                     detail="対象Projectは指定Spaceに属していません",
                 )
             user_id = await get_bookmark_user_id(request)
-            user_info = await server._get_user_info_from_request(request) or {}
-            is_admin = getattr(server, "auth_enabled", None) is False or str(
-                user_info.get("role") or ""
-            ).lower() == "admin"
+            # Use the server's trusted principal authorization for the ACL
+            # bypass.  The user info object is still used for identity and
+            # Space access, but a client supplied admin-shaped payload must
+            # never influence target authorization.
+            is_admin = getattr(server, "auth_enabled", None) is False or await server._is_admin_user(
+                request
+            )
             if not is_admin:
                 allowed = await ProjectRepository.has_permission(
                     session,
@@ -2129,14 +2138,14 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         space_id: UUID,
         user_id: UUID,
         user_info: dict,
+        validate_bookmark_targets: bool = False,
     ) -> list:
-        """Project-ACL filter for a Space collection read projection.
+        """Filter a Space collection for the current reader.
 
         Space read grants access to the collection, but each persisted target
-        still has a Project ACL.  Filtering here prevents a stale/revoked
-        Project membership from leaking path/name metadata through the shared
-        sidebar list.  Folder nodes are retained only when they are empty or
-        lead to at least one visible descendant.
+        bookmarks recheck normal Files read access and existence; launchers
+        retain their Project ACL policy. Folder nodes are retained only when
+        they are empty or lead to at least one visible descendant.
         """
 
         if not items:
@@ -2171,7 +2180,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         }
 
         visible_projects: set[UUID] = set()
-        if project_ids:
+        if project_ids and not validate_bookmark_targets:
             from sqlalchemy import select
 
             from ...memory.models import Project
@@ -2222,8 +2231,15 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             if kind == "folder" or path.startswith(BOOKMARK_FOLDER_PATH_PREFIX):
                 continue
             project_id = _shared_target_project_id(path)
-            # Unknown/private/absolute/provider paths are never projected from
-            # a shared collection, even if a legacy row was migrated into it.
+            if validate_bookmark_targets:
+                try:
+                    await _validate_shared_bookmark_target(request, path)
+                    direct_visibility[item_id] = True
+                except Exception:
+                    # Authorization, availability and missing targets all fail closed.
+                    direct_visibility[item_id] = False
+                continue
+            # Launcher projections retain the existing Project-only boundary.
             direct_visibility[item_id] = project_id is not None and project_id in visible_projects
 
         folder_visibility: dict[UUID, bool] = {}
@@ -2692,6 +2708,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 space_id=space_id,
                 user_id=user_id,
                 user_info=user_info,
+                validate_bookmark_targets=True,
             )
             return JSONResponse(
                 {
@@ -2732,9 +2749,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                         status_code=400,
                         detail="このパスはブックマークに使用できません",
                     )
-                validated_path = await _validate_shared_sidebar_target(
-                    request, payload.path, target="bookmark", space_id=space_id
-                )
+                validated_path = await _validate_shared_bookmark_target(request, payload.path)
             bookmark = await _space_repo_method(
                 FileExplorerBookmarkRepository, "add_for_space"
             )(
@@ -2814,9 +2829,23 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             raise HTTPException(status_code=503, detail="Database is not available")
         session = await server._db_manager.get_session()
         try:
-            await _resolve_sidebar_scope(
+            _scope, _space, user_id, user_info = await _resolve_sidebar_scope(
                 request, session, scope="shared", space_id=space_id, write=True
             )
+            items = await _space_repo_method(
+                FileExplorerBookmarkRepository, "list_for_space"
+            )(session, space_id)
+            visible = await _filter_shared_sidebar_items(
+                request, session, items, space_id=space_id, user_id=user_id,
+                user_info=user_info, validate_bookmark_targets=True,
+            )
+            visible_by_id = {item.id: item for item in visible}
+            if bookmark_id not in visible_by_id:
+                raise HTTPException(status_code=404, detail="ブックマークが見つかりません")
+            if "parent_id" in payload.model_fields_set and payload.parent_id is not None:
+                parent = visible_by_id.get(payload.parent_id)
+                if parent is None or getattr(parent, "kind", None) != "folder":
+                    raise HTTPException(status_code=404, detail="ブックマークが見つかりません")
             update_kwargs = {
                 "name": payload.name,
                 "icon": payload.icon,

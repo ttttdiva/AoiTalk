@@ -8,7 +8,6 @@ from typing import Any, Callable, Mapping, Protocol
 from . import procurement_action
 from .marketplace import crowdworks_action
 from .agent_identity_service import sha256_json
-from uuid import UUID
 
 
 class ActionPolicyError(ValueError):
@@ -46,25 +45,6 @@ def _specialized(*_args):
     raise ActionPolicyError("specialized_action_required")
 
 
-def _transfer_policy(value):
-    import re
-    if not isinstance(value, dict) or set(value) != {"route_id", "allowed_destination_keys"}:
-        raise ActionPolicyError("action_policy_constraint_failed")
-    route = str(UUID(str(value["route_id"])))
-    keys = value["allowed_destination_keys"]
-    if not isinstance(keys, list) or not 1 <= len(keys) <= 64 or any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", k) for k in keys):
-        raise ActionPolicyError("action_policy_constraint_failed")
-    return {"route_id": route, "allowed_destination_keys": sorted(set(keys))}
-
-
-def _transfer_payload(value, policy):
-    if not isinstance(value, dict) or set(value) != {"telephony_call_id", "destination_key"}:
-        raise ActionPolicyError("action_policy_constraint_failed")
-    if value["destination_key"] not in _transfer_policy(policy)["allowed_destination_keys"]:
-        raise ActionPolicyError("action_policy_constraint_failed")
-    return {"telephony_call_id": str(UUID(str(value["telephony_call_id"]))), "destination_key": value["destination_key"]}
-
-
 @dataclass(frozen=True)
 class IntegrationActionDefinition:
     action_type: str
@@ -90,8 +70,6 @@ class IntegrationActionDefinition:
     def dedupe_key(self, payload: Mapping[str, Any], binding: Mapping[str, Any]) -> str:
         # Quantity and policy id deliberately excluded: another report/policy
         # cannot turn the same replenishment target into a second order.
-        if self.action_type == "telephony.transfer_call":
-            return sha256_json({"connection_id": str(binding["connection_id"]), "call": payload["telephony_call_id"]})
         if self.action_type == "engagement.submit_application":
             return sha256_json({"connection_id": str(binding["connection_id"]),
                                 "action_type": self.action_type,
@@ -102,7 +80,7 @@ class IntegrationActionDefinition:
 
 
 class IntegrationActionRegistry:
-    def __init__(self, *, procurement_adapter_factory=None, telephony_adapter_factory=None, engagement_adapter_factory=None):
+    def __init__(self, *, procurement_adapter_factory=None, engagement_adapter_factory=None):
         adapter = procurement_adapter_factory() if procurement_adapter_factory else None
         self._definitions = {
             key: IntegrationActionDefinition(key, key, "legacy", "1", (), (), None, None,
@@ -127,12 +105,6 @@ class IntegrationActionRegistry:
             "automatable" if adapter else "unavailable", procurement_action.normalize_policy,
             procurement_action.normalize_payload, ("item_ref", "quantity", "ship_to_ref", "currency"),
             procurement_adapter_factory, "durable")
-        phone = telephony_adapter_factory() if telephony_adapter_factory else None
-        self._definitions["telephony.transfer_call"] = IntegrationActionDefinition(
-            "telephony.transfer_call", "Transfer active call", "telephony", "1", ("telephony_control",),
-            ("openai_realtime_sip",), phone.adapter_key if phone else "openai_realtime_sip",
-            phone.adapter_version if phone else "1", "automatable" if phone else "unavailable",
-            _transfer_policy, _transfer_payload, ("telephony_call_id", "destination_key"), telephony_adapter_factory, "realtime")
 
     def get(self, action_type):
         return self._definitions.get(action_type)

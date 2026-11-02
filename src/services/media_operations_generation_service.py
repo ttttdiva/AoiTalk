@@ -260,6 +260,7 @@ class HttpGenerationStudioAdapter:
         path: str,
         *,
         payload: Mapping[str, Any] | None = None,
+        video_plan_lookup: bool = False,
     ) -> Mapping[str, Any]:
         if not self.configured:
             return {"status": "unavailable", "reason_code": "adapter_token_missing"}
@@ -289,6 +290,15 @@ class HttpGenerationStudioAdapter:
         if response.status_code in {401, 403}:
             return {"status": "unavailable", "reason_code": "studio_auth_failed"}
         if response.status_code == 404:
+            if video_plan_lookup:
+                try:
+                    error = response.json().get("error", {})
+                except (AttributeError, TypeError, ValueError):
+                    error = {}
+                if (isinstance(error, Mapping) and error.get("code") == "not_found"
+                        and error.get("message") == "video resource not found"):
+                    # 73 intentionally returns the same response for a different scope.
+                    return {"status": "not_found_or_scope_mismatch", "reason_code": "not_found"}
             return {"status": "unavailable", "reason_code": "studio_endpoint_unavailable"}
         if response.status_code >= 500:
             raise RuntimeError("generation_studio_server_error")
@@ -552,6 +562,11 @@ class HttpGenerationStudioAdapter:
         selector = request.get("video_model_selection_id") or request.get("model_selection_id")
         if not isinstance(selector, str) or not _VIDEO_MODEL_SELECTION_RE.fullmatch(selector):
             return {"status": "unavailable", "reason_code": "video_selector_unavailable"}
+        # The selected workflow's execution contract is not guaranteed to
+        # bind negative prompts (in particular, H3 rejects that named input).
+        # Never silently lose a nonempty user instruction.
+        if request.get("negative_prompt"):
+            raise MediaOperationsValidationError("video negative_prompt is not supported by the Studio adapter")
         # Resolve every workflow/version/model binding through the public
         # profile catalog.  The caller supplies only the opaque selector ID;
         # AoiTalk never persists or forwards provider-internal IDs directly.
@@ -600,6 +615,12 @@ class HttpGenerationStudioAdapter:
             return {"status": "unavailable", "reason_code": "video_selector_unavailable"}
         safe_selection = dict(workflow_selection)
         safe_selection["verified"] = True
+        named_parameters = [
+            {"name": name, "value": request[name]}
+            for name in ("seed",) if request.get(name) is not None
+        ]
+        if named_parameters:
+            safe_selection["named_parameters"] = named_parameters
         payload = {
             "workspace_id": binding.workspace_id,
             "project_id": binding.project_id,
@@ -725,6 +746,31 @@ class HttpGenerationStudioAdapter:
             elif field in proof:
                 projected[field] = proof.get(field)
         return projected
+
+    async def get_video_plan_by_idempotency(
+        self, binding: StudioScope, external_idempotency_key: str
+    ) -> Mapping[str, Any]:
+        """Read only the scoped Plan, retaining no prompt or provider payload."""
+        key = _validated_sha256(external_idempotency_key, "external_idempotency_key")
+        body = await self._json_request(
+            "GET", binding, f"/api/v1/video/plans/by-idempotency/{key}",
+            video_plan_lookup=True,
+        )
+        if body.get("status") in {"unavailable", "failed", "not_found_or_scope_mismatch"} and body.get("reason_code"):
+            return body
+        if (body.get("workspace_id") != binding.workspace_id
+                or body.get("project_id") != binding.project_id
+                or body.get("idempotency_key") != key):
+            raise RuntimeError("generation_studio_video_plan_scope_mismatch")
+        plan_id = body.get("video_plan_id")
+        if not isinstance(plan_id, str) or not re.fullmatch(r"vpl_[A-Za-z0-9_-]{8,160}", plan_id):
+            raise RuntimeError("generation_studio_video_invalid_plan")
+        checksum = _validated_sha256(body.get("plan_checksum"), "plan_checksum")
+        state = body.get("status")
+        if state not in {"draft", "previewed", "validated", "applied", "queued", "failed"}:
+            raise RuntimeError("generation_studio_video_invalid_plan")
+        return {"status": "found", "video_plan_id": plan_id,
+                "plan_checksum": checksum, "plan_status": state}
 
     async def reconcile_video(
         self,
@@ -1486,10 +1532,18 @@ class MediaOperationsGenerationService(MediaOperationsService):
         except Exception:
             return []
 
+        video_scope_matches = False
         if isinstance(raw, Mapping):
             if str(raw.get("status") or "").strip().lower() in {"unavailable", "unverified"}:
                 return []
             items: Any = raw.get("items")
+            if kind_value == "video" and "scope" in raw:
+                page_scope = raw.get("scope")
+                if not isinstance(page_scope, Mapping) or (
+                    page_scope.get("workspace_id"), page_scope.get("project_id")
+                ) != (scope.workspace_id, scope.project_id):
+                    return []
+                video_scope_matches = True
             if items is None:
                 # 73 Generation Studio exposes its public catalog as a
                 # flattened ``selections`` array.  Keep that array bounded and
@@ -1526,7 +1580,37 @@ class MediaOperationsGenerationService(MediaOperationsService):
             return []
 
         result: list[dict[str, Any]] = []
+        claimed_video_selectors: set[str] = set()
         for item in items[:100]:
+            if kind_value == "video" and isinstance(item, Mapping) and any(
+                key in item for key in ("video_profile_id", "workspace_id", "project_id")
+            ):
+                if not video_scope_matches or (
+                    item.get("workspace_id"), item.get("project_id")
+                ) != (scope.workspace_id, scope.project_id):
+                    continue
+                selector = item.get("workflow_selector_id")
+                if isinstance(selector, str) and item.get("enabled") is True and item.get("verification") == "verified":
+                    if selector in claimed_video_selectors:
+                        continue
+                    claimed_video_selectors.add(selector)
+                models = item.get("generation_model_ids")
+                options = item.get("generation_model_options")
+                first_model = models[0] if isinstance(models, list) and models else None
+                resolved = isinstance(first_model, str) and isinstance(options, list) and any(
+                    isinstance(option, Mapping) and option.get("id") == first_model
+                    for option in options
+                )
+                item = {
+                    "workflow_selector_id": item.get("workflow_selector_id"),
+                    "label": item.get("label"),
+                    "status": "available" if (
+                        item.get("enabled") is True
+                        and item.get("verification") == "verified"
+                        and item.get("purpose") == "video_prompt"
+                        and resolved
+                    ) else "unavailable",
+                }
             if isinstance(item, str):
                 item = {"model_selection_id": item}
             if not isinstance(item, Mapping):
@@ -1991,7 +2075,7 @@ class MediaOperationsGenerationService(MediaOperationsService):
             raise MediaOperationsConflictError("CreativeRecipe revision changed concurrently") from exc
         return revision.to_safe_dict()
 
-    async def create_generation_plan(self, session: Any | None = None, actor: Any | None = None, *, persona_revision_id: UUID | str, creative_recipe_revision_id: UUID | str, workspace_id: UUID | str, requested_outputs: Any = 1, request_spec: Any, content_item_id: UUID | str | None = None, content_variant_id: UUID | str | None = None, idempotency_key: Any) -> dict[str, Any]:
+    async def create_generation_plan(self, session: Any | None = None, actor: Any | None = None, *, persona_revision_id: UUID | str, creative_recipe_revision_id: UUID | str, workspace_id: UUID | str, requested_outputs: Any = 1, request_spec: Any, content_item_id: UUID | str | None = None, content_variant_id: UUID | str | None = None, idempotency_key: Any, commit: bool = True) -> dict[str, Any]:
         session = self._resolve_session(session)
         if actor is None:
             raise MediaOperationsValidationError("actor is required")
@@ -2059,6 +2143,10 @@ class MediaOperationsGenerationService(MediaOperationsService):
             request_spec=normalized_spec, idempotency_key=key, plan_hash=plan_hash, status="draft", created_by=actor_id,
         )
         session.add(plan)
+        if not commit:
+            # The caller owns this transaction, including rollback after a flush failure.
+            await self._flush_only(session)
+            return await self._plan_detail(session, plan)
         try:
             await self._flush_commit(session)
         except IntegrityError as exc:
@@ -2195,20 +2283,35 @@ class MediaOperationsGenerationService(MediaOperationsService):
                 "duration_ms": int(round(float(duration_seconds) * 1000)),
                 "fps": fps,
             }
-            if frame_count is not None:
-                media_settings["frame_count"] = frame_count
             storyboard = spec.get("storyboard")
+            if storyboard is None:
+                storyboard = getattr(recipe_revision, "storyboard_json", None)
             if storyboard:
-                media_settings["storyboard"] = storyboard
+                raise MediaOperationsValidationError(
+                    "video storyboard cannot be represented by the Studio manual plan"
+                )
+            if frame_count is not None and round(media_settings["duration_ms"] * fps / 1000) != frame_count:
+                raise MediaOperationsValidationError(
+                    "video frame_count does not match duration_seconds and fps"
+                )
             # Only the typed 73 media settings are forwarded.  Arbitrary
             # generation controls stay in AoiTalk's hash and are not treated
             # as provider instructions.
-            for setting_key in ("width", "height", "codec", "audio", "poster"):
+            for setting_key in ("width", "height", "codec", "poster"):
                 if setting_key in settings:
                     media_settings[setting_key] = settings[setting_key]
+            if "audio" in settings:
+                audio = settings["audio"]
+                if isinstance(audio, bool):
+                    media_settings["audio"] = {"enabled": audio, "codec": "aac" if audio else "none"}
+                elif isinstance(audio, dict):
+                    media_settings["audio"] = audio
+                else:
+                    raise MediaOperationsValidationError("video audio must be a boolean or mapping")
             video_request = {
                 "prompt": prompt,
                 "negative_prompt": spec.get("negative_prompt"),
+                "seed": spec.get("seed"),
                 "model_selection_id": spec["model_selection_id"],
                 "video_model_selection_id": spec["model_selection_id"],
                 "generation_settings": dict(spec.get("generation_settings") or {}),
@@ -4295,6 +4398,21 @@ class MediaOperationsGenerationService(MediaOperationsService):
                 session, plan, intent, auto_ingest=False
             )
             envelope["status"] = "uncertain"
+            # A video Plan can exist even when no shared Run receipt exists.
+            # This is diagnostic only: no 404 authorizes a replay or reset.
+            video_plan_recovery = None
+            lookup = getattr(self.adapter, "get_video_plan_by_idempotency", None)
+            if generation_kind == "video" and callable(lookup):
+                try:
+                    plan_result = lookup(scope, intent.external_idempotency_key)
+                    if inspect.isawaitable(plan_result):
+                        plan_result = await plan_result
+                    if isinstance(plan_result, Mapping) and plan_result.get("status") in {
+                        "found", "not_found_or_scope_mismatch", "unavailable", "failed"
+                    }:
+                        video_plan_recovery = dict(plan_result)
+                except Exception:
+                    video_plan_recovery = {"status": "uncertain", "reason_code": "video_plan_lookup_unknown"}
             envelope["receipt_recovery"] = {
                 "status": "uncertain",
                 "reason_code": str(
@@ -4303,6 +4421,8 @@ class MediaOperationsGenerationService(MediaOperationsService):
                     or "generation_recovery_receipt_pending"
                 )[:128],
             }
+            if video_plan_recovery is not None:
+                envelope["receipt_recovery"]["video_plan"] = video_plan_recovery
             return envelope
         self._validate_recovery_receipt_proof(
             response,

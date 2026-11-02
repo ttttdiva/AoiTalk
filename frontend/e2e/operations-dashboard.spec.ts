@@ -220,7 +220,7 @@ test("execution hierarchy restores URL focus and keeps phase/tool evidence separ
   const paging = { limit: 50, has_more: false, next_cursor: null, truncated: false };
   const execution = { schema_version: "operations-work-execution-v1", observed_at: "2026-10-03T01:00:00Z",
     work: { id: "running", state: "running", execution_summary: { attempt_count: 1, max_attempts: 3, attention_reasons: [], observation_status: "partial" } },
-    runs: [{ id: "main", work_item_id: "running", acting_subagent_id: "Aoi", status: "running" }, { id: "child", work_item_id: "child-work", parent_run_id: "main", acting_subagent_id: "Reviewer", status: "awaiting_approval" }],
+    runs: [{ id: "main", work_item_id: "running", legacy: { acting_subagent_id: "Aoi" }, status: "running" }, { id: "child", work_item_id: "child-work", parent_run_id: "main", legacy: { acting_subagent_id: "Reviewer" }, status: "awaiting_approval" }],
     events: [{ id: "phase-a", run_id: "main", sequence: 1, phase: "planning", event_type: "stream.status_update" }],
     tool_calls: [{ id: "tool-a", run_id: "main", tool_name: "search", status: "running" }], runs_page: paging, events_page: paging, tools_page: paging };
   await page.route("**/api/python-proxy/operations/command-center*", route => route.fulfill({ json: dashboard }));

@@ -47,8 +47,14 @@ def create_agent_work_router(
     get_coordinator: Callable[[], Any] | None = None,
     get_user_from_request: Callable[..., Any] | None = None,
     get_generation_status: Callable[[str], Any] | None = None,
+    restart_work_dependency: Callable[..., Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/agent-work", tags=["agent-work"])
+
+    async def _no_restart_admission_for_standalone_router() -> None:
+        return None
+
+    require_restart_work = restart_work_dependency or _no_restart_admission_for_standalone_router
 
     async def _session() -> Any:
         manager = get_db_manager() if callable(get_db_manager) else get_db_manager
@@ -62,6 +68,12 @@ def create_agent_work_router(
             raise HTTPException(status_code=409, detail="autonomous_agent_runtime is disabled")
         if is_admin_user is None or not bool(await _maybe(is_admin_user(request))):
             raise HTTPException(status_code=403, detail="Administrator privileges required")
+
+    async def _require_admin_action(
+        request: Request,
+        _auth: Any = Depends(require_auth_dependency),
+    ) -> None:
+        await _admin(request)
 
     async def _viewer(request: Request, row: Any) -> Any:
         if is_admin_user is not None and bool(await _maybe(is_admin_user(request))):
@@ -195,16 +207,22 @@ def create_agent_work_router(
         finally:
             await session.close()
 
-    @router.post("/discover")
-    async def discover(request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:
-        await _admin(request)
+    @router.post(
+        "/discover",
+        dependencies=[Depends(_require_admin_action), Depends(require_restart_work)],
+        responses={409: {"description": "Admin restart admission is closed"}},
+    )
+    async def discover(request: Request) -> JSONResponse:
         coordinator = await _coordinator()
         rows = await coordinator.discover_and_materialize()
         return JSONResponse({"success": True, "items": rows})
 
-    @router.post("/tick")
-    async def tick(request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:
-        await _admin(request)
+    @router.post(
+        "/tick",
+        dependencies=[Depends(_require_admin_action), Depends(require_restart_work)],
+        responses={409: {"description": "Admin restart admission is closed"}},
+    )
+    async def tick(request: Request) -> JSONResponse:
         coordinator = await _coordinator()
         result = await coordinator.execute_once(limit=coordinator.max_concurrency)
         return JSONResponse({"success": True, "results": result})
@@ -263,12 +281,18 @@ def create_agent_work_router(
                 live_generation_active=live_generation_active,
             )
         except InteractiveHistoryFenceError as error:
-            raise HTTPException(status_code=error.http_status, detail=error.code) from error
+            detail: Any = error.code
+            if error.details:
+                detail = {"code": error.code, **dict(error.details)}
+            raise HTTPException(status_code=error.http_status, detail=detail) from error
         return JSONResponse({"success": True, **result})
 
-    @router.post("/{work_item_id}/resume-after-approval")
-    async def resume_after_approval(work_item_id: str, request: Request, _: Any = Depends(require_auth_dependency)) -> JSONResponse:
-        await _admin(request)
+    @router.post(
+        "/{work_item_id}/resume-after-approval",
+        dependencies=[Depends(_require_admin_action), Depends(require_restart_work)],
+        responses={409: {"description": "Admin restart admission is closed"}},
+    )
+    async def resume_after_approval(work_item_id: str, request: Request) -> JSONResponse:
         coordinator = await _coordinator()
         action_id = request.query_params.get("action_id")
         resumed = await coordinator.resume_after_approval(work_item_id, action_id=action_id)

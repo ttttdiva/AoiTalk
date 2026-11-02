@@ -154,6 +154,7 @@ def build_task_tools() -> list:
         auto_close_on_due: bool = False,
         priority: str = "medium",
         assignee_ids: str = "",
+        tag_ids: str = "",
         recurrence_rrule: str = "",
         recurrence_timezone: str = DEFAULT_TASK_TIMEZONE,
     ) -> str:
@@ -177,6 +178,7 @@ def build_task_tools() -> list:
             auto_close_on_due: Automatically close the task after its due time (opt-in; defaults to False).
             priority: Task priority; use medium when unspecified.
             assignee_ids: Comma-separated assignee user IDs.
+            tag_ids: Comma-separated tag IDs.
             recurrence_rrule: Recurrence rule when the task repeats.
             recurrence_timezone: Recurrence timezone.
         """
@@ -270,6 +272,7 @@ def build_task_tools() -> list:
                     "all_day": normalized_all_day,
                     "auto_close_on_due": auto_close_on_due,
                     "assignee_ids": _parse_ids(assignee_ids),
+                    "tag_ids": _parse_ids(tag_ids),
                     "recurrence_rrule": recurrence_rrule or None,
                     "recurrence_timezone": recurrence_timezone
                     or DEFAULT_TASK_TIMEZONE,

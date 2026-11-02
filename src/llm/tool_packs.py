@@ -17,12 +17,6 @@ from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Optional
 
 from ..tools.core import ToolDefinition, ToolParam
-from ..services.agent_team_v3 import (
-    agent_team_scope_active,
-    agent_team_v3_context_tags,
-    agent_team_v3_delegation_enabled,
-    agent_team_v3_teams,
-)
 from ..services.project_context import (
     get_runtime_project_context,
     project_context_activation_values,
@@ -250,16 +244,6 @@ DEFERRED_TOOL_PACKS: tuple[ToolPack, ...] = (
         prompt_fragment=_PROJECT_TABLES_FRAGMENT,
     ),
     ToolPack(
-        pack_id="agent_team",
-        summary="独立した調査・設計・実装・レビュー担当への委譲",
-        tool_names=frozenset({"agent_team_delegate"}),
-        prompt_fragment=(
-            "独立したスコープを持つ調査・設計・実装・レビューを委譲する。"
-            "同じ依頼を複数インスタンスへ重複して渡さず、複数件が必要なら各スコープを"
-            "`scopes` に明示する。"
-        ),
-    ),
-    ToolPack(
         pack_id="characters",
         summary="この環境に登録されたキャラクターエージェントへの委譲",
         owners=frozenset({CHARACTER_TOOL_OWNER}),
@@ -291,112 +275,40 @@ def contextual_agent_team_scope(
     project_context: dict[str, Any] | None = None,
     loaded_team_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Resolve canonical Team activation for the current request.
+    """Return neutral App context for contextual tool-pack admission.
 
-    Apps visibility and App Development Team activation deliberately consume
-    this one resolver.  ``project_context`` is the server-resolved runtime
-    object; when omitted, the request-local ContextVar is used.  No prose
-    keyword or mutable prompt flag can activate either capability.
+    The old name remains as an internal call-site seam until P3 registry
+    cleanup, but no Team topology or delegation setting is consulted.
     """
 
-    project = project_context
-    if project is None:
-        project = get_runtime_project_context()
+    del config, client, loaded_team_ids
+    project = project_context if isinstance(project_context, dict) else get_runtime_project_context()
     if not isinstance(project, dict):
         project = {}
-
     activation = project_context_activation_values(project)
     app_context = activation.get("app_context")
     app_context = app_context if isinstance(app_context, dict) else {}
-    # An App context is an authorization-bearing object.  Keep the App id as a
-    # fallback activation identity when older rows did not persist a target
-    # key; Project-only contexts do not have this nested object and therefore
-    # never receive the App Development tag.
     app_identity = str(
         app_context.get("id") or app_context.get("app_id") or ""
     ).strip()
-    app_target_id = str(
-        activation.get("app_target_id")
-        or app_context.get("target_key")
-        or app_identity
-        or ""
-    ).strip() or None
-    development_status = str(
+    status = str(
         activation.get("development_status")
         or app_context.get("development_status")
         or "working"
-    ).strip() or None
-
-    # ``agent_team_v3_context_tags`` also accepts legacy top-level
-    # ``app_target_id``/``app_id`` fields.  Those fields can be present on a
-    # plain Project projection, so do not let them activate App Development
-    # unless the trusted nested App scope was resolved as well.
-    project_for_tags: dict[str, Any] = project
-    if not app_identity:
-        project_for_tags = dict(project)
-        for key in ("app_target_id", "app_id", "target_id", "development_status", "status"):
-            project_for_tags.pop(key, None)
-        raw_metadata = project_for_tags.get("metadata")
-        if isinstance(raw_metadata, dict):
-            metadata = dict(raw_metadata)
-            for key in ("app_target_id", "app_id", "development_status", "status"):
-                metadata.pop(key, None)
-            project_for_tags["metadata"] = metadata
-
-    tags = agent_team_v3_context_tags(
-        project=project_for_tags,
-        app_target_id=app_target_id if app_identity else None,
-        development_status=development_status if app_identity else None,
-    )
-    scope = agent_team_scope_active(
-        config,
-        project=project_for_tags,
-        context_tags=tags,
-        app_target_id=app_target_id if app_identity else None,
-        development_status=development_status if app_identity else None,
-        loaded_team_ids=loaded_team_ids,
-    )
-
-    active_team_ids = {
-        str(item).strip()
-        for item in scope.get("active_team_ids") or []
-        if str(item).strip()
-    }
-    app_development_team_ids: set[str] = set()
-    for team in agent_team_v3_teams(config):
-        activation_config = team.get("activation") or {}
-        contexts = {
-            str(item).strip().lower()
-            for item in activation_config.get("contexts", []) or []
-            if str(item).strip()
-        }
-        team_id = str(team.get("team_id") or "").strip()
-        team_name = str(team.get("name") or "").strip().casefold().replace(" ", "_")
-        if team_id and (
-            "app_development" in contexts
-            or team_id.casefold() == "app_development"
-            or team_name == "app_development"
-        ):
-            app_development_team_ids.add(team_id)
-
+    ).strip().casefold()
+    app_active = bool(app_identity and status not in {"completed", "cancelled", "failed", "retired"})
     return {
-        **scope,
-        "context_tags": sorted(tags),
+        "context_tags": ["app_development"] if app_active else [],
         "app_context_active": bool(app_identity),
-        "app_development_active": bool(
-            app_identity
-            and "app_development" in tags
-            and bool(active_team_ids & app_development_team_ids)
-        ),
-        "active_team_ids": sorted(active_team_ids),
-        "active_subagent_ids": sorted(
-            {
-                str(item).strip()
-                for item in scope.get("active_subagent_ids") or []
-                if str(item).strip()
-            }
-        ),
-        "app_target_id": app_target_id,
+        "app_development_active": app_active,
+        "active_team_ids": [],
+        "active_subagent_ids": [],
+        "app_target_id": str(
+            activation.get("app_target_id")
+            or app_context.get("target_key")
+            or app_identity
+            or ""
+        ).strip() or None,
     }
 
 
@@ -469,10 +381,6 @@ def contextual_tool_pack_allowed(
                     _get("agents.media.enabled", True), default=True
                 ):
                     return False
-            if pack_name == "agent_team" and not agent_team_v3_delegation_enabled(
-                effective_config
-            ):
-                return False
         except (AttributeError, TypeError):
             # Malformed persisted config should not make optional packs
             # executable.  The Apps/Spotify/Media/Team branches above are
@@ -481,7 +389,6 @@ def contextual_tool_pack_allowed(
                 APPS_TOOL_PACK_ID,
                 "spotify",
                 "media",
-                "agent_team",
                 "browser",
             }:
                 return False
@@ -603,7 +510,7 @@ def auto_load_contextual_packs(
     project_context: dict[str, Any] | None = None,
     contextual_scope: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
-    """Auto-load Apps/Agent Team packs for trusted App or Story context."""
+    """Auto-load Apps packs for trusted App context."""
 
     effective_config = config if config is not None else getattr(client, "config", None)
     scope = contextual_scope
@@ -622,8 +529,6 @@ def auto_load_contextual_packs(
         contextual_scope=scope,
     ):
         pack_ids.append(APPS_TOOL_PACK_ID)
-        if agent_team_v3_delegation_enabled(effective_config):
-            pack_ids.append("agent_team")
     return session.load_many(pack_ids)
 
 
@@ -668,10 +573,29 @@ def available_packs_for_registry(
     """レジストリに実際に登録されている pack だけを返す。"""
     from .tool_exposure import runtime_tool_capability_status
 
-    tools = [
-        tool for tool in _registry_tools(registry)
-        if runtime_tool_capability_status(tool, client=client, config=config) is None
-    ]
+    tools = []
+    for tool in _registry_tools(registry):
+        if runtime_tool_capability_status(tool, client=client, config=config) is not None:
+            continue
+        try:
+            from .tool_policy import agent_tool_scope_permits_exposure
+
+            if agent_tool_scope_permits_exposure(
+                str(getattr(tool, "name", "")),
+                tool,
+            ) is False:
+                continue
+        except Exception:
+            # An Agent-scoped catalog must fail closed if its ceiling cannot
+            # be evaluated. Unscoped callers retain the existing catalog.
+            try:
+                from .tool_policy import get_current_agent_tool_scope
+
+                if get_current_agent_tool_scope() is not None:
+                    continue
+            except Exception:
+                continue
+        tools.append(tool)
     available: list[ToolPack] = []
     for pack in DEFERRED_TOOL_PACKS:
         if not pack.manual_load:
@@ -701,6 +625,37 @@ def pack_tool_names_in_registry(pack: ToolPack, registry: Any) -> tuple[str, ...
             str(getattr(tool, "owner", "")),
         )
     )
+
+
+def declared_tool_pack_ids(tool_definition: Any) -> frozenset[str]:
+    """Return the server-generated pack enum carried by a loader definition."""
+
+    for parameter in getattr(tool_definition, "parameters", ()) or ():
+        if str(getattr(parameter, "name", "")).strip() != "pack":
+            continue
+        values = getattr(parameter, "enum", None)
+        if values is None:
+            schema = getattr(parameter, "schema", None)
+            values = schema.get("enum") if isinstance(schema, Mapping) else None
+        if isinstance(values, (list, tuple, set, frozenset)):
+            return frozenset(
+                str(value).strip()
+                for value in values
+                if isinstance(value, str) and value.strip()
+            )
+        return frozenset()
+    return frozenset()
+
+
+def agent_tool_pack_denial_code(pack_id: Any, tool_definition: Any) -> str | None:
+    """Classify an Agent pack request using its server-generated loader enum."""
+
+    candidate = pack_id.strip() if isinstance(pack_id, str) else ""
+    if candidate not in DEFERRED_TOOL_PACKS_BY_ID:
+        return "pack_unknown"
+    if candidate not in declared_tool_pack_ids(tool_definition):
+        return "pack_not_allowed"
+    return None
 
 
 def browser_pack_prompt(pack: ToolPack, config: Any) -> str:
@@ -975,7 +930,16 @@ def build_load_tool_pack_tool(
         contextual_scope=contextual_scope,
     )
     if not packs:
-        return None
+        # Keep the bounded presentation exemption present for Agent turns.
+        # An empty enum offers no pack and the execution guard rejects every
+        # attempted id; ordinary unscoped turns still omit the unused control.
+        try:
+            from .tool_policy import get_current_agent_tool_scope
+
+            if get_current_agent_tool_scope() is None:
+                return None
+        except Exception:
+            return None
     pack_ids = [pack.pack_id for pack in packs]
 
     def _current_pack_ids() -> list[str]:
@@ -989,7 +953,11 @@ def build_load_tool_pack_tool(
 
         return [
             pack.pack_id
-            for pack in available_packs_for_registry(registry, client=client)
+            for pack in available_packs_for_registry(
+                registry,
+                client=client,
+                contextual_scope=contextual_scope,
+            )
         ]
 
     def load_tool_pack(pack: str) -> str:
@@ -1005,7 +973,16 @@ def build_load_tool_pack_tool(
                 f"Available packs: {', '.join(current_pack_ids)}"
             )
         newly_loaded = session.load(pack_id)
-        tool_names = pack_tool_names_in_registry(target, registry)
+        tool_names = tuple(
+            name
+            for name in pack_tool_names_in_registry(target, registry)
+            if name
+            in {
+                str(getattr(tool, "name", ""))
+                for tool in _registry_tools(registry)
+                if agent_tool_scope_permits_pack_tool(tool)
+            }
+        )
         header = (
             f"Loaded tool pack `{pack_id}`."
             if newly_loaded
@@ -1039,6 +1016,25 @@ def build_load_tool_pack_tool(
         requires_approval=False,
         supports_parallel=False,
     )
+
+
+def agent_tool_scope_permits_pack_tool(tool: Any) -> bool:
+    """Whether one deferred tool fits the current Agent capability ceiling."""
+
+    try:
+        from .tool_policy import agent_tool_scope_permits_exposure
+
+        return agent_tool_scope_permits_exposure(
+            str(getattr(tool, "name", "")),
+            tool,
+        ) is not False
+    except Exception:
+        try:
+            from .tool_policy import get_current_agent_tool_scope
+
+            return get_current_agent_tool_scope() is None
+        except Exception:
+            return False
 
 
 def register_load_tool_pack_tool(

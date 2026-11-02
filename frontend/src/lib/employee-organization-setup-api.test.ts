@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { webcrypto } from "node:crypto";
 import { employeeOrganizationApi, parseOrganizationManifest, organizationSetupReadback, organizationSnapshot, createOrganizationPending, reconcileOrganizationPending, importOrganizationPreview, readOrganizationPending, type OrganizationGraph } from "./employee-organization-setup-api";
 import type { EmployeeCatalog } from "./agent-employees-api";
-const catalog = { can_manage: true, teams: [{ team_id: "team", name: "既存Team", subagents: [] }], capabilities: [] } as EmployeeCatalog;
-const graph: OrganizationGraph = { success: true, edges: [], nodes: [{ agent: { id: "director", slug: "director", display_name: "既存統括", state: "active" }, organization_profile: { manager_agent_id: "old-manager" }, revision: { agent_team_id: "team", execution_profile_id: "existing-profile" } }] };
+const catalog = { can_manage: true, capabilities: [] } as EmployeeCatalog;
+const graph: OrganizationGraph = { success: true, edges: [], nodes: [{ agent: { id: "director", slug: "director", display_name: "既存統括", state: "active" }, organization_profile: { manager_agent_id: "old-manager" }, revision: { legacy: { agent_team_id: "team", execution_profile_id: "existing-profile" } } }] };
 const existing = { key: "director", agent_id: "director", display_name: "既存統括" };
 describe("canonical authenticated owner readback", () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -36,14 +36,30 @@ describe("canonical authenticated owner readback", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
+describe("organization route response", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("accepts the ORM's nullable historical slug without losing fields", async () => {
+    const response = { success: true, edges: [], nodes: [{ agent: { id: "id", display_name: "Agent", slug: null, state: "active", created_by: "owner" }, organization_profile: { manager_agent_id: null, extra: { preserved: true } }, revision: { model_overrides: null, legacy: { agent_team_id: "team" } } }] };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(response))));
+    expect(await employeeOrganizationApi.graph()).toEqual(response);
+  });
+  it.each([401, 403, 500])("propagates HTTP %i", async status => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status })));
+    await expect(employeeOrganizationApi.graph()).rejects.toMatchObject({ status });
+  });
+  it.each([null, ""])('rejects invalid identity %s', async id => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true, edges: [], nodes: [{ agent: { id, display_name: "Agent", slug: null, state: "active" }, organization_profile: null, revision: null }] }))));
+    await expect(employeeOrganizationApi.graph()).rejects.toThrow("照合");
+  });
+});
 describe("canonical organization setup preserves bound employees", () => {
   it("preserves omitted manager/model/lifecycle and never adds a grant", () => {
     expect(parseOrganizationManifest(JSON.stringify({ employees: [existing] }), graph, catalog)).toEqual({ employees: [existing] });
-    expect(() => parseOrganizationManifest(JSON.stringify({ employees: [{ ...existing, revision: { agent_team_id: "team", execution_profile_id: "different" } }] }), graph, catalog)).toThrow("既存の職務");
+    expect(() => parseOrganizationManifest(JSON.stringify({ employees: [{ ...existing, revision: { unsupported: true } }] }), graph, catalog)).toThrow("職務");
     expect(() => parseOrganizationManifest(JSON.stringify({ employees: [{ ...existing, project_grants: [] }] }), graph, catalog)).toThrow("正規");
   });
   it("shows explicit new model configuration and rejects unknown references and cycles", () => {
-    const worker = { key: "worker", slug: "new-worker", display_name: "制作担当", manager_key: "director", revision: { agent_team_id: "team", execution_profile_id: "chosen", display_name: "制作担当", mission: "根拠から制作", operational_instructions: "許可済み資料だけ", responsibility_summary: "制作" }, activate: true };
+    const worker = { key: "worker", slug: "new-worker", display_name: "制作担当", manager_key: "director", revision: { display_name: "制作担当", mission: "根拠から制作", operational_instructions: "許可済み資料だけ", responsibility_summary: "制作", model_overrides: {}, tool_ids: [], delegate_policy: { agents: [], workers: [] } }, activate: true };
     expect(parseOrganizationManifest(JSON.stringify({ employees: [existing, worker] }), graph, catalog).employees[1]).toEqual(worker);
     expect(() => parseOrganizationManifest(JSON.stringify({ employees: [{ ...existing, agent_id: "foreign" }] }), graph, catalog)).toThrow("照合");
     expect(() => parseOrganizationManifest(JSON.stringify({ employees: [{ ...existing, manager_key: "worker" }, worker] }), graph, catalog)).toThrow("循環");
@@ -59,9 +75,14 @@ describe("canonical organization setup preserves bound employees", () => {
 });
 describe("owner-bound read-only organization reconciliation", () => {
   vi.stubGlobal("crypto", webcrypto);
-  const before: OrganizationGraph = { ...graph, nodes: [{ ...graph.nodes[0], organization_profile: { agent_id: "director", job_title: "統括", responsibility_summary: "既存責務", manager_agent_id: "old-manager", manager_user_id: null, primary_space_id: "space", autonomy_level: "supervised", employment_state: "active", company_permission_ceiling: { capabilities: ["workspace_read"] }, created_at: "original", updated_at: "before" }, revision: { id: "rev", agent_team_id: "team", execution_profile_id: "existing-profile", mission: "既存本文", capability_ceiling: ["workspace_read"], wake_policy: { mode: "manual" }, budget_policy: { currency: "JPY" } } }] };
+  const before: OrganizationGraph = { ...graph, nodes: [{ ...graph.nodes[0], organization_profile: { agent_id: "director", job_title: "統括", responsibility_summary: "既存責務", manager_agent_id: "old-manager", manager_user_id: null, primary_space_id: "space", autonomy_level: "supervised", employment_state: "active", company_permission_ceiling: { capabilities: ["workspace_read"] }, created_at: "original", updated_at: "before" }, revision: { id: "rev", legacy: { agent_team_id: "team", execution_profile_id: "existing-profile" }, mission: "既存本文", capability_ceiling: ["workspace_read"], wake_policy: { mode: "manual" }, budget_policy: { currency: "JPY" } } }] };
   const body = { employees: [{ ...existing, manager_key: null, job_title: "新しい役職" }] };
   const saved = { ...before, nodes: [{ ...before.nodes[0], organization_profile: { ...before.nodes[0].organization_profile, job_title: "新しい役職", manager_agent_id: null, updated_at: "after" } }] };
+  it("retains ID-based pending proof for an agent without a slug", async () => {
+    const historical = { ...before, nodes: [{ ...before.nodes[0], agent: { ...before.nodes[0].agent, slug: null } }] };
+    const proof = await createOrganizationPending(body, historical, "owner");
+    expect(readOrganizationPending(JSON.stringify(proof), "owner").employees[0].id).toBe("director");
+  });
   it("requires original manifest and owner, preserves full profile/revision, accepts only complete readback", async () => {
     const proof = await createOrganizationPending(body, before, "owner");
     expect(JSON.stringify(proof)).not.toContain("既存本文");

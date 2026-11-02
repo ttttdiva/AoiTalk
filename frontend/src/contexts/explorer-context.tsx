@@ -48,6 +48,7 @@ import {
   createFilesSidebarOwner,
   publishFilesSidebarState,
   resetFilesSidebarStore,
+  filesSidebarBrowseScopeKey,
   type FilesSidebarOwner,
 } from "@/components/explorer/files-sidebar-store";
 
@@ -323,6 +324,8 @@ type DirectoryFetchRequest = {
   path: string;
   /** Principal whose session authorized the request. */
   principalId: string | null;
+  /** Files sidebar scope that initiated the request. */
+  browseScopeKey: string;
   generation: number;
   /** Navigation identity that initiated this request. */
   navigationEpoch: number;
@@ -367,6 +370,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [filesTargetProjectId, setFilesTargetProjectId] = useState<string | null>(null);
   const [browseDataState, setBrowseDataState] =
     useState<ExplorerListResponse | null>(null);
+  const [browseDataScopeKey, setBrowseDataScopeKey] = useState<string | null>(null);
   // Principal that produced browseDataState.  Rendering is gated below so a
   // logout/login switch cannot flash the previous user's directory.
   const [dataPrincipalId, setDataPrincipalId] = useState<string | null>(null);
@@ -508,6 +512,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     (
       data: ExplorerListResponse | null,
       principalId: string | null = userId,
+      scopeKey?: string,
     ) => {
       // A successful delete is represented by a committed tombstone until a
       // current-directory response proves that the server no longer returns
@@ -538,6 +543,11 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       }
       setBrowseDataState(data);
       setDataPrincipalId(principalId);
+      if (data === null) {
+        setBrowseDataScopeKey(null);
+      } else if (scopeKey !== undefined) {
+        setBrowseDataScopeKey(scopeKey);
+      }
     },
     [userId],
   );
@@ -788,6 +798,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       setNavigationEpoch(nextNavigationEpoch);
       pendingFetchRef.current = null;
       setBrowseDataState(null);
+      setBrowseDataScopeKey(null);
       setDataPrincipalId(null);
       setLoading(false);
       setCurrentPath("");
@@ -843,6 +854,10 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     }
     return { scope: "personal" };
   }, [filerTab, isRemoteWorkspace, selectedProject?.source, selectedSpaceId]);
+
+  const sidebarScopeRoot = homeRootPath;
+  const sidebarScopeKey = `${filerTab}:${bookmarkScope.scope}:${bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : ""}:${userId ?? ""}`;
+  const browseScopeKey = filesSidebarBrowseScopeKey(sidebarScopeKey, sidebarScopeRoot);
 
   // The sidebar needs the complete set of Project roots in the selected
   // Space.  Keep this derived solely from ProjectContext's authoritative
@@ -949,11 +964,13 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       requestedPrincipalId: string | null = userId,
       requestedNavigationEpoch: number = navigationEpochRef.current,
       restoreViewState: ExplorerHistoryEntry | null = null,
+      requestedBrowseScopeKey: string = browseScopeKey,
     ) => {
       const generation = principalGenerationRef.current;
       const request: DirectoryFetchRequest = {
         path,
         principalId: requestedPrincipalId,
+        browseScopeKey: requestedBrowseScopeKey,
         generation,
         navigationEpoch: requestedNavigationEpoch,
         restoreViewState,
@@ -969,6 +986,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           !pending ||
           pending.path !== request.path ||
           pending.principalId !== request.principalId ||
+          pending.browseScopeKey !== request.browseScopeKey ||
           pending.generation !== request.generation ||
           pending.navigationEpoch !== request.navigationEpoch ||
           !historyEntriesEqual(pending.restoreViewState, request.restoreViewState)
@@ -1011,6 +1029,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         while (nextRequest !== null) {
           const targetPath = nextRequest.path;
           const targetPrincipalId = nextRequest.principalId;
+          const requestBrowseScopeKey = nextRequest.browseScopeKey;
           const requestGeneration: number = nextRequest.generation;
           const requestNavigationEpoch = nextRequest.navigationEpoch;
           const requestRestoreViewState = nextRequest.restoreViewState;
@@ -1107,7 +1126,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 total_items: remoteData.total_items ?? 0,
               };
               setIsAbsoluteFilerPath(true);
-              setBrowseDataForPrincipal(data, targetPrincipalId);
+              setBrowseDataForPrincipal(data, targetPrincipalId, requestBrowseScopeKey);
               setCurrentPath(data.current_path);
               currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
@@ -1119,7 +1138,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 requestNavigationEpoch !== navigationEpochRef.current
               ) continue;
               setIsAbsoluteFilerPath(true);
-              setBrowseDataForPrincipal(data, targetPrincipalId);
+              setBrowseDataForPrincipal(data, targetPrincipalId, requestBrowseScopeKey);
               setCurrentPath(data.current_path);
               currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
@@ -1138,7 +1157,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 requestNavigationEpoch !== navigationEpochRef.current
               ) continue;
               setIsAbsoluteFilerPath(false);
-              setBrowseDataForPrincipal(data, targetPrincipalId);
+              setBrowseDataForPrincipal(data, targetPrincipalId, requestBrowseScopeKey);
               setCurrentPath(data.current_path);
               currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
@@ -1264,6 +1283,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
                 pendingFetchRef.current = null;
                 nextRequest = null;
                 activeFetchRef.current = null;
+                if (requestGeneration === principalGenerationRef.current) {
+                  setLoading(false);
+                }
               }
             }
           }
@@ -1279,6 +1301,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     [
       isAdmin,
       rememberCurrentPath,
+      browseScopeKey,
       selectedProject,
       setBrowseDataForPrincipal,
       userId,
@@ -1758,7 +1781,34 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       const navigationEpoch = bumpNavigationEpoch();
       const restorePath = initialPathForTab(tab);
       if (restorePath) {
-        fetchDirectory(restorePath, userId, navigationEpoch);
+        const targetIsRemoteWorkspace =
+          tab === "workspace" &&
+          (selectedProject?.source === "remote" || isRemoteFilerPath(restorePath));
+        const targetBookmarkScope: ExplorerBookmarkScope =
+          tab === "workspace" && selectedSpaceId && !targetIsRemoteWorkspace
+            ? { scope: "shared", spaceId: selectedSpaceId }
+            : { scope: "personal" };
+        const targetScopeRoot =
+          tab === "workspace"
+            ? selectedProject?.source === "remote"
+              ? remoteWorkspacePath(
+                  selectedProject.remote_server_id ?? "",
+                  selectedProject.resource_id ?? "",
+                )
+              : selectedProjectId
+                ? workspaceRoot(selectedProjectId)
+                : ""
+            : userId
+              ? userRoot(userId)
+              : "";
+        const targetScopeKey = `${tab}:${targetBookmarkScope.scope}:${targetBookmarkScope.scope === "shared" ? targetBookmarkScope.spaceId : ""}:${userId ?? ""}`;
+        fetchDirectory(
+          restorePath,
+          userId,
+          navigationEpoch,
+          null,
+          filesSidebarBrowseScopeKey(targetScopeKey, targetScopeRoot),
+        );
       }
     },
     [
@@ -1767,6 +1817,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       fetchDirectory,
       initialPathForTab,
       invalidateExplorerDeleteScope,
+      selectedProject,
+      selectedProjectId,
+      selectedSpaceId,
       userId,
     ],
   );
@@ -2096,8 +2149,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     ],
   );
 
-  const sidebarScopeRoot = homeRootPath;
-  const sidebarScopeKey = `${filerTab}:${bookmarkScope.scope}:${bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : ""}:${userId ?? ""}`;
   useEffect(() => {
     const owner = filesSidebarOwnerRef.current;
     if (!owner) return;
@@ -2110,7 +2161,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     publishFilesSidebarState(owner, {
       currentPath,
       browseData,
+      browseDataScopeKey,
       loading,
+      error,
       filerTab,
       focusedItemPath,
       editingFilePath: editingFile?.path ?? null,
@@ -2135,6 +2188,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   }, [
     bookmarks,
     browseData,
+    browseDataScopeKey,
     closeEditor,
     currentPath,
     filesTargetProjectId,
@@ -2143,6 +2197,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     editingFile,
     isAdmin,
     isRemoteWorkspace,
+    error,
     bookmarkScope,
     bookmarkCollections,
     navigate,

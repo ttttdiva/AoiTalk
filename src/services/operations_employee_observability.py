@@ -11,7 +11,7 @@ from ..memory.models import (
     AgentActionPolicy, AgentActionPolicyRevision, AgentAutomationEvent,
     AgentAutomationRule, AgentRun, AgentWorkItem, ExternalAction,
     ExternalActionApproval, ExternalActionAttempt, ExternalActionReceipt,
-    ExternalConnection, IntegrationCredential, TelephonyCall, TelephonyRoute,
+    ExternalConnection, IntegrationCredential,
 )
 
 
@@ -63,22 +63,12 @@ def work_metadata(row):
                   "completed_at", "attempt_count")
 
 
-def call_metadata(row, *, admin):
-    result = fields(row, "id", "agent_id", "agent_revision_id", "agent_run_id", "state",
-                    "received_at", "accepted_at", "ended_at", "created_at", "updated_at")
-    if admin:
-        result.update(fields(row, "route_id", "route_version"))
-    # No provider IDs, destination keys, raw/masked stored numbers or transcript.
-    return result
-
-
 async def employee_summary(session, agent_id, *, admin, projects, registry):
     result = {
         "management_visible": admin,
         "rule_count": None, "active_rule_count": None, "action_policy_count": None,
         "integration_readiness": None, "last_automation_trigger": None,
         "last_automation_result": None, "uncertain_action_count": None,
-        "phone": {"route_count": None, "routes": [], "recent_calls": []},
     }
     if admin:
         rules = await optional_rows(session, select(func.count()).select_from(AgentAutomationRule).where(AgentAutomationRule.agent_id == agent_id))
@@ -94,13 +84,6 @@ async def employee_summary(session, agent_id, *, admin, projects, registry):
             AgentActionPolicy, AgentActionPolicy.id == AgentActionPolicyRevision.policy_id
         ).where(AgentActionPolicy.agent_id == agent_id, AgentActionPolicyRevision.version == latest).limit(501))
         result["integration_readiness"] = await integration_readiness(session, revisions, registry)
-        count = await optional_rows(session, select(func.count()).select_from(TelephonyRoute).where(TelephonyRoute.agent_id == agent_id))
-        result["phone"]["route_count"] = count[0] if count else None
-        routes = await optional_rows(session, select(TelephonyRoute).where(TelephonyRoute.agent_id == agent_id).order_by(TelephonyRoute.updated_at.desc()).limit(10))
-        result["phone"]["routes"] = [dict(fields(row, "id", "agent_revision_id", "state", "version", "updated_at"),
-                                                   readiness="unknown", executable=False)
-                                             for row in routes or []]
-
     uncertain = await optional_rows(session, scoped(select(func.count()).select_from(ExternalAction).where(
         ExternalAction.origin_agent_id == agent_id, ExternalAction.status == "uncertain"
     ), ExternalAction.project_id, projects))
@@ -137,12 +120,6 @@ async def employee_summary(session, agent_id, *, admin, projects, registry):
         if runs:
             status["run_id"] = identity(runs[0].id)
         result["last_automation_result"] = status
-    calls_stmt = select(TelephonyCall).where(TelephonyCall.agent_id == agent_id)
-    if projects is not None:
-        calls_stmt = calls_stmt.join(AgentRun, AgentRun.id == TelephonyCall.agent_run_id).where(
-            AgentRun.agent_id == agent_id, AgentRun.project_id.in_(projects or {UUID(int=0)}))
-    calls = await optional_rows(session, calls_stmt.order_by(TelephonyCall.received_at.desc()).limit(10))
-    result["phone"]["recent_calls"] = [call_metadata(row, admin=admin) for row in calls or []]
     return result
 
 

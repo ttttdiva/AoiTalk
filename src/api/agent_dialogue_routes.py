@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from typing import Any, Callable, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -14,6 +15,10 @@ from ..services.agent_dialogue_service import (
     AgentDialogueService,
 )
 from ..services.agent_identity_service import AgentIdentityConflictError
+from ..services.admin_restart_admission import (
+    AdminRestartPendingError,
+    conversation_work_lease,
+)
 
 
 class _DialogueModel(BaseModel):
@@ -31,6 +36,21 @@ class AoiDotsProfile(_DialogueModel):
     agent_name: str = Field(default="AoiDots", min_length=1, max_length=160)
     state: str = Field(default="ready", min_length=1, max_length=32)
     pending_input_count: int = Field(default=0, ge=0, le=64)
+
+
+class CallerRunBudgetDTO(_DialogueModel):
+    """Safe usage and settlement projection for a caller Run reservation."""
+
+    state: str | None = Field(default=None, max_length=32)
+    reserved_tokens: int | None = None
+    reserved_cost_micros: int | None = None
+    usage_state: str | None = Field(default=None, max_length=32)
+    actual_tokens: int | None = None
+    actual_cost_micros: int | None = None
+    charged_tokens: int | None = None
+    charged_cost_micros: int | None = None
+    overrun_tokens: int | None = None
+    overrun_cost_micros: int | None = None
 
 
 class AoiDotsWorkItem(_DialogueModel):
@@ -58,6 +78,7 @@ class AoiDotsWorkItem(_DialogueModel):
         "expired",
     ] | None = None
     budget: AgentDialogueBudgetDTO | None = None
+    caller_run_budget: CallerRunBudgetDTO | None = None
     allowed_actions: list[Literal["stop", "resume", "rework", "answer"]] = Field(default_factory=list, max_length=4)
     refs: "AgentDialogueRefs"
     control_revision: int = 0
@@ -157,6 +178,43 @@ class DialogueControlRequest(_DialogueModel):
     instruction: str | None = Field(default=None, max_length=30_000)
 
 
+class NativeOutcomeRecoveryRequest(_DialogueModel):
+    expected_control_revision: int = Field(ge=0, strict=True)
+    idempotency_key: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Validated request token; recovery identity is fixed per original delivery, regardless of this value.",
+    )
+
+
+class StaleControlDeliveryTerminalizationRequest(_DialogueModel):
+    dialogue_id: UUID = Field(description="CAS identity; must equal the dialogue_id path parameter")
+    expected_state: Literal["pending"] = Field(description="The observed state of this exact Delivery")
+    expected_control_revision: int = Field(
+        ge=0,
+        strict=True,
+        description="CAS value of the current Dialogue control_revision; the Delivery revision must be older",
+    )
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Owner-scoped key for one terminalization request",
+    )
+
+
+class StaleControlDeliveryTerminalizationResponse(_DialogueModel):
+    success: bool
+    dialogue_id: str
+    delivery_id: str
+    previous_state: str
+    state: str
+    expected_control_revision: int
+    dialogue_control_revision: int
+    transport_work_item_id: str
+    transport_work_state: str
+    idempotent: bool
+
+
 class AoiDotsBootstrapRequest(_DialogueModel):
     # This field is context only.  The service never attaches the private root
     # to it implicitly and never persists it as the root's Project binding.
@@ -195,6 +253,7 @@ def create_agent_dialogue_router(
     get_service: Callable[[], Any] | None = None,
     get_dispatch_bridge: Callable[[], Any] | None = None,
     config: Any | None = None,
+    restart_admission_server: Any | None = None,
 ) -> APIRouter:
     """Build the small authenticated AoiDots/AgentDialogue router."""
 
@@ -224,6 +283,18 @@ def create_agent_dialogue_router(
 
             bridge = get_agent_dialogue_dispatch_bridge(manager, config=config)
         return AgentDialogueService(manager, config=config, dispatch_bridge=bridge)
+
+    async def _with_conversation_admission(operation: Callable[[], Any]) -> Any:
+        if restart_admission_server is None:
+            return await operation()
+        try:
+            async with conversation_work_lease(restart_admission_server):
+                return await operation()
+        except AdminRestartPendingError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "admin_restart_pending", "message": str(exc)},
+            ) from exc
 
     @router.post(
         "/api/aoidots/bootstrap",
@@ -309,6 +380,7 @@ def create_agent_dialogue_router(
     @router.post(
         "/api/agent-dialogues/{dialogue_id}/inputs/{input_id}/answer",
         response_model=dict[str, Any],
+        responses={409: {"description": "Conversation restart admission is closed"}},
     )
     async def answer_input(
         dialogue_id: str,
@@ -320,16 +392,18 @@ def create_agent_dialogue_router(
         user = await _current_user(request)
         service = await _service()
         try:
-            return await service.resolve_input(
-                dialogue_id,
-                input_id,
-                answer=payload.answer,
-                client_message_id=payload.client_message_id,
-                expected_control_revision=payload.expected_control_revision,
-                expected_input_revision=payload.expected_input_revision,
-                actor_user_id=_user_value(user, "id", "user_id"),
-                actor_role=_user_value(user, "role", "user_role"),
-                source_kind="human",
+            return await _with_conversation_admission(
+                lambda: service.resolve_input(
+                    dialogue_id,
+                    input_id,
+                    answer=payload.answer,
+                    client_message_id=payload.client_message_id,
+                    expected_control_revision=payload.expected_control_revision,
+                    expected_input_revision=payload.expected_input_revision,
+                    actor_user_id=_user_value(user, "id", "user_id"),
+                    actor_role=_user_value(user, "role", "user_role"),
+                    source_kind="human",
+                )
             )
         except AgentDialogueError as exc:
             raise _error(exc) from exc
@@ -353,14 +427,22 @@ def create_agent_dialogue_router(
         except AgentDialogueError as exc:
             raise _error(exc) from exc
 
-    @router.post("/api/agent-dialogues/{dialogue_id}/control", response_model=dict[str, Any])
+    @router.post(
+        "/api/agent-dialogues/{dialogue_id}/control",
+        response_model=dict[str, Any],
+        responses={409: {"description": "Conversation restart admission is closed"}},
+    )
     async def control(
         dialogue_id: str,
         payload: DialogueControlRequest,
         request: Request,
         _: Any = Depends(require_auth_dependency),
     ) -> dict[str, Any]:
-        return await _control(dialogue_id, payload, request)
+        if payload.action == "stop":
+            return await _control(dialogue_id, payload, request)
+        return await _with_conversation_admission(
+            lambda: _control(dialogue_id, payload, request)
+        )
 
     @router.post("/api/agent-dialogues/{dialogue_id}/stop", response_model=dict[str, Any])
     async def stop(
@@ -375,31 +457,91 @@ def create_agent_dialogue_router(
             request,
         )
 
-    @router.post("/api/agent-dialogues/{dialogue_id}/resume", response_model=dict[str, Any])
+    @router.post(
+        "/api/agent-dialogues/{dialogue_id}/resume",
+        response_model=dict[str, Any],
+        responses={409: {"description": "Conversation restart admission is closed"}},
+    )
     async def resume(
         dialogue_id: str,
         request: Request,
         expected_control_revision: int = Query(ge=0),
         _: Any = Depends(require_auth_dependency),
     ) -> dict[str, Any]:
-        return await _control(
-            dialogue_id,
-            DialogueControlRequest(action="resume", expected_control_revision=expected_control_revision),
-            request,
+        return await _with_conversation_admission(
+            lambda: _control(
+                dialogue_id,
+                DialogueControlRequest(action="resume", expected_control_revision=expected_control_revision),
+                request,
+            )
         )
 
-    @router.post("/api/agent-dialogues/{dialogue_id}/rework", response_model=dict[str, Any])
+    @router.post(
+        "/api/agent-dialogues/{dialogue_id}/rework",
+        response_model=dict[str, Any],
+        responses={409: {"description": "Conversation restart admission is closed"}},
+    )
     async def rework(
         dialogue_id: str,
         request: Request,
         expected_control_revision: int = Query(ge=0),
         _: Any = Depends(require_auth_dependency),
     ) -> dict[str, Any]:
-        return await _control(
-            dialogue_id,
-            DialogueControlRequest(action="rework", expected_control_revision=expected_control_revision),
-            request,
+        return await _with_conversation_admission(
+            lambda: _control(
+                dialogue_id,
+                DialogueControlRequest(action="rework", expected_control_revision=expected_control_revision),
+                request,
+            )
         )
+
+    @router.post(
+        "/api/agent-dialogues/{dialogue_id}/deliveries/{delivery_id}/terminalize-stale-control",
+        response_model=StaleControlDeliveryTerminalizationResponse,
+        responses={409: {"description": "Delivery is not proven safe to terminalize"}},
+    )
+    async def terminalize_stale_control_delivery(
+        dialogue_id: str,
+        delivery_id: str,
+        payload: StaleControlDeliveryTerminalizationRequest,
+        request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> StaleControlDeliveryTerminalizationResponse:
+        user = await _current_user(request)
+        service = await _service()
+        try:
+            result = await service.terminalize_stale_control_delivery(
+                dialogue_id,
+                delivery_id,
+                body_dialogue_id=payload.dialogue_id,
+                expected_state=payload.expected_state,
+                expected_control_revision=payload.expected_control_revision,
+                idempotency_key=payload.idempotency_key,
+                actor_user_id=_user_value(user, "id", "user_id"),
+                actor_role=_user_value(user, "role", "user_role"),
+            )
+            return StaleControlDeliveryTerminalizationResponse.model_validate(result)
+        except AgentDialogueError as exc:
+            raise _error(exc) from exc
+
+    @router.post(
+        "/api/agent-dialogues/{dialogue_id}/deliveries/{delivery_id}/recover-native-outcome",
+        response_model=dict[str, Any],
+        responses={409: {"description": "Native outcome cannot be safely recovered"}},
+    )
+    async def recover_native_outcome(
+        dialogue_id: str, delivery_id: str, payload: NativeOutcomeRecoveryRequest, request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> dict[str, Any]:
+        user = await _current_user(request)
+        service = await _service()
+        try:
+            return await _with_conversation_admission(lambda: service.recover_native_outcome(
+                dialogue_id, delivery_id, expected_control_revision=payload.expected_control_revision,
+                actor_user_id=_user_value(user, "id", "user_id"),
+                actor_role=_user_value(user, "role", "user_role")))
+        except AgentDialogueError as exc:
+            raise _error(exc) from exc
 
     return router
 
@@ -414,6 +556,7 @@ __all__ = [
     "AoiDotsWorkItem",
     "AoiDotsWorkList",
     "ArtifactSafeRef",
+    "CallerRunBudgetDTO",
     "DialogueControlRequest",
     "InputAnswerRequest",
     "create_agent_dialogue_router",

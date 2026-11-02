@@ -38,6 +38,7 @@ print("Frontend production build fingerprint saved.")
   cwd: projectRoot,
   env: { ...process.env, PYTHONUTF8: "1" },
   stdio: "inherit",
+  windowsHide: true,
 });
 
 if (result.error) console.error(result.error.message);

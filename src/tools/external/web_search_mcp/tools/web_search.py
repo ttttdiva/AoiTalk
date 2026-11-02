@@ -305,6 +305,12 @@ def register(mcp: FastMCP):
                 if "unexpected keyword argument" not in str(exc):
                     raise
                 client = AsyncOpenAI(api_key=api_key)
+            from .....services.provider_key_attribution_service import (
+                call_with_provider_key_attribution,
+                prepare_provider_key_identity,
+            )
+
+            key_identity = prepare_provider_key_identity(api_key)
             request_input = (
                 "あなたはWeb検索アシスタントです。"
                 "与えられたクエリについて最新の情報を検索し、"
@@ -339,7 +345,11 @@ def register(mcp: FastMCP):
                         raise PrivacyError(
                             "privacy protection returned no protected input"
                         )
-                    return await client.responses.create(**dict(protected_payload))
+                    return await call_with_provider_key_attribution(
+                        lambda: client.responses.create(**dict(protected_payload)),
+                        identity=key_identity,
+                        consumer_id="openai_web_search",
+                    )
 
                 # Compatibility-only branch for old protect-only embedding
                 # gateways.  Production always uses the full-wire branch.
@@ -350,10 +360,14 @@ def register(mcp: FastMCP):
                     raise PrivacyError(
                         "privacy protection returned no protected input"
                     )
-                return await client.responses.create(
-                    model=requested_model,
-                    tools=expected_tools,
-                    input=protected_input,
+                return await call_with_provider_key_attribution(
+                    lambda: client.responses.create(
+                        model=requested_model,
+                        tools=expected_tools,
+                        input=protected_input,
+                    ),
+                    identity=key_identity,
+                    consumer_id="openai_web_search",
                 )
 
             response = await _execute_web_search(

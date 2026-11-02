@@ -55,9 +55,6 @@ class WorkItem:
     causation_id: str | None = None
     causal_depth: int = 0
     space_id: str | None = None
-    team_id: str | None = None
-    execution_profile_id: str | None = None
-    subagent_id: str | None = None
     authority_hash: str | None = None
     run_scope_hash: str | None = None
 
@@ -99,9 +96,6 @@ class WorkItem:
             "parent_work_item_id": self.parent_work_item_id,
             "causation_id": self.causation_id,
             "causal_depth": self.causal_depth,
-            "team_id": self.team_id,
-            "execution_profile_id": self.execution_profile_id,
-            "subagent_id": self.subagent_id,
         }
 
 

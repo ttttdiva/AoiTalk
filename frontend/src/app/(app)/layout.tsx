@@ -11,6 +11,7 @@ import { GlobalCreateTask } from "@/components/layout/global-create-task";
 import { AudioPlayerBar } from "@/components/layout/audio-player-bar";
 import { ShortcutsHelpDialog } from "@/components/layout/shortcuts-help-dialog";
 import { GlobalAdminRestart } from "@/components/layout/global-admin-restart";
+import { RestartDrainIndicator } from "@/components/layout/restart-drain-indicator";
 import { GlobalMemoPad } from "@/components/layout/global-memo-pad";
 import { HomeTodayOverlay } from "@/components/layout/home-today-overlay";
 import { TaskCompletionUndoProvider } from "@/components/tasks/task-completion-undo-provider";
@@ -68,6 +69,7 @@ export default async function AppLayout({
                             <GlobalCreateTask />
                             <ShortcutsHelpDialog />
                             <GlobalAdminRestart />
+                            <RestartDrainIndicator />
                             <GlobalMemoPad />
                             <DailyCaptureDialog />
                             <HomeTodayOverlay />

@@ -8,6 +8,32 @@ export type SyncStatusPresentation = {
   detail: string | null;
 };
 
+export type SyncLaneName = "push" | "changes" | "bootstrap";
+
+const SAFE_SYNC_ERROR_CODES = new Set([
+  "not_sent",
+  "no_response",
+  "response_invalid",
+  "write_failed",
+  "sqlite_write_failed",
+  "sync_disabled",
+  "cursor_expired",
+]);
+
+export function safeSyncErrorCode(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return /^http_[1-5]\d{2}$/.test(value) || SAFE_SYNC_ERROR_CODES.has(value) ? value : null;
+}
+
+export function describeLaneErrorCode(status: SyncV3Status, lane: SyncLaneName): string | null {
+  const runtimeCode = status[lane].lastErrorCode;
+  if (runtimeCode != null) return safeSyncErrorCode(runtimeCode);
+
+  const latest = [...(status.recentRequests ?? [])].reverse().find((request) => request.lane === lane);
+  if (!latest || latest.outcome === "ok") return null;
+  return safeSyncErrorCode(latest.errorCode ?? latest.outcome);
+}
+
 export function describeSyncStatus(status: SyncV3Status | null): SyncStatusPresentation {
   if (!status) return { label: "同期を準備中", tone: "info", detail: null };
   switch (status.overall) {

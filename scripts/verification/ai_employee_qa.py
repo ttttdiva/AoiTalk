@@ -12,7 +12,6 @@ Run with the repository venv Python. Commands:
   migration-test --manifest PATH
   recovery-check --manifest PATH
   ui-smoke --manifest PATH  (copies only the two reviewed UI repair files)
-  phone-smoke --manifest PATH  (enables explicit local phone fixture DI)
   cleanup --manifest PATH  (drops only the owned DB and removes private files)
   stop --manifest PATH [--drop-database]
 
@@ -38,6 +37,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -80,6 +80,54 @@ def qa_artifact_path(name: str, repository: Path = REPO) -> Path:
     return parent / safe_name
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    """Return true for symlinks, junctions, and Windows reparse entries."""
+
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        item_stat = path.lstat()
+        return bool(
+            getattr(item_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError):
+        return True
+
+
+def _has_link_or_reparse_component(path: Path) -> bool:
+    """Inspect existing lexical path components without following them."""
+
+    path = Path(path)
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current = current / component
+        if _is_link_or_reparse(current):
+            return True
+    return False
+
+
+def _iter_owned_entries(root: Path):
+    """Walk a QA run without descending through reparse entries."""
+
+    pending = [Path(root)]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            raise
+        for entry in entries:
+            yield entry
+            if entry.is_dir() and not _is_link_or_reparse(entry):
+                pending.append(entry)
+
+
 def read_qa_credentials() -> tuple[str, str]:
     from dotenv import dotenv_values
 
@@ -119,26 +167,37 @@ def source_provenance() -> dict:
 
 
 def load_manifest(path: Path) -> dict:
-    path = path.resolve(strict=True)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    name = check_identity(data["database"])
-    if (data.get("harness") != "ai_employee_qa" or data.get("schema") != "public"
-            or path.name != "manifest.json" or path.parent.name != name
-            or Path(data["output_dir"]).resolve() != path.parent
-            or Path(data["repo"]).resolve() != REPO):
-        raise ValueError("QA manifest identity/path mismatch")
-    if name != PREFIX + UUID(data["run_id"]).hex:
-        raise ValueError("QA database name and run UUID disagree")
-    if data["pg_host"] != "127.0.0.1":
-        raise ValueError("QA PostgreSQL must be loopback")
-    for key in ("pg_port", "backend_port", "frontend_port"):
-        if type(data[key]) is not int or not 1024 <= data[key] <= 65535:
-            raise ValueError("QA port invalid")
-    if len({data[key] for key in ("pg_port", "backend_port", "frontend_port")}) != 3:
-        raise ValueError("QA ports must be distinct")
-    if data["backend_port"] in (3000, 3002) or data["frontend_port"] in (3000, 3002):
-        raise ValueError("Existing application ports are forbidden")
-    return data
+    candidate = Path(path)
+    if _has_link_or_reparse_component(candidate) or _is_link_or_reparse(candidate):
+        raise ValueError("QA manifest path cannot use a symlink or reparse point")
+    try:
+        path = candidate.resolve(strict=True)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        name = check_identity(data["database"])
+        output_path = Path(data["output_dir"])
+        if _has_link_or_reparse_component(output_path) or _is_link_or_reparse(output_path):
+            raise ValueError("QA output path cannot use a symlink or reparse point")
+        if (data.get("harness") != "ai_employee_qa" or data.get("schema") != "public"
+                or path.name != "manifest.json" or path.parent.name != name
+                or output_path.resolve() != path.parent
+                or Path(data["repo"]).resolve() != REPO):
+            raise ValueError("QA manifest identity/path mismatch")
+        if name != PREFIX + UUID(data["run_id"]).hex:
+            raise ValueError("QA database name and run UUID disagree")
+        if data["pg_host"] != "127.0.0.1":
+            raise ValueError("QA PostgreSQL must be loopback")
+        for key in ("pg_port", "backend_port", "frontend_port"):
+            if type(data[key]) is not int or not 1024 <= data[key] <= 65535:
+                raise ValueError("QA port invalid")
+        if len({data[key] for key in ("pg_port", "backend_port", "frontend_port")}) != 3:
+            raise ValueError("QA ports must be distinct")
+        if data["backend_port"] in (3000, 3002) or data["frontend_port"] in (3000, 3002):
+            raise ValueError("Existing application ports are forbidden")
+        return data
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith(("QA ", "Existing ", "Refusing ")):
+            raise
+        raise ValueError("QA manifest identity/path mismatch") from exc
 
 
 def choose_port(excluded=()) -> int:
@@ -209,8 +268,6 @@ def child_environment(manifest: dict, private: dict) -> dict[str, str]:
         "AOITALK_EMPLOYEE_QA_MANIFEST": str(root / "manifest.json"),
         "HF_HOME": str(root / "model-cache"), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
     })
-    if manifest.get("phone_fixture"):
-        env.update(FEATURE_VOICE_INPUT="true", FEATURE_TTS_OUTPUT="true")
     return env
 
 
@@ -254,6 +311,163 @@ def run_logged(argv, *, cwd, env, log: Path, timeout=180) -> None:
         raise RuntimeError(f"QA command failed ({code}); see {log.name}")
 
 
+def _prepare_has_active_process(root: Path, manifest: dict) -> bool:
+    """Fail closed when any process may still own a QA run directory.
+
+    This is deliberately inspection-only.  Prepare interruption cleanup never
+    terminates a process, because a PID may have been reused or may belong to
+    another QA/app run.  A later explicit ``stop`` command performs the
+    existing ownership checked termination flow.
+    """
+
+    try:
+        import psutil
+
+        known_pids: set[int] = set()
+        for info in (manifest.get("processes") or {}).values():
+            if not isinstance(info, dict) or type(info.get("pid")) is not int:
+                return True
+            known_pids.add(info["pid"])
+        postgres_pid = manifest.get("postgres_pid")
+        if postgres_pid is not None:
+            if type(postgres_pid) is not int:
+                return True
+            known_pids.add(postgres_pid)
+        pid_file = root / "postgres" / "postmaster.pid"
+        if pid_file.is_file() and not _is_link_or_reparse(pid_file):
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").splitlines()[0])
+            except (OSError, UnicodeError, ValueError, IndexError):
+                return True
+            known_pids.add(pid)
+        for pid in known_pids:
+            try:
+                psutil.Process(pid)
+            except psutil.NoSuchProcess:
+                continue
+            except (OSError, psutil.Error):
+                return True
+            return True
+        # Also inspect command lines for an unrecorded helper.  If process
+        # enumeration itself is unavailable, retain the run for an operator.
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                if process.pid == os.getpid():
+                    continue
+                command = " ".join(str(item) for item in (process.info.get("cmdline") or []))
+                if command and str(root) in command:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except (OSError, psutil.Error):
+                return True
+    except ImportError:
+        return True
+    return False
+
+
+def _drop_owned_prepare_database(manifest: dict, private: dict) -> bool:
+    """Drop only a database carrying this prepare run's exact marker."""
+
+    if manifest.get("dedicated_cluster"):
+        # A dedicated cluster's database is physically owned by the run
+        # directory.  The caller already checked that its postmaster is not
+        # active, so removing the run directory is the bounded cleanup.
+        return True
+    try:
+        from psycopg2 import sql
+
+        with contextlib.closing(pg_connect(manifest, private, admin=True, maintenance=True)) as connection:
+            connection.autocommit = True
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname=%s",
+                    (manifest["database"],),
+                )
+                row = cursor.fetchone()
+                # A crash can happen after CREATE DATABASE returns but before
+                # the manifest status is advanced.  The database query is the
+                # source of truth in that window.  Absence means another
+                # cleanup already removed this task-owned database; continue
+                # with scratch cleanup.  Any present database still needs the
+                # exact run marker.
+                if row is None:
+                    return True
+                if row[0] != "ai_employee_qa:" + manifest["run_id"]:
+                    return False
+                # Do not force-drop active connections.  If another process
+                # still references this database, preserve the run for the
+                # explicit operator cleanup path.
+                cursor.execute(
+                    sql.SQL("DROP DATABASE {} ").format(
+                        sql.Identifier(check_identity(manifest["database"]))
+                    )
+                )
+    except Exception:
+        return False
+    return True
+
+
+def _cleanup_failed_prepare(root: Path, manifest: dict | None, private: dict | None) -> bool:
+    """Remove an interrupted prepare only while its ownership is provable."""
+
+    if manifest is None or private is None:
+        # Failure before the manifest/private state is written leaves only an
+        # empty directory created by this invocation.  Remove that exact
+        # collision-free path; retain anything containing unknown content.
+        if manifest is not None or private is not None:
+            return False
+        try:
+            safe_name = check_identity(Path(root).name)
+            expected_root = qa_run_path(safe_name)
+            if (
+                Path(root).absolute() != expected_root.absolute()
+                or _has_link_or_reparse_component(expected_root)
+                or _is_link_or_reparse(expected_root)
+                or not expected_root.is_dir()
+                or any(expected_root.iterdir())
+            ):
+                return False
+            expected_root.rmdir()
+            return True
+        except (OSError, ValueError, RuntimeError):
+            return False
+    try:
+        name = check_identity(manifest["database"])
+        expected_root = qa_run_path(name)
+        if Path(root).absolute() != expected_root.absolute():
+            return False
+        if _has_link_or_reparse_component(expected_root) or _is_link_or_reparse(expected_root):
+            return False
+        manifest_path = expected_root / "manifest.json"
+        loaded = load_manifest(manifest_path)
+        if (
+            loaded.get("run_id") != manifest.get("run_id")
+            or loaded.get("database") != manifest.get("database")
+            or Path(loaded.get("output_dir", "")).resolve() != expected_root.resolve()
+        ):
+            return False
+        if _prepare_has_active_process(expected_root, loaded):
+            return False
+        # Always inspect the shared-cluster database marker.  ``status`` may
+        # still be ``allocated`` when preparation was interrupted immediately
+        # after CREATE DATABASE.
+        if not _drop_owned_prepare_database(loaded, private):
+            return False
+        # A reparse entry can redirect a recursive delete.  The one known
+        # producer link is the frontend dependency junction; unlinking that
+        # link preserves the source node_modules tree.
+        for entry in _iter_owned_entries(expected_root):
+            if _is_link_or_reparse(entry):
+                if entry.relative_to(expected_root).as_posix().casefold() != "frontend/node_modules":
+                    return False
+                entry.unlink()
+        shutil.rmtree(expected_root, ignore_errors=False)
+        return not expected_root.exists()
+    except (OSError, ValueError, KeyError, RuntimeError):
+        return False
+
+
 def prepare(args) -> Path:
     read_qa_credentials()  # Fail before allocating resources; never print values.
     node = args.node or shutil.which("node")
@@ -263,70 +477,78 @@ def prepare(args) -> Path:
     run_id = uuid4()
     name = check_identity(PREFIX + run_id.hex)
     root = qa_run_path(name)
-    root.parent.mkdir(parents=True, exist_ok=True)
-    root.mkdir(mode=0o700)
-    settings = local_settings()
-    dedicated_cluster = not settings["admin_password"]
-    pg_port = choose_port() if dedicated_cluster else settings["port"]
-    backend_port = choose_port([pg_port])
-    frontend_port = choose_port([pg_port, backend_port])
-    manifest = {"harness": "ai_employee_qa", "run_id": str(run_id), "database": name, "schema": "public",
-        "repo": str(REPO), "output_dir": str(root), "pg_host": "127.0.0.1", "pg_port": pg_port,
-        "backend_port": backend_port, "frontend_port": frontend_port,
-        "backend_url": f"http://127.0.0.1:{backend_port}", "frontend_url": f"http://127.0.0.1:{frontend_port}",
-        "node": str(Path(node).resolve()), "postgres_bin": str(pg_bin.resolve()),
-        "dedicated_cluster": dedicated_cluster, "status": "allocated", "processes": {},
-        "provider_mode": args.provider_mode,
-        "provider_evidence": "deterministic_test_only; live suppliers and telephony UNVERIFIED"}
-    private = {key: secrets.token_urlsafe(40) for key in
-        ("web_secret", "next_secret", "jwt_secret", "internal_key", "fixture_api_key")}
-    private["field_key"] = base64.b64encode(secrets.token_bytes(32)).decode()
-    private.update({"pg_user": "aoitalk_qa" if dedicated_cluster else settings["user"],
-        "pg_password": secrets.token_urlsafe(32) if dedicated_cluster else settings["password"],
-        "admin_user": "qa_cluster_admin" if dedicated_cluster else "postgres",
-        "admin_password": secrets.token_urlsafe(32) if dedicated_cluster else settings["admin_password"]})
-    write_json(root / "manifest.json", manifest)
-    write_json(root / ".runtime-private.json", private if dedicated_cluster else
-        {key: value for key, value in private.items() if key not in ("pg_password", "admin_password")})
-    env = child_environment(manifest, private)
-    if dedicated_cluster:
-        pwfile = root / ".initdb-password"
-        pwfile.write_text(private["admin_password"], encoding="utf-8")
-        pwfile.chmod(0o600)
-        try:
-            run_logged([pg_bin / "initdb.exe", "-D", root / "postgres", "-U", private["admin_user"],
-                "--auth=scram-sha-256", "--encoding=UTF8", "--locale=C", f"--pwfile={pwfile}"],
-                cwd=root, env=env, log=root / "postgres-init.log")
-        finally:
-            pwfile.unlink(missing_ok=True)
-        run_logged([pg_bin / "pg_ctl.exe", "-D", root / "postgres", "-l", root / "postgres.log",
-            "-o", f"-h 127.0.0.1 -p {pg_port} -c max_connections=60", "-w", "start"],
-            cwd=root, env=env, log=root / "postgres-init.log")
-        manifest["postgres_pid"] = int((root / "postgres" / "postmaster.pid").read_text().splitlines()[0])
+    manifest: dict | None = None
+    private: dict | None = None
+    try:
+        if _has_link_or_reparse_component(root.parent):
+            raise RuntimeError("QA scratch parent cannot use a symlink or reparse point")
+        root.parent.mkdir(parents=True, exist_ok=True)
+        root.mkdir(mode=0o700)
+        settings = local_settings()
+        dedicated_cluster = not settings["admin_password"]
+        pg_port = choose_port() if dedicated_cluster else settings["port"]
+        backend_port = choose_port([pg_port])
+        frontend_port = choose_port([pg_port, backend_port])
+        manifest = {"harness": "ai_employee_qa", "run_id": str(run_id), "database": name, "schema": "public",
+            "repo": str(REPO), "output_dir": str(root), "pg_host": "127.0.0.1", "pg_port": pg_port,
+            "backend_port": backend_port, "frontend_port": frontend_port,
+            "backend_url": f"http://127.0.0.1:{backend_port}", "frontend_url": f"http://127.0.0.1:{frontend_port}",
+            "node": str(Path(node).resolve()), "postgres_bin": str(pg_bin.resolve()),
+            "dedicated_cluster": dedicated_cluster, "status": "allocated", "processes": {},
+            "provider_mode": args.provider_mode,
+            "provider_evidence": "deterministic_test_only; live suppliers UNVERIFIED"}
+        private = {key: secrets.token_urlsafe(40) for key in
+            ("web_secret", "next_secret", "jwt_secret", "internal_key", "fixture_api_key")}
+        private["field_key"] = base64.b64encode(secrets.token_bytes(32)).decode()
+        private.update({"pg_user": "aoitalk_qa" if dedicated_cluster else settings["user"],
+            "pg_password": secrets.token_urlsafe(32) if dedicated_cluster else settings["password"],
+            "admin_user": "qa_cluster_admin" if dedicated_cluster else "postgres",
+            "admin_password": secrets.token_urlsafe(32) if dedicated_cluster else settings["admin_password"]})
         write_json(root / "manifest.json", manifest)
-    from psycopg2 import sql
+        write_json(root / ".runtime-private.json", private if dedicated_cluster else
+            {key: value for key, value in private.items() if key not in ("pg_password", "admin_password")})
+        env = child_environment(manifest, private)
+        if dedicated_cluster:
+            pwfile = root / ".initdb-password"
+            pwfile.write_text(private["admin_password"], encoding="utf-8")
+            pwfile.chmod(0o600)
+            try:
+                run_logged([pg_bin / "initdb.exe", "-D", root / "postgres", "-U", private["admin_user"],
+                    "--auth=scram-sha-256", "--encoding=UTF8", "--locale=C", f"--pwfile={pwfile}"],
+                    cwd=root, env=env, log=root / "postgres-init.log")
+            finally:
+                pwfile.unlink(missing_ok=True)
+            run_logged([pg_bin / "pg_ctl.exe", "-D", root / "postgres", "-l", root / "postgres.log",
+                "-o", f"-h 127.0.0.1 -p {pg_port} -c max_connections=60", "-w", "start"],
+                cwd=root, env=env, log=root / "postgres-init.log")
+            manifest["postgres_pid"] = int((root / "postgres" / "postmaster.pid").read_text().splitlines()[0])
+            write_json(root / "manifest.json", manifest)
+        from psycopg2 import sql
 
-    with contextlib.closing(pg_connect(manifest, private, admin=True, maintenance=True)) as connection:
-        connection.autocommit = True
-        with connection.cursor() as cursor:
-            if dedicated_cluster:
-                cursor.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE").format(sql.Identifier(private["pg_user"])), (private["pg_password"],))
-            cursor.execute(sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template0 ENCODING 'UTF8'").format(sql.Identifier(name), sql.Identifier(private["pg_user"])))
-            cursor.execute(sql.SQL("COMMENT ON DATABASE {} IS %s").format(sql.Identifier(name)), ("ai_employee_qa:" + str(run_id),))
-    manifest["status"] = "database_created"
-    manifest["migration_source_sha256"] = migration_hashes()
-    manifest["source_before_prepare"] = source_provenance()
-    write_json(root / "manifest.json", manifest)
-    run_logged([sys.executable, SCRIPT, "_seed", "--manifest", root / "manifest.json"], cwd=root,
-        env=env, log=root / "migration-seed.log", timeout=300)
-    manifest = load_manifest(root / "manifest.json")
-    if manifest["migration_source_sha256"] != migration_hashes():
-        raise RuntimeError("Migration sources changed during preparation; rebuild after the owner finishes")
-    snapshot_frontend(manifest)
-    manifest["source_after_prepare"] = source_provenance()
-    manifest["status"] = "prepared"
-    write_json(root / "manifest.json", manifest)
-    return root / "manifest.json"
+        with contextlib.closing(pg_connect(manifest, private, admin=True, maintenance=True)) as connection:
+            connection.autocommit = True
+            with connection.cursor() as cursor:
+                if dedicated_cluster:
+                    cursor.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD %s NOSUPERUSER NOCREATEDB NOCREATEROLE").format(sql.Identifier(private["pg_user"])), (private["pg_password"],))
+                cursor.execute(sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template0 ENCODING 'UTF8'").format(sql.Identifier(name), sql.Identifier(private["pg_user"])))
+                cursor.execute(sql.SQL("COMMENT ON DATABASE {} IS %s").format(sql.Identifier(name)), ("ai_employee_qa:" + str(run_id),))
+        manifest["status"] = "database_created"
+        manifest["migration_source_sha256"] = migration_hashes()
+        manifest["source_before_prepare"] = source_provenance()
+        write_json(root / "manifest.json", manifest)
+        run_logged([sys.executable, SCRIPT, "_seed", "--manifest", root / "manifest.json"], cwd=root,
+            env=env, log=root / "migration-seed.log", timeout=300)
+        manifest = load_manifest(root / "manifest.json")
+        if manifest["migration_source_sha256"] != migration_hashes():
+            raise RuntimeError("Migration sources changed during preparation; rebuild after the owner finishes")
+        snapshot_frontend(manifest)
+        manifest["source_after_prepare"] = source_provenance()
+        manifest["status"] = "prepared"
+        write_json(root / "manifest.json", manifest)
+        return root / "manifest.json"
+    except BaseException:
+        _cleanup_failed_prepare(root, manifest, private)
+        raise
 
 
 def snapshot_frontend(manifest: dict) -> None:
@@ -524,16 +746,8 @@ async def backend(manifest: dict) -> None:
     validate_runtime_db(manifest)
     registry, vault, invoker = fixture_dependencies(manifest)
     await install_fixture_connection(manager, manifest, vault)
-    phone = None
-    if manifest.get("phone_fixture"):
-        from scripts.verification.ai_employee_qa_phone import install_phone_fixture
-        from src.services.integration_action_registry import IntegrationActionRegistry
-        from src.services.telephony_service import TelephonyTransferAdapter
-        phone = await install_phone_fixture(manager, config, manifest, vault)
-        registered = IntegrationActionRegistry(telephony_adapter_factory=lambda: TelephonyTransferAdapter(phone))
-        registry._definitions["telephony.transfer_call"] = registered.require("telephony.transfer_call")
     with patch.object(platform, "build_ai_employee_services", partial(platform.build_ai_employee_services,
-            registry=registry, credential_vault=vault, invoker=invoker, telephony=phone)):
+            registry=registry, credential_vault=vault, invoker=invoker)):
         server = create_web_interface(config, character_name="project_manager")
     if not server.auth_enabled or not hasattr(server, "ai_employee_services"):
         raise RuntimeError("Real authenticated employee route composition is unavailable")
@@ -775,22 +989,6 @@ def ui_smoke(manifest: dict, *, history=False) -> None:
     verify_journey(manifest)
 
 
-def phone_smoke(manifest: dict) -> None:
-    root = Path(manifest["output_dir"])
-    stop(manifest)
-    manifest = load_manifest(root / "manifest.json")
-    manifest["phone_fixture"] = True
-    write_json(root / "manifest.json", manifest)
-    start(manifest)
-    manifest = load_manifest(root / "manifest.json")
-    env = child_environment(manifest, private_state(manifest))
-    username, password = read_qa_credentials()
-    env.update(AI_EMPLOYEE_QA_EMAIL=username, AI_EMPLOYEE_QA_PASSWORD=password, AI_EMPLOYEE_QA_SMOKE_MODE="phone")
-    run_logged([manifest["node"], SCRIPT.with_name("ai_employee_qa_smoke.cjs"), root], cwd=root,
-        env=env, log=root / "phone-ui.log", timeout=180)
-    verify_journey(manifest)
-
-
 def stop(manifest: dict, *, drop_database=False) -> None:
     import psutil
     root = Path(manifest["output_dir"])
@@ -826,7 +1024,10 @@ def stop(manifest: dict, *, drop_database=False) -> None:
                 row = cursor.fetchone()
                 if row is None or row[0] != "ai_employee_qa:" + manifest["run_id"]:
                     raise RuntimeError("Refusing to drop database without exact QA ownership marker")
-                cursor.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(check_identity(manifest["database"]))))
+                # Do not force-close connections owned by another process.
+                # The explicit stop path must leave the run intact when the
+                # exact database is still active.
+                cursor.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(check_identity(manifest["database"]))))
         if manifest["dedicated_cluster"]:
             run_logged([Path(manifest["postgres_bin"]) / "pg_ctl.exe", "-D", root / "postgres", "-m", "fast", "-w", "stop"],
                 cwd=root, env=child_environment(manifest, private), log=root / "postgres-init.log")
@@ -945,22 +1146,10 @@ def cleanup(manifest: dict) -> Path | None:
     return root / "manifest.json"
 
 
-def _is_link_or_reparse(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    is_junction = getattr(path, "is_junction", None)
-    if callable(is_junction):
-        try:
-            return bool(is_junction())
-        except OSError:
-            return True
-    return False
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "start", "upgrade", "refresh-frontend", "check", "browser", "verify-journey",
-        "concurrency", "migration-test", "recovery-check", "ui-smoke", "history-smoke", "phone-smoke", "cleanup", "stop", "_seed", "_backend", "_upgrade", "_concurrency"))
+        "concurrency", "migration-test", "recovery-check", "ui-smoke", "history-smoke", "cleanup", "stop", "_seed", "_backend", "_upgrade", "_concurrency"))
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--node")
     parser.add_argument("--postgres-bin", default=r"C:\Program Files\PostgreSQL\16\bin")
@@ -987,7 +1176,7 @@ def main() -> int:
         manifest_path = {"start": start, "upgrade": upgrade, "refresh-frontend": refresh_frontend, "check": check,
          "browser": browser, "verify-journey": verify_journey, "concurrency": concurrency,
          "migration-test": migration_test, "recovery-check": recovery_check, "ui-smoke": ui_smoke,
-         "history-smoke": lambda value: ui_smoke(value, history=True), "phone-smoke": phone_smoke, "cleanup": cleanup}[args.command](manifest)
+         "history-smoke": lambda value: ui_smoke(value, history=True), "cleanup": cleanup}[args.command](manifest)
         if isinstance(manifest_path, Path):
             args.manifest = manifest_path
     print(json.dumps({"manifest": str(args.manifest), "command": args.command, "result": "complete"}))

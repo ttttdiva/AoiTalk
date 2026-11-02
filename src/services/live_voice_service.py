@@ -23,7 +23,8 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import (
     Any,
     AsyncIterable,
@@ -52,6 +53,21 @@ from .outbound_privacy_service import (
     get_privacy_policy_context,
     set_privacy_policy_context,
     reset_privacy_policy_context,
+)
+from .live_voice_spend_guard import (
+    LIVE_VOICE_PROVIDER as REALTIME_USAGE_PROVIDER,
+    RealtimeUsage,
+    daily_spend_cap,
+    estimate_realtime_cost_usd,
+    extract_realtime_usage,
+    read_daily_realtime_spend,
+    utc_day_bounds,
+)
+from .openai_provider_circuit import (
+    admit_openai_provider_call,
+    provider_circuit_status,
+    quota_429_evidence_from_fields,
+    trip_openai_provider_circuit,
 )
 
 logger = logging.getLogger(__name__)
@@ -330,6 +346,24 @@ class LiveVoiceSession:
     audio_transport: Any = field(default=None, repr=False, compare=False)
     _sideband_confirmations: list[Any] = field(
         default_factory=list, repr=False, compare=False
+    )
+    _realtime_spend_limit_pending_day: date | None = field(
+        default=None, repr=False, compare=False
+    )
+    _realtime_spend_notice_day: date | None = field(
+        default=None, repr=False, compare=False
+    )
+    _realtime_spend_close_scheduled: bool = field(
+        default=False, repr=False, compare=False
+    )
+    _realtime_response_in_progress: bool = field(
+        default=False, repr=False, compare=False
+    )
+    _realtime_spend_close_event: asyncio.Event = field(
+        default_factory=asyncio.Event, repr=False, compare=False
+    )
+    _recorded_response_usage_ids: set[str] = field(
+        default_factory=set, repr=False, compare=False
     )
 
     def to_dict(self) -> dict[str, Any]:
@@ -763,6 +797,7 @@ class OpenAIRealtimeProvider:
     """公開 OpenAI Realtime API の server-side adapter。"""
 
     name = LIVE_VOICE_PROVIDER
+    requires_daily_spend_guard = True
 
     def __init__(
         self,
@@ -926,6 +961,12 @@ class OpenAIRealtimeProvider:
             ),
         )
         endpoint = f"{self._base_url}/v1/realtime/calls"
+        from .provider_key_attribution_service import (
+            call_with_provider_key_attribution,
+            prepare_provider_key_identity,
+        )
+
+        key_identity = prepare_provider_key_identity(api_key)
         sent_session_config = dict(session_config)
         descriptor = EgressDescriptor(
             action="live_voice.connect",
@@ -951,24 +992,51 @@ class OpenAIRealtimeProvider:
                     status_code=502,
                 )
             sent_session_config = dict(protected_session)
-            response = await client.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "OpenAI-Safety-Identifier": self._safety_identifier(actor),
-                },
-                files={
-                    "sdp": (None, outbound_sdp, "application/sdp"),
-                    "session": (
-                        None,
-                        json.dumps(sent_session_config, ensure_ascii=False),
-                        "application/json",
-                    ),
-                },
-                follow_redirects=False,
+
+            async def perform() -> httpx.Response:
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "OpenAI-Safety-Identifier": self._safety_identifier(actor),
+                    },
+                    files={
+                        "sdp": (None, outbound_sdp, "application/sdp"),
+                        "session": (
+                            None,
+                            json.dumps(sent_session_config, ensure_ascii=False),
+                            "application/json",
+                        ),
+                    },
+                    follow_redirects=False,
+                )
+                response.raise_for_status()
+                return response
+
+            return await call_with_provider_key_attribution(
+                perform,
+                identity=key_identity,
+                consumer_id="realtime_voice:openai",
             )
-            response.raise_for_status()
-            return response
+
+        admission = admit_openai_provider_call(self._privacy_config)
+        if admission["blocked"]:
+            state = admission.get("state") or {}
+            raise LiveVoiceProviderError(
+                "OpenAI organization quota circuit is open; wait until "
+                f"{state.get('blocked_until') or 'the next UTC reset'}",
+                status_code=429,
+            )
+        half_open_probe = bool(admission.get("probe"))
+        probe_finished = False
+
+        def finish_probe(*, clear: bool) -> None:
+            nonlocal probe_finished
+            if half_open_probe and not probe_finished:
+                from .openai_provider_circuit import finish_openai_provider_probe
+
+                finish_openai_provider_probe(self._privacy_config, clear=clear)
+                probe_finished = True
 
         try:
             response = await gateway.execute(
@@ -981,16 +1049,43 @@ class OpenAIRealtimeProvider:
                 model=model,
             )
         except httpx.HTTPStatusError as exc:
+            quota_rejection = None
+            try:
+                body = exc.response.json()
+                error_body = body.get("error", body) if isinstance(body, Mapping) else {}
+                if isinstance(error_body, Mapping):
+                    quota_rejection = quota_429_evidence_from_fields(
+                        status_code=exc.response.status_code,
+                        code=error_body.get("code"),
+                        error_type=error_body.get("type"),
+                    )
+            except Exception:
+                quota_rejection = None
+            circuit_state = None
+            if quota_rejection is not None:
+                circuit_state = trip_openai_provider_circuit(
+                    self._privacy_config, quota_rejection
+                )
+                finish_probe(clear=False)
+            else:
+                finish_probe(clear=True)
             failure = classify_generation_error(exc)
             logger.warning(
                 "OpenAI Realtime unified call failed: status=%s kind=%s",
                 exc.response.status_code,
                 failure.kind,
             )
+            if circuit_state is not None:
+                raise LiveVoiceProviderError(
+                    "OpenAI organization quota is blocked; wait until "
+                    f"{circuit_state.get('blocked_until') or 'the next UTC reset'}",
+                    status_code=429,
+                ) from exc
             raise LiveVoiceProviderError(
                 _safe_provider_failure_message(exc), status_code=502
             ) from exc
         except httpx.HTTPError as exc:
+            finish_probe(clear=False)
             failure = classify_generation_error(exc)
             logger.warning(
                 "OpenAI Realtime unified call failed: type=%s kind=%s",
@@ -1000,6 +1095,13 @@ class OpenAIRealtimeProvider:
             raise LiveVoiceProviderError(
                 _safe_provider_failure_message(exc), status_code=502
             ) from exc
+        except BaseException:
+            finish_probe(clear=False)
+            raise
+        else:
+            finish_probe(clear=True)
+        finally:
+            finish_probe(clear=False)
         location = response.headers.get("Location") or response.headers.get("location")
         call_id = str(location or "").rstrip("/").split("/")[-1] or None
         if call_id:
@@ -1120,6 +1222,12 @@ class OpenAIRealtimeProvider:
         from urllib.parse import quote
 
         api_key = self._require_key()
+        from .provider_key_attribution_service import (
+            call_with_provider_key_attribution,
+            prepare_provider_key_identity,
+        )
+
+        key_identity = prepare_provider_key_identity(api_key)
         client = await self._client()
         endpoint = (
             f"{self._base_url}/v1/realtime/calls/"
@@ -1135,10 +1243,20 @@ class OpenAIRealtimeProvider:
         )
 
         async def send_hangup(_protected_payload: Any) -> httpx.Response:
-            return await client.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {api_key}"},
-                follow_redirects=False,
+            async def perform() -> httpx.Response:
+                return await client.post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    follow_redirects=False,
+                )
+
+            return await call_with_provider_key_attribution(
+                perform,
+                identity=key_identity,
+                consumer_id="realtime_voice:openai",
+                result_is_success=lambda response: (
+                    200 <= response.status_code < 300 or response.status_code == 404
+                ),
             )
 
         try:
@@ -1221,6 +1339,7 @@ class MockRealtimeProvider:
     """Deterministic provider used by backend tests and local demos."""
 
     name = LIVE_VOICE_PROVIDER
+    requires_daily_spend_guard = False
 
     def __init__(self, *, secret_prefix: str = "ek_mock_") -> None:
         # Kept as a zero-call compatibility probe for existing integrations;
@@ -1358,6 +1477,7 @@ class LiveVoiceService:
         allowed_models: set[str] | list[str] | tuple[str, ...] | None = None,
         allowed_voices: set[str] | list[str] | tuple[str, ...] | None = None,
         session_ttl_seconds: float | None = None,
+        realtime_spend_reader: Callable[..., Any] | None = None,
     ) -> None:
         self.provider: LiveVoiceProvider = provider or OpenAIRealtimeProvider()
         self.config = config if config is not None else getattr(self.provider, "_privacy_config", None)
@@ -1423,6 +1543,11 @@ class LiveVoiceService:
         except (TypeError, ValueError):
             self.start_failure_window_seconds = 60.0
         self._cleanup_task: asyncio.Task[Any] | None = None
+        self._realtime_spend_reader = realtime_spend_reader
+        self._realtime_spend_lock = asyncio.Lock()
+        self._realtime_spend_cache_day: date | None = None
+        self._realtime_spend_cache_total = Decimal("0")
+        self._realtime_spend_unknown_day: date | None = None
         self._voice_tool_definitions: dict[str, Any] | None = None
         self._starting_actors: set[str] = set()
         self._start_failures: dict[str, list[float]] = {}
@@ -1465,6 +1590,372 @@ class LiveVoiceService:
         if values is None:
             values = default or ()
         return frozenset(str(item).strip() for item in values if str(item).strip())
+
+    def _realtime_daily_spend_guard_enabled(self) -> bool:
+        return getattr(self.provider, "requires_daily_spend_guard", False) is True
+
+    async def _read_realtime_spend(self, *, force_refresh: bool) -> tuple[date, Decimal] | None:
+        start, end, day = utc_day_bounds()
+        if self._realtime_spend_unknown_day == day:
+            return None
+        async with self._realtime_spend_lock:
+            cached = (
+                self._realtime_spend_cache_total
+                if self._realtime_spend_cache_day == day
+                else Decimal("0")
+            )
+            if not force_refresh and self._realtime_spend_cache_day == day:
+                return day, cached
+            try:
+                if self._realtime_spend_reader is not None:
+                    value = self._realtime_spend_reader(start, end)
+                    value = await _maybe_await(value)
+                else:
+                    value = await read_daily_realtime_spend(
+                        self.db_manager,
+                        start=start,
+                        end=end,
+                    )
+                stored = Decimal(str(value)) if value is not None else None
+            except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                stored = None
+            except Exception as exc:
+                logger.warning(
+                    "Realtime daily spend check failed: exception_type=%s",
+                    type(exc).__name__,
+                )
+                stored = None
+            if stored is None or not stored.is_finite() or stored < 0:
+                return None
+            total = max(stored, cached)
+            self._realtime_spend_cache_day = day
+            self._realtime_spend_cache_total = total
+            return day, total
+
+    async def _require_realtime_daily_budget(self, model: str) -> None:
+        if not self._realtime_daily_spend_guard_enabled():
+            return
+        if estimate_realtime_cost_usd(
+            model,
+            RealtimeUsage(0, 0, 0, 0, None, None, None, None),
+        ) is None:
+            raise LiveVoiceProviderError(
+                "Realtime model has no safe local price estimate", status_code=503
+            )
+        cap = daily_spend_cap(self.config)
+        state = await self._read_realtime_spend(force_refresh=True)
+        if state is None:
+            raise LiveVoiceProviderError(
+                "Realtime daily usage is unavailable", status_code=503
+            )
+        day, spent = state
+        if cap <= 0 or spent >= cap:
+            raise LiveVoiceError(
+                "本日のRealtime利用上限に達しました。翌UTC日までお待ちください。",
+                status_code=429,
+            )
+        if self._realtime_spend_unknown_day == day:
+            raise LiveVoiceProviderError(
+                "Realtime daily usage cannot be verified", status_code=503
+            )
+
+    async def _record_realtime_response_usage(
+        self,
+        session: LiveVoiceSession,
+        event: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record one provider response and advance the in-process daily guard."""
+        response = event.get("response")
+        response_id = (
+            str(response.get("id") or "").strip()
+            if isinstance(response, Mapping)
+            else ""
+        )
+        dedupe_id = response_id or _event_id(event) or _event_key(event)
+        if dedupe_id in session._recorded_response_usage_ids:
+            return {"status": "duplicate", "estimated_cost_usd": Decimal("0")}
+
+        usage = extract_realtime_usage(event)
+        if usage is None:
+            await self._mark_realtime_spend_unknown(session)
+            _start, _end, day = utc_day_bounds()
+            return {
+                "status": "unknown",
+                "estimated_cost_usd": None,
+                "usage": None,
+                "day": day,
+            }
+        estimated = estimate_realtime_cost_usd(session.model, usage)
+        if estimated is None:
+            await self._mark_realtime_spend_unknown(session)
+            return {
+                "status": "unknown",
+                "estimated_cost_usd": None,
+                "usage": usage,
+                "day": utc_day_bounds()[2],
+            }
+
+        start, end, day = utc_day_bounds()
+        async with self._realtime_spend_lock:
+            if self._realtime_spend_unknown_day == day:
+                return {
+                    "status": "unknown",
+                    "estimated_cost_usd": None,
+                    "usage": usage,
+                    "day": day,
+                }
+            if self._realtime_spend_cache_day != day:
+                try:
+                    if self._realtime_spend_reader is not None:
+                        baseline = await _maybe_await(
+                            self._realtime_spend_reader(start, end)
+                        )
+                    else:
+                        baseline = await read_daily_realtime_spend(
+                            self.db_manager,
+                            start=start,
+                            end=end,
+                        )
+                    baseline = Decimal(str(baseline)) if baseline is not None else None
+                except Exception as exc:
+                    logger.warning(
+                        "Realtime daily spend refresh failed: exception_type=%s",
+                        type(exc).__name__,
+                    )
+                    baseline = None
+                if baseline is None or not baseline.is_finite() or baseline < 0:
+                    self._realtime_spend_unknown_day = day
+                    return {
+                        "status": "unknown",
+                        "estimated_cost_usd": None,
+                        "usage": usage,
+                        "day": day,
+                    }
+                self._realtime_spend_cache_day = day
+                self._realtime_spend_cache_total = baseline
+
+            try:
+                from .token_tracking_service import get_token_tracking_service
+
+                result = await get_token_tracking_service().record_usage(
+                    provider=REALTIME_USAGE_PROVIDER,
+                    model=session.model,
+                    requested_model=session.model,
+                    resolved_model=session.model,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cached_tokens=usage.cached_tokens,
+                    cache_read_tokens=usage.cached_tokens,
+                    reasoning_tokens=usage.reasoning_tokens,
+                    billing_scope_id=None,
+                    session_id=self._uuid_or_none(session.conversation_session_id),
+                    user_id=session.actor.user_id,
+                    project_id=self._uuid_or_none(session.project_id),
+                    agent_run_id=session.agent_run_id,
+                    agent_name="live_voice",
+                    request_type="realtime",
+                    is_streaming=True,
+                    metrics_source="live_voice.response.done",
+                )
+                persisted = isinstance(result, Mapping)
+            except Exception as exc:
+                logger.warning(
+                    "Realtime usage write failed: exception_type=%s",
+                    type(exc).__name__,
+                )
+                result = None
+                persisted = False
+
+            persisted_cost = None
+            if isinstance(result, Mapping):
+                try:
+                    persisted_cost = Decimal(str(result.get("list_total_cost")))
+                except (InvalidOperation, TypeError, ValueError):
+                    persisted_cost = None
+            actual_estimate = max(estimated, persisted_cost) if (
+                persisted_cost is not None
+                and persisted_cost.is_finite()
+                and persisted_cost >= 0
+            ) else estimated
+            self._realtime_spend_cache_total += actual_estimate
+            session._recorded_response_usage_ids.add(dedupe_id)
+            return {
+                "status": "recorded" if persisted else "token_usage_unpersisted",
+                "estimated_cost_usd": actual_estimate,
+                "usage": usage,
+                "day": day,
+                "daily_total_usd": self._realtime_spend_cache_total,
+                "daily_cap_usd": daily_spend_cap(self.config),
+            }
+
+    async def _handle_realtime_response_usage_event(
+        self,
+        session: LiveVoiceSession,
+        event: Mapping[str, Any],
+        event_id: str,
+    ) -> dict[str, Any]:
+        try:
+            accounting = await self._record_realtime_response_usage(session, event)
+        except Exception as exc:
+            logger.warning(
+                "Realtime usage capture failed: exception_type=%s",
+                type(exc).__name__,
+            )
+            await self._mark_realtime_spend_unknown(session)
+            accounting = {
+                "status": "unknown",
+                "estimated_cost_usd": None,
+                "usage": None,
+                "day": utc_day_bounds()[2],
+            }
+
+        parsed_usage = accounting.get("usage")
+        safe_usage = (
+            {
+                "input_tokens": parsed_usage.input_tokens,
+                "output_tokens": parsed_usage.output_tokens,
+                "cached_tokens": parsed_usage.cached_tokens,
+                "reasoning_tokens": parsed_usage.reasoning_tokens,
+                "input_audio_tokens": parsed_usage.input_audio_tokens,
+                "input_text_tokens": parsed_usage.input_text_tokens,
+                "output_audio_tokens": parsed_usage.output_audio_tokens,
+                "output_text_tokens": parsed_usage.output_text_tokens,
+            }
+            if isinstance(parsed_usage, RealtimeUsage)
+            else None
+        )
+        try:
+            await self._record_run_event(
+                session,
+                "live_voice.response.done",
+                status="running",
+                message="Realtime response completed",
+                payload={
+                    "source": "live_voice",
+                    "event_source": EVENT_SOURCE_SIDEBAND,
+                    "event_type": "response.done",
+                    "event_id": event_id,
+                    "usage": safe_usage,
+                    "usage_accounting_status": accounting.get("status"),
+                    "estimated_cost_usd": (
+                        str(accounting.get("estimated_cost_usd"))
+                        if accounting.get("estimated_cost_usd") is not None
+                        else None
+                    ),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Realtime usage audit write failed: exception_type=%s",
+                type(exc).__name__,
+            )
+            if accounting.get("status") == "token_usage_unpersisted":
+                await self._mark_realtime_spend_unknown(session)
+
+        current_day = utc_day_bounds()[2]
+        spend = accounting.get("daily_total_usd")
+        cap = accounting.get("daily_cap_usd")
+        if cap is None:
+            cap = daily_spend_cap(self.config)
+        if (
+            accounting.get("status") == "unknown"
+            or self._realtime_spend_unknown_day == current_day
+            or session._realtime_spend_limit_pending_day == current_day
+            or (isinstance(spend, Decimal) and spend >= cap)
+        ):
+            await self._announce_realtime_spend_limit(session)
+        return accounting
+
+    async def _mark_realtime_spend_unknown(self, session: LiveVoiceSession) -> None:
+        _start, _end, day = utc_day_bounds()
+        async with self._realtime_spend_lock:
+            self._realtime_spend_unknown_day = day
+            if self._realtime_spend_cache_day != day:
+                self._realtime_spend_cache_day = day
+                self._realtime_spend_cache_total = daily_spend_cap(self.config)
+
+    async def _announce_realtime_spend_limit(self, session: LiveVoiceSession) -> None:
+        _start, _end, day = utc_day_bounds()
+        async with self._lock:
+            active = [
+                item
+                for item in self._sessions.values()
+                if item.status == "active"
+                and getattr(self.provider, "requires_daily_spend_guard", False) is True
+            ]
+            first_notice = not any(
+                item._realtime_spend_limit_pending_day == day for item in active
+            )
+            for item in active:
+                item._realtime_spend_limit_pending_day = day
+        if first_notice:
+            logger.warning(
+                "OpenAI Realtime daily spend cap reached; active sessions will close at response boundaries"
+            )
+        for item in active:
+            if item._realtime_spend_notice_day == day:
+                continue
+            item._realtime_spend_notice_day = day
+            await self._broadcast(
+                item,
+                {
+                    "event_type": "daily_spend_limit_reached",
+                    "event_source": "server",
+                    "message": "本日の音声利用上限に達しました。進行中の応答を区切ってセッションを終了します。",
+                },
+            )
+        for item in active:
+            if item.status != "active" or item._realtime_spend_close_scheduled:
+                continue
+            wait_for_boundary = item._realtime_response_in_progress
+            if wait_for_boundary and self._sideband_is_established(item):
+                try:
+                    await self._send_sideband_event(item, {"type": "response.cancel"})
+                except Exception as exc:
+                    logger.warning(
+                        "Realtime spend limit cancellation failed: exception_type=%s",
+                        type(exc).__name__,
+                    )
+                    wait_for_boundary = False
+            item._realtime_spend_close_scheduled = True
+
+            async def close_at_boundary(
+                target: LiveVoiceSession = item,
+                wait: bool = wait_for_boundary,
+            ) -> None:
+                if wait:
+                    try:
+                        await asyncio.wait_for(
+                            target._realtime_spend_close_event.wait(),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Realtime spend limit response boundary timed out; closing session"
+                        )
+                try:
+                    await self.close_session(target.id, target.actor)
+                except LiveVoiceError:
+                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "Realtime spend limit session close failed: exception_type=%s",
+                        type(exc).__name__,
+                    )
+
+            task = asyncio.create_task(
+                close_at_boundary(),
+                name=f"live-voice-spend-limit-close-{item.id}",
+            )
+            self._connect_cleanup_tasks.add(task)
+            task.add_done_callback(self._connect_cleanup_tasks.discard)
+
+    @staticmethod
+    def _uuid_or_none(value: Any) -> uuid.UUID | None:
+        try:
+            return uuid.UUID(str(value)) if value else None
+        except (TypeError, ValueError, AttributeError):
+            return None
 
     @classmethod
     def from_server(cls, server: Any) -> "LiveVoiceService":
@@ -2413,6 +2904,15 @@ class LiveVoiceService:
             )
         resolved_mode = str(mode or resolved_policy.mode)
         pipeline_mode = resolved_mode == VoiceSessionMode.PIPELINE.value
+        if not pipeline_mode and self._realtime_daily_spend_guard_enabled():
+            circuit = provider_circuit_status(self.config)
+            if circuit["provider_blocked"]:
+                raise LiveVoiceProviderError(
+                    "OpenAI organization quota circuit is open; wait until "
+                    f"{circuit.get('provider_blocked_until') or 'the next UTC reset'}",
+                    status_code=429,
+                )
+            await self._require_realtime_daily_budget(normalized_model)
         if conversation_session_id:
             conversation_session_id = str(conversation_session_id).strip()
             if not conversation_session_id:
@@ -2665,7 +3165,7 @@ class LiveVoiceService:
                     **(dict(metadata) if metadata else {}),
                 },
                 sender_type=("service" if role == "user" else "agent") if session.actor.agent_id else ("user" if role == "user" else "character"),
-                sender_id=("telephony.caller" if role == "user" else session.actor.agent_id) if session.actor.agent_id else (session.actor.user_id if role == "user" else session.provider),
+                sender_id=("voice.caller" if role == "user" else session.actor.agent_id) if session.actor.agent_id else (session.actor.user_id if role == "user" else session.provider),
                 sender_display_name=session.actor.display_name if role == "user" else "Live Voice",
             )
             message_id = str(getattr(message, "id", "") or "").strip() or None
@@ -2790,6 +3290,20 @@ class LiveVoiceService:
             include_project_context=session.include_project_context,
         )
         try:
+            if normalized_source == EVENT_SOURCE_SIDEBAND and self._realtime_daily_spend_guard_enabled():
+                if event_type == "response.created":
+                    session._realtime_response_in_progress = True
+                elif event_type == "response.done":
+                    session._realtime_response_in_progress = False
+                    try:
+                        await self._handle_realtime_response_usage_event(
+                            session, event, incoming_id
+                        )
+                    finally:
+                        # Sessions asked to close at a response boundary must
+                        # wait until that boundary's usage and audit record have
+                        # been processed, not merely until response.done arrived.
+                        session._realtime_spend_close_event.set()
             from .voice_sessions.models import VoiceSessionMode
 
             if (
@@ -2898,8 +3412,14 @@ class LiveVoiceService:
                     provenance=provenance,
                 )
                 result["tool_call"] = tool_result
-            if event_type == "response.done":
+            if (
+                event_type == "response.done"
+                and not self._realtime_daily_spend_guard_enabled()
+            ):
                 usage = event.get("usage")
+                response = event.get("response")
+                if not isinstance(usage, Mapping) and isinstance(response, Mapping):
+                    usage = response.get("usage")
                 await self._record_run_event(
                     session,
                     "live_voice.response.done",
@@ -3715,6 +4235,33 @@ class LiveVoiceService:
                 session._connect_in_progress = False
             await self._mark_sideband_failed(session)
             raise
+        if self._realtime_daily_spend_guard_enabled():
+            try:
+                circuit = provider_circuit_status(self.config)
+                if circuit["provider_blocked"]:
+                    raise LiveVoiceProviderError(
+                        "OpenAI organization quota circuit is open; wait until "
+                        f"{circuit.get('provider_blocked_until') or 'the next UTC reset'}",
+                        status_code=429,
+                    )
+                await self._require_realtime_daily_budget(session.model)
+            except LiveVoiceError as exc:
+                async with session._connect_lock:
+                    session._connect_in_progress = False
+                if exc.status_code == 429:
+                    await self._broadcast(
+                        session,
+                        {
+                            "event_type": "daily_spend_limit_reached",
+                            "event_source": "server",
+                            "message": "本日の音声利用上限に達しました。翌UTC日までお待ちください。",
+                        },
+                    )
+                    try:
+                        await self.close_session(session.id, actor)
+                    except LiveVoiceError:
+                        pass
+                raise
         try:
             result = await self._call_provider(
                 "create_unified_call",

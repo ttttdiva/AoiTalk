@@ -95,7 +95,6 @@ export function isPublicAgentRunTimelineItem(
   const eventType = item.event_type ?? "";
   return (
     eventType === "agent_operation" ||
-    eventType.startsWith("agent_team.") ||
     [
       "stream.reasoning_progress",
       "stream.status_update",

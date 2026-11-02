@@ -25,6 +25,7 @@ from .models import (
     Project,
     ProjectMember,
 )
+from .conversation_sync_receipts import conversation_message_sync_fingerprint_expression
 from .database import get_database_manager
 from .conversation_titles import update_title_in_transaction
 from ..features import Features
@@ -1532,6 +1533,8 @@ class ConversationRepository:
         actor_role: Optional[str] = None,
         branch_from_message_id: Optional[str] = None,
         message_id: Optional[str] = None,
+        explicit_parent_message_id: Optional[str] = None,
+        is_active_branch: bool = True,
     ) -> ConversationMessage:
         """Add a message to a session
         
@@ -1651,6 +1654,22 @@ class ConversationRepository:
                     session_id,
                     str(parent_message_id) if parent_message_id else None,
                 )
+            elif explicit_parent_message_id:
+                explicit_parent = await session.scalar(
+                    select(ConversationMessage).where(
+                        ConversationMessage.id
+                        == uuid.UUID(str(explicit_parent_message_id)),
+                        ConversationMessage.session_id == session_uuid,
+                    )
+                )
+                if explicit_parent is None:
+                    raise ValueError(
+                        f"Message not found: {explicit_parent_message_id}"
+                    )
+                parent_message_id = explicit_parent.id
+                branch_index = await self._count_branch_siblings(
+                    session, session_id, str(parent_message_id)
+                )
             else:
                 parent = await self._latest_active_message(session, session_id)
                 parent_message_id = parent.id if parent else None
@@ -1669,7 +1688,7 @@ class ConversationRepository:
                 content=content,
                 parent_message_id=parent_message_id,
                 branch_index=branch_index,
-                is_active_branch=True,
+                is_active_branch=is_active_branch,
                 message_metadata=message_metadata,
                 client_message_id=client_message_id,
                 sender_type=sender_type,
@@ -1800,6 +1819,7 @@ class ConversationRepository:
         limit: Optional[int] = None,
         offset: int = 0,
         since: Optional[datetime] = None,
+        include_sync_fingerprint: bool = False,
     ) -> List[ConversationMessage]:
         """Get messages for a session
 
@@ -1821,6 +1841,7 @@ class ConversationRepository:
                 limit=limit,
                 offset=offset,
                 since=since,
+                include_sync_fingerprint=include_sync_fingerprint,
             )
         finally:
             if not self._session:
@@ -1834,9 +1855,19 @@ class ConversationRepository:
         limit: Optional[int] = None,
         offset: int = 0,
         since: Optional[datetime] = None,
+        include_sync_fingerprint: bool = False,
     ) -> List[ConversationMessage]:
         await self._ensure_linear_parent_links(session, session_id)
-        query = select(ConversationMessage).where(
+        query = (
+            select(
+                ConversationMessage,
+                conversation_message_sync_fingerprint_expression().label(
+                    "_sync_fingerprint"
+                ),
+            )
+            if include_sync_fingerprint
+            else select(ConversationMessage)
+        ).where(
             ConversationMessage.session_id == uuid.UUID(session_id)
         ).order_by(ConversationMessage.created_at)
 
@@ -1871,6 +1902,13 @@ class ConversationRepository:
             query = query.limit(limit)
 
         result = await session.execute(query)
+        if include_sync_fingerprint:
+            messages: list[ConversationMessage] = []
+            for item in result.unique().all():
+                message = item[0]
+                setattr(message, "_sync_fingerprint", item[1])
+                messages.append(message)
+            return messages
         return list(result.scalars().all())
 
     async def get_session_messages_with_branch_info(
@@ -1879,6 +1917,7 @@ class ConversationRepository:
         limit: Optional[int] = None,
         offset: int = 0,
         since: Optional[datetime] = None,
+        include_sync_fingerprint: bool = False,
     ) -> tuple[List[ConversationMessage], Dict[str, Dict[str, int]]]:
         """Get full/delta messages and their branch projection in one session."""
         session = await self._get_session()
@@ -1889,6 +1928,7 @@ class ConversationRepository:
                 limit=limit,
                 offset=offset,
                 since=since,
+                include_sync_fingerprint=include_sync_fingerprint,
             )
             branch_info = await self._get_branch_info_for_messages_in_session(
                 session, session_id, messages
@@ -2311,20 +2351,47 @@ class ConversationRepository:
     async def switch_active_branch(
         self,
         session_id: str,
-        target_message_id: str
+        target_message_id: str,
+        expected_active_leaf_id: Optional[str] = None,
     ) -> bool:
         """Switch to a different branch by activating a message and its descendants
         
         Args:
             session_id: Session UUID string
             target_message_id: Message ID to switch to
+            expected_active_leaf_id: Optional conditional switch.  When given,
+                the session row is locked exactly as ``add_message`` locks it
+                and the switch happens only if the current active leaf (the
+                row ``add_message`` would parent on) is this message; the
+                check and the switch are one transaction.  ``None`` keeps the
+                unconditional behaviour.
             
         Returns:
-            True if switched successfully
+            True if switched successfully; False (nothing changed) when the
+            target is missing or the expected active leaf no longer matches
         """
         session = await self._get_session()
         try:
+            if expected_active_leaf_id is not None:
+                locked_session = await session.scalar(
+                    select(ConversationSession)
+                    .where(
+                        and_(
+                            ConversationSession.id == uuid.UUID(session_id),
+                            ConversationSession.deleted_at.is_(None),
+                        )
+                    )
+                    .with_for_update()
+                )
+                if locked_session is None:
+                    await session.rollback()
+                    return False
             await self._ensure_linear_parent_links(session, session_id)
+            if expected_active_leaf_id is not None:
+                active_leaf = await self._latest_active_message(session, session_id)
+                if active_leaf is None or str(active_leaf.id) != str(expected_active_leaf_id):
+                    await session.rollback()
+                    return False
             session_uuid = uuid.UUID(session_id)
             # Get the target message
             query = select(ConversationMessage).where(

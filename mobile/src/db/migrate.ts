@@ -9,6 +9,8 @@
  */
 
 import { getSqlite } from "./client";
+import { GENERAL_MESSAGE_RECEIPT_REVISION_DDL } from "./general-message-receipt-revision";
+import { GENERAL_SESSION_FINGERPRINT_REVISION_DDL } from "./general-session-fingerprint-revision";
 
 const DDL: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -177,6 +179,15 @@ const DDL: string[] = [
    );`,
   `CREATE INDEX IF NOT EXISTS idx_cm_session_id ON conversation_messages(session_id);`,
   `CREATE INDEX IF NOT EXISTS idx_cm_updated_at ON conversation_messages(updated_at);`,
+  // Lets the general message receipt read scope/id/fingerprint from the index
+  // instead of parsing every message_metadata blob (about 2 s on device).
+  // The expressions must stay identical to general-message-sync-receipt.ts.
+  `CREATE INDEX IF NOT EXISTS idx_cm_general_receipt ON conversation_messages(
+     json_extract(message_metadata, '$.__aoitalk_general_sync_scope'),
+     id,
+     json_extract(message_metadata, '$.__aoitalk_general_sync_fingerprint'),
+     json_extract(message_metadata, '$.local_only')
+   ) WHERE deleted_at IS NULL;`,
 
   `CREATE TABLE IF NOT EXISTS record_tables (
      id TEXT PRIMARY KEY,
@@ -603,6 +614,24 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_outbox_created_at ON outbox(created_at);`,
   `CREATE INDEX IF NOT EXISTS idx_outbox_entity ON outbox(table_name, entity_id);`,
 
+  // ---------- outbox_discard_log（自動取り下げた操作のprivate history） ----------
+  `CREATE TABLE IF NOT EXISTS outbox_discard_log (
+     id TEXT PRIMARY KEY,
+     auth_scope TEXT NOT NULL,
+     op_id TEXT NOT NULL,
+     table_name TEXT NOT NULL,
+     entity_id TEXT NOT NULL,
+     action TEXT NOT NULL,
+     payload TEXT,
+     base_payload TEXT,
+     conflict_payload TEXT,
+     last_error TEXT,
+     reason TEXT NOT NULL,
+     discarded_at TEXT NOT NULL
+   );`,
+  `CREATE INDEX IF NOT EXISTS idx_outbox_discard_auth_scope
+     ON outbox_discard_log(auth_scope, discarded_at);`,
+
   // ---------- outbox_resolution_records（明示的な解決のprivate journal） ----------
   // The journal is independent from outbox so history remains readable after
   // the selected operation is adopted and the queue becomes empty.  Snapshot
@@ -646,6 +675,13 @@ const DDL: string[] = [
      last_pulled_at TEXT,
      last_pushed_at TEXT,
      cursor TEXT
+   );`,
+  `CREATE TABLE IF NOT EXISTS general_row_versions (
+     auth_scope TEXT NOT NULL,
+     table_name TEXT NOT NULL,
+     row_id TEXT NOT NULL,
+     version TEXT NOT NULL,
+     PRIMARY KEY (auth_scope, table_name, row_id)
    );`,
   // Sync v3: which server scope/generation delivers each local entity.
   `CREATE TABLE IF NOT EXISTS sync_v3_membership (
@@ -845,6 +881,8 @@ const BASE_SCHEMA_DDL = DDL.filter((statement) => !isIndexDdl(statement));
 let _applied = false;
 let _asyncEnsurePromise: Promise<void> | null = null;
 let _asyncSchemaReady = false;
+let _asyncMaintenancePromise: Promise<void> | null = null;
+let _asyncMaintenanceReady = false;
 const PENDING_CLIP_REQUEUE_V0100_MARKER =
   "migration:pending_clip_ingests_requeue_v0.1.100";
 const CLIP_TARGET_FILM_POLICY_V0103_MARKER =
@@ -1064,26 +1102,41 @@ function applySchemaBootstrapSync(): void {
   for (const stmt of SCHEMA_INDEX_DDL) {
     db.execSync(stmt);
   }
+  for (const stmt of GENERAL_MESSAGE_RECEIPT_REVISION_DDL) {
+    db.execSync(stmt);
+  }
+  for (const stmt of GENERAL_SESSION_FINGERPRINT_REVISION_DDL) {
+    db.execSync(stmt);
+  }
 }
 
 async function applySchemaBootstrapAsync(
   tx: AsyncSqliteExecutor,
 ): Promise<void> {
-  for (const stmt of BASE_SCHEMA_DDL) {
-    await tx.execAsync(stmt);
-  }
+  await tx.execAsync(BASE_SCHEMA_DDL.join("\n"));
+  const columnsByTable = new Map<string, Set<string>>();
   for (const [tableName, columnName, ddl] of COLUMN_MIGRATIONS) {
-    const columns = await tx.getAllAsync<{ name?: string }>(
-      `PRAGMA table_info(${tableName});`,
-    );
-    if (!columns.some((column) => column.name === columnName)) {
+    let columns = columnsByTable.get(tableName);
+    if (!columns) {
+      const columnRows = await tx.getAllAsync<{ name?: string }>(
+        `PRAGMA table_info(${tableName});`,
+      );
+      columns = new Set(
+        columnRows
+          .map((column) => column.name)
+          .filter((name): name is string => typeof name === "string"),
+      );
+      columnsByTable.set(tableName, columns);
+    }
+    if (!columns.has(columnName)) {
       await tx.execAsync(ddl);
+      columns.add(columnName);
     }
   }
   await ensureConversationAgentsScopedAsync(tx);
-  for (const stmt of SCHEMA_INDEX_DDL) {
-    await tx.execAsync(stmt);
-  }
+  await tx.execAsync(SCHEMA_INDEX_DDL.join("\n"));
+  await tx.execAsync(GENERAL_MESSAGE_RECEIPT_REVISION_DDL.join("\n"));
+  await tx.execAsync(GENERAL_SESSION_FINGERPRINT_REVISION_DDL.join("\n"));
 }
 
 /**
@@ -1450,7 +1503,9 @@ async function backfillDocsOutboxScopeKeysAsync(tx: AsyncSqliteExecutor): Promis
 }
 
 
-async function runSchemaMaintenanceAsync(tx: AsyncSqliteExecutor): Promise<void> {
+async function runSchemaMaintenanceInTransactionAsync(
+  tx: AsyncSqliteExecutor,
+): Promise<void> {
   // v0.1.144 pins new durable operations to their configured API server. Do
   // not assign the current server to older rows: their original endpoint is
   // unknown, so NULL remains recovery-only until explicit user action.
@@ -1623,7 +1678,7 @@ export function ensureSchema(): void {
     applySchemaBootstrapSync();
   });
   // Synchronous callers retain the historical schema bootstrap contract, but
-  // intentionally leave large-table maintenance to ensureSchemaAsync().
+  // intentionally leave data backfills to ensureSchemaMaintenanceAsync().
   _applied = true;
 }
 
@@ -1639,13 +1694,12 @@ export function ensureSchemaAsync(): Promise<void> {
   const db = getSqlite();
   const promise = Promise.resolve()
     .then(() => db.withExclusiveTransactionAsync(async (tx) => {
-      // A synchronous caller may have completed the lightweight bootstrap
-      // before this async upgrade starts.  In that case only maintenance is
-      // missing; otherwise apply the full DDL/column/index bootstrap here.
+      // A synchronous caller may have completed the schema bootstrap before
+      // this async upgrade starts. Otherwise apply the full DDL/column/index
+      // bootstrap here.
       if (!_applied) {
         await applySchemaBootstrapAsync(tx);
       }
-      await runSchemaMaintenanceAsync(tx);
     }))
     .then(() => {
       _applied = true;
@@ -1660,5 +1714,31 @@ export function ensureSchemaAsync(): Promise<void> {
       _asyncEnsurePromise = null;
     });
   _asyncEnsurePromise = promise;
+  return promise;
+}
+
+/**
+ * Run data backfills and legacy normalization after the required schema is
+ * ready. Startup can render local screens before this maintenance transaction
+ * completes; callers should keep sync/replay behind this promise.
+ */
+export function ensureSchemaMaintenanceAsync(): Promise<void> {
+  if (_asyncMaintenanceReady) return Promise.resolve();
+  if (_asyncMaintenancePromise) return _asyncMaintenancePromise;
+
+  const promise = ensureSchemaAsync()
+    .then(() => {
+      const db = getSqlite();
+      return db.withExclusiveTransactionAsync((tx) =>
+        runSchemaMaintenanceInTransactionAsync(tx),
+      );
+    })
+    .then(() => {
+      _asyncMaintenanceReady = true;
+    })
+    .finally(() => {
+      _asyncMaintenancePromise = null;
+    });
+  _asyncMaintenancePromise = promise;
   return promise;
 }

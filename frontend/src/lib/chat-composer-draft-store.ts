@@ -23,8 +23,6 @@ export type ChatComposerDraft = {
   clientMessageId?: string;
   /** Preserve the selected route when retrying an uncertain submission. */
   dispatchMode?: ChatComposerDispatchMode;
-  /** Runtime captured at first submit (null = role default); replayed on restore. */
-  executionProfileId?: string | null;
 };
 
 export const EMPTY_CHAT_COMPOSER_DRAFT: ChatComposerDraft = {
@@ -223,15 +221,6 @@ function parsePersistedDraft(value: unknown): {
   ) {
     return null;
   }
-  if (
-    rawDraft.executionProfileId !== undefined &&
-    rawDraft.executionProfileId !== null &&
-    (typeof rawDraft.executionProfileId !== "string" ||
-      rawDraft.executionProfileId.length > 512)
-  ) {
-    return null;
-  }
-
   const updatedAt =
     typeof record.updatedAt === "number" && Number.isFinite(record.updatedAt)
       ? record.updatedAt
@@ -252,11 +241,6 @@ function parsePersistedDraft(value: unknown): {
       dispatchMode:
         rawDraft.dispatchMode === "chat" || rawDraft.dispatchMode === "deep_research"
           ? rawDraft.dispatchMode
-          : undefined,
-      executionProfileId:
-        typeof rawDraft.executionProfileId === "string" ||
-        rawDraft.executionProfileId === null
-          ? rawDraft.executionProfileId
           : undefined,
     },
     updatedAt,
@@ -305,9 +289,6 @@ function writeDraftNow(scope: DraftScope): boolean {
         ? { clientMessageId: draft.clientMessageId }
         : {}),
       ...(draft.dispatchMode ? { dispatchMode: draft.dispatchMode } : {}),
-      ...(draft.executionProfileId !== undefined
-        ? { executionProfileId: draft.executionProfileId }
-        : {}),
     },
   };
   try {

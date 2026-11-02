@@ -87,6 +87,8 @@ export interface ConversationMessage {
   sender_type?: "user" | "human" | "agent" | "character" | "assistant" | "service" | string | null;
   sender_id?: string | null;
   sender_display_name?: string | null;
+  /** Opaque row-version receipt used only by additive general sync. */
+  _sync_fingerprint?: string;
 }
 
 export interface AgentRunTimelineItem {
@@ -109,6 +111,23 @@ export interface AgentRunTimelineItem {
   created_at?: string | null;
 }
 
+/**
+ * Historical execution metadata returned under `legacy`.
+ *
+ * Team, profile, and subagent identifiers are no longer part of the current
+ * AgentRun contract.  The server may still expose them for an old run so a
+ * history screen can explain how that run was created.  Keep this object
+ * intentionally optional and open ended: it is display data, never a route
+ * selection or a permission input.
+ */
+export interface LegacyExecutionRecord {
+  agent_team_id?: string | null;
+  execution_profile_id?: string | null;
+  allowed_subagent_ids?: string[] | null;
+  acting_subagent_id?: string | null;
+  [key: string]: unknown;
+}
+
 export interface AgentRun {
   id: string;
   run_type: string;
@@ -121,7 +140,8 @@ export interface AgentRun {
   work_item_id?: string | null;
   session_id?: string | null;
   task_id?: string | null;
-  acting_subagent_id?: string | null;
+  /** Historical Team/Profile/Subagent pins, never used for new execution. */
+  legacy?: LegacyExecutionRecord | null;
   previous_attempt_run_id?: string | null;
   resolved_execution_manifest?: Record<string, unknown> | null;
   execution_manifest?: Record<string, unknown> | null;

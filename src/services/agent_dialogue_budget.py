@@ -785,6 +785,44 @@ async def _validate_usage_identity(
             .limit(1)
         )
     ).scalars().first()
+    if normalized_role == "worker" and delivery is None:
+        authorization = (
+            dialogue.authorization_json
+            if isinstance(dialogue.authorization_json, Mapping)
+            else {}
+        )
+        external_worker = authorization.get("delegate_worker")
+        if isinstance(external_worker, Mapping):
+            expected_auth_hash = hashlib.sha256(
+                json.dumps(
+                    authorization,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            scope_digest = _text(
+                external_worker.get("workspace_scope_sha256"), 64
+            ).lower()
+            if (
+                _text(external_worker.get("kind"), 32).casefold()
+                not in {"codex", "antigravity", "claude", "grok", "muse"}
+                or expected_auth_hash != _text(dialogue.authorization_hash, 64).lower()
+                or not _SHA256.fullmatch(scope_digest)
+                or not _same_id(external_worker.get("session_id"), run.session_id)
+                or not _same_id(external_worker.get("agent_id"), run.agent_id)
+                or not _same_id(
+                    external_worker.get("agent_revision_id"),
+                    run.agent_revision_id,
+                )
+                or not _same_id(external_worker.get("run_id"), run.id)
+                or not _same_id(external_worker.get("work_item_id"), run.work_item_id)
+            ):
+                raise DialogueBudgetError(
+                    "external worker usage pin is invalid",
+                    code="usage_external_worker_identity_conflict",
+                )
+            return run, None
     if normalized_role == "root" and delivery is None:
         metadata = run.run_metadata if isinstance(run.run_metadata, Mapping) else {}
         marker = metadata.get("agent_dialogue") if isinstance(metadata.get("agent_dialogue"), Mapping) else {}

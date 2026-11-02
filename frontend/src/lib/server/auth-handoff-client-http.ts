@@ -370,3 +370,35 @@ export function readExactClientAuthorizeQuery(
     ? { requestHandle, state }
     : null;
 }
+
+export function parseConsumerExchangeBody(value: unknown): { body: ClientAuthExchangeBody; consumerApp: "73" | "86" } {
+  if (!isRecord(value) || !hasExactlyKeys(value, ["code", "state", "redirect_uri", "audience", "code_verifier", "consumer_app"]) ||
+      (value.consumer_app !== "73" && value.consumer_app !== "86")) throw new InvalidClientAuthBody();
+  const { consumer_app, ...exchange } = value;
+  return { body: parseClientAuthExchangeBody(exchange), consumerApp: consumer_app };
+}
+
+export type ConsumerRenewBody = {
+  consumerApp: "73" | "86";
+  renewalProof: string;
+};
+
+const RENEWAL_PROOF_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
+
+export function parseConsumerRenewBody(value: unknown): ConsumerRenewBody {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ["consumer_app", "renewal_proof"]) ||
+    (value.consumer_app !== "73" && value.consumer_app !== "86") ||
+    typeof value.renewal_proof !== "string" ||
+    value.renewal_proof.length === 0 ||
+    value.renewal_proof.length > 4096 ||
+    !RENEWAL_PROOF_RE.test(value.renewal_proof)
+  ) {
+    throw new InvalidClientAuthBody();
+  }
+  return {
+    consumerApp: value.consumer_app,
+    renewalProof: value.renewal_proof,
+  };
+}

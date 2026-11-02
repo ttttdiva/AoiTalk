@@ -9,6 +9,35 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def select_build_roots(dist_root, work_root, onedir, no_install):
+    """Select explicit paths or allocate one external temporary build root."""
+    default_root = None
+    persistent_dist = onedir or no_install
+    if work_root is None or (dist_root is None and not persistent_dist):
+        temp_root = Path(tempfile.gettempdir())
+        # Check both spellings: a lexical child can resolve out through a link,
+        # and an apparently external path can resolve into the repository.
+        for candidate, repository in (
+            (Path(os.path.abspath(temp_root)), Path(os.path.abspath(ROOT))),
+            (temp_root.resolve(), ROOT.resolve()),
+        ):
+            if candidate.is_relative_to(repository):
+                raise SystemExit("Temporary directory must be outside the repository")
+        default_root = Path(tempfile.mkdtemp(prefix="aoitalk-pc-bridge-", dir=temp_root))
+    if dist_root is None and persistent_dist:
+        artifact_parent = ROOT / "artifacts" / "pc-bridge"
+        artifact_parent.mkdir(parents=True, exist_ok=True)
+        dist_root = Path(tempfile.mkdtemp(prefix="build-", dir=artifact_parent)) / (
+            "dist" if onedir else "onefile"
+        )
+    return (
+        (dist_root if dist_root is not None else default_root / "onefile").resolve(),
+        (work_root if work_root is not None else default_root / "build").resolve(),
+    )
+
+
 HELPER_DESTINATION = "resources/agent-browser"
 EDGE_EXTENSION_DESTINATION = "resources/edge-browser-extension"
 EDGE_EXTENSION_FILES = frozenset({
@@ -121,11 +150,11 @@ def validate_distribution_environment(manifest, helper_directory=None):
         raise SystemExit("Build runtime differs from the reviewed distribution inventory")
     expected_helper = manifest.get("helper_sha256")
     if expected_helper is not None:
-        from pc_bridge.browser_backend import PINNED_HELPER_SHA256
+        from pc_bridge.agent_browser_bundle import PINNED_HELPER_SHA256
         if expected_helper != PINNED_HELPER_SHA256:
             raise SystemExit("Reviewed helper hash is not the pinned bridge.4 helper")
     if helper_directory is not None:
-        from pc_bridge.browser_backend import load_helper_bundle
+        from pc_bridge.agent_browser_bundle import load_helper_bundle
         if expected_helper != load_helper_bundle(
             helper_directory, require_pinned=True
         ).manifest.sha256:
@@ -250,7 +279,7 @@ def helper_bundle_arguments(
     # Keep the optional backend import out of extension-only builds.
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from pc_bridge.browser_backend import load_helper_bundle
+    from pc_bridge.agent_browser_bundle import load_helper_bundle
     from pc_bridge.agent_browser_supervisor import AgentBrowserPreparationError
 
     # Do not resolve symlinks: the shared verifier must see and reject them.
@@ -388,7 +417,12 @@ def validate_enterprise_brand(executable, helper, legacy):
     if helper is not None:
         # Reuse the same fixed member allowlist and verifier as the build command.
         helper_bundle_arguments(helper, require_pinned=True)
-        for relative in ("agent-browser.exe", "manifest.json", *HELPER_NOTICES):
+        from pc_bridge.agent_browser_bundle import load_helper_bundle
+        bundle = load_helper_bundle(helper, require_pinned=True)
+        external_names = ["agent-browser.exe", "manifest.json", *HELPER_NOTICES]
+        if bundle.build_manifest is not None:
+            external_names.append("build-manifest.json")
+        for relative in external_names:
             external[HELPER_DESTINATION + "/" + relative] = (helper / relative).read_bytes()
     archive = _checked_archive(executable)
     actual = {name.replace("\\", "/"): name for name in archive.toc}
@@ -497,6 +531,8 @@ def main(argv=None):
     parser.add_argument("--enterprise-legacy-brand", help="Require exact external identity and decompressed Enterprise branding checks")
     parser.add_argument("--onedir", action="store_true")
     parser.add_argument("--no-install", action="store_true")
+    parser.add_argument("--skip-exe-self-tests", action="store_true",
+                        help="Do not execute the newly built EXE; packaged byte checks still run")
     parser.add_argument("--name", default="AoiTalk-PC-Bridge")
     parser.add_argument("--dist-root", type=Path)
     parser.add_argument("--work-root", type=Path)
@@ -564,9 +600,7 @@ def main(argv=None):
         if args.agent_browser_bundle is not None else []
     )
 
-    default_work = ROOT / ".local" / "portable-bridge" / "pyinstaller"
-    dist_root = (args.dist_root or (default_work / ("dist" if args.onedir else "onefile"))).resolve()
-    work_root = (args.work_root or (default_work / "build")).resolve()
+    dist_root, work_root = select_build_roots(args.dist_root, args.work_root, args.onedir, args.no_install)
     spec_root = work_root / "spec"
     dist_root.mkdir(parents=True, exist_ok=True)
     work_root.mkdir(parents=True, exist_ok=True)
@@ -642,10 +676,11 @@ def main(argv=None):
     enterprise_sha = None
     if args.enterprise_legacy_brand:
         enterprise_sha = validate_enterprise_brand(exe, args.agent_browser_bundle, args.enterprise_legacy_brand)
-    subprocess.run([str(exe), "--self-test"], cwd=work_root, check=True)
-    subprocess.run([str(exe), "--verify-profile-driver"], cwd=work_root, check=True)
-    if args.agent_browser_bundle is not None:
-        subprocess.run([str(exe), "--verify-browser-helper"], cwd=work_root, check=True)
+    if not args.skip_exe_self_tests:
+        subprocess.run([str(exe), "--self-test"], cwd=work_root, check=True)
+        subprocess.run([str(exe), "--verify-profile-driver"], cwd=work_root, check=True)
+        if args.agent_browser_bundle is not None:
+            subprocess.run([str(exe), "--verify-browser-helper"], cwd=work_root, check=True)
     if args.distribution_notices is not None:
         # CLI checks are offline and run before installing the resulting EXE.
         # An existing export must never be overwritten by either code path.

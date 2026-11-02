@@ -67,6 +67,8 @@ from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
 if TYPE_CHECKING:
     # 戻り値型注釈（文字列フォワードリファレンス）用。実行時importは循環回避のため行わない。
     from .cli_llm_client import CLILLMClient
+    from .grok_bot_client import GrokBotChatClient
+    from .muse_client import MuseChatClient
     from .ollama_engine import OllamaClient
 
 logger = logging.getLogger(__name__)
@@ -242,6 +244,7 @@ class AgentLLMClient(
             api_key=api_key,
             base_url=base_url,
             default_headers=default_headers,
+            provider_key_attribution_enabled=provider_label == "openai",
         )
         self._turn_runner = AgentTurnRunner(
             client=self._openai_client,
@@ -709,6 +712,34 @@ def _overlay_openai_compatible_local_target_runtime(
     overrides["openai_compatible_local"] = local_copy
 
 
+def _create_grok_bot_target_client(config: Any, model: str):
+    """Grok BotはChat専用Gateway adapterで、model APIのclientではない。"""
+
+    if resolve_llm_deployment(config) is not None:
+        raise ValueError("Grok Bot ChatはEnterprise deployment構成では利用できません。")
+    model_id = str(model or "").strip().lower()
+    if model_id not in {"", "grok-bot"}:
+        raise ValueError(f"Grok Bot Chatのmodelは grok-bot のみです: {model_id}")
+    from .grok_bot_client import create_grok_bot_chat_client
+
+    # bindingが無い/不正な場合はGrokBotChatUnavailable(ValueError)で明示的に失敗する。
+    return create_grok_bot_chat_client(config)
+
+
+def _create_muse_chat_target_client(config: Any):
+    """Muse通常Chat (provider=muse-remote, model=muse-chat) 専用adapter。
+
+    自然文の返信をそのままChat履歴へ返す。tool loop/JSON契約は使わない。
+    """
+
+    if resolve_llm_deployment(config) is not None:
+        raise ValueError("Muse ChatはEnterprise deployment構成では利用できません。")
+    from .muse_client import create_muse_chat_client
+
+    # 未設定/不許可はMuseChatUnavailable(ValueError)で明示的に失敗する。
+    return create_muse_chat_client(config)
+
+
 def create_llm_client_for_target(
     config: Any,
     *,
@@ -719,10 +750,16 @@ def create_llm_client_for_target(
     base_url: str = "",
     provider_options: Optional[Dict[str, Any]] = None,
     api_key: str = "",
+    allow_construction_fallback: bool = True,
 ):
     """明示provider/model/credentialからターン専用clientを生成する。"""
 
     provider = str(provider or "").strip().lower()
+    if provider == "grok-bot":
+        return _create_grok_bot_target_client(config, model)
+    if provider == "muse-remote" and str(model or "").strip().lower() == "muse-chat":
+        # model=muse-chat だけが通常Chat。Agent route (model空) は従来通り拒否。
+        return _create_muse_chat_target_client(config)
     if provider not in TARGET_CLIENT_PROVIDERS:
         raise ValueError(f"未対応のターン専用LLM providerです: {provider or '(empty)'}")
     # Enterprise deployment constraints are checked before any provider
@@ -829,6 +866,17 @@ def create_llm_client_for_target(
         if resolved_key:
             overrides["gemini_api_key"] = resolved_key
         overrides["gemini.model"] = model
+        profile_key = getattr(credential_profile, "api_key", "") or ""
+        # The scope is a ledger attribution, not proof of provider credit.
+        if credential_profile is not None or api_key:
+            # Equality identifies the selected profile key, not a Google project.
+            # Other keys and profiles without a scope mask the global scope.
+            overrides["gemini.billing_scope_id"] = (
+                getattr(credential_profile, "billing_scope_id", None)
+                if profile_key and resolved_key == profile_key
+                else None
+            )
+        # With no selected credential, retain the default key's global scope.
     elif provider == "openrouter":
         if resolved_key:
             overrides["openrouter_api_key"] = resolved_key
@@ -862,6 +910,18 @@ def create_llm_client_for_target(
         if is_free_team_openrouter_request:
             # Free Team's price ceiling remains a separate request policy.
             overrides["runtime.free_team_openrouter_request"] = True
+            # Drop paid provider selection/fallback fields while retaining
+            # configured privacy directives such as ZDR and data_collection.
+            configured_provider_options = {
+                key: configured_provider_options[key]
+                for key in ("zdr", "data_collection")
+                if key in configured_provider_options
+            }
+            overrides[MODEL_PROVIDER_OPTIONS_CONFIG_KEY] = (
+                {normalized_model: configured_provider_options}
+                if configured_provider_options
+                else {}
+            )
         # The pinned paid Decart profile must be allowed to reach its provider;
         # Free Team calls and every other OpenRouter target retain the guard.
         is_paid_fixed_decart_profile = (
@@ -877,6 +937,8 @@ def create_llm_client_for_target(
             provider_request_options["max_price"] = {
                 "prompt": 0,
                 "completion": 0,
+                "request": 0,
+                "image": 0,
             }
         overrides["free_team.request_extra_body"] = {
             "provider": provider_request_options,
@@ -971,10 +1033,23 @@ def create_llm_client_for_target(
             )
         overrides["llm_provider"] = "routing-profile"
         overrides["llm_model"] = "free-team"
+        pool_id = str(options.get("pool_id") or "").strip()
+        if pool_id:
+            overrides["routing_profiles.free-team.main_pool_id"] = pool_id[:128]
     if resolved_base_url and provider != "openrouter":
         overrides[f"{provider}.base_url"] = resolved_base_url
     target_config = TargetConfig(config, overrides)
-    client = create_llm_client(target_config)
+    if allow_construction_fallback:
+        client = create_llm_client(target_config)
+    else:
+        try:
+            client = create_llm_client(target_config, allow_construction_fallback=False)
+        except ImportError as exc:
+            # This boundary is entered only for an explicitly selected frozen
+            # target, before its client can issue a provider request.
+            from ..services.agent_route_fallback_policy import RoutePreflightFailure
+
+            raise RoutePreflightFailure("provider_unavailable") from exc
     if target_response_mode is not None:
         set_mode = getattr(client, "set_llm_mode", None)
         if not callable(set_mode):
@@ -987,7 +1062,384 @@ def create_llm_client_for_target(
 
 def create_llm_client(
     config: Config,
-) -> Union[AgentLLMClient, "GeminiLLMClient", "CLILLMClient", "OllamaClient"]:
+    *,
+    allow_construction_fallback: bool = True,
+) -> Union[
+    AgentLLMClient,
+    "GeminiLLMClient",
+    "CLILLMClient",
+    "OllamaClient",
+    "GrokBotChatClient",
+    "MuseChatClient",
+]:
+    """Create the primary client, optionally allowing construction fallbacks.
+
+    Frozen candidate execution disables fallback for each individual attempt so
+    that the selected provider and model cannot change inside this factory.
+    """
+
+    if not allow_construction_fallback:
+        return _create_llm_client_primary(config)
+
+    try:
+        return _create_llm_client_primary(config)
+    except Exception as primary_error:
+        # Explicit target clients are used by tool/agent routes and are not the
+        # ordinary Chat main client.  create_llm_client_for_target sets this
+        # marker before calling back into this factory, preventing recursion.
+        revision = _agent_revision_from_config(config)
+        agent_role = _agent_role_from_config(config)
+        is_agent_target = bool(
+            _config_get(config, "runtime.target_model")
+            and revision is not None
+            and agent_role
+        )
+        if _config_get(config, "runtime.target_model") and not is_agent_target:
+            raise
+
+        # A v2 revision may replace Chat's primary/fallback chain for this
+        # request.  Try that chain before the app-wide model_roles fallback;
+        # each attempt is still construction-only, so no provider request has
+        # started at this boundary.
+        if revision is not None:
+            try:
+                from ..services.agent_revision_v2 import (
+                    revision_role_route_candidates,
+                )
+
+                revision_routes, revision_allow_paid, revision_source = (
+                    revision_role_route_candidates(config, revision, agent_role)
+                )
+            except Exception as exc:
+                logger.info(
+                    "AgentRevision v2 Chat fallback configuration could not be loaded (%s)",
+                    type(exc).__name__,
+                )
+                try:
+                    from ..services.agent_revision_v2 import revision_model_overrides
+
+                    overrides = revision_model_overrides(revision)
+                except Exception:
+                    overrides = None
+                if isinstance(overrides, dict) and any(
+                    key in overrides
+                    for key in (
+                        "chat",
+                        "conversation",
+                        "writer",
+                        "data_worker",
+                        "general_worker",
+                        "operator",
+                    )
+                ):
+                    # An explicit v2 Chat override with no valid candidates
+                    # is a revision error; do not widen it to the app-global
+                    # fallback chain.
+                    raise primary_error.with_traceback(
+                        primary_error.__traceback__
+                    ) from None
+                revision_routes = []
+                revision_allow_paid = False
+                revision_source = ""
+            if revision_source == "agent" or is_agent_target:
+                client = _try_chat_fallback_routes(
+                    config,
+                    revision_routes,
+                    allow_paid_fallback=revision_allow_paid,
+                )
+                if client is not None:
+                    return client
+
+            if is_agent_target and agent_role != "chat":
+                raise primary_error.with_traceback(primary_error.__traceback__) from None
+
+        try:
+            from ..services.model_roles_service import (
+                normalize_model_roles,
+                route_billing_class,
+            )
+
+            model_roles = normalize_model_roles(
+                _config_get(config, "model_roles", {}) or {},
+                config=config,
+            )
+            model_roles_loaded = True
+        except Exception as exc:
+            logger.info(
+                "Chat fallback configuration could not be loaded (%s)",
+                type(exc).__name__,
+            )
+            if revision is None or not revision_routes:
+                raise primary_error.with_traceback(
+                    primary_error.__traceback__
+                ) from None
+            # Raw P2 role rows may coexist with a P1 normalizer that does not
+            # know the additional role keys yet.  Continue to the v2 chain
+            # below and keep the original error if every candidate fails.
+            model_roles = {"roles": {"chat": {"fallbacks": [], "allow_paid_fallback": False}}}
+            route_billing_class = None
+            model_roles_loaded = False
+
+        chat_role = model_roles.get("roles", {}).get("chat", {})
+        fallbacks = chat_role.get("fallbacks", [])
+        allow_paid_fallback = chat_role.get("allow_paid_fallback") is True
+        for route in fallbacks:
+            if not isinstance(route, dict):
+                continue
+            try:
+                billing_class = (
+                    route_billing_class(config, route)
+                    if route_billing_class is not None
+                    else "paid"
+                )
+            except Exception as exc:
+                logger.info(
+                    "Chat fallback billing class could not be resolved (%s)",
+                    type(exc).__name__,
+                )
+                # Fail closed: an unresolved route must obey the same paid
+                # fallback gate as any route classified as paid.
+                billing_class = "paid"
+            if billing_class == "paid" and not allow_paid_fallback:
+                logger.info(
+                    "Stopping Chat fallback before paid route %s",
+                    _chat_fallback_route_label(route),
+                )
+                break
+
+            try:
+                if route.get("kind") == "pool":
+                    pool_id = str(route.get("pool_id") or "").strip()
+                    target_config = TargetConfig(
+                        config,
+                        {
+                            "llm_provider": "routing-profile",
+                            "llm_model": "free-team",
+                            "runtime.target_model": "free-team",
+                            "routing_profiles.free-team.main_pool_id": pool_id,
+                        },
+                    )
+                    client = _create_llm_client_primary(target_config)
+                elif route.get("kind") == "llm":
+                    client = create_llm_client_for_target(
+                        config,
+                        provider=str(route.get("provider") or ""),
+                        model=str(route.get("model") or ""),
+                        effort=str(route.get("effort") or ""),
+                    )
+                else:
+                    continue
+            except Exception as exc:
+                logger.info(
+                    "Chat fallback route %s failed to construct (%s)",
+                    _chat_fallback_route_label(route),
+                    type(exc).__name__,
+                )
+                continue
+
+            logger.info(
+                "Using Chat fallback route %s",
+                _chat_fallback_route_label(route),
+            )
+            return client
+
+        # A v2 revision without a Chat override inherits the global Chat
+        # fallback column.  The normalized P1 path above is preferred, but a
+        # sparse/legacy config may only expose the raw role table; project it
+        # here while retaining the same paid-fallback gate.
+        if (
+            revision is not None
+            and revision_source != "agent"
+            and not model_roles_loaded
+        ):
+            client = _try_chat_fallback_routes(
+                config,
+                revision_routes,
+                allow_paid_fallback=revision_allow_paid,
+                skip_first=True,
+            )
+            if client is not None:
+                return client
+
+        # Keep the original construction error, including its traceback, as
+        # the failure visible to the caller when no fallback can be used.
+        raise
+
+
+def _chat_fallback_route_label(route: dict[str, Any]) -> str:
+    if route.get("kind") == "pool":
+        return f"pool/{str(route.get('pool_id') or '')[:80]}"
+    provider = str(route.get("provider") or "")[:80]
+    model = str(route.get("model") or "")[:120]
+    return f"{provider}/{model}"
+
+
+def _agent_revision_from_config(config: Any) -> Any | None:
+    """Find a request-local AgentRevision projection without importing ORM types."""
+
+    for key in (
+        "runtime.agent_revision",
+        "agent_revision",
+        "runtime.agent_revision_v2",
+        "agent_revision_v2",
+    ):
+        value = _config_get(config, key, None)
+        if value is not None:
+            try:
+                from ..services.agent_revision_v2 import revision_v2_fields_present
+
+                if revision_v2_fields_present(value):
+                    return value
+            except Exception:
+                return value
+    for attr in ("agent_revision", "agent_revision_v2", "_agent_revision"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            try:
+                from ..services.agent_revision_v2 import revision_v2_fields_present
+
+                if revision_v2_fields_present(value):
+                    return value
+            except Exception:
+                return value
+    # Some request builders project only the additive columns into a target
+    # config.  Reconstruct a minimal revision mapping for the helper.
+    values: dict[str, Any] = {}
+    for name in ("model_overrides", "tool_ids", "delegate_policy"):
+        value = _config_get(config, f"runtime.agent_revision_{name}", None)
+        if value is None:
+            value = _config_get(config, f"agent_revision_{name}", None)
+        if value is not None:
+            values[name] = value
+    if values:
+        try:
+            from ..services.agent_revision_v2 import revision_v2_fields_present
+
+            return values if revision_v2_fields_present(values) else None
+        except Exception:
+            return values
+    # Agent clients normally carry the immutable binding in TurnContext while
+    # TargetConfig only contains provider/model overlays.  Read that trusted
+    # binding so the target factory can apply the same pre-request fallback
+    # boundary.  Legacy bindings without v2 fields remain fail-fast.
+    try:
+        from ..services.agent_revision_v2 import revision_v2_fields_present
+        from ..services.turn_context import get_turn_context
+
+        turn = get_turn_context()
+        for candidate in (
+            getattr(turn, "agent_execution_binding", None),
+            getattr(turn, "agent_execution_config", None),
+        ):
+            if candidate is not None and revision_v2_fields_present(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _agent_role_from_config(config: Any) -> str:
+    for key in ("runtime.agent_role", "agent_role"):
+        value = _config_get(config, key, None)
+        if value:
+            return str(value).strip().casefold()
+    for attr in ("agent_role", "_agent_role"):
+        value = getattr(config, attr, None)
+        if value:
+            return str(value).strip().casefold()
+    try:
+        from ..services.turn_context import get_turn_context
+
+        value = getattr(get_turn_context(), "agent_role", None)
+        if value:
+            return str(value).strip().casefold()
+    except Exception:
+        pass
+    return "chat"
+
+
+def _try_chat_fallback_routes(
+    config: Any,
+    routes: Any,
+    *,
+    allow_paid_fallback: bool,
+    skip_first: bool = False,
+) -> Any | None:
+    """Construct v2 Chat fallback routes until one succeeds."""
+
+    if not isinstance(routes, (list, tuple)):
+        return None
+    try:
+        from ..services.model_roles_service import route_billing_class
+    except Exception:
+        return None
+    items = list(routes)[1:] if skip_first else list(routes)
+    for route in items:
+        if not isinstance(route, dict):
+            continue
+        try:
+            billing_class = route_billing_class(config, route)
+        except Exception as exc:
+            logger.info(
+                "AgentRevision Chat fallback billing class could not be resolved (%s)",
+                type(exc).__name__,
+            )
+            billing_class = "paid"
+        if billing_class == "paid" and not allow_paid_fallback:
+            break
+        try:
+            if route.get("kind") == "pool":
+                pool_id = str(route.get("pool_id") or "").strip()
+                if not pool_id:
+                    continue
+                target_config = TargetConfig(
+                    config,
+                    {
+                        "llm_provider": "routing-profile",
+                        "llm_model": "free-team",
+                        "runtime.target_model": "free-team",
+                        "routing_profiles.free-team.main_pool_id": pool_id,
+                    },
+                )
+                client = _create_llm_client_primary(target_config)
+            elif route.get("kind") == "llm":
+                provider = str(route.get("provider") or "").strip()
+                model = str(route.get("model") or "").strip()
+                if not provider or not model:
+                    continue
+                client = create_llm_client_for_target(
+                    config,
+                    provider=provider,
+                    model=model,
+                    effort=str(route.get("effort") or ""),
+                )
+            else:
+                continue
+        except Exception as exc:
+            logger.info(
+                "AgentRevision Chat fallback route %s failed to construct (%s)",
+                _chat_fallback_route_label(route),
+                type(exc).__name__,
+            )
+            continue
+        logger.info(
+            "Using AgentRevision Chat fallback route %s",
+            _chat_fallback_route_label(route),
+        )
+        return client
+    return None
+
+
+def _create_llm_client_primary(
+    config: Config,
+) -> Union[
+    AgentLLMClient,
+    "GeminiLLMClient",
+    "CLILLMClient",
+    "OllamaClient",
+    "GrokBotChatClient",
+    "MuseChatClient",
+]:
     """Factory function to create LLM client
 
     Args:
@@ -996,6 +1448,25 @@ def create_llm_client(
     Returns:
         Configured LLM client instance
     """
+    requested_provider = str(
+        config.get("llm_provider", "openai") or "openai"
+    ).strip().lower()
+    requested_model = str(config.get("llm_model", "") or "").strip()
+    # Ordinary Chat providers are intentionally absent from KNOWN_PROVIDER_IDS:
+    # they do not use the generic model transport. If a normal Chat caller
+    # enters through this legacy factory, route it through the same dedicated
+    # adapters as create_llm_client_for_target instead of rejecting the
+    # selected route or falling back to OpenAI.
+    if requested_provider == "grok-bot" or (
+        requested_provider == "muse-remote"
+        and requested_model.lower() == "muse-chat"
+    ):
+        return create_llm_client_for_target(
+            config,
+            provider=requested_provider,
+            model=requested_model,
+        )
+
     # ``Config`` remains the persisted source of truth, but an Enterprise
     # deployment may expose a fixed runtime backend.  Apply only an in-memory
     # TargetConfig overlay so DB values remain available for diagnostics and

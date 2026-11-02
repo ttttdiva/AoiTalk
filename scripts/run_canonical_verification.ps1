@@ -1,18 +1,17 @@
 <#
 .SYNOPSIS
-  Run local canonical verification gates that mirror .github/workflows/ci.yml on Windows.
+  Run local canonical verification gates on Windows.
 
 .DESCRIPTION
-  Run local canonical verification gates that mirror .github/workflows/ci.yml on Windows.
+  Run local canonical verification gates on Windows.
 
-  **Manual use only.** Codex/agents must NOT auto-run this in normal work or on CI UNAVAILABLE.
-  Use when the user explicitly requests local full-CI parity, for CI infrastructure investigation,
-  or special local reproduction.
+  **Manual use only.** Run for an explicitly requested full verification or local reproduction.
+  Normal work uses targeted verification for the changed scope.
 
   Each gate reports PASS / FAIL / SKIP with a reason. Fail-fast: stops after the first gate FAIL.
   Exit 0 only when every executed gate passes (no SKIP).
 
-  Gates (ci.yml parity):
+  Gates:
     - mobile release gate
     - Mobile Product Contract, route inventory, and shared OpenAPI JSON parity
     - frontend: lint, typecheck, typegen drift, vitest, build, build:production, BUILD_ID
@@ -20,9 +19,9 @@
     - python: MCP import smoke, ruff, security boundary tests, wheel smoke
     - backend: full pytest
     - schema drift: alembic upgrade head, check_schema_drift.py, login-log postgres vitest
-    - frontend E2E Playwright (same specs as CI; requires PostgreSQL)
+    - frontend renderer and E2E Playwright (requires PostgreSQL)
 
-  PostgreSQL: requires ephemeral Docker containers (postgres:16), one per CI postgres job
+  PostgreSQL: requires ephemeral Docker containers (postgres:16), one per verification group
   (schema-drift and E2E each get a fresh container). Local existing databases are not used.
 
 .PARAMETER Base
@@ -32,7 +31,7 @@
   Git ref for mobile release gate target (default: HEAD).
 
 .PARAMETER SkipE2E
-  Skip Playwright E2E gates. Documented escape hatch only; full parity requires E2E.
+  Skip Playwright E2E gates. Documented escape hatch only; full verification requires E2E.
 
 .PARAMETER KeepPostgres
   Do not stop Docker container or drop temporary database after completion (debugging).
@@ -75,6 +74,7 @@ $E2ESpecs = @(
     "e2e/navigation.spec.ts",
     "e2e/filer-editor-double-escape.spec.ts",
     "e2e/chat.spec.ts",
+    "e2e/chat-composer-editing.spec.ts",
     "e2e/tasks.spec.ts",
     "e2e/remediation-smoke.spec.ts"
 )
@@ -253,12 +253,6 @@ function Test-VersionAtLeast {
         return ($vMajor -gt $Major) -or ($vMajor -eq $Major -and $vMinor -ge $Minor)
     }
     return $false
-}
-
-function Test-WorkflowsChanged {
-    param([string]$Base = "origin/main")
-    $files = @(& git -C $Script:RepoRoot diff --name-only "$Base..HEAD" 2>$null)
-    return @($files | Where-Object { $_ -match '^\.github/workflows/' }).Count -gt 0
 }
 
 function Start-CanonicalPostgres {
@@ -670,17 +664,6 @@ try {
     }
     if (-not $ok) { $allPassed = $false }
 
-    if (Test-WorkflowsChanged -Base $Base) {
-        $ok = Invoke-Gate -Name "preflight actionlint" -Action {
-            if (-not (Test-CommandAvailable "actionlint")) {
-                throw "actionlint not installed (.github/workflows changed)"
-            }
-            & actionlint (Join-Path $Script:RepoRoot ".github\workflows\ci.yml")
-            if ($LASTEXITCODE -ne 0) { throw "actionlint failed" }
-        }
-        if (-not $ok) { $allPassed = $false }
-    }
-
     # --- mobile release gate ---
     $ok = Invoke-Gate -Name "mobile release gate" -Action {
         Push-Location $Script:RepoRoot
@@ -694,7 +677,7 @@ try {
     }
     if (-not $ok) { $allPassed = $false }
 
-    # --- mobile conformance (ci.yml mobile-product-contract job) ---
+    # --- mobile conformance (mobile contract) ---
     $ok = Invoke-Gate -Name "mobile product contract and shared OpenAPI" -Action {
         Invoke-PythonGate @("scripts/validate_mobile_product_contract.py")
 
@@ -750,7 +733,7 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
     }
     if (-not $ok) { $allPassed = $false }
 
-    # --- python lightweight (ci.yml python job) ---
+    # --- python lightweight (Python checks) ---
     $ok = Invoke-Gate -Name "python install check deps" -Action {
         Install-CanonicalPythonDeps @(
             "ruff", "pytest", "pytest-asyncio",
@@ -830,7 +813,7 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
     }
     if (-not $ok) { $allPassed = $false }
 
-    # --- frontend (ci.yml frontend job) ---
+    # --- frontend (frontend checks) ---
     $ok = Invoke-Gate -Name "frontend npm ci" -Action {
         Invoke-FrontendNpm -Arguments @("ci")
     }
@@ -908,7 +891,7 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
     }
     if (-not $ok) { $allPassed = $false }
 
-    # --- schema drift (fresh PostgreSQL, ci.yml schema-drift job) ---
+    # --- schema drift (fresh PostgreSQL, schema checks) ---
     if ($Script:FailFastAbort) {
         $null = Invoke-Gate -Name "schema drift (skipped)" -SkipReason "earlier gate failed (fail-fast)"
     }
@@ -938,6 +921,16 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
         }
         if (-not $ok) { $allPassed = $false }
 
+        $ok = Invoke-Gate -Name "meeting retry CAS postgres" -Action {
+            $previousDsn = $env:AOITALK_TEST_POSTGRES_DSN
+            try {
+                $env:AOITALK_TEST_POSTGRES_DSN = $schemaPgUrl -replace '^postgres://', 'postgresql+asyncpg://'
+                Invoke-PythonGate @('-m', 'pytest', '-q', '-o', 'addopts=', 'tests/test_meeting_processing_retry_cas.py', '-k', 'postgres')
+            }
+            finally { $env:AOITALK_TEST_POSTGRES_DSN = $previousDsn }
+        }
+        if (-not $ok) { $allPassed = $false }
+
         $ok = Invoke-Gate -Name "schema drift check_schema_drift.py" -Action {
             Invoke-PythonGate @((Join-Path $Script:RepoRoot "scripts\check_schema_drift.py"))
         }
@@ -961,9 +954,9 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
     }
     }
 
-    # --- frontend E2E (separate fresh PostgreSQL, ci.yml frontend-e2e job) ---
+    # --- frontend E2E (separate fresh PostgreSQL, E2E checks) ---
     if ($SkipE2E) {
-        $null = Invoke-Gate -Name "frontend E2E Playwright" -SkipReason "-SkipE2E specified (not full CI parity)"
+        $null = Invoke-Gate -Name "frontend E2E Playwright" -SkipReason "-SkipE2E specified (not full verification)"
     }
     elseif ($Script:FailFastAbort) {
         $null = Invoke-Gate -Name "frontend E2E (skipped)" -SkipReason "earlier gate failed (fail-fast)"
@@ -1005,6 +998,11 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
             }
             if (-not $ok) { $allPassed = $false }
 
+            $ok = Invoke-Gate -Name "frontend renderer" -Action {
+                Invoke-FrontendNpm -Arguments @('run', 'test:renderer')
+            }
+            if (-not $ok) { $allPassed = $false }
+
             $e2eArgs = @("run", "test:e2e", "--") + $E2ESpecs + @("--grep-invert", "Python API起動時")
             $ok = Invoke-Gate -Name "frontend E2E Playwright" -Action {
                 $prevCi = $env:CI
@@ -1012,7 +1010,7 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
                 try {
                     $env:CI = "true"
                     $env:PLAYWRIGHT_REUSE_EXISTING_SERVER = "0"
-                    Invoke-FrontendNpm -Arguments $e2eArgs -ExtraEnv @{
+                    $e2eEnv = @{
                         POSTGRES_HOST            = $Script:E2ePostgresContext.Host
                         POSTGRES_PORT            = "$($Script:E2ePostgresContext.Port)"
                         POSTGRES_USER            = $Script:E2ePostgresContext.User
@@ -1026,6 +1024,8 @@ print(f"Shared OpenAPI JSON and {len(physical)} mobile routes: PASS")
                         PLAYWRIGHT_NEXT_DIST_DIR = ".next"
                         NEXT_DIST_DIR            = ".next"
                     }
+                    Invoke-FrontendNpm -Arguments @('run', 'test:e2e', '--', 'e2e/docs-editor.spec.ts', '--grep', 'Docs resume location') -ExtraEnv $e2eEnv
+                    Invoke-FrontendNpm -Arguments $e2eArgs -ExtraEnv $e2eEnv
                 }
                 finally {
                     if ($null -eq $prevCi) { Remove-Item Env:CI -ErrorAction SilentlyContinue } else { $env:CI = $prevCi }
@@ -1060,7 +1060,7 @@ if ($verificationResult.ExitCode -eq $EXIT_PASS) {
 
 if ($verificationResult.AllPassed -and $verificationResult.SkippedGates.Count -gt 0) {
     Write-Host ""
-    Write-Host "All executed gates passed, but some gates were skipped — not full CI parity." -ForegroundColor Yellow
+    Write-Host "All executed gates passed, but some gates were skipped — not full verification." -ForegroundColor Yellow
     exit $verificationResult.ExitCode
 }
 

@@ -765,13 +765,58 @@ class RemoteDedicatedControlBridge(RemoteControlBridge):
             params, timeout=timeout, expected_connection=self._connection, jev_relay=binding)
 
 
+def _remote_enabled() -> bool:
+    """Whether controlling other PCs through a PC Bridge is switched on (default off).
+
+    The PC Bridge routes install ``hub.remote_control_enabled`` from the live setting
+    ``pc_bridge.remote_enabled``; without it (routes not registered) it is off.
+    """
+    check = getattr(get_pc_bridge_hub(), 'remote_control_enabled', None)
+    try:
+        return callable(check) and check() is True
+    except Exception:
+        return False
+
+
+def _use_local_target(device_id) -> bool:
+    """The server PC is the default target; another PC needs the optional remote setting."""
+    if device_id == 'local' or not device_id:
+        if not device_id and _remote_enabled():
+            return False  # the user may have selected a Bridge PC for this session
+        return True
+    if not _remote_enabled():
+        raise PcBridgeError('pc_bridge_remote_disabled')
+    return False
+
+
+def _local_control_bridge(owner, *, dedicated, cleanup_only):
+    if dedicated:
+        from .local_target.dedicated import LocalDedicatedBridge
+
+        return LocalDedicatedBridge(owner, cleanup_only=cleanup_only)
+    if cleanup_only:
+        raise PcBridgeError('bridge_cleanup_target_required')
+    from .local_target.control import LocalControlBridge
+
+    return LocalControlBridge(owner)
+
+
 async def resolve_control_bridge(device_id: str | None = None, *, dedicated=False, cleanup_only=False):
     from .turn_context import get_turn_context
     turn = get_turn_context()
     if not turn.user_id:
         raise PcBridgeError('bridge_authenticated_user_required')
+    owner = str(turn.user_id)
     hub = get_pc_bridge_hub()
-    selected = await hub.store.resolve(str(turn.user_id), device_id, turn.session_id)
+    if _use_local_target(device_id):
+        return _local_control_bridge(owner, dedicated=dedicated, cleanup_only=cleanup_only)
+    try:
+        selected = await hub.store.resolve(owner, device_id, turn.session_id)
+    except PcBridgeError as exc:
+        if device_id or str(exc) != 'bridge_select_a_pc_first':
+            raise
+        # Remote control is on but no PC is selected for this session: use the server PC.
+        return _local_control_bridge(owner, dedicated=dedicated, cleanup_only=cleanup_only)
     if dedicated:
         if not cleanup_only and not hub.dedicated_enabled():
             raise PcBridgeError('bridge_dedicated_disabled')

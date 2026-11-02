@@ -32,12 +32,14 @@ def valid(vectors, count):
 
 
 def capacity(vector, count):
+    scratch = Path(tempfile.gettempdir()).resolve()
+    repo = ROOT.resolve()
+    if scratch == repo or repo in scratch.parents:
+        raise RuntimeError("embedding_capacity_temp_inside_repo")
     from qdrant_client import QdrantClient, models
     import numpy as np
     import psutil
 
-    scratch = ROOT / ".local"
-    scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="eg2-capacity-", dir=scratch) as work:
         client = QdrantClient(path=str(Path(work) / "qdrant"))
         name = "fixture_native_768"

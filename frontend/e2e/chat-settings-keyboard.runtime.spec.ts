@@ -67,18 +67,6 @@ test("Chat settings keyboard outer/inner transitions keep Portal focus determini
       },
     });
   });
-  await page.route("**/api/python-proxy/llm/execution-profiles", async (route) => {
-    await route.fulfill({
-      json: {
-        active_profile_id: "manual",
-        profiles: [],
-        effective_main: null,
-      },
-    });
-  });
-  await page.route("**/api/python-proxy/agent-team/config", async (route) => {
-    await route.fulfill({ json: { teams: {} } });
-  });
 
   await page.goto("/chat");
   const control = page.getByTestId("chat-model-control");
@@ -89,8 +77,6 @@ test("Chat settings keyboard outer/inner transitions keep Portal focus determini
   const provider = page.getByRole("combobox", { name: "Provider" });
   const model = page.getByRole("combobox", { name: "Model" });
   const effort = page.getByRole("combobox", { name: "推論・LLMモード" });
-  const agentTeam = page.getByRole("combobox", { name: "Execution Team" });
-  const executionProfile = page.getByRole("combobox", { name: "Execution Profile" });
   const character = page.getByRole("combobox", { name: "キャラクター" });
   await expect(provider).toBeVisible();
   await expect(provider).toBeFocused();
@@ -105,10 +91,6 @@ test("Chat settings keyboard outer/inner transitions keep Portal focus determini
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
   await expect(page.getByRole("option")).toHaveCount(0);
-  await page.keyboard.press("ArrowDown");
-  await expect(agentTeam).toBeFocused();
-  await page.keyboard.press("ArrowDown");
-  await expect(executionProfile).toBeFocused();
   await page.keyboard.press("ArrowDown");
   await expect(character).toBeFocused();
   await expect(page.getByRole("option")).toHaveCount(0);
@@ -181,18 +163,6 @@ test("Chat settings keeps Melody reasoning unsupported and skips its status row"
       },
     });
   });
-  await page.route("**/api/python-proxy/llm/execution-profiles", async (route) => {
-    await route.fulfill({
-      json: {
-        active_profile_id: "manual",
-        profiles: [],
-        effective_main: null,
-      },
-    });
-  });
-  await page.route("**/api/python-proxy/agent-team/config", async (route) => {
-    await route.fulfill({ json: { teams: {} } });
-  });
 
   await page.goto("/chat");
   const control = page.getByTestId("chat-model-control");
@@ -202,7 +172,6 @@ test("Chat settings keeps Melody reasoning unsupported and skips its status row"
 
   const provider = page.getByRole("combobox", { name: "Provider" });
   const model = page.getByRole("combobox", { name: "Model" });
-  const agentTeam = page.getByRole("combobox", { name: "Execution Team" });
   await expect(provider).toBeVisible();
   await expect(provider).toBeFocused();
   await expect(page.getByTestId("chat-effort-unsupported")).toHaveText(
@@ -220,5 +189,5 @@ test("Chat settings keeps Melody reasoning unsupported and skips its status row"
   await page.keyboard.press("ArrowDown");
   await expect(model).toBeFocused();
   await page.keyboard.press("ArrowDown");
-  await expect(agentTeam).toBeFocused();
+  await expect(page.getByRole("combobox", { name: "キャラクター" })).toBeFocused();
 });

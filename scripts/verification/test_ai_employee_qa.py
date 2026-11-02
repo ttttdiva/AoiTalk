@@ -7,12 +7,13 @@ import tempfile
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from scripts.verification.ai_employee_qa import (
     QA_SESSION_COOKIE_NAME, REPO, check_identity, child_environment, load_manifest,
-    qa_artifact_path, qa_run_path, write_json,
+    _cleanup_failed_prepare, _drop_owned_prepare_database, qa_artifact_path,
+    qa_run_path, write_json,
 )
 
 
@@ -26,6 +27,15 @@ class LauncherBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.run_id = uuid4()
         self.name = "aoitalk_test_employee_" + self.run_id.hex
+
+    def _owned_prepare_manifest(self, root, *, status="allocated", dedicated=False):
+        return {
+            "harness": "ai_employee_qa", "database": self.name,
+            "run_id": str(self.run_id), "schema": "public", "repo": str(REPO),
+            "output_dir": str(root), "pg_host": "127.0.0.1", "pg_port": 55432,
+            "backend_port": 3100, "frontend_port": 3102, "processes": {},
+            "dedicated_cluster": dedicated, "status": status,
+        }
 
     def test_rejects_live_or_ambiguous_database_names(self):
         self.assertEqual(check_identity(self.name), self.name)
@@ -269,6 +279,102 @@ for address in [('203.0.113.1',443),('127.0.0.1',3000),('127.0.0.1',3002),('127.
         finally:
             shutil.rmtree(root, ignore_errors=True)
             shutil.rmtree(artifact_root, ignore_errors=True)
+
+    def test_interrupted_prepare_removes_only_empty_owned_scratch(self):
+        root = qa_run_path(self.name)
+        root.mkdir(parents=True)
+        try:
+            self.assertTrue(_cleanup_failed_prepare(root, None, None))
+            self.assertFalse(root.exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_interrupted_prepare_keeps_active_owned_run(self):
+        from scripts.verification import ai_employee_qa as qa
+
+        root = qa_run_path(self.name)
+        root.mkdir(parents=True)
+        manifest = {
+            "harness": "ai_employee_qa", "database": self.name, "run_id": str(self.run_id),
+            "schema": "public", "repo": str(REPO), "output_dir": str(root),
+            "pg_host": "127.0.0.1", "pg_port": 55432, "backend_port": 3100,
+            "frontend_port": 3102, "processes": {}, "dedicated_cluster": False,
+            "status": "allocated",
+        }
+        write_json(root / "manifest.json", manifest)
+        try:
+            with patch.object(qa, "_prepare_has_active_process", return_value=True):
+                self.assertFalse(_cleanup_failed_prepare(root, manifest, {}))
+            self.assertTrue(root.exists())
+            self.assertTrue((root / "manifest.json").exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_interrupted_prepare_checks_shared_db_even_when_status_is_allocated(self):
+        from scripts.verification import ai_employee_qa as qa
+
+        root = qa_run_path(self.name)
+        root.mkdir(parents=True)
+        manifest = self._owned_prepare_manifest(root, status="allocated", dedicated=False)
+        write_json(root / "manifest.json", manifest)
+        try:
+            with patch.object(qa, "_prepare_has_active_process", return_value=False), patch.object(
+                qa, "_drop_owned_prepare_database", return_value=True
+            ) as drop:
+                self.assertTrue(_cleanup_failed_prepare(root, manifest, {}))
+            drop.assert_called_once()
+            self.assertFalse(root.exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_shared_db_marker_mismatch_preserves_interrupted_scratch(self):
+        from scripts.verification import ai_employee_qa as qa
+
+        root = qa_run_path(self.name)
+        root.mkdir(parents=True)
+        manifest = self._owned_prepare_manifest(root, status="allocated", dedicated=False)
+        write_json(root / "manifest.json", manifest)
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = ("ai_employee_qa:" + uuid4().hex,)
+        try:
+            with patch.object(qa, "pg_connect", return_value=connection), patch.object(
+                qa, "_prepare_has_active_process", return_value=False
+            ):
+                self.assertFalse(_cleanup_failed_prepare(root, manifest, {}))
+            self.assertTrue(root.exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_shared_db_absence_is_already_removed(self):
+        from scripts.verification import ai_employee_qa as qa
+
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+        manifest = self._owned_prepare_manifest(Path("owned"), status="allocated", dedicated=False)
+        with patch.object(qa, "pg_connect", return_value=connection):
+            self.assertTrue(_drop_owned_prepare_database(manifest, {}))
+
+    def test_shared_db_active_connection_preserves_interrupted_scratch(self):
+        from scripts.verification import ai_employee_qa as qa
+
+        root = qa_run_path(self.name)
+        root.mkdir(parents=True)
+        manifest = self._owned_prepare_manifest(root, status="allocated", dedicated=False)
+        write_json(root / "manifest.json", manifest)
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = ("ai_employee_qa:" + str(self.run_id),)
+        cursor.execute.side_effect = [None, RuntimeError("database is in use")]
+        try:
+            with patch.object(qa, "pg_connect", return_value=connection), patch.object(
+                qa, "_prepare_has_active_process", return_value=False
+            ):
+                self.assertFalse(_cleanup_failed_prepare(root, manifest, {}))
+            self.assertTrue(root.exists())
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

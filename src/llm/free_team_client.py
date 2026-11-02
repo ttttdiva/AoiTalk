@@ -13,6 +13,8 @@ from typing import Any, Awaitable, Callable, Dict, Generator, Optional
 
 from ..memory.history import HistoryManager
 from ..services.free_team_service import (
+    FreeTeamCooldownWait,
+    FreeTeamQuotaExhausted,
     FreeTeamUnavailableError,
     acquire_route_lease,
     finalize_route_lease,
@@ -23,6 +25,8 @@ from ..services.free_team_service import (
 from ..services.turn_context import (
     AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
     get_turn_context,
+    override_turn_context,
+    reset_turn_context,
 )
 from .context_snapshot import validate_context_manifest_metadata
 from .provider_capabilities import ProviderCapabilities
@@ -101,6 +105,11 @@ def _usage_from_client(client: Any) -> dict[str, Any]:
             "total_tokens",
             "requests",
             "usd",
+            "cached_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cache_provider",
+            "metrics_source",
         }
         and value is not None
     }
@@ -202,6 +211,33 @@ async def _cleanup_client(client: Any) -> None:
     result = cleanup()
     if inspect.isawaitable(result):
         await result
+
+
+def project_free_team_target_config(config: Any, lease: Any) -> tuple[Any, dict[str, Any]]:
+    """Project one Free Team lease onto a request-scoped provider config."""
+
+    from .manager import TargetConfig
+
+    provider = str(getattr(lease, "provider", "") or "").strip().lower()
+    options = {
+        **dict(getattr(lease, "provider_options", {}) or {}),
+        "max_output_tokens": int(getattr(lease, "max_output_tokens", 1) or 1),
+    }
+    target_config = config
+    if provider == "openrouter":
+        options["_free_team_openrouter_request"] = True
+    if provider == "gemini":
+        api_key = str(getattr(lease, "api_key", "") or "").strip()
+        if not api_key:
+            raise FreeTeamUnavailableError("free_team_gemini_credential_missing")
+        target_config = TargetConfig(config, {"gemini_api_key": api_key})
+    if (
+        provider == "openai"
+        and str(getattr(lease, "billing_mode", "paid") or "paid").strip().lower()
+        == "complimentary"
+    ):
+        target_config = TargetConfig(config, {"openai.billing_mode": "complimentary"})
+    return target_config, options
 
 
 def _set_isolated_prompt_on_target(target: Any, prompt: str) -> None:
@@ -496,7 +532,7 @@ class FreeTeamRoutingClient:
         steering_callback: Optional[SteeringCallback] = None,
         system_prompt: str | None = None,
     ) -> str:
-        from .manager import TargetConfig, create_llm_client_for_target
+        from .manager import create_llm_client_for_target
 
         isolated_controller_turn = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
@@ -583,6 +619,7 @@ class FreeTeamRoutingClient:
             ),
         )
 
+        provider_request_started_any = False
         for fallback_count in range(max_fallbacks + 1):
             history_snapshot = {
                 "history": [dict(item) for item in self.history_manager.history],
@@ -599,15 +636,29 @@ class FreeTeamRoutingClient:
                     dict(item) for item in self._last_model_transcript
                 ],
             }
-            lease = await acquire_route_lease(
-                intent,
-                prompt=reservation_prompt,
-                required_capabilities=required,
-                excluded_candidate_ids=excluded,
-                fallback_count=fallback_count,
-                config=self.config,
-                meter_per_request=True,
-            )
+            try:
+                lease = await acquire_route_lease(
+                    intent,
+                    prompt=reservation_prompt,
+                    required_capabilities=required,
+                    excluded_candidate_ids=excluded,
+                    fallback_count=fallback_count,
+                    config=self.config,
+                    meter_per_request=True,
+                    strict_complimentary_only=bool(
+                        self.config.get("runtime.free_team_strict_complimentary_only", False)
+                    ),
+                )
+            except (FreeTeamQuotaExhausted, FreeTeamCooldownWait):
+                if provider_request_started_any:
+                    if last_error is not None and _error_class(last_error) == "429":
+                        # Preserve an explicit 429 so task-level retry policy
+                        # can recheck candidate cooldowns before its next Run.
+                        raise last_error
+                    raise FreeTeamUnavailableError(
+                        "free_team_quota_changed_after_provider_attempt"
+                    ) from None
+                raise
             excluded.add(lease.candidate_id)
             target: Any = None
             side_effect_started = False
@@ -638,15 +689,9 @@ class FreeTeamRoutingClient:
                         "CLIクリップ取り込みは、ツール無効化を検証済みのCodex CLIでのみ利用できます"
                     )
 
-                target_provider_options = {
-                    **lease.provider_options,
-                    "max_output_tokens": lease.max_output_tokens,
-                }
-                if str(lease.provider or "").strip().lower() == "openrouter":
-                    # OpenRouter Free Team leases must retain the complimentary
-                    # provider guard. Ordinary OpenRouter target clients do not
-                    # receive this marker or its zero-price request policy.
-                    target_provider_options["_free_team_openrouter_request"] = True
+                target_config, target_provider_options = project_free_team_target_config(
+                    self.config, lease
+                )
                 if isolated_controller_turn:
                     # Help is a server-grounded, tool-free controller turn.
                     # Disable tools before constructing the routed target so
@@ -672,21 +717,6 @@ class FreeTeamRoutingClient:
                 if self._lightweight_ephemeral_client:
                     target_provider_options["lightweight_client"] = True
 
-                target_config = self.config
-                # ``create_llm_client_for_target`` projects the selected
-                # candidate onto an ordinary provider config. Preserve the
-                # credential's complimentary contract across that projection
-                # so the OpenAI egress guard cannot mistake a Free Team lease
-                # for an ordinary paid request.
-                if (
-                    str(getattr(lease, "billing_mode", "paid") or "paid").strip().lower()
-                    == "complimentary"
-                    and str(lease.provider or "").strip().lower() == "openai"
-                ):
-                    target_config = TargetConfig(
-                        self.config,
-                        {"openai.billing_mode": "complimentary"},
-                    )
                 target = create_llm_client_for_target(
                     target_config,
                     provider=lease.provider,
@@ -721,11 +751,22 @@ class FreeTeamRoutingClient:
                         "max_tokens": lease.max_output_tokens,
                     }
                 provider_request_started = True
-                with (cli_lease_termination_scope(lease) if lease.provider in CLI_PROVIDERS else nullcontext(None)) as termination_receipt:
-                    response = await asyncio.wait_for(
-                        _call_target_method(target, method_name, prompt, **kwargs),
-                        timeout=max(1, lease.timeout_seconds),
-                    )
+                provider_request_started_any = True
+                reservation_context_token = override_turn_context(
+                    quota_reservation_id=str(lease.reservation_id),
+                    billing_scope_id=(
+                        str(getattr(lease, "billing_scope_id", "") or "").strip()
+                        or None
+                    ),
+                )
+                try:
+                    with (cli_lease_termination_scope(lease) if lease.provider in CLI_PROVIDERS else nullcontext(None)) as termination_receipt:
+                        response = await asyncio.wait_for(
+                            _call_target_method(target, method_name, prompt, **kwargs),
+                            timeout=max(1, lease.timeout_seconds),
+                        )
+                finally:
+                    reset_turn_context(reservation_context_token)
                 latency_ms = (time.perf_counter() - started) * 1000
                 usage = _usage_from_client(target)
                 await finalize_route_lease(

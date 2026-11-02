@@ -74,6 +74,7 @@ import {
 } from "../../../lib/task-date-filter";
 
 const FILTERS = ["all", "open", "in_progress", "closed"] as const;
+const EMPTY_TASKS: Task[] = [];
 const FILTER_LABELS: Record<string, string> = {
   all: "すべて",
   open: "未着手",
@@ -614,6 +615,7 @@ export default function TaskListScreen() {
     selectedProject,
     selectedSpaceId,
     selectedSpace,
+    scopeHydrated = true,
     refreshProjects,
   } = useProject();
   const { isAuthenticated, isAnonymous, user } = useAuth();
@@ -622,7 +624,26 @@ export default function TaskListScreen() {
     : isAnonymous
       ? "anonymous"
       : "signed_out";
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const scopeKey = JSON.stringify([authScope, scopeHydrated, selectedProjectId, selectedSpaceId]);
+  const scopeKeyRef = useRef(scopeKey);
+  scopeKeyRef.current = scopeKey;
+  const [taskSnapshot, setTaskSnapshot] = useState<{
+    scope: string;
+    tasks: Task[];
+    ready: boolean;
+    error: string | null;
+  } | null>(null);
+  const currentSnapshot = taskSnapshot?.scope === scopeKey ? taskSnapshot : null;
+  const tasks = currentSnapshot?.tasks ?? EMPTY_TASKS;
+  const setTasks = useCallback((update: React.SetStateAction<Task[]>) => {
+    setTaskSnapshot((previous) => {
+      if (!previous || previous.scope !== scopeKey) return previous;
+      return {
+        ...previous,
+        tasks: typeof update === "function" ? update(previous.tasks) : update,
+      };
+    });
+  }, [scopeKey]);
   const [filter, setFilter] = useState<string>("all");
   const [showFuture, setShowFuture] = useState(false);
   const [dateFilter, setDateFilter] = useState<TaskDateFilter>(EMPTY_TASK_DATE_FILTER);
@@ -634,10 +655,10 @@ export default function TaskListScreen() {
   const [searchExpanded, setSearchExpanded] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const completionRefreshToken = useTaskCompletionUndoStore(
     (state) => state.refreshToken,
   );
+  const previousCompletionRefreshToken = useRef(completionRefreshToken);
   const [showCommandDialog, setShowCommandDialog] = useState(false);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [commandBusy, setCommandBusy] = useState(false);
@@ -666,6 +687,9 @@ export default function TaskListScreen() {
 
   const loadTasks = useCallback(
     async (options?: { force?: boolean; localOnly?: boolean }) => {
+    if (!scopeHydrated) {
+      return;
+    }
     const requestId = ++loadRequestRef.current;
     try {
       const list = options?.localOnly
@@ -680,23 +704,28 @@ export default function TaskListScreen() {
             selectedSpaceId ? { space_id: selectedSpaceId } : {},
             options,
           );
-      if (requestId === loadRequestRef.current) {
+      if (requestId === loadRequestRef.current && scopeKeyRef.current === scopeKey) {
         const canonical = sortTasksCanonical(list);
         tasksRef.current = canonical;
-        setTasks(canonical);
-        setLoadError(null);
+        setTaskSnapshot({ scope: scopeKey, tasks: canonical, ready: true, error: null });
       }
     } catch (error) {
-      if (requestId === loadRequestRef.current) {
-        setLoadError(
-          error instanceof Error ? error.message : "タスク取得に失敗しました",
-        );
+      if (requestId === loadRequestRef.current && scopeKeyRef.current === scopeKey) {
+        setTaskSnapshot((previous) => ({
+          scope: scopeKey,
+          tasks: previous?.scope === scopeKey ? previous.tasks : EMPTY_TASKS,
+          ready: previous?.scope === scopeKey ? previous.ready : false,
+          error: error instanceof Error ? error.message : "タスク取得に失敗しました",
+        }));
       }
     }
-  }, [authScope, selectedProjectId, selectedSpaceId]);
+  }, [scopeKey, scopeHydrated, selectedProjectId, selectedSpaceId]);
+
+  const lastFocusedLoadRef = useRef<typeof loadTasks | null>(null);
 
   useFocusEffect(
     useCallback(() => {
+      lastFocusedLoadRef.current = loadTasks;
       let active = true;
       const unsubscribeGeneral = useSyncStatusStore.subscribe((state, previous) => {
         if (state.generalAuthScope !== previous.generalAuthScope &&
@@ -707,6 +736,14 @@ export default function TaskListScreen() {
         if (state.generalRevision === previous.generalRevision ||
             state.generalAuthScope !== authScope ||
             AppState.currentState !== "active") return;
+        void loadTasks({ localOnly: true });
+      });
+      const unsubscribeTaskList = tasksRepo.subscribeListRefresh(({ authScope: refreshedAuthScope }) => {
+        if (
+          !active ||
+          refreshedAuthScope !== authScope ||
+          AppState.currentState !== "active"
+        ) return;
         void loadTasks({ localOnly: true });
       });
       const appStateSubscription = AppState.addEventListener("change", (state) => {
@@ -729,12 +766,16 @@ export default function TaskListScreen() {
         active = false;
         ++loadRequestRef.current;
         unsubscribeGeneral();
+        unsubscribeTaskList();
         appStateSubscription.remove();
       };
     }, [authScope, loadTasks, refreshProjects]),
   );
 
   useEffect(() => {
+    if (previousCompletionRefreshToken.current === completionRefreshToken &&
+        lastFocusedLoadRef.current === loadTasks) return;
+    previousCompletionRefreshToken.current = completionRefreshToken;
     void loadTasks();
   }, [completionRefreshToken, loadTasks]);
 
@@ -797,7 +838,9 @@ export default function TaskListScreen() {
   }, [filteredTasks, tasks]);
 
   const scopeSwitcherLabel =
-    selectedProject?.name ?? selectedSpace?.name ?? "全体";
+    selectedProject?.name ??
+    selectedSpace?.name ??
+    (scopeHydrated ? "全体" : "未確定");
 
   const selectedTasks = useMemo(
     () => tasks.filter((task) => selectedIds.has(task.id)),
@@ -879,7 +922,7 @@ export default function TaskListScreen() {
         });
       }
     },
-    [loadTasks, statusBusyIds],
+    [loadTasks, setTasks, statusBusyIds],
   );
 
   const updateTaskStatusFromMenu = useCallback(
@@ -1177,7 +1220,7 @@ export default function TaskListScreen() {
         );
       }
     },
-    [applyTopLevelOrder, selectedProjectId],
+    [applyTopLevelOrder, selectedProjectId, setTasks],
   );
 
   const renderItem = ({ item }: { item: Task }) => {
@@ -1215,7 +1258,7 @@ export default function TaskListScreen() {
   return (
     <View style={styles.container}>
       <ScreenHeader
-        title="タスク"
+        title="Tasks"
         compact
       />
       <Surface style={styles.header} elevation={1}>
@@ -1420,7 +1463,7 @@ export default function TaskListScreen() {
           ListEmptyComponent={
             <View style={styles.empty}>
               <Text style={styles.emptyText}>
-                {loadError ?? "タスクがありません"}
+                {currentSnapshot?.error ?? (scopeHydrated && currentSnapshot?.ready ? "タスクがありません" : "読み込み中…")}
               </Text>
             </View>
           }

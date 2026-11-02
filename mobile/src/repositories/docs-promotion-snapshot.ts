@@ -14,6 +14,8 @@ export type DocsPromotionDirtyRows = {
   fieldValues: Set<string>;
 };
 
+export type DocsPromotionKeysByTable = Map<string, Set<string>>;
+
 export type DocsPromotionMembershipSnapshot = {
   refs: Map<string, number>;
   scoped: Map<string, Set<string>>;
@@ -256,6 +258,85 @@ export async function loadDocsMembershipSnapshotTx(
   return { refs, scoped, readonlyNodes, needsUpsert };
 }
 
+/**
+ * Load membership only for staged or stale keys during a targeted promotion.
+ * Fallback promotions use the same reader for staged and explicitly stale
+ * keys. Each supplied authority array is reconciled in SQLite; tables without
+ * authority retain their membership without materializing the account-wide
+ * projection in JavaScript.
+ */
+export async function loadDocsMembershipSnapshotForKeysTx(
+  tx: DocsSqliteAsyncTransaction,
+  authScope: string,
+  scopeKey: string,
+  scopeMeta: {
+    workspace_id?: string;
+    project_id?: string | null;
+    access?: string;
+    read_only?: boolean;
+  } | undefined,
+  keysByTable: DocsPromotionKeysByTable,
+  assertActive: () => void = () => undefined,
+): Promise<DocsPromotionMembershipSnapshot> {
+  const refs = new Map<string, number>();
+  const scoped = new Map<string, Set<string>>();
+  const readonlyNodes = new Set<string>();
+  const needsUpsert = new Map<string, Set<string>>();
+  const targetWorkspaceId = scopeMeta?.workspace_id;
+  const targetProjectId = scopeMeta?.project_id ?? null;
+  const desiredReadOnly = scopeMeta?.read_only == null ? null : scopeMeta.read_only ? 1 : 0;
+  for (const [table, keys] of keysByTable) {
+    const values = [...keys];
+    if (!values.length) continue;
+    assertActive();
+    const rows = values.length > 300
+      ? await tx.getAllAsync<MembershipScanRow>(
+        `SELECT scope_key, scope_id, project_id, table_name, entity_key, state, access, read_only
+           FROM docs_scope_membership
+          WHERE auth_scope = ? AND table_name = ?
+            AND entity_key IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+        authScope,
+        table,
+        JSON.stringify(values),
+      )
+      : await tx.getAllAsync<MembershipScanRow>(
+        `SELECT scope_key, scope_id, project_id, table_name, entity_key, state, access, read_only
+           FROM docs_scope_membership
+          WHERE auth_scope = ? AND table_name = ? AND entity_key IN (${values.map(() => "?").join(", ")})`,
+        authScope,
+        table,
+        ...values,
+      );
+      for (const row of rows) {
+        if (row.state !== "deleted") {
+          const refKey = `${row.table_name}:${row.entity_key}`;
+          refs.set(refKey, (refs.get(refKey) ?? 0) + 1);
+        }
+        if (row.scope_key !== scopeKey || row.state === "deleted") continue;
+        const bucket = scoped.get(row.table_name) ?? new Set<string>();
+        bucket.add(row.entity_key);
+        scoped.set(row.table_name, bucket);
+        if (row.table_name === "knowledge_nodes" && (
+          row.state !== "active" || sqliteBoolean(row.read_only) || row.access === "read"
+        )) readonlyNodes.add(row.entity_key);
+        const readonly = row.table_name === "knowledge_nodes" && readonlyNodes.has(row.entity_key);
+        const metadataNeedsRefresh = Boolean(targetWorkspaceId)
+          && (row.scope_id !== targetWorkspaceId
+            || (row.project_id ?? null) !== targetProjectId);
+        const accessNeedsRefresh = row.access !== (readonly ? "read" : scopeMeta?.access ?? null);
+        const currentReadOnly = row.read_only == null ? null : sqliteBoolean(row.read_only) ? 1 : 0;
+        const readOnlyNeedsRefresh = currentReadOnly !== (readonly ? 1 : desiredReadOnly);
+        if (metadataNeedsRefresh || row.state !== (readonly ? "readonly" : "active")
+          || accessNeedsRefresh || readOnlyNeedsRefresh) {
+          const refresh = needsUpsert.get(row.table_name) ?? new Set<string>();
+          refresh.add(row.entity_key);
+          needsUpsert.set(row.table_name, refresh);
+        }
+    }
+  }
+  return { refs, scoped, readonlyNodes, needsUpsert };
+}
+
 export async function loadDocsQuarantineMembershipSnapshotTx(
   tx: DocsSqliteAsyncTransaction,
   authScope: string,
@@ -293,10 +374,47 @@ export async function loadDocsScopedOutboxProtectionTx(
   authScope: string,
   scopeKey: string,
   tableNames: readonly string[],
+  targetKeys?: DocsPromotionKeysByTable,
 ): Promise<Map<string, Set<string>>> {
   const allowed = new Set(tableNames);
   const protection = new Map<string, Set<string>>();
   type Row = { op_id: string; table_name: string; entity_id: string };
+  if (targetKeys) {
+    for (const table of tableNames) {
+      const values = [...(targetKeys.get(table) ?? [])];
+      if (!values.length) continue;
+      const rows = values.length > 300
+        ? await tx.getAllAsync<Row>(
+          `SELECT op_id, table_name, entity_id
+             FROM outbox
+            WHERE (auth_scope IS NULL OR auth_scope = ?)
+              AND docs_scope_key = ? AND table_name = ?
+              AND entity_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+          authScope,
+          scopeKey,
+          table,
+          JSON.stringify(values),
+        )
+        : await tx.getAllAsync<Row>(
+          `SELECT op_id, table_name, entity_id
+             FROM outbox
+            WHERE (auth_scope IS NULL OR auth_scope = ?)
+              AND docs_scope_key = ? AND table_name = ?
+              AND entity_id IN (${values.map(() => "?").join(", ")})`,
+          authScope,
+          scopeKey,
+          table,
+          ...values,
+        );
+      for (const row of rows) {
+        if (!allowed.has(row.table_name)) continue;
+        const bucket = protection.get(row.table_name) ?? new Set<string>();
+        bucket.add(row.entity_id);
+        protection.set(row.table_name, bucket);
+      }
+    }
+    return protection;
+  }
   await forEachSnapshotPage<Row>(
     (cursor) =>
       cursor == null
@@ -512,5 +630,66 @@ export async function loadDocsDirtyRowsPagedTx(
     (row) => fieldValues.add(`${row.node_id}:${row.field_id}`),
   );
 
+  return { nodes, supertags, nodeSupertags, fieldValues };
+}
+
+/** Read dirty protection only for keys changed/reconciled by an incremental run. */
+export async function loadDocsDirtyRowsForKeysTx(
+  tx: DocsSqliteAsyncTransaction,
+  keysByTable: DocsPromotionKeysByTable,
+): Promise<DocsPromotionDirtyRows> {
+  const nodes = new Set<string>();
+  const supertags = new Set<string>();
+  const nodeSupertags = new Set<string>();
+  const fieldValues = new Set<string>();
+  const loadScalarIds = async (table: string, target: Set<string>): Promise<void> => {
+    const ids = [...(keysByTable.get(table) ?? [])];
+    if (!ids.length) return;
+    const rows = ids.length > 500
+      ? await tx.getAllAsync<{ id: string }>(
+        `SELECT id FROM ${table}
+          WHERE dirty = 1 AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+        JSON.stringify(ids),
+      )
+      : await tx.getAllAsync<{ id: string }>(
+        `SELECT id FROM ${table} WHERE dirty = 1 AND id IN (${ids.map(() => "?").join(", ")})`,
+        ...ids,
+      );
+    for (const row of rows) target.add(row.id);
+  };
+  await loadScalarIds("knowledge_nodes", nodes);
+  await loadScalarIds("knowledge_supertags", supertags);
+  const loadComposite = async (
+    table: string,
+    target: Set<string>,
+    leftColumn: string,
+    rightColumn: string,
+  ): Promise<void> => {
+    const pairs = [...(keysByTable.get(table) ?? [])].map((key) => {
+      const separator = key.indexOf(":");
+      return separator < 0 ? [key, ""] : [key.slice(0, separator), key.slice(separator + 1)];
+    });
+    if (!pairs.length) return;
+    if (pairs.length > 400) {
+      const rows = await tx.getAllAsync<Record<string, string>>(
+        `SELECT ${leftColumn}, ${rightColumn} FROM ${table}
+          WHERE dirty = 1 AND (${leftColumn}, ${rightColumn}) IN (
+            SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)
+          )`,
+        JSON.stringify(pairs),
+      );
+      for (const row of rows) target.add(`${row[leftColumn]}:${row[rightColumn]}`);
+      return;
+    }
+    const values = pairs.map(() => "(?, ?)").join(", ");
+    const rows = await tx.getAllAsync<Record<string, string>>(
+      `SELECT ${leftColumn}, ${rightColumn} FROM ${table}
+        WHERE dirty = 1 AND (${leftColumn}, ${rightColumn}) IN (${values})`,
+      ...pairs.flat(),
+    );
+    for (const row of rows) target.add(`${row[leftColumn]}:${row[rightColumn]}`);
+  };
+  await loadComposite("knowledge_node_supertags", nodeSupertags, "node_id", "supertag_id");
+  await loadComposite("knowledge_field_values", fieldValues, "node_id", "field_id");
   return { nodes, supertags, nodeSupertags, fieldValues };
 }

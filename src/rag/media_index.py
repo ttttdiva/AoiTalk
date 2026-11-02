@@ -394,6 +394,13 @@ class MediaIndexService:
             return True
         if self.client is None:
             cfg = self.config.qdrant
+            if not cfg.local_path:
+                from ..utils import qdrant_readiness
+
+                try:
+                    await qdrant_readiness.await_ready()
+                except qdrant_readiness.QdrantNotReady:
+                    return False
             self.client = (
                 (await self._io(SharedQdrantClient.get_client, cfg.local_path))
                 if cfg.local_path

@@ -61,6 +61,14 @@ _DEDUPE_LOCKS_GUARD = threading.Lock()
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_\-]{3,}")
 _CJK_RUN_RE = re.compile(r"[ぁ-んァ-ン一-龥]{2,}")
 _ALWAYS_ON_MEMORY_TYPES = {"preference", "constraint", "instruction"}
+_ALWAYS_ON_MEMORY_IMPORTANCE = 8
+
+
+def _is_always_on_guidance(memory_type: Any, importance: Any) -> bool:
+    return (
+        str(memory_type or "").casefold() in _ALWAYS_ON_MEMORY_TYPES
+        and int(importance or 0) >= _ALWAYS_ON_MEMORY_IMPORTANCE
+    )
 _CJK_STOP_BIGRAMS = {
     "して",
     "する",
@@ -188,7 +196,7 @@ def _memory_selection(
 
     memory_type = str(item.get("memory_type") or "").casefold()
     importance = int(item.get("importance") or 0)
-    if memory_type in _ALWAYS_ON_MEMORY_TYPES and importance >= 8:
+    if _is_always_on_guidance(memory_type, importance):
         return True, "high_importance_user_guidance", 0
     if (
         importance >= 7
@@ -4850,6 +4858,10 @@ class ScopedMemoryService:
             protected = list((await session.execute(statement.where(or_(
                 ContextMemory.is_pinned.is_(True), ContextMemory.importance >= 9)).order_by(
                     ContextMemory.is_pinned.desc(), ContextMemory.importance.desc(), ContextMemory.id).limit(candidate_limit))).scalars())
+            guidance = list((await session.execute(statement.where(
+                ContextMemory.memory_type.in_(_ALWAYS_ON_MEMORY_TYPES),
+                ContextMemory.importance >= _ALWAYS_ON_MEMORY_IMPORTANCE,
+            ).order_by(ContextMemory.importance.desc(), ContextMemory.id).limit(candidate_limit))).scalars())
         memory_config = {}
         getter = getattr(self._config, "get_memory_config", None)
         if callable(getter):
@@ -4886,13 +4898,27 @@ class ScopedMemoryService:
                     [uuid.UUID(item["id"]) for item in hits])))).scalars())
             ranks = {item["id"]: rank for rank, item in enumerate(hits)}
             semantic = [(0, row, "keyword_and_scope_match") for row in sorted(lexical, key=lambda row: ranks[str(row.id)])]
+        # Preserve the existing protected shortlist before sharing remaining
+        # capacity between guidance and matches.
         rows = {str(row.id): row for row in protected}
-        semantic_scores = {}
-        for score, row, _ in semantic:
-            if str(row.id) in rows or len(rows) < candidate_limit:
-                rows[str(row.id)] = row
-                if meta["engine"] == "eg2":
-                    semantic_scores[str(row.id)] = score
+        sources = [iter((0, row, "guidance") for row in guidance), iter(semantic)]
+        while sources and len(rows) < candidate_limit:
+            remaining = []
+            for source in sources:
+                entry = next(source, None)
+                while entry is not None and str(entry[1].id) in rows:
+                    entry = next(source, None)
+                if entry is None:
+                    continue
+                remaining.append(source)
+                _, row, _ = entry
+                if len(rows) < candidate_limit:
+                    rows[str(row.id)] = row
+            sources = remaining
+        semantic_scores = {
+            str(row.id): score for score, row, _ in semantic
+            if meta["engine"] == "eg2" and str(row.id) in rows
+        }
         return list(rows.values()), semantic_scores, meta
 
     async def _current_context_candidates(self, scope_ids, scored):
@@ -4965,6 +4991,8 @@ class ScopedMemoryService:
                 if str(row.id) in semantic_scores
                 else "keyword_and_scope_match"
                 if keyword_overlap
+                else "high_importance_user_guidance"
+                if _is_always_on_guidance(row.memory_type, row.importance)
                 else "scope_priority"
             )
             scored.append((score, row, reason))
@@ -5005,7 +5033,8 @@ class ScopedMemoryService:
             used_chars = 0
             for score, row, reason in scored:
                 relevance_probability = relevance.get(str(row.id))
-                protected = bool(row.is_pinned) or int(row.importance or 0) >= 9
+                protected = (bool(row.is_pinned) or int(row.importance or 0) >= 9
+                             or _is_always_on_guidance(row.memory_type, row.importance))
                 if relevance_meta.get("engine") == "jev" and relevance_probability is None and not protected:
                     trace.append({"memory_id": str(row.id), "scope": row.scope_type, "reason": "jev_not_evaluated",
                                   "score": round(score, 4), "excluded": True, "cost_chars": len(str(row.content or "")) + 64})

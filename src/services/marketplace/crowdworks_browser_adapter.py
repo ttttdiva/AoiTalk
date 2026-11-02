@@ -9,8 +9,9 @@ from typing import Any
 
 from ..browser_agent_service import BrowserAgentService
 from ..integration_action_registry import DefinitelyNotSent, IntegrationActionResult
-from ..pc_bridge_service import RemoteControlBridge, get_pc_bridge_hub
+from .bridge_inspection import require_crowdworks_url
 from .crowdworks_action import CrowdWorksApplicationPayload
+from .crowdworks_browser_provider import resolve_browser_bridge
 
 
 _CONFIRMATION_MARKERS = (
@@ -33,11 +34,12 @@ class CrowdWorksBrowserAdapter:
         return None
 
     def _browser_client(self, routing):
-        """Browser client for the proposing Agent's ``operator`` Subagent.
+        """Browser client for the proposing Agent's frozen role route.
 
         An application proposed by an Operations Agent is submitted with the
-        route of its exact AgentRevision.  Only an action without an Agent
-        origin (legacy/human-created) uses the configured Main model.
+        route snapshot of its exact AgentRevision.  The legacy pin values
+        accepted below are read-only audit data from that snapshot.  Only an
+        action without an Agent origin uses the configured Main model.
         """
 
         from ...llm.manager import create_llm_client, create_llm_client_for_target
@@ -57,10 +59,17 @@ class CrowdWorksBrowserAdapter:
             pins = AgentRoutingPins(
                 agent_id=routing.get("agent_id"),
                 agent_revision_id=routing.get("agent_revision_id"),
-                agent_team_id=str(routing.get("agent_team_id") or ""),
-                execution_profile_id=str(routing.get("execution_profile_id") or ""),
-                allowed_subagent_ids=tuple(routing.get("allowed_subagent_ids") or ()),
+                agent_team_id="",
+                execution_profile_id="",
+                allowed_subagent_ids=(),
                 route_snapshot=routing["route_snapshot"],
+                model_overrides=routing.get("model_overrides"),
+                tool_ids=(
+                    tuple(routing["tool_ids"])
+                    if isinstance(routing.get("tool_ids"), (list, tuple))
+                    else None
+                ),
+                delegate_policy=routing.get("delegate_policy"),
             )
             route = resolve_agent_role_route(self.config, pins, "operator")
         except AgentModelRouteError as exc:
@@ -86,15 +95,23 @@ class CrowdWorksBrowserAdapter:
     ):
         data = CrowdWorksApplicationPayload.model_validate(payload)
         owner = str(connection.get("owner_user_id") or "")
-        device = str(connection.get("device_id") or "")
-        if not owner or not device:
+        device_value = connection.get("device_id")
+        device = str(device_value) if device_value else None
+        if not owner:
             raise DefinitelyNotSent("crowdworks_bridge_binding_missing")
 
-        hub = get_pc_bridge_hub()
-        try:
-            bridge = RemoteControlBridge(owner, device, hub)
-        except Exception as exc:
-            raise DefinitelyNotSent("crowdworks_bridge_offline") from exc
+        browser = await resolve_browser_bridge(owner, config=self.config, device_id=device)
+        if browser.backend == "bridge" and not device:
+            raise DefinitelyNotSent("crowdworks_bridge_binding_missing")
+        if not browser.ready or browser.bridge is None:
+            raise DefinitelyNotSent(browser.reason_code or "browser_backend_unavailable")
+        bridge = browser.bridge
+        source_url = data.source_url
+        if browser.backend == "local":
+            try:
+                source_url = require_crowdworks_url(source_url)
+            except RuntimeError:
+                raise DefinitelyNotSent("crowdworks_selected_origin_required") from None
 
         from ..session_llm_generation import cleanup_ephemeral_llm_client
 
@@ -111,25 +128,26 @@ class CrowdWorksBrowserAdapter:
         )
         try:
             tab_id = None
-            try:
-                tabs = await bridge.request("tabs")
-                rows = tabs.get("tabs") if isinstance(tabs, dict) else []
-                if isinstance(rows, list):
-                    for item in rows:
-                        if not isinstance(item, dict):
-                            continue
-                        url = str(item.get("url") or "")
-                        if url.startswith("https://crowdworks.jp/public/jobs/") or url.startswith("https://www.crowdworks.jp/public/jobs/"):
-                            value = item.get("tab_id")
-                            if isinstance(value, int):
-                                tab_id = value
-                                break
-            except Exception:
-                tab_id = None
-            if tab_id is not None:
-                await bridge.request("wake_tab", tab_id=tab_id)
+            if browser.backend != "local":
+                try:
+                    tabs = await bridge.request("tabs")
+                    rows = tabs.get("tabs") if isinstance(tabs, dict) else []
+                    if isinstance(rows, list):
+                        for item in rows:
+                            if not isinstance(item, dict):
+                                continue
+                            url = str(item.get("url") or "")
+                            if url.startswith("https://crowdworks.jp/public/jobs/") or url.startswith("https://www.crowdworks.jp/public/jobs/"):
+                                value = item.get("tab_id")
+                                if isinstance(value, int):
+                                    tab_id = value
+                                    break
+                except Exception:
+                    tab_id = None
+                if tab_id is not None:
+                    await bridge.request("wake_tab", tab_id=tab_id)
             service = BrowserAgentService(self.config, client=client, bridge=bridge)
-            result = await service.run_goal(goal=goal, start_url=data.source_url, tab_id=tab_id)
+            result = await service.run_goal(goal=goal, start_url=source_url, tab_id=tab_id)
         finally:
             await cleanup_ephemeral_llm_client(client)
 

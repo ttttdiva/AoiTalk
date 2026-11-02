@@ -53,6 +53,11 @@ SUBPROCESS_ENV_ALLOWLIST = frozenset(
 SUBPROCESS_SECRET_ENV_NAMES = frozenset(
     {
         "OPENAI_API_KEY",
+        "OPENAI_ADMIN_KEY",
+        "OPENAI_ADMIN_KEY_FILE",
+        # Obsolete Free Team input remains sensitive during migration of old
+        # environments; never forward it to a child process.
+        "OPENAI_FREE_TEAM_API_KEY",
         "ANTHROPIC_API_KEY",
         "GOOGLE_API_KEY",
         "DATABASE_URL",
@@ -64,6 +69,9 @@ SUBPROCESS_SECRET_ENV_NAMES = frozenset(
         "CHATGPT_SESSION_STATE",
         "BROWSER_LOGIN_STATE",
     }
+)
+SUBPROCESS_NEVER_ENV_NAMES = frozenset(
+    {"OPENAI_ADMIN_KEY", "OPENAI_ADMIN_KEY_FILE"}
 )
 
 
@@ -91,6 +99,7 @@ def _is_sensitive_env_name(name: str) -> bool:
         marker in normalized
         for marker in (
             "API_KEY",
+            "ADMIN_KEY",
             "ACCESS_KEY",
             "PASSWORD",
             "TOKEN",
@@ -189,6 +198,8 @@ def build_aoitalk_subprocess_env(
     if extra_env:
         for key, value in extra_env.items():
             normalized_key = str(key).upper()
+            if normalized_key in SUBPROCESS_NEVER_ENV_NAMES:
+                continue
             if (
                 _is_sensitive_env_name(normalized_key)
                 and normalized_key not in explicitly_authorized_sensitive

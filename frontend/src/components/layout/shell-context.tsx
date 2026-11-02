@@ -16,6 +16,7 @@ import {
 } from "react";
 import { usePathname } from "next/navigation";
 import { DOUBLE_ESCAPE_RESET_EVENT } from "@/lib/double-escape";
+import { safeSessionStorage } from "@/lib/safe-storage";
 
 export type WorkspaceShellRegistrationOptions = {
   /** Optional stable key when a page owns more than one registration. */
@@ -192,9 +193,11 @@ export type ShellChromeContextValue = {
 };
 
 const ShellChromeContext = createContext<ShellChromeContextValue | null>(null);
+export const AOI_DOTS_OPEN_SESSION_STORAGE_KEY = "aoitalk:ui:aoi-dots-open:v1";
 
 export function ShellChromeProvider({ children }: { children: ReactNode }) {
   const [aoiDotsOpen, setAoiDotsOpen] = useState(false);
+  const [aoiDotsOpenStorageReady, setAoiDotsOpenStorageReady] = useState(false);
   const [runtimePanelOpen, setRuntimePanelOpen] = useState(false);
   const [notificationPanelOpen, setNotificationPanelOpenState] =
     useState(false);
@@ -203,6 +206,27 @@ export function ShellChromeProvider({ children }: { children: ReactNode }) {
   const [workspaceShellRegistrations, setWorkspaceShellRegistrations] = useState<
     Record<string, WorkspaceShellRegistrationEntry>
   >({});
+
+  useEffect(() => {
+    const savedOpen = safeSessionStorage.getItem(
+      AOI_DOTS_OPEN_SESSION_STORAGE_KEY,
+    );
+    // Start closed for SSR, then hydrate the tab-local preference without
+    // reading browser storage during render. Storage failures leave the panel
+    // closed and do not affect later in-memory toggles.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setAoiDotsOpen(savedOpen === "true");
+    setAoiDotsOpenStorageReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!aoiDotsOpenStorageReady) return;
+    safeSessionStorage.setItem(
+      AOI_DOTS_OPEN_SESSION_STORAGE_KEY,
+      String(aoiDotsOpen),
+    );
+  }, [aoiDotsOpen, aoiDotsOpenStorageReady]);
+
   const pathname = useOptionalPathname();
   const contextRailPresentation = Object.values(workspaceShellRegistrations)
     .filter(entry => entry.routeKey === (pathname ?? "/") && entry.contextRail !== undefined)

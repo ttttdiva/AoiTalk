@@ -1,8 +1,8 @@
-"""無料Teamの routing/profile overlay 用の初期値。
+"""無料Teamの候補プールと quota 用の初期値。
 
-Free Team は Agent Team の topology を所有しない。ここで定義するのは、
-``routing_profiles.free-team`` が参照する候補プールと、canonical な
-``agent_team.llm_profiles`` に対応する pool target だけである。
+Free Team は Agent の topology を所有しない。ここで定義するのは、
+``routing_profiles.free-team`` が参照する候補、quota、pool だけである。
+役割から pool への解決は ``model_roles`` が所有する。
 """
 
 from __future__ import annotations
@@ -11,19 +11,25 @@ import copy
 from typing import Any
 
 
+OPENROUTER_FREE_DAILY_TIERS = (50, 1000)
+OPENROUTER_DEFAULT_FREE_DAILY_TIER = 1000
+OPENROUTER_SAFETY_MARGIN_REQUESTS = 2
+
+
 _PROFILE_TEMPLATE: dict[str, Any] = {
     "display_name": "無料Team",
     "enabled": True,
     "main_pool_id": "coordinator",
     "max_fallbacks": 6,
+    "openrouter_free_tier": OPENROUTER_DEFAULT_FREE_DAILY_TIER,
     "credential_profiles": {
         "openai-complimentary": {
-            "display_name": "OpenAI 無料トークン枠",
+            "display_name": "OpenAI共有キー参照（legacy FK）",
             "provider": "openai",
             "authentication_type": "api_key",
-            "environment_variable": "OPENAI_FREE_TEAM_API_KEY",
             "billing_mode": "complimentary",
             "privacy_class": "standard",
+            "enabled": False,
         },
         "gemini-free": {
             "display_name": "Gemini Free Tier",
@@ -78,9 +84,9 @@ _PROFILE_TEMPLATE: dict[str, Any] = {
     "quota_pools": {
         "openai-sol-daily": {"credential_profile_id": "openai-complimentary", "metric_type": "total_tokens", "limit": 1_000_000, "safety_margin_units": 30_000, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
         "openai-luna-daily": {"credential_profile_id": "openai-complimentary", "metric_type": "total_tokens", "limit": 10_000_000, "safety_margin_units": 30_000, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
-        "gemini-free-rpm": {"credential_profile_id": "gemini-free", "metric_type": "rpm", "limit": 0, "reset_policy": {"kind": "minute"}},
-        "gemini-free-tpm": {"credential_profile_id": "gemini-free", "metric_type": "tpm", "limit": 0, "reset_policy": {"kind": "minute"}},
-        "gemini-free-rpd": {"credential_profile_id": "gemini-free", "metric_type": "rpd", "limit": 0, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
+        "gemini-free-rpm": {"credential_profile_id": "gemini-free", "metric_type": "rpm", "limit": 0, "reset_policy": {"local_cap_mode": "provider", "kind": "minute"}},
+        "gemini-free-tpm": {"credential_profile_id": "gemini-free", "metric_type": "tpm", "limit": 0, "reset_policy": {"local_cap_mode": "provider", "kind": "minute"}},
+        "gemini-free-rpd": {"credential_profile_id": "gemini-free", "metric_type": "rpd", "limit": 0, "reset_policy": {"local_cap_mode": "provider", "kind": "daily", "timezone": "UTC", "hour": 0}},
         "openrouter-free-rpm": {"credential_profile_id": "openrouter-free", "metric_type": "rpm", "limit": 20, "reset_policy": {"kind": "minute"}},
         "openrouter-free-rpd": {"credential_profile_id": "openrouter-free", "metric_type": "rpd", "limit": 1000, "safety_margin_units": 2, "reset_policy": {"kind": "daily", "timezone": "UTC", "hour": 0}},
         "gemini-promo-monthly-usd": {"credential_profile_id": "gemini-promo", "metric_type": "usd", "limit": 10, "safety_margin_ratio": 0.01, "reset_policy": {"kind": "monthly", "timezone": "UTC", "day": 1, "hour": 0}},
@@ -106,56 +112,6 @@ _PROFILE_TEMPLATE: dict[str, Any] = {
         "coding": {"tool_mode": "required", "candidate_ids": ["openrouter-free-*", "gemini-free-flash", "codex-spark", "antigravity", "grok-build"]},
         "tool-executor": {"tool_mode": "required", "candidate_ids": ["gemini-free-flash", "openrouter-free-*", "gemini-promo-flash", "codex-spark", "antigravity", "grok-build"]},
         "vision": {"tool_mode": "required", "candidate_ids": ["gemini-free-flash", "gemini-promo-flash"]},
-    },
-    # These are routing overlays for the canonical Agent Team profiles.  The
-    # Team/Subagent graph remains in ``agent_team`` and is never copied here.
-    # Provider/model identify the Free Team routing profile; pool_id selects
-    # the candidate pool maintained below.
-    "llm_profiles": {
-        "heavy": {
-            "profile_id": "heavy",
-            "name": "高負荷",
-            "target_type": "pool",
-            "provider": "routing-profile",
-            "model": "free-team",
-            "effort_policy": "same",
-            "effort": "",
-            "pool_id": "heavy",
-            "routing_profile_id": "free-team",
-        },
-        "light": {
-            "profile_id": "light",
-            "name": "軽量",
-            "target_type": "pool",
-            "provider": "routing-profile",
-            "model": "free-team",
-            "effort_policy": "lower",
-            "effort": "",
-            "pool_id": "light",
-            "routing_profile_id": "free-team",
-        },
-        "coding": {
-            "profile_id": "coding",
-            "name": "コーディング",
-            "target_type": "pool",
-            "provider": "routing-profile",
-            "model": "free-team",
-            "effort_policy": "same",
-            "effort": "",
-            "pool_id": "coding",
-            "routing_profile_id": "free-team",
-        },
-        "tool-executor": {
-            "profile_id": "tool-executor",
-            "name": "ツール実行",
-            "target_type": "pool",
-            "provider": "routing-profile",
-            "model": "free-team",
-            "effort_policy": "same",
-            "effort": "",
-            "pool_id": "tool-executor",
-            "routing_profile_id": "free-team",
-        },
     },
 }
 

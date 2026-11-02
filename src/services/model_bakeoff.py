@@ -2,10 +2,10 @@
 
 This module deliberately does not start an LLM server or download a model.
 Callers provide the runner (and, when needed, an evaluator) callback.  The
-service resolves the callback's route through AoiTalk's existing Execution
-Profile/model routing and turns each callback result into a small, stable
-metric record.  This makes a local fake runner and a production runner share
-the same contract.
+service resolves the callback's route through the shared ``model_roles`` table
+or a supplied AgentRevision v2 and turns each callback result into a small,
+stable metric record.  This makes a local fake runner and a production runner
+share the same contract.
 
 The public API is intentionally callback based:
 
@@ -14,9 +14,9 @@ The public API is intentionally callback based:
 * :class:`ModelBakeoffEvaluator` normalizes provider-specific result shapes.
 * :func:`run_model_bakeoff` is a convenience wrapper for one report.
 
-No model ID is selected by this module.  If ``models`` is omitted, the model
-from the resolved Main route is used; otherwise every supplied model or route
-specification is evaluated as-is.
+If ``models`` is omitted, the primary route for the selected model role is
+used; otherwise every supplied model or route specification is evaluated
+against that role route.
 """
 
 from __future__ import annotations
@@ -29,9 +29,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
-from .execution_profile_service import (
-    resolve_execution_main_route,
-    resolve_execution_profile_route,
+from .agent_revision_v2 import (
+    resolve_agent_role_route_v2,
 )
 
 
@@ -479,9 +478,8 @@ class ModelBakeoffConfig:
     models: tuple[Any, ...] = ()
     repeats: int = 1
     context: Mapping[str, Any] = field(default_factory=dict)
-    execution_profile_id: str | None = None
-    subagent_id: str | None = None
-    team_id: str | None = None
+    role: str = "chat"
+    agent_revision: Any | None = None
 
 
 def _case_from_value(value: Any, index: int = 0) -> BakeoffCase:
@@ -946,6 +944,67 @@ def _model_spec_id(spec: Any, fallback: str) -> str:
     return _as_text(spec) or fallback
 
 
+def _default_bakeoff_revision() -> dict[str, Any]:
+    """Create the complete v2 marker used for a global role route.
+
+    A bake-off can be run without an Agent-specific revision.  Supplying an
+    explicit empty v2 policy lets the canonical resolver apply the global
+    ``model_roles`` table while keeping the historical all-NULL revision
+    branch unavailable for new work.
+    """
+
+    return {
+        "model_overrides": {},
+        "tool_ids": [],
+        "delegate_policy": {},
+    }
+
+
+def _route_for_role(
+    config: Any,
+    revision: Any,
+    role: str,
+) -> dict[str, Any]:
+    """Resolve one primary route through the P2 AgentRevision v2 reader."""
+
+    selected_revision = revision if revision is not None else _default_bakeoff_revision()
+    try:
+        route, _source = resolve_agent_role_route_v2(
+            config,
+            selected_revision,
+            role,
+        )
+    except Exception as exc:  # noqa: BLE001 - bake-off admission is fail-closed
+        raise ValueError("agent role route is unavailable") from exc
+    if not isinstance(route, Mapping):
+        raise ValueError("agent role route is unavailable")
+    result = dict(route)
+    kind = _as_text(result.get("kind")).lower()
+    if kind == "pool":
+        pool_id = _as_text(result.get("pool_id"))
+        if not pool_id:
+            raise ValueError("agent pool route is unavailable")
+        result.setdefault("provider", "routing-profile")
+        result.setdefault("model", "free-team")
+        result.setdefault("backend", "api")
+        return result
+    provider = _as_text(result.get("provider")).lower()
+    model = _as_text(result.get("model"))
+    if not provider or not model:
+        raise ValueError("agent role route is unavailable")
+    result.setdefault(
+        "backend",
+        "remote" if provider == "muse-remote" else "cli" if provider.endswith("-cli") else "api",
+    )
+    return result
+
+
+def _route_model_id(route: Mapping[str, Any]) -> str:
+    if _as_text(route.get("kind")).lower() == "pool":
+        return f"pool:{_as_text(route.get('pool_id'))}"
+    return _as_text(route.get("model"))
+
+
 class ModelBakeoffRunner:
     """Execute deterministic cases against one or more routed models."""
 
@@ -961,9 +1020,9 @@ class ModelBakeoffRunner:
         model_ids: Iterable[Any] | Mapping[str, Any] | None = None,
         repeats: int | None = None,
         context: Mapping[str, Any] | None = None,
-        execution_profile_id: str | None = None,
-        subagent_id: str | None = None,
-        team_id: str | None = None,
+        role: str | None = None,
+        model_role: str | None = None,
+        agent_revision: Any | None = None,
         route_resolver: RouteResolver | None = None,
         clock: Clock | None = None,
     ) -> None:
@@ -996,49 +1055,28 @@ class ModelBakeoffRunner:
         )
         configured_context = config_object.context if config_object else {}
         self.context = {**_copy_mapping(configured_context), **_copy_mapping(context)}
-        self.execution_profile_id = _as_text(
-            execution_profile_id
-            if execution_profile_id is not None
-            else (config_object.execution_profile_id if config_object else "")
-        ) or None
-        self.subagent_id = _as_text(
-            subagent_id if subagent_id is not None else (config_object.subagent_id if config_object else "")
-        ) or None
-        self.team_id = _as_text(
-            team_id if team_id is not None else (config_object.team_id if config_object else "")
-        ) or None
+        configured_role = (
+            role
+            if role is not None
+            else (model_role if model_role is not None else (config_object.role if config_object else "chat"))
+        )
+        self.role = _as_text(configured_role).lower() or "chat"
+        self.agent_revision = (
+            agent_revision
+            if agent_revision is not None
+            else (config_object.agent_revision if config_object else None)
+        )
         self.runner = runner
         self.evaluator = evaluator
         self.route_resolver = route_resolver
         self.clock = clock or time.perf_counter
 
     def _resolve_route(self, spec: Any, case: BakeoffCase) -> tuple[str, dict[str, Any]]:
-        main_route = dict(resolve_execution_main_route(self.config or {}))
-        base_route = main_route
-        if self.subagent_id:
-            profile_route = None
-            if self.team_id and self.execution_profile_id:
-                # The regular resolver intentionally follows request-bound
-                # session selection.  For offline bake-off scripts an
-                # explicit team/profile pair is equally valid, so ask the
-                # same canonical Team resolver directly without mutating a
-                # ContextVar.
-                from .agent_team_v3 import resolve_team_execution_route
-
-                profile_route = resolve_team_execution_route(
-                    self.config or {},
-                    self.subagent_id,
-                    team_id=self.team_id,
-                    execution_profile_id=self.execution_profile_id,
-                )
-            if profile_route is None:
-                profile_route = resolve_execution_profile_route(
-                    self.config or {},
-                    self.subagent_id,
-                    main_route=main_route,
-                )
-            if profile_route:
-                base_route = dict(profile_route)
+        base_route = _route_for_role(
+            self.config or {},
+            self.agent_revision,
+            self.role,
+        )
         model_id = _model_spec_id(spec, _as_text(base_route.get("model")) or "configured-model")
         route = dict(base_route)
         if isinstance(spec, Mapping):
@@ -1052,19 +1090,18 @@ class ModelBakeoffRunner:
                 "reasoning_effort",
                 "backend",
                 "base_url",
-                "execution_profile_id",
             ):
                 if key in spec:
                     route[key] = spec[key]
             model_id = _as_text(spec.get("model_id") or spec.get("id") or spec.get("model") or model_id)
         else:
-            route["model"] = model_id
+            if _as_text(route.get("kind")).lower() != "pool":
+                route["model"] = model_id
         if not _as_text(route.get("model")):
-            route["model"] = model_id
-        if self.execution_profile_id:
-            route.setdefault("execution_profile_id", self.execution_profile_id)
-        if self.team_id:
-            route.setdefault("team_id", self.team_id)
+            if _as_text(route.get("kind")).lower() == "pool":
+                route["model"] = "free-team"
+            else:
+                route["model"] = model_id
         if self.route_resolver is not None:
             resolver_values = {
                 "config": self.config,
@@ -1104,12 +1141,16 @@ class ModelBakeoffRunner:
         normalized_cases = self.cases if selected_cases is None else normalize_bakeoff_cases(selected_cases)
         model_specs = self.models if selected_models is None else _normalise_model_specs(selected_models)
         if not model_specs:
-            main_route = dict(resolve_execution_main_route(self.config or {}))
-            configured_model = _as_text(main_route.get("model"))
+            main_route = _route_for_role(
+                self.config or {},
+                self.agent_revision,
+                self.role,
+            )
+            configured_model = _route_model_id(main_route)
             if configured_model:
-                model_specs = (configured_model,)
+                model_specs = ({"model_id": configured_model, "route": main_route},)
             else:
-                raise ValueError("models are required when the resolved Main route has no model")
+                raise ValueError("models are required when the selected role route has no model")
         if not normalized_cases:
             raise ValueError("at least one bake-off case is required")
 
@@ -1300,9 +1341,9 @@ async def run_model_bakeoff(
     evaluator: BakeoffEvaluatorCallback | Any | None = None,
     repeats: int = 1,
     context: Mapping[str, Any] | None = None,
-    execution_profile_id: str | None = None,
-    subagent_id: str | None = None,
-    team_id: str | None = None,
+    role: str = "chat",
+    model_role: str | None = None,
+    agent_revision: Any | None = None,
     route_resolver: RouteResolver | None = None,
     clock: Clock | None = None,
 ) -> ModelBakeoffReport:
@@ -1318,9 +1359,9 @@ async def run_model_bakeoff(
         model_ids=model_ids,
         repeats=repeats,
         context=context,
-        execution_profile_id=execution_profile_id,
-        subagent_id=subagent_id,
-        team_id=team_id,
+        role=role,
+        model_role=model_role,
+        agent_revision=agent_revision,
         route_resolver=route_resolver,
         clock=clock,
     ).run()

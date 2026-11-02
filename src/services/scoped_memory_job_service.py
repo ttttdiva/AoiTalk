@@ -1595,6 +1595,9 @@ async def process_scoped_memory_job(
         # Keep the provider client/transport reusable, but never share the
         # parent turn's mutable generation/usage/snapshot/tool/audit state with
         # this background extraction job.
+        from .dreaming_memory_routing import route_scoped_memory_client
+
+        llm_client = route_scoped_memory_client(llm_client)
         scoped_client = _scoped_memory_llm_client(
             llm_client,
             user_id=str(user_id),

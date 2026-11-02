@@ -127,6 +127,13 @@ class DevelopmentRequirementsResolveRequest(_OperationsModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class DevelopmentRetryRequest(_OperationsModel):
+    expected_work_item_id: UUID
+    expected_run_id: UUID
+    idempotency_key: str = Field(..., min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class EvaluationCreateRequest(_OperationsModel):
     estimated_effort_hours: float | None = None
     estimated_cost: float | None = None
@@ -497,6 +504,16 @@ class ArtifactResponse(_OperationsResponseModel):
     created_at: str | None = None
 
 
+class DelegationArtifactAdoptionRequest(_OperationsModel):
+    order_id: UUID
+    work_artifact_id: UUID
+    review_artifact_id: UUID
+    source_snapshot_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    expected_work_hash: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    expected_review_hash: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+
+
 class OpportunityResponse(_OperationsResponseModel):
     id: str
     owner_user_id: str | None = None
@@ -509,6 +526,7 @@ class OpportunityResponse(_OperationsResponseModel):
     source_snapshot: dict[str, Any] | None = None
     source_untrusted: bool | None = None
     status: str | None = None
+    ai_review_status: str | None = None
     created_by: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -1445,6 +1463,16 @@ def create_operations_router(
             ),
         )
 
+    @router.post("/opportunities/{opportunity_id}/adopt-delegation-artifact", response_model=ArtifactResponse)
+    @protected
+    async def adopt_delegation_artifact(
+        opportunity_id: str, payload: DelegationArtifactAdoptionRequest, request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(get_db_manager, lambda session: _invoke(
+            operations.adopt_delegation_artifact, session, actor, opportunity_id, **payload.model_dump()))
+
     @router.post(
         "/artifacts",
         response_model=ArtifactResponse,
@@ -1660,6 +1688,19 @@ def create_operations_router(
                 resolved=payload.resolved,
                 note=payload.note,
             ),
+        )
+
+    @router.post("/opportunities/{opportunity_id}/development-retry", response_model=OpportunityResponse)
+    @protected
+    async def retry_development(
+        opportunity_id: str, payload: DevelopmentRetryRequest, request: Request,
+        _: Any = Depends(require_auth_dependency),
+    ) -> Any:
+        actor = await current_actor(request)
+        return await _with_session(
+            get_db_manager,
+            lambda session: _invoke(operations.retry_development, session, actor, opportunity_id,
+                                    **payload.model_dump()),
         )
 
     @router.post("/opportunities/{opportunity_id}/evaluations", response_model=EvaluationResponse)

@@ -1,14 +1,9 @@
 /**
- * タスク用のコンパクトな日付入力フィールド。
+ * タスクの開始日時・期限を入力するフィールド。
  *
- * - タップでカレンダーダイアログを開き、日付（終日でなければ時刻も）を選択できる。
- * - 値があるときは「M/d HH:mm」等の短い表記で表示する。
- * - クリア可能。終日（allDay）に対応。
- * - 入出力の文字列形式は task-datetime.ts の想定に合わせる:
- *     終日          -> "yyyy-MM-dd"
- *     終日でない場合 -> "yyyy-MM-ddTHH:mm"
- *   これは [taskId].tsx の formatTaskDateInput が生成する形式と一致するため、
- *   自動保存の未保存判定（署名比較）を崩さない。
+ * 入力値の解釈は PC と共有する pure parser に任せ、保存値は
+ * `yyyy-MM-dd` または `yyyy-MM-ddTHH:mm` の wall-clock のまま保持する。
+ * ダイアログ内では編集中の値だけを保持し、決定するまで親へ通知しない。
  */
 import React, { useMemo, useState } from "react";
 import {
@@ -27,9 +22,10 @@ import {
   Switch,
   Portal,
   Text,
+  TextInput,
   TouchableRipple,
 } from "react-native-paper";
-import { Calendar } from "react-native-calendars";
+import { parseFlexibleTaskDate } from "../../../shared/task-date-parser";
 
 type TaskDateFieldProps = {
   label: string;
@@ -44,36 +40,69 @@ type TaskDateFieldProps = {
   recurrenceDisabled?: boolean;
 };
 
+type ParsedTaskDate = {
+  value: string;
+  dateOnly: boolean;
+};
+
 function pad(value: number): string {
   return String(value).padStart(2, "0");
-}
-
-function parseValue(value: string): {
-  date: string;
-  hour: number;
-  minute: number;
-} {
-  if (!value) return { date: "", hour: 9, minute: 0 };
-  const [datePart, timePart] = value.split("T");
-  if (!timePart) return { date: datePart, hour: 9, minute: 0 };
-  const [hh, mm] = timePart.split(":");
-  const hour = Number(hh);
-  const minute = Number(mm);
-  return {
-    date: datePart,
-    hour: Number.isFinite(hour) ? hour : 9,
-    minute: Number.isFinite(minute) ? minute : 0,
-  };
 }
 
 function formatShort(value: string, allDay: boolean): string {
   if (!value) return "";
   const [datePart, timePart] = value.split("T");
   const [, month, day] = datePart.split("-");
+  if (!month || !day) return value;
   const md = `${Number(month)}/${Number(day)}`;
   if (allDay || !timePart) return md;
   const [hh, mm] = timePart.split(":");
   return `${md} ${hh}:${mm}`;
+}
+
+function localTimezoneLabel(value: string): string {
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$/,
+  );
+  const date = match
+    ? new Date(
+        Number(match[1]),
+        Number(match[2]) - 1,
+        Number(match[3]),
+        Number(match[4] ?? 0),
+        Number(match[5] ?? 0),
+      )
+    : new Date();
+  const timezone =
+    Intl.DateTimeFormat().resolvedOptions().timeZone || "ローカル";
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  return `${timezone} (UTC${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(
+    absoluteOffset % 60,
+  )})`;
+}
+
+function resolveForMode(
+  raw: string,
+  now: Date,
+  allDay: boolean,
+): ParsedTaskDate | null {
+  const parsed = parseFlexibleTaskDate(raw, now);
+  if (!parsed) return null;
+
+  // allDay is a field-level contract. Do not silently discard a typed time;
+  // ask the user to switch off all-day before saving a timed value.
+  if (allDay && !parsed.dateOnly) {
+    return null;
+  }
+  // The shared parser keeps the resolved civil time at midnight for date-only
+  // expressions so it can resolve weekdays uniformly. The task contract stores
+  // date-only values without a synthetic T00:00 suffix.
+  if (parsed.dateOnly) {
+    return { value: parsed.value.slice(0, 10), dateOnly: true };
+  }
+  return parsed;
 }
 
 export function TaskDateField({
@@ -90,33 +119,31 @@ export function TaskDateField({
 }: TaskDateFieldProps) {
   const [visible, setVisible] = useState(false);
   const [localAllDay, setLocalAllDay] = useState(allDay);
+  const [draftText, setDraftText] = useState("");
+  const [parseNow, setParseNow] = useState<Date>(() => new Date());
   const { height } = useWindowDimensions();
-  const [localDate, setLocalDate] = useState("");
-  const [localHour, setLocalHour] = useState(9);
-  const [localMinute, setLocalMinute] = useState(0);
 
   const display = useMemo(() => formatShort(value, allDay), [value, allDay]);
+  const resolved = useMemo(
+    () => resolveForMode(draftText, parseNow, localAllDay),
+    [draftText, localAllDay, parseNow],
+  );
 
   const open = () => {
-    const parsed = parseValue(value);
-    setLocalDate(parsed.date);
+    setDraftText(value);
     setLocalAllDay(allDay);
-    setLocalHour(parsed.hour);
-    setLocalMinute(parsed.minute);
+    setParseNow(new Date());
     setVisible(true);
   };
 
-  const close = () => setVisible(false);
+  const cancel = () => {
+    setVisible(false);
+  };
 
   const commit = () => {
+    if (!resolved) return;
     if (localAllDay !== allDay) onAllDayChange?.(localAllDay);
-    if (!localDate) {
-      onChange("");
-    } else if (localAllDay) {
-      onChange(localDate);
-    } else {
-      onChange(`${localDate}T${pad(localHour)}:${pad(localMinute)}`);
-    }
+    onChange(resolved.value);
     setVisible(false);
   };
 
@@ -125,15 +152,15 @@ export function TaskDateField({
     setVisible(false);
   };
 
-  const adjustHour = (delta: number) => {
-    setLocalHour((current) => (current + delta + 24) % 24);
-  };
-
-  const adjustMinute = (delta: number) => {
-    setLocalMinute((current) => {
-      const snapped = Math.round(current / 5) * 5;
-      return (snapped + delta + 60) % 60;
-    });
+  const openRecurrence = () => {
+    // Recurrence is a separate editor. Keep a valid date draft before
+    // entering it, while an unfinished/invalid text draft is discarded.
+    if (resolved) {
+      commit();
+    } else {
+      cancel();
+    }
+    onOpenRecurrence?.();
   };
 
   return (
@@ -193,7 +220,7 @@ export function TaskDateField({
       </TouchableRipple>
 
       <Portal>
-        <Dialog visible={visible} onDismiss={close} style={styles.dialog}>
+        <Dialog visible={visible} onDismiss={cancel} style={styles.dialog}>
           <Dialog.Title style={styles.dialogTitle}>{label}</Dialog.Title>
           <Dialog.ScrollArea style={{ maxHeight: height * 0.65 }}>
             <ScrollView
@@ -210,82 +237,60 @@ export function TaskDateField({
                   />
                 </View>
               ) : null}
-              <Calendar
-                current={localDate || undefined}
-                markedDates={
-                  localDate ? { [localDate]: { selected: true } } : {}
-                }
-                onDayPress={(day: { dateString: string }) =>
-                  setLocalDate(day.dateString)
-                }
-                firstDay={0}
-                enableSwipeMonths
-                theme={{
-                  calendarBackground: "#1e1e2e",
-                  monthTextColor: "#cdd6f4",
-                  textMonthFontWeight: "bold",
-                  textMonthFontSize: 16,
-                  arrowColor: "#7c3aed",
-                  todayTextColor: "#7c3aed",
-                  todayBackgroundColor: "transparent",
-                  dayTextColor: "#cdd6f4",
-                  textDisabledColor: "#585b70",
-                  selectedDayBackgroundColor: "#4c1d95",
-                  selectedDayTextColor: "#cdd6f4",
-                  textDayFontSize: 14,
-                  textDayHeaderFontSize: 12,
-                  textSectionTitleColor: "#a6adc8",
-                }}
+
+              <TextInput
+                accessibilityLabel={`${label}の日付/時刻入力`}
+                testID={`${label}-date-input`}
+                mode="outlined"
+                label="日付 / 時刻"
+                placeholder="Tomorrow 12:00 / Friday / 3 days"
+                value={draftText}
+                onChangeText={setDraftText}
+                autoFocus
+                autoCorrect={false}
+                autoCapitalize="none"
+                style={styles.input}
               />
-              {!localAllDay ? (
-                <View style={styles.timeRow}>
-                  <Text style={styles.timeLabel}>時刻</Text>
-                  <View style={styles.stepper}>
-                    <IconButton
-                      icon="chevron-down"
-                      size={18}
-                      iconColor="#89b4fa"
-                      onPress={() => adjustHour(-1)}
-                      style={styles.stepButton}
-                    />
-                    <Text style={styles.timeValue}>{pad(localHour)}</Text>
-                    <IconButton
-                      icon="chevron-up"
-                      size={18}
-                      iconColor="#89b4fa"
-                      onPress={() => adjustHour(1)}
-                      style={styles.stepButton}
-                    />
-                  </View>
-                  <Text style={styles.timeColon}>:</Text>
-                  <View style={styles.stepper}>
-                    <IconButton
-                      icon="chevron-down"
-                      size={18}
-                      iconColor="#89b4fa"
-                      onPress={() => adjustMinute(-5)}
-                      style={styles.stepButton}
-                    />
-                    <Text style={styles.timeValue}>{pad(localMinute)}</Text>
-                    <IconButton
-                      icon="chevron-up"
-                      size={18}
-                      iconColor="#89b4fa"
-                      onPress={() => adjustMinute(5)}
-                      style={styles.stepButton}
-                    />
-                  </View>
-                </View>
-              ) : null}
+              <Text style={styles.inputHint}>
+                例: Tomorrow 12:00、Friday、3 days、2026-08-04T09:30
+              </Text>
+
+              <View
+                style={[styles.preview, !resolved && styles.previewInvalid]}
+                accessibilityLiveRegion="polite"
+              >
+                <Text style={styles.previewTitle}>解釈結果</Text>
+                {resolved ? (
+                  <>
+                    <Text
+                      testID={`${label}-date-preview`}
+                      style={styles.previewValue}
+                    >
+                      {resolved.value}
+                    </Text>
+                    <Text style={styles.previewMeta}>
+                      {resolved.dateOnly ? "日付のみ" : "年月日と時刻"} ・ 端末のローカル時刻として保存
+                    </Text>
+                    <Text
+                      testID={`${label}-timezone-preview`}
+                      style={styles.previewMeta}
+                    >
+                      ローカルタイムゾーン: {localTimezoneLabel(resolved.value)}
+                    </Text>
+                  </>
+                ) : (
+                  <Text style={styles.invalidText}>
+                    入力を解釈できません。日付/時刻を入力してください。
+                  </Text>
+                )}
+              </View>
+
               {onOpenRecurrence ? (
                 <TouchableRipple
                   accessibilityRole="button"
                   accessibilityLabel={`繰り返し: ${recurrenceLabel}`}
                   disabled={recurrenceDisabled}
-                  onPress={() => {
-                    commit();
-                    onOpenRecurrence();
-                  }}
+                  onPress={openRecurrence}
                 >
                   <View style={styles.scheduleRow}>
                     <Icon source="repeat" size={18} color="#a6adc8" />
@@ -301,10 +306,14 @@ export function TaskDateField({
             <Button onPress={clear} textColor="#f38ba8">
               クリア
             </Button>
-            <Button onPress={close} textColor="#a6adc8">
+            <Button onPress={cancel} textColor="#a6adc8">
               キャンセル
             </Button>
-            <Button onPress={commit} textColor="#89b4fa" disabled={!localDate}>
+            <Button
+              onPress={commit}
+              textColor="#89b4fa"
+              disabled={!resolved}
+            >
               決定
             </Button>
           </Dialog.Actions>
@@ -323,7 +332,7 @@ const styles = StyleSheet.create({
   },
   compactRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   compactValue: { flex: 1, minWidth: 0, color: "#cdd6f4", fontSize: 13 },
-  dialogScroll: { paddingHorizontal: 16 },
+  dialogScroll: { paddingHorizontal: 16, paddingBottom: 8 },
   scheduleRow: {
     minHeight: 44,
     flexDirection: "row",
@@ -353,23 +362,25 @@ const styles = StyleSheet.create({
   trailingButton: { margin: 0, marginRight: -6 },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
-  timeRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
+  input: { marginTop: 6, backgroundColor: "#1e1e2e" },
+  inputHint: { color: "#9399b2", fontSize: 12, marginTop: 6 },
+  preview: {
+    borderWidth: 1,
+    borderColor: "#45475a",
+    borderRadius: 8,
+    padding: 10,
     marginTop: 14,
+    gap: 4,
   },
-  timeLabel: { color: "#a6adc8", fontSize: 14, marginRight: 8 },
-  stepper: { alignItems: "center" },
-  stepButton: { margin: 0 },
-  timeValue: {
+  previewInvalid: { borderColor: "#6c3448" },
+  previewTitle: { color: "#a6adc8", fontSize: 12, fontWeight: "700" },
+  previewValue: {
     color: "#cdd6f4",
-    fontSize: 20,
+    fontSize: 16,
     fontWeight: "700",
     fontVariant: ["tabular-nums"],
-    minWidth: 32,
-    textAlign: "center",
   },
-  timeColon: { color: "#cdd6f4", fontSize: 20, fontWeight: "700" },
+  previewMeta: { color: "#a6adc8", fontSize: 12 },
+  invalidText: { color: "#f38ba8", fontSize: 13 },
+  timeLabel: { color: "#a6adc8", fontSize: 14, marginRight: 8 },
 });

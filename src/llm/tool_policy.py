@@ -46,6 +46,105 @@ _current_shared_resource_scope: ContextVar[Optional[dict[str, Any]]] = ContextVa
     default=None,
 )
 
+_TOOL_IDS_UNSET = object()
+_DELEGATE_POLICY_UNSET = object()
+
+# P2 ``AgentRevision.tool_ids`` accepts concrete catalog names and a small set
+# of server-owned groups.  Keep group expansion here, next to the existing
+# capability catalog, so presentation and execution use the same mapping.
+# The CrowdWorks Agent's tools run under the granted external_action_propose
+# authority; the ``crowdworks`` tool id only limits what the revision sees.
+_CROWDWORKS_AGENT_TOOL_NAMES = frozenset({
+    "crowdworks_list_jobs",
+    "crowdworks_candidates",
+    "crowdworks_read_job",
+    "crowdworks_profile",
+    "crowdworks_submit_proposal",
+})
+
+_AGENT_REVISION_TOOL_GROUPS: dict[str, frozenset[str]] = {
+    "crowdworks": _CROWDWORKS_AGENT_TOOL_NAMES,
+    "browser": frozenset(
+        {"browser_agent", "browser_agent_dedicated"}
+    ),
+    "browser_qa": frozenset(
+        {"browser_agent", "browser_agent_dedicated", "computer_observe", "computer_use"}
+    ),
+    "delegate": frozenset(
+        {
+            "delegate",
+            "delegate_agent_work",
+            "delegate_plan",
+            "delegate_media",
+            "agent_team_delegate",
+            "list_agent_workers",
+            "get_agent_work_status",
+            "send_agent_work_message",
+            "answer_agent_work_question",
+            "escalate_agent_work_question",
+            "stop_agent_work",
+            "resume_agent_work",
+        }
+    ),
+    "aoi_tools": frozenset(
+        {
+            "calculate",
+            "get_current_time",
+            "get_weather",
+            "get_weather_info",
+            "agent_activity",
+            "list_agent_workers",
+            "delegate_agent_work",
+            "delegate_plan",
+            "delegate_media",
+            "get_agent_work_status",
+            "send_agent_work_message",
+            "answer_agent_work_question",
+            "escalate_agent_work_question",
+            "stop_agent_work",
+            "resume_agent_work",
+            "ask_user_question",
+        }
+    ),
+    "workspace": frozenset(
+        {
+            "read_file",
+            "search_files",
+            "list_directory",
+            "get_repo_map",
+            "get_repo_tree",
+            "repo_map",
+            "write_file",
+            "create_file",
+            "edit_file",
+            "delete_file",
+            "execute_command",
+            "shell_command",
+            "run_command",
+            "read_command_output",
+            "list_commands",
+            "stop_command",
+        }
+    ),
+    "command": frozenset(
+        {
+            "execute_command",
+            "shell_command",
+            "run_command",
+            "read_command_output",
+            "list_commands",
+            "stop_command",
+        }
+    ),
+}
+
+# Conversation-control tools every Agent keeps regardless of its tool list:
+# asking the user and loading a deferred tool pack expose no capability.
+_AGENT_REVISION_ALWAYS_VISIBLE_TOOL_NAMES = frozenset({"ask_user_question", "load_tool_pack"})
+# Shows every tool ordinary Chat would show, including tools added later; the
+# capability ceiling and the other exposure gates still apply.
+AGENT_REVISION_CHAT_DEFAULT_TOOL_ID = "chat_default"
+
 VALID_COMMAND_CAPABILITIES: set[str] = {
     "aoitalk_help",
     "web_search",
@@ -275,6 +374,13 @@ KNOWLEDGE_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+_PERSONAL_DEADLINE_DRAFT_TOOL_NAME = "create_personal_deadline_candidate"
+_PERSONAL_DEADLINE_DRAFT_CAPABILITY = "personal_deadline_draft"
+_PERSONAL_DEADLINE_DRAFT_CONFIG_KEY = "personal.deadline_chat_draft.enabled"
+_PERSONAL_DEADLINE_DRAFT_AVAILABILITY_KEY = (
+    "_personal_deadline_current_turn_availability_check"
+)
+
 SEMANTIC_EMBEDDING_TOOL_NAMES: frozenset[str] = frozenset(
     {
         # Semantic-only search surfaces: they cannot answer without the
@@ -346,6 +452,45 @@ def reset_current_user_input(token: Token) -> None:
 
 def get_current_user_input() -> Optional[str]:
     return _current_user_input.get()
+
+
+def append_current_user_input_update(instruction: str | None) -> Optional[str]:
+    """Apply a human-authored steering update to this turn's policy input.
+
+    Generated review/continuation prompts never call this function.  The
+    streaming steering callback does, so its actual user instruction becomes
+    visible to tool policy without treating verifier prose as new authority.
+    """
+
+    normalized = str(instruction or "").strip()
+    if not normalized:
+        return get_current_user_input()
+
+    steering_lines = [
+        line.strip() for line in normalized.splitlines() if line.strip()
+    ]
+    marker = "Human steering update:\nConstraints:\n" + "\n".join(
+        f"- {line}" for line in steering_lines
+    )
+    current = str(get_current_user_input() or "").strip()
+    updated = f"{current}\n\n{marker}" if current else marker
+    _current_user_input.set(updated)
+
+    # Agent Dialogue uses its own pinned human anchor for tool policy. Keep
+    # that anchor current too when the authenticated user steers the turn.
+    authority = _current_agent_dialogue_authority.get()
+    if (
+        isinstance(authority, dict)
+        and authority.get("role") in {"worker", "root"}
+        and isinstance(authority.get("human_anchor"), str)
+        and authority.get("human_anchor").strip()
+    ):
+        updated_authority = dict(authority)
+        anchor = str(authority["human_anchor"]).strip()
+        updated_authority["human_anchor"] = f"{anchor}\n\n{marker}"[:131_072]
+        _current_agent_dialogue_authority.set(updated_authority)
+
+    return updated
 
 
 def set_current_agent_dialogue_authority(
@@ -513,6 +658,8 @@ def set_current_agent_tool_scope(
     *,
     allowed_subagent_ids: Any = None,
     revalidate: Any = None,
+    tool_ids: Any = _TOOL_IDS_UNSET,
+    delegate_policy: Any = _DELEGATE_POLICY_UNSET,
 ) -> Token:
     """Bind the trusted AgentRevision capability ceiling for one turn.
 
@@ -538,6 +685,13 @@ def set_current_agent_tool_scope(
         raw_subagents = list(allowed_subagent_ids)
     else:
         raw_subagents = []
+    if tool_ids is _TOOL_IDS_UNSET or delegate_policy is _DELEGATE_POLICY_UNSET:
+        bound_tool_ids, bound_delegate_policy = _revision_fields_from_current_agent_binding()
+        if tool_ids is _TOOL_IDS_UNSET:
+            tool_ids = bound_tool_ids
+        if delegate_policy is _DELEGATE_POLICY_UNSET:
+            delegate_policy = bound_delegate_policy
+    normalized_tool_ids = _normalize_revision_tool_ids(tool_ids)
     return _current_agent_tool_scope.set(
         {
             "capabilities": normalized,
@@ -546,7 +700,19 @@ def set_current_agent_tool_scope(
                 for item in raw_subagents
                 if str(item).strip()
             ),
+            # These are presentation/delegation policy projections from the
+            # exact pinned AgentRevision.  Keep them separate from the
+            # capability ceiling: a visible tool still passes the existing
+            # authority and capability checks when it executes.
+            "delegate_policy": (
+                dict(delegate_policy)
+                if isinstance(delegate_policy, Mapping)
+                else None
+            ),
             "revalidate": revalidate if callable(revalidate) else None,
+            # ``None`` means the legacy capability-only policy.  An empty
+            # frozenset is an explicit v2 deny-all tool surface.
+            "tool_ids": normalized_tool_ids,
         }
     )
 
@@ -557,6 +723,306 @@ def reset_current_agent_tool_scope(token: Token) -> None:
 
 def get_current_agent_tool_scope() -> dict[str, Any] | None:
     return _current_agent_tool_scope.get()
+
+
+def _normalize_revision_tool_ids(value: Any) -> frozenset[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        values = re.split(r"[, \t\r\n]+", value)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        values = list(value)
+    else:
+        return frozenset()
+    return frozenset(
+        str(item).strip().casefold()
+        for item in values
+        if str(item).strip()
+    )
+
+
+def _candidate_has_revision_tool_or_delegate_fields(candidate: Any) -> bool:
+    names = {"tool_ids", "tool_ids_json", "delegate_policy", "delegate_policy_json"}
+    if isinstance(candidate, Mapping):
+        return bool(names.intersection(candidate))
+    return any(hasattr(candidate, name) for name in names)
+
+
+def _revision_candidates_for_turn(turn: Any) -> list[Any]:
+    binding = getattr(turn, "agent_execution_binding", None)
+    candidates: list[Any] = []
+    if binding is not None:
+        if isinstance(binding, Mapping):
+            nested = binding.get("agent_revision") or binding.get("revision")
+        else:
+            nested = getattr(binding, "agent_revision", None) or getattr(
+                binding, "revision", None
+            )
+        if nested is not None:
+            candidates.append(nested)
+        for method_name in ("to_revision_dict", "revision_projection", "to_dict"):
+            method = getattr(binding, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                projection = method()
+            except Exception:
+                continue
+            if projection is not None:
+                candidates.append(projection)
+        candidates.append(binding)
+
+    config = getattr(turn, "agent_execution_config", None)
+    if config is not None:
+        for key in ("agent_revision", "runtime.agent_revision", "agent_revision_v2"):
+            candidate = _policy_config_get(config, key, None)
+            if candidate is not None:
+                candidates.append(candidate)
+    return candidates
+
+
+def _revision_fields_from_current_agent_binding() -> tuple[Any, Any]:
+    """Project both P2 revision fields from the same pinned binding source."""
+
+    try:
+        from ..services.agent_revision_v2 import (
+            revision_delegate_policy,
+            revision_tool_ids,
+        )
+        from ..services.turn_context import get_turn_context
+
+        turn = get_turn_context()
+        for candidate in _revision_candidates_for_turn(turn):
+            tool_ids = revision_tool_ids(candidate)
+            delegate_policy = revision_delegate_policy(candidate)
+            if (
+                tool_ids is not None
+                or delegate_policy is not None
+                or _candidate_has_revision_tool_or_delegate_fields(candidate)
+            ):
+                return tool_ids, delegate_policy
+    except Exception:
+        # Reduced embedding/test contexts retain the legacy capability path.
+        return None, None
+    return None, None
+
+
+def _revision_tool_id_matches(
+    tool_name: str,
+    tool_definition: Any,
+    tool_ids: frozenset[str],
+) -> bool:
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().casefold()
+    if normalized_tool == "delegate":
+        # The canonical ID is not borrowed from the alias alone, and a
+        # broad capability/tool group must not expose it either.
+        return "delegate" in tool_ids
+    if normalized_tool == "delegate_agent_work":
+        # Adopted synonymous-alias compatibility, matching
+        # agent_delegate_policy: a pinned canonical ``delegate`` also
+        # permits the alias, and a pinned alias permits only itself.
+        return bool({"delegate", "delegate_agent_work"} & tool_ids)
+    if (
+        normalized_tool in tool_ids
+        or normalized_tool in _AGENT_REVISION_ALWAYS_VISIBLE_TOOL_NAMES
+        or AGENT_REVISION_CHAT_DEFAULT_TOOL_ID in tool_ids
+    ):
+        return True
+    if normalized_tool == "delegate_worker":
+        return any(item.startswith("delegate_worker:") for item in tool_ids)
+    owner = str(getattr(tool_definition, "owner", "") or "").strip().casefold()
+    for requested in tool_ids:
+        if requested in _AGENT_REVISION_TOOL_GROUPS and normalized_tool in _AGENT_REVISION_TOOL_GROUPS[requested]:
+            return True
+        family = _AGENT_TOOL_CAPABILITY_FAMILIES.get(requested)
+        if family is not None and normalized_tool in family:
+            return True
+        if owner and requested == owner:
+            return True
+    return False
+
+
+def agent_tool_scope_has_explicit_tool_ids() -> bool:
+    scope = get_current_agent_tool_scope()
+    return isinstance(scope, dict) and scope.get("tool_ids") is not None
+
+
+def agent_revision_tool_id_permits(
+    tool_name: str,
+    tool_definition: Any = None,
+    *,
+    tool_ids: Any = _TOOL_IDS_UNSET,
+) -> bool | None:
+    """Return the P2 tool-id decision for a bound or explicit revision list.
+
+    ``None`` means no P2 list is available. Explicit ``tool_ids`` lets
+    presentation code apply the exact same id/group matcher before a turn
+    scope has been installed.
+    """
+
+    if tool_ids is _TOOL_IDS_UNSET:
+        scope = get_current_agent_tool_scope()
+        if not isinstance(scope, dict):
+            return None
+        tool_ids = scope.get("tool_ids")
+        if tool_ids is None:
+            return None
+        if not isinstance(tool_ids, frozenset):
+            tool_ids = _normalize_revision_tool_ids(tool_ids) or frozenset()
+    else:
+        tool_ids = _normalize_revision_tool_ids(tool_ids)
+        if tool_ids is None:
+            return None
+    return _revision_tool_id_matches(tool_name, tool_definition, tool_ids)
+
+
+def _worker_dialogue_tool_ids() -> list[str] | None:
+    """Read the parent/child tool intersection only on a worker turn."""
+
+    try:
+        from ..services.turn_context import get_turn_context
+
+        turn = get_turn_context()
+    except Exception:
+        return None
+    if (
+        str(getattr(turn, "agent_dialogue_role", "") or "").strip().casefold()
+        != "worker"
+        or not str(getattr(turn, "agent_dialogue_id", "") or "").strip()
+    ):
+        return None
+    config = getattr(turn, "agent_execution_config", None)
+    if not isinstance(config, Mapping) or "agent_dialogue_tool_ids" not in config:
+        return None
+    raw = config.get("agent_dialogue_tool_ids")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return []
+    return [str(item).strip().casefold() for item in raw if str(item).strip()]
+
+
+def _current_agent_delegation_projection() -> tuple[
+    list[str] | None, dict[str, Any] | None
+]:
+    """Return both revision projections from the active scope or pinned binding."""
+
+    scope = get_current_agent_tool_scope()
+    if isinstance(scope, Mapping) and (
+        "tool_ids" in scope or "delegate_policy" in scope
+    ):
+        scoped_tool_ids = scope.get("tool_ids")
+        scoped_policy = scope.get("delegate_policy")
+    else:
+        scoped_tool_ids, scoped_policy = _revision_fields_from_current_agent_binding()
+
+    tool_ids = (
+        [str(item).strip().casefold() for item in scoped_tool_ids if str(item).strip()]
+        if isinstance(scoped_tool_ids, (list, tuple, set, frozenset))
+        else None
+    )
+    delegate_policy = dict(scoped_policy) if isinstance(scoped_policy, Mapping) else None
+    worker_ids = _worker_dialogue_tool_ids()
+    if tool_ids is not None and worker_ids is not None:
+        worker_set = set(worker_ids)
+        tool_ids = [item for item in tool_ids if item in worker_set]
+    return tool_ids, delegate_policy
+
+
+def current_agent_revision_tool_ids() -> list[str] | None:
+    """Return the pinned revision's explicit tool ids, or None for legacy."""
+
+    tool_ids, _delegate_policy = _current_agent_delegation_projection()
+    return tool_ids
+
+
+def current_agent_delegate_policy() -> dict[str, Any] | None:
+    """Return the pinned revision's delegate policy, or None for legacy."""
+
+    _tool_ids, delegate_policy = _current_agent_delegation_projection()
+    return delegate_policy
+
+
+def current_agent_worker_kinds(
+    workspace_mode: str | None = None,
+) -> list[str] | None:
+    """Return kinds usable in the requested mode, or None for legacy turns."""
+
+    tool_ids, delegate_policy = _current_agent_delegation_projection()
+    if tool_ids is None:
+        return None
+    scope = get_current_agent_tool_scope()
+    if not isinstance(scope, Mapping):
+        return []
+    capabilities = {
+        str(item).strip().casefold()
+        for item in scope.get("capabilities", ())
+        if str(item).strip()
+    }
+    mode = str(workspace_mode or "").strip().casefold()
+    if mode and mode not in {"read", "write"}:
+        return []
+
+    from ..services.agent_delegate_policy import (
+        revision_allows_worker_delegate,
+        worker_delegate_required_capabilities,
+    )
+
+    revision = {"tool_ids": tool_ids, "delegate_policy": delegate_policy}
+    modes = (mode,) if mode else ("read", "write")
+    order = ("codex", "antigravity", "claude", "grok", "muse")
+    return [
+        kind
+        for kind in order
+        if revision_allows_worker_delegate(revision, kind)
+        and any(
+            (required := worker_delegate_required_capabilities(kind, candidate_mode))
+            and required <= capabilities
+            for candidate_mode in modes
+        )
+    ]
+
+
+def agent_revision_tool_permits_exposure(
+    tool_name: str,
+    tool_definition: Any = None,
+) -> bool | None:
+    """Apply P3's exact delegation ids on top of the P2 group matcher."""
+
+    tool_ids, delegate_policy = _current_agent_delegation_projection()
+    normalized = str(tool_name or "").rsplit(".", 1)[-1].strip().casefold()
+    if normalized in {"delegate_plan", "delegate_media"}:
+        return tool_ids is not None and normalized in tool_ids
+    if tool_ids is None:
+        return None
+    normalized_ids = {item.strip().casefold() for item in tool_ids}
+    if normalized in {"agent_team_delegate", "load_agent_team"}:
+        if delegate_policy is None:
+            return None
+        return False
+    if normalized == "delegate_worker":
+        return any(item.startswith("delegate_worker:") for item in normalized_ids)
+    if delegate_policy is None:
+        return None
+    if normalized in {"delegate", "delegate_agent_work", "delegate_plan"}:
+        return normalized in normalized_ids
+    return agent_revision_tool_id_permits(tool_name, tool_definition)
+
+
+def agent_revision_delegation_tool_permits_exposure(tool_name: str) -> bool | None:
+    """Apply the P2 tool-id gate to the Agent delegation tool family."""
+
+    normalized = str(tool_name or "").rsplit(".", 1)[-1].strip().casefold()
+    if normalized not in {
+        "delegate",
+        "delegate_agent_work",
+        "delegate_plan",
+        "delegate_media",
+        "delegate_worker",
+        "agent_team_delegate",
+        "load_agent_team",
+    }:
+        return None
+    return agent_revision_tool_permits_exposure(tool_name)
+
 
 
 _AGENT_TOOL_CAPABILITY_FAMILIES: dict[str, frozenset[str]] = {
@@ -613,7 +1079,10 @@ _AGENT_TOOL_CAPABILITY_FAMILIES: dict[str, frozenset[str]] = {
             # provider/fake-registry lane, which may not carry a
             # ToolDefinition, resolves the same capability family.
             "list_agent_workers",
+            "delegate",
             "delegate_agent_work",
+            "delegate_plan",
+            "delegate_media",
             "get_agent_work_status",
             "send_agent_work_message",
             "answer_agent_work_question",
@@ -621,11 +1090,24 @@ _AGENT_TOOL_CAPABILITY_FAMILIES: dict[str, frozenset[str]] = {
             "stop_agent_work",
             "resume_agent_work",
             "ask_user_question",
+            "delegate_worker:codex",
+            "delegate_worker:antigravity",
+            "delegate_worker:claude",
+            "delegate_worker:grok",
         }
     ),
     "browser_qa": frozenset({"browser_agent", "browser_agent_dedicated", "computer_observe", "computer_use"}),
-    "external_action_propose": frozenset({"propose_external_action", "execute_external_action"}),
-    "telephony_control": frozenset({"telephony_control", "place_call", "transfer_call"}),
+    "external_action_propose": frozenset(
+        {"propose_external_action", "execute_external_action"} | _CROWDWORKS_AGENT_TOOL_NAMES
+    ),
+    "remote_agent_delegate": frozenset(
+        {
+            "delegate_worker:muse",
+        }
+    ),
+    _PERSONAL_DEADLINE_DRAFT_CAPABILITY: frozenset(
+        {_PERSONAL_DEADLINE_DRAFT_TOOL_NAME}
+    ),
 }
 
 
@@ -641,13 +1123,43 @@ def agent_capability_ids_for_tool(
     """
 
     normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    if normalized_tool == "delegate_worker":
+        # The P3 tool has one wire name with a kind argument.  Static schema
+        # exposure is allowed when at least one pinned worker ID has its
+        # matching worker capability; dispatch validates the requested scope below.
+        scope = get_current_agent_tool_scope()
+        if not isinstance(scope, dict):
+            return frozenset()
+        requested = scope.get("tool_ids")
+        allowed = {
+            str(item).strip().casefold()
+            for item in (scope.get("capabilities") or ())
+            if str(item).strip()
+        }
+        ids = requested if isinstance(requested, (set, frozenset, tuple, list)) else ()
+        from ..services.agent_delegate_policy import worker_delegate_required_capabilities
+
+        return next(
+            (
+                required
+                for kind in ("codex", "antigravity", "claude", "grok", "muse")
+                if f"delegate_worker:{kind}" in ids
+                if (required := worker_delegate_required_capabilities(kind, ""))
+                if required <= allowed
+            ),
+            frozenset(),
+        )
     matches = {
         capability
         for capability, tools in _AGENT_TOOL_CAPABILITY_FAMILIES.items()
         if normalized_tool in tools or normalized_tool == capability
     }
     owner = str(getattr(tool_definition, "owner", "") or "").strip().lower()
-    if owner and owner in _AGENT_TOOL_CAPABILITY_FAMILIES:
+    if (
+        owner
+        and owner in _AGENT_TOOL_CAPABILITY_FAMILIES
+        and normalized_tool != "delegate_worker"
+    ):
         matches.add(owner)
     return frozenset(matches)
 
@@ -704,9 +1216,30 @@ def agent_tool_scope_permits_exposure(
             and not bool(workspace.get("native_allowed"))
         ):
             return False
+    tool_ids = current_agent_revision_tool_ids()
+    delegate_policy = current_agent_delegate_policy()
+    if agent_revision_tool_id_permits(normalized_tool, tool_definition) is False:
+        return False
+    if agent_revision_tool_permits_exposure(normalized_tool, tool_definition) is False:
+        return False
     if normalized_tool == "agent_team_delegate":
+        if tool_ids is not None and delegate_policy is not None:
+            return False
         return bool(scope.get("allowed_subagent_ids"))
+    if normalized_tool == "load_agent_team" and tool_ids is not None and delegate_policy is not None:
+        return False
     allowed = {str(item).strip().lower() for item in capabilities if str(item).strip()}
+    if normalized_tool == "delegate_worker":
+        revision_kinds = current_agent_worker_kinds()
+        if revision_kinds is not None:
+            return bool(revision_kinds)
+        from ..services.agent_delegate_policy import worker_delegate_required_capabilities
+
+        return any(
+            required <= allowed
+            for kind in ("codex", "antigravity", "claude", "grok", "muse")
+            if (required := worker_delegate_required_capabilities(kind, ""))
+        )
     # Mirror the execution guard: every authority family of the tool (for
     # example ``get_repo_map`` is both workspace_read and repo_map) must be
     # inside the ceiling, otherwise the model is shown a tool it cannot call.
@@ -721,12 +1254,60 @@ def _agent_tool_scope_decision(
     tool_definition: Any,
 ) -> ToolPolicyDecision | None:
     scope = get_current_agent_tool_scope()
+    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().casefold()
+    tool_ids = current_agent_revision_tool_ids()
+    if (
+        agent_revision_tool_id_permits(normalized_tool, tool_definition) is False
+        or agent_revision_tool_permits_exposure(normalized_tool, tool_definition) is False
+    ):
+        return ToolPolicyDecision(False, "Tool is outside the AgentRevision tool allowlist")
     if not isinstance(scope, dict):
         return None
     capabilities = scope.get("capabilities")
     if not isinstance(capabilities, (set, frozenset, tuple, list)):
         return ToolPolicyDecision(False, "Agent capability scope is invalid")
-    normalized_tool = str(tool_name or "").rsplit(".", 1)[-1].strip().lower()
+    allowed = {
+        str(item).strip().casefold()
+        for item in capabilities
+        if str(item).strip()
+    }
+
+    worker_required_capabilities = frozenset()
+    if normalized_tool == "delegate_worker":
+        from ..services.agent_delegate_policy import worker_delegate_required_capabilities
+
+        requested_kind = str((tool_args or {}).get("kind") or "").strip().casefold()
+        workspace_scope = (tool_args or {}).get("workspace_scope")
+        mode = (
+            str(workspace_scope.get("mode") or "").strip().casefold()
+            if isinstance(workspace_scope, Mapping)
+            else ""
+        )
+        worker_required_capabilities = worker_delegate_required_capabilities(
+            requested_kind,
+            mode,
+        )
+        if not worker_required_capabilities:
+            return ToolPolicyDecision(
+                False,
+                "Agent worker kind and workspace mode must be supported",
+            )
+        revision_kinds = current_agent_worker_kinds(workspace_mode=mode)
+        if (
+            tool_ids is not None
+            and revision_kinds is not None
+            and requested_kind not in set(revision_kinds)
+        ):
+            return ToolPolicyDecision(
+                False,
+                "AgentRevision does not allow this worker kind",
+            )
+        if not worker_required_capabilities <= allowed:
+            return ToolPolicyDecision(
+                False,
+                "Agent capability ceiling does not allow this worker scope",
+            )
+
     workspace = get_current_agent_workspace_scope()
     if (
         current_structured_task_mode() is not None
@@ -751,22 +1332,42 @@ def _agent_tool_scope_decision(
                 "native execution is not authorized for this Agent workspace",
             )
     if normalized_tool == "agent_team_delegate":
-        requested = str((tool_args or {}).get("subagent") or "").strip().lower()
+        if tool_ids is not None and current_agent_delegate_policy() is not None:
+            return ToolPolicyDecision(
+                False,
+                "AgentRevision must use the delegate tool instead of legacy Team delegation",
+            )
+        requested = str((tool_args or {}).get("subagent") or "").strip().casefold()
         allowed_subagents = scope.get("allowed_subagent_ids") or frozenset()
         if requested and requested not in allowed_subagents:
             return ToolPolicyDecision(False, "AgentRevision does not allow this Subagent")
         if not requested:
             return ToolPolicyDecision(False, "Subagent identity is required")
-    allowed = {str(item).strip().lower() for item in capabilities if str(item).strip()}
-    # A selected Agent with an empty revision ceiling is explicitly read-only
-    # at the tool layer; ordinary text generation remains available.
-    required = agent_capability_ids_for_tool(normalized_tool, tool_definition)
+
+    is_pack_loader = normalized_tool == "load_tool_pack"
+    if is_pack_loader:
+        from .tool_packs import agent_tool_pack_denial_code
+
+        denial_code = agent_tool_pack_denial_code(
+            (tool_args or {}).get("pack"),
+            tool_definition,
+        )
+        if denial_code == "pack_unknown":
+            return ToolPolicyDecision(False, "Unknown Agent tool pack")
+        if denial_code == "pack_not_allowed":
+            return ToolPolicyDecision(False, "Agent tool pack is not available for this turn")
+
+    required = (
+        worker_required_capabilities
+        if normalized_tool == "delegate_worker"
+        else agent_capability_ids_for_tool(normalized_tool, tool_definition)
+    )
     matches = required if required <= allowed else set()
-    # Delegation is a control operation whose required capabilities are the
-    # requested child intersection, checked by AgentAuthorityResolver below;
-    # it must not require an invented capability ID or the child's first
-    # concrete tool capability at this static policy layer.
-    if not matches and normalized_tool != "agent_team_delegate":
+    if not matches and normalized_tool not in {
+        "agent_team_delegate",
+        "delegate_worker",
+        "load_tool_pack",
+    }:
         return ToolPolicyDecision(False, "Tool is outside the AgentRevision capability ceiling")
     checker = scope.get("revalidate")
     if callable(checker):
@@ -775,9 +1376,6 @@ def _agent_tool_scope_decision(
         except Exception:
             return ToolPolicyDecision(False, "Agent authority could not be revalidated")
         if inspect.isawaitable(verdict):
-            # Sync policy callers must never treat a coroutine object as a
-            # truthy allow. The unified async lane awaits the central guard
-            # before entering this policy.
             close = getattr(verdict, "close", None)
             if callable(close):
                 close()
@@ -791,7 +1389,6 @@ def _agent_tool_scope_decision(
         ):
             return ToolPolicyDecision(False, "Agent authority was not explicitly allowed")
     return None
-
 
 def sanitize_command_capabilities(value: Any) -> tuple[str, ...]:
     if value is None:
@@ -1227,12 +1824,13 @@ _MUTATION_FORBIDDEN_PATTERNS = (
         # modifier for a later, non-mutating continuation constraint such as
         # ``追加の委譲は不要`` or ``追加ツールは不要``.  Do not let that
         # modifier turn a required current delegation into a global
-        # no-mutation request.  Other action tokens, including a later
-        # ``追加`` after a separator, remain covered by the same pattern.
-        r"(?:作成|(?!追加(?:の)?(?:委譲|ツール))追加|登録|更新|変更|修正|削除|消去|割り当て|"
+        # no-mutation request.  ``追加fallback`` is also an execution-route
+        # constraint, not a file mutation. Other action tokens, including a
+        # later ``追加`` after a separator, remain covered by the same pattern.
+        r"(?:作成|(?!追加(?:の)?(?:委譲|ツール|fallback))追加|登録|更新|変更|修正|削除|消去|割り当て|"
         r"スケジュール|書き込み)"
         r"(?:[／/・、,\s]*"
-        r"(?:作成|(?!追加(?:の)?(?:委譲|ツール))追加|登録|更新|変更|修正|削除|消去|割り当て|"
+        r"(?:作成|(?!追加(?:の)?(?:委譲|ツール|fallback))追加|登録|更新|変更|修正|削除|消去|割り当て|"
         r"スケジュール|書き込み))*"
         r"[^。\n]{0,12}(?:禁止|しないで|しない|不要|不可)"
     ),
@@ -1266,6 +1864,57 @@ def mutation_execution_forbidden(text: str | None) -> bool:
     )
 
 
+# Only named configuration subjects can scope this exception.  Mask the
+# smallest complete prohibition, leaving neighbouring restrictions visible.
+_CW_CONFIG_SUBJECT = r"(?:モデル|model|policy|ポリシー|権限|permissions?)(?:設定)?"
+_CW_SCOPED_CONFIG_BAN = re.compile(
+    r"(?<![A-Za-z0-9_])" + _CW_CONFIG_SUBJECT
+    + r"(?:\s*[/／・、,]\s*" + _CW_CONFIG_SUBJECT + r")*"
+    + r"(?:は|を)?\s*(?:変更|更新)(?:は|を)?(?:しないでください|しない|禁止|不可|せず)"
+    r"|\b(?:do\s+not|don't|dont|never)\s+(?:change|update|modify)\s+"
+    r"(?:the\s+)?" + _CW_CONFIG_SUBJECT
+    + r"(?:\s*(?:,|/|and)\s*(?:the\s+)?" + _CW_CONFIG_SUBJECT + r")*"
+    + r"(?=\s*(?:[.;；\n]|$))",
+    re.IGNORECASE,
+)
+_CW_INTERNAL_REQUEST = re.compile(r"内部|\binternal\b", re.IGNORECASE)
+_CW_DRAFT_REQUEST = re.compile(r"draft|ドラフト|下書き|proposed|承認待ち", re.IGNORECASE)
+_CW_PREPARE_REQUEST = re.compile(r"作成|準備|進め|\b(?:create|prepare)\b", re.IGNORECASE)
+_CW_QA_REQUEST = re.compile(r"(?<![A-Za-z0-9_])qa(?![A-Za-z0-9_])", re.IGNORECASE)
+_CW_OTHER_BAN = re.compile(
+    r"read[\s_-]*only|読み取り専用|停止|中止|止めて|実行しない|実行禁止"
+    r"|ツール.{0,12}(?:禁止|しない|不可)|crowdworks_\w+.{0,12}(?:禁止|しない|不可)"
+    r"|\b(?:stop|cancel)\b|\b(?:do not|don't|never)\s+(?:use|call)\b",
+    re.IGNORECASE,
+)
+
+
+def _crowdworks_internal_proposal_with_scoped_policy_ban(text: str, tool_name: str) -> bool:
+    """Separate named configuration bans from an explicit internal CW request."""
+    if tool_name not in _CROWDWORKS_AGENT_TOOL_NAMES:
+        return False
+    request = _extract_effective_user_request(text)
+    # Steering may revoke the original request; do not infer permission from it.
+    if "Human steering update:" in request or "追加指示:" in request:
+        return False
+    remaining, count = _CW_SCOPED_CONFIG_BAN.subn(" ", request)
+    if not count or _CW_OTHER_BAN.search(remaining) or mutation_execution_forbidden(remaining):
+        return False
+    # Require a positive, bounded internal preparation instruction in one
+    # sentence. A prohibition mentioning a draft is not an authorization.
+    for sentence in re.split(r"[。;；\n]", remaining):
+        if (
+            _CW_INTERNAL_REQUEST.search(sentence)
+            and _CW_DRAFT_REQUEST.search(sentence)
+            and _CW_PREPARE_REQUEST.search(sentence)
+            and _CW_QA_REQUEST.search(sentence)
+            and not mutation_execution_forbidden(sentence)
+            and not re.search(r"(?:作成|準備|進め).{0,12}(?:禁止|しない|不可)|\b(?:do not|don't|never)\s+(?:create|prepare)\b", sentence, re.IGNORECASE)
+        ):
+            return True
+    return False
+
+
 # Workspace file tools whose target is a single ``path`` argument.  Under a
 # structured ``mode=mutate`` API Agent task these are authorised by the task
 # mode and narrowed by path-scoped Constraints instead of the lexical
@@ -1279,6 +1928,36 @@ STRUCTURED_TASK_FILE_EDIT_TOOL_NAMES: frozenset[str] = frozenset(
         "insert_to_file",
         "delete_file",
         "undo_edit",
+    }
+)
+# AgentDialogue controls only create or advance an internal Work/Dialogue.
+# Their worker-side authority separately fences external mutations.
+AGENT_DIALOGUE_COORDINATION_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "list_agent_workers",
+        "delegate",
+        "delegate_agent_work",
+        "delegate_plan",
+        "delegate_media",
+        "get_agent_work_status",
+        "send_agent_work_message",
+        "answer_agent_work_question",
+        "escalate_agent_work_question",
+        "stop_agent_work",
+        "resume_agent_work",
+    }
+)
+# A Worker turn may only read its status, message the Root and ask a question.
+# The authority guard denies these, so showing them only wastes model requests.
+AGENT_DIALOGUE_ROOT_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "list_agent_workers",
+        "delegate",
+        "delegate_agent_work",
+        "answer_agent_work_question",
+        "escalate_agent_work_question",
+        "stop_agent_work",
+        "resume_agent_work",
     }
 )
 # ``Inspect only relevant sections`` / ``Read only the relevant parts`` narrows
@@ -1458,6 +2137,11 @@ _TASK_EDIT_VERB_RE = re.compile(
     # ``移植``/``保存`` name the destination file of a port or save.
     r"編集|修正|変更|追記|書き換え|更新|置換|直す|直して|作成|移植|保存|書き込"
     r"|\b(?:edit|modify|update|change|fix|patch|rewrite|replace|append|create|write)\b",
+    re.IGNORECASE,
+)
+_TASK_DUPLICATE_PREVENTION_RE = re.compile(
+    r"\b(?:do\s+not|don['’]?t|dont|never)\s+add\s+"
+    r"(?:a\s+)?(?:second|duplicate|extra|another)\s+copy\b",
     re.IGNORECASE,
 )
 _TASK_ONLY_RE = re.compile(r"だけ|のみ|\bonly\b", re.IGNORECASE)
@@ -1652,6 +2336,12 @@ class StructuredTaskMutationScope:
     editable_directories: frozenset[str] = frozenset()
 
 
+def _latest_human_steering_update(text: str | None) -> str | None:
+    marker = "Human steering update:\nConstraints:\n"
+    _prefix, found, update = str(text or "").rpartition(marker)
+    return update.strip() if found and update.strip() else None
+
+
 def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationScope:
     """Classify read-only/no-mutation prose of a structured mutate task.
 
@@ -1666,6 +2356,18 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
     """
 
     policy_text = _extract_effective_user_request(str(text or ""))
+    has_scoped_positive_edit = any(
+        _task_path_tokens(clause)
+        and _TASK_EDIT_VERB_RE.search(clause)
+        and _TASK_READ_ONLY_TARGET_RE.search(clause) is None
+        and not any(pattern.search(clause) for pattern in _MUTATION_FORBIDDEN_PATTERNS)
+        for sentence in _TASK_SENTENCE_SPLIT_RE.split(policy_text)
+        for clause in _TASK_WHOLE_CLAUSE_SPLIT_RE.split(sentence)
+    )
+    ignore_duplicate_prevention = (
+        has_scoped_positive_edit
+        and _TASK_DUPLICATE_PREVENTION_RE.search(policy_text) is not None
+    )
     whole = False
     carve_out = False
     protected: set[str] = set()
@@ -1678,6 +2380,8 @@ def structured_task_mutation_scope(text: str | None) -> StructuredTaskMutationSc
         sentence = sentence.strip()
         if not sentence:
             continue
+        if ignore_duplicate_prevention:
+            sentence = _TASK_DUPLICATE_PREVENTION_RE.sub(" ", sentence)
         scan = _task_local_constraint_scan(_TASK_SHORTCUT_CONSTRAINT_RE.sub(
             " ", _TASK_INSPECTION_QUALIFIER_RE.sub(" ", sentence)
         ))
@@ -2068,17 +2772,51 @@ def current_structured_edit_scope() -> FixedEditScope | None:
     return scope if isinstance(scope, FixedEditScope) else None
 
 
+def _latest_human_steering_update(text: str | None) -> str | None:
+    marker = "Human steering update:\nConstraints:\n"
+    _prefix, found, update = str(text or "").rpartition(marker)
+    return update.strip() if found and update.strip() else None
+
+
 def _structured_mutate_task_decision(
     text: str,
     tool_name: str,
     tool_args: Mapping[str, Any] | None,
+    *,
+    human_steering_update: str | None = None,
+    human_steering_history: str | None = None,
 ) -> ToolPolicyDecision:
-    # An admitted API task enforces its frozen scope.  Turn text may be
-    # framework guidance or a corrective note, so prose is re-read only for
-    # legacy callers that never bound a scope.
+    # An admitted API task keeps its frozen scope as the maximum authority.
+    # The current input is the human request plus explicit user steering
+    # updates; honor newer read-only and target restrictions within that bound.
     fixed = current_structured_edit_scope()
-    scope = fixed.as_mutation_scope() if fixed is not None else structured_task_mutation_scope(text)
-    if scope.whole_task_forbidden:
+    # Admission already reconciles the original prose with explicit targets.
+    # Re-parsing that prose would undo the authoritative target selection.
+    # Only later human-authored steering may further narrow a frozen scope.
+    current_scope = structured_task_mutation_scope(
+        human_steering_history if fixed is not None else text
+    )
+    if human_steering_update:
+        steering_scope = structured_task_mutation_scope(human_steering_update)
+        if steering_scope.editable_limited:
+            current_scope = StructuredTaskMutationScope(
+                whole_task_forbidden=(
+                    current_scope.whole_task_forbidden
+                    or steering_scope.whole_task_forbidden
+                ),
+                restricted=True,
+                protected_paths=(
+                    current_scope.protected_paths
+                    | steering_scope.protected_paths
+                ),
+                editable_paths=steering_scope.editable_paths,
+                editable_limited=True,
+                unenumerated_targets=steering_scope.unenumerated_targets,
+                carve_out=steering_scope.carve_out,
+                editable_directories=steering_scope.editable_directories,
+            )
+    scope = fixed.as_mutation_scope() if fixed is not None else current_scope
+    if scope.whole_task_forbidden or current_scope.whole_task_forbidden:
         return ToolPolicyDecision(
             False,
             "the user explicitly requested read-only or no-mutation handling",
@@ -2089,7 +2827,10 @@ def _structured_mutate_task_decision(
         # by the Agent tool scope (required_capabilities).  The file-target
         # scope is not a command filesystem sandbox.
         return ToolPolicyDecision(True, "structured mutate task authorises this tool")
-    if not scope.restricted:
+    restricted = bool(
+        scope.restricted or (fixed is not None and current_scope.restricted)
+    )
+    if not restricted:
         return ToolPolicyDecision(True, "structured mutate task authorises workspace edits")
     args = tool_args or {}
     path = _normalise_task_path(args.get("path") or args.get("file_path") or "")
@@ -2101,6 +2842,23 @@ def _structured_mutate_task_decision(
     from ..security.agent_run_scope import get_current_run_scope
 
     run_scope = get_current_run_scope()
+    if fixed is not None and current_scope.restricted:
+        if any(
+            _task_path_matches(path, token, run_scope, protected=True)
+            for token in current_scope.protected_paths
+        ):
+            return ToolPolicyDecision(
+                False,
+                "the current user instruction marks this file read-only",
+            )
+        if current_scope.editable_limited and not any(
+            _task_path_matches(path, token, run_scope)
+            for token in current_scope.editable_paths
+        ):
+            return ToolPolicyDecision(
+                False,
+                "the current user instruction restricts edits to its named targets",
+            )
     if any(
         _task_path_matches(path, token, run_scope, protected=True)
         for token in scope.protected_paths
@@ -2797,10 +3555,42 @@ def _runtime_capability_for_tool(
     outside a configured runtime; an explicit config always wins.
     """
 
-    if config is None:
-        return None
     name = str(tool_name or "").strip()
     owner = str(_tool_metadata_value(tool_definition, "owner", "") or "").strip().casefold()
+
+    # The private personal deadline seam is fail-closed even for callers that
+    # do not otherwise carry a runtime config.  Only the literal boolean
+    # ``True`` in the canonical dotted key can expose or execute it.
+    if name == _PERSONAL_DEADLINE_DRAFT_TOOL_NAME and _policy_config_get(
+        config,
+        _PERSONAL_DEADLINE_DRAFT_CONFIG_KEY,
+        None,
+    ) is not True:
+        return "personal deadline chat draft is disabled in configuration"
+
+    if name == _PERSONAL_DEADLINE_DRAFT_TOOL_NAME and tool_definition is not None:
+        availability = _tool_metadata_value(tool_definition, "availability", None)
+        checker = (
+            availability.get(_PERSONAL_DEADLINE_DRAFT_AVAILABILITY_KEY)
+            if isinstance(availability, Mapping)
+            else None
+        )
+        if not callable(checker):
+            return "personal deadline current-turn availability is unavailable"
+        try:
+            current_availability = checker()
+        except Exception:
+            return "personal deadline current-turn availability is unavailable"
+        if inspect.isawaitable(current_availability):
+            close = getattr(current_availability, "close", None)
+            if callable(close):
+                close()
+            return "personal deadline current-turn availability is unavailable"
+        if current_availability is not None:
+            return "personal deadline current-turn availability is unavailable"
+
+    if config is None:
+        return None
 
     if not _policy_config_bool(_policy_config_get(config, "use_tools", True), default=True):
         return "tools are disabled in configuration"
@@ -3074,6 +3864,23 @@ def check_tool_call_allowed(
     side-effect metadata even when a custom tool has an unfamiliar name.
     """
     dialogue_authority = get_current_agent_dialogue_authority()
+    current_user_input = get_current_user_input()
+    steering_source = (
+        dialogue_authority.get("human_anchor")
+        if isinstance(dialogue_authority, dict)
+        and dialogue_authority.get("role") == "worker"
+        else current_user_input
+    )
+    steering_marker = "Human steering update:\nConstraints:\n"
+    _before_steering, has_steering, steering_history = str(
+        steering_source or ""
+    ).partition(steering_marker)
+    human_steering_history = (
+        "Constraints:\n" + steering_history if has_steering else None
+    )
+    human_steering_update = _latest_human_steering_update(
+        str(steering_source or "")
+    )
     if (
         isinstance(dialogue_authority, dict)
         and dialogue_authority.get("role") == "worker"
@@ -3085,7 +3892,18 @@ def check_tool_call_allowed(
         # a read-only/mutation override.
         text = _combined_text(dialogue_authority["human_anchor"], tool_args)
     else:
-        text = _combined_text(user_input, tool_args)
+        # Review and continuation prompts are generated inside the turn and
+        # can contain their own ``User request:`` section plus verifier prose.
+        # They are model input, not a new source of user authority. This
+        # ContextVar carries the human request and explicit human steering
+        # updates; use it for policy whenever present and retain the explicit
+        # argument only for legacy/direct callers outside a bound turn.
+        policy_user_input = (
+            current_user_input
+            if isinstance(current_user_input, str) and current_user_input.strip()
+            else user_input
+        )
+        text = _combined_text(policy_user_input, tool_args)
     # Help is a hard provider boundary, not merely a prompt hint.  The normal
     # server path emits a trusted command preamble; the lexical fallback is
     # limited to the leading user token and protects direct/test callers that
@@ -3096,8 +3914,8 @@ def check_tool_call_allowed(
             if isinstance(dialogue_authority, dict)
             else None
         )
+        or current_user_input
         or user_input
-        or get_current_user_input()
         or ""
     )
     trusted_help = "aoitalk_help" in command_capabilities_from_text(trusted_input)
@@ -3227,12 +4045,27 @@ def check_tool_call_allowed(
             text,
             normalized_tool_name,
             tool_args,
+            human_steering_update=human_steering_update,
+            human_steering_history=human_steering_history,
         )
         if not structured_decision.allowed:
             return structured_decision
     elif (
         mutation_execution_forbidden(text)
         and mutation
+        and normalized_tool_name not in AGENT_DIALOGUE_COORDINATION_TOOL_NAMES
+        and not _crowdworks_internal_proposal_with_scoped_policy_ban(
+            text, normalized_tool_name
+        )
+        and not (
+            normalized_tool_name == "delegate_worker"
+            and isinstance(tool_args, Mapping)
+            and isinstance(tool_args.get("workspace_scope"), Mapping)
+            and str(
+                tool_args["workspace_scope"].get("mode") or ""
+            ).strip().casefold()
+            == "read"
+        )
     ):
         return ToolPolicyDecision(
             False,

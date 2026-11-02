@@ -85,16 +85,19 @@ class Features:
     @classmethod
     def _get_profile_settings(cls) -> Dict[str, bool]:
         """Load profile settings from YAML file if specified"""
-        if cls._profile_cache is not None:
-            return cls._profile_cache
+        # ``Config()`` resets this cache from any thread.  Work on a local copy so a
+        # concurrent reset cannot turn the value being returned into None.
+        cached = cls._profile_cache
+        if cached is not None:
+            return cached
         
         profile_name = cls.profile_name()
         
         if profile_name == "enterprise":
-            cls._profile_cache = cls.ENTERPRISE_DEFAULTS.copy()
+            settings = cls.ENTERPRISE_DEFAULTS.copy()
             logger.info("Feature Flags: Enterprise プロファイルを使用")
         elif profile_name == "personal":
-            cls._profile_cache = cls.DEFAULTS.copy()
+            settings = cls.DEFAULTS.copy()
             logger.info("Feature Flags: Personal プロファイルを使用")
         elif profile_name:
             # Try to load from YAML file
@@ -105,19 +108,20 @@ class Features:
                     with open(profile_path, 'r', encoding='utf-8') as f:
                         profile_data = yaml.safe_load(f) or {}
                     features = profile_data.get('features', {})
-                    cls._profile_cache = {**cls.DEFAULTS, **features}
+                    settings = {**cls.DEFAULTS, **features}
                     logger.info(f"Feature Flags: {profile_name} プロファイルを読み込みました")
                 except Exception as e:
                     logger.warning(f"Feature Flags: プロファイル読み込みエラー: {e}")
-                    cls._profile_cache = cls.DEFAULTS.copy()
+                    settings = cls.DEFAULTS.copy()
             else:
                 logger.warning(f"Feature Flags: プロファイル {profile_name} が見つかりません")
-                cls._profile_cache = cls.DEFAULTS.copy()
+                settings = cls.DEFAULTS.copy()
         else:
             # No profile specified, use defaults
-            cls._profile_cache = cls.DEFAULTS.copy()
+            settings = cls.DEFAULTS.copy()
         
-        return cls._profile_cache
+        cls._profile_cache = settings
+        return settings
     
     @classmethod
     def is_enabled(cls, feature: str) -> bool:

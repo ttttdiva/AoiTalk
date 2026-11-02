@@ -21,6 +21,7 @@ type AgentSelectorProps = {
   onRefresh: () => Promise<void>;
   onAdoptServerAgent?: () => Promise<void>;
   bindingLocked?: boolean;
+  compact?: boolean;
 };
 
 function currentLabel(session: ConversationSession | null): string {
@@ -38,6 +39,7 @@ export function AgentSelector({
   onRefresh,
   onAdoptServerAgent,
   bindingLocked = false,
+  compact = false,
 }: AgentSelectorProps) {
   const [visible, setVisible] = useState(false);
   const [saving, setSaving] = useState<string | null>(null);
@@ -74,9 +76,16 @@ export function AgentSelector({
           setError(null);
           setVisible(true);
         }}
-        style={[styles.chip, unavailable ? styles.disabled : null]}
+        style={[styles.chip, compact && styles.compactChip, unavailable ? styles.disabled : null]}
       >
-        <Text style={styles.label}>{currentLabel(session)}</Text>
+        <Text
+          testID="agent-selector-label"
+          style={[styles.label, compact && styles.compactLabel]}
+          numberOfLines={compact ? 1 : undefined}
+          ellipsizeMode={compact ? "tail" : undefined}
+        >
+          {currentLabel(session)}
+        </Text>
         <Text style={styles.chevron}>⌄</Text>
       </Pressable>
       <Portal>
@@ -172,8 +181,10 @@ export function AgentSelector({
 
 const styles = StyleSheet.create({
   chip: { width: "100%", maxWidth: "100%", minHeight: 44, minWidth: 0, flexShrink: 1, flexDirection: "row", alignItems: "flex-start", borderRadius: 12, paddingHorizontal: 6, paddingVertical: 5 },
+  compactChip: { alignItems: "center" },
   disabled: { opacity: 0.62 },
   label: { flex: 1, minWidth: 0, color: "#cdd6f4", fontSize: 12, fontWeight: "600", paddingVertical: 4 },
+  compactLabel: { paddingVertical: 0 },
   chevron: { color: "#a6adc8", fontSize: 12, marginLeft: 3, paddingTop: 4, flexShrink: 0 },
   dialog: { backgroundColor: "#1e1e2e" },
   title: { color: "#cdd6f4" },

@@ -23,6 +23,7 @@ import inspect
 import os
 import platform
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -30,6 +31,10 @@ from ..tools.registry import ToolRegistry
 from ..features import Features
 
 logger = logging.getLogger(__name__)
+
+_issued_native_delegation_proof: ContextVar[Any | None] = ContextVar(
+    "issued_native_delegation_proof", default=None
+)
 
 NATIVE_READ = "read"
 NATIVE_EDIT = "edit"
@@ -183,6 +188,75 @@ def _agent_dialogue_policy(client: Any | None) -> tuple[bool, bool, bool] | None
         bool(getattr(workspace, "readonly", False)),
         bool(getattr(workspace, "native_allowed", False)),
     )
+
+
+def _native_delegation_phase_proof(client: Any | None) -> Any | None:
+    """Validate the distinct, server-issued readonly delegation proof."""
+    from ..services.agent_delegation_native_scope import NativeDelegationScopeProof
+    from ..services.turn_context import get_turn_context
+    from ..security.harness_execution_scope import get_current_harness_execution_scope
+    from .tool_policy import get_current_agent_tool_scope
+    from .cli_backends.codex import CodexCLIBackend
+    from pathlib import Path
+
+    proof = getattr(client, "_agent_native_scope_proof", None)
+    if (type(proof) is not NativeDelegationScopeProof
+            or proof is not _issued_native_delegation_proof.get()
+            or type(getattr(client, "cli_backend", None)) is not CodexCLIBackend):
+        return None
+    try:
+        proof.assert_context(client)
+        workspace = proof.workspace
+        scope = workspace.native_scope
+        turn = get_turn_context()
+        tools = get_current_agent_tool_scope()
+        if (not workspace.readonly or not workspace.native_allowed
+                or scope.workspace_access_level != "read"
+                or get_current_harness_execution_scope() is not proof.issued_scope
+                or str(getattr(client.cli_backend, "_model", "") or "") != str(workspace.model_id)
+                or not isinstance(tools, dict) or tools.get("tool_ids") != frozenset()
+                or str(turn.user_id) != proof.owner_id or str(turn.session_id) != proof.session_id
+                or str(turn.project_id) != proof.project_id
+                or str(getattr(client, "session_user_id", None)) != proof.owner_id
+                or str(getattr(client, "current_session_id", None)) != proof.session_id
+                or str(getattr(client, "current_project_id", None)) != proof.project_id
+                or Path(workspace.working_directory).resolve() != Path(scope.canonical_root).resolve()):
+            return None
+    except Exception:
+        return None
+    return proof
+
+
+def _codex_aoidots_agent_execution(client: Any | None) -> bool:
+    """Recognize only the server-marked AoiDots Root/Worker Codex lane."""
+
+    if client is None:
+        return False
+    backend = getattr(client, "cli_backend", None)
+    name_getter = getattr(backend, "get_provider_name", None)
+    provider = str(name_getter() if callable(name_getter) else "").strip().casefold()
+    if provider not in {"codex cli", "codex-cli"}:
+        return False
+    if not bool(getattr(client, "_agent_native_scope_required", False)):
+        logger.info("AoiDots Codex lane not used: client is not an Agent client")
+        return False
+    marker = getattr(client, "_agent_root_scope_marker", None)
+    if not isinstance(marker, Mapping) or str(marker.get("scope_kind") or "") not in {
+        "aoidots",
+        "agent_dialogue",
+    }:
+        # Falling out of this lane sends Codex to the WSL sandbox, where the
+        # host CLI and its ChatGPT login do not exist.  Say why.
+        logger.warning("AoiDots Codex lane not used: scope marker is missing")
+        return False
+    policy = _agent_dialogue_policy(client)
+    if policy is None or not policy[0] or not policy[2]:
+        logger.warning("AoiDots Codex lane not used: dialogue policy=%s", policy)
+        return False
+    if _agent_native_scope_proof(client) is None:
+        logger.warning("AoiDots Codex lane not used: scope proof is unavailable")
+        return False
+    return True
 
 
 def _agent_native_scope_proof(client: Any | None) -> Any | None:
@@ -343,15 +417,29 @@ def native_repository_capabilities(backend: Any) -> frozenset[str]:
         return frozenset()
     resolver = getattr(backend, "native_repository_capabilities_for_scope", None)
     if not callable(resolver):
-        return frozenset({NATIVE_READ})
+        capabilities = frozenset({NATIVE_READ})
+        return (
+            capabilities & frozenset({NATIVE_READ})
+            if bool(getattr(backend, "_agent_task_native_read_only", False))
+            else capabilities
+        )
     try:
         capabilities = resolver(scope)
     except Exception:
         logger.debug("native repository capability resolution failed", exc_info=True)
         return frozenset()
-    return frozenset(
+    capabilities = frozenset(
         str(item) for item in (capabilities or ()) if str(item) in _TOOLS_BY_CAPABILITY
     )
+    # Generic Agent Chat may use provider-native read/edit/shell tools when
+    # its issued scope and authority allow them. Agent Tasks deliberately use
+    # a narrower provider-native lane: writes and commands must go through
+    # the managed AoiTalk ToolRegistry, where edit_scope and command policy
+    # are enforced. The marker is task-local and attached to the backend only
+    # for the lifetime of one task client.
+    if bool(getattr(backend, "_agent_task_native_read_only", False)):
+        capabilities &= frozenset({NATIVE_READ})
+    return capabilities
 
 
 def cli_native_duplicate_tool_names(backend: Any) -> frozenset[str]:
@@ -526,6 +614,9 @@ def _formal_agent_mcp_server(
     return True
 
 
+_CODEX_AOIDOTS_MCP_ATTESTATION = type("_CodexAoiDotsMcpAttestation", (str,), {})("verified")
+
+
 def formal_agent_mcp_servers_for_cli_backend(
     mcp_servers: Mapping[str, Any] | None,
     backend: Any,
@@ -544,14 +635,46 @@ def formal_agent_mcp_servers_for_cli_backend(
     context = _formal_agent_work_context(client)
     if context is None:
         return {}
+    configured = dict(mcp_servers or {})
+    codex_aoidots = _codex_aoidots_agent_execution(client)
+    if codex_aoidots:
+        for name in ("agent_activity", "dialogue8"):
+            configured.setdefault(
+                name,
+                {
+                    "command": sys.executable,
+                    "args": ["-m", _FORMAL_AGENT_ENTRY_MODULE, name],
+                },
+            )
+    root_startup_required = False
+    if codex_aoidots and not getattr(client, "_agent_native_phase_required", False):
+        from .openai_compatible_local_engine import OpenAICompatibleLocalClient
+
+        binding = getattr(client, "_agent_execution_binding", None)
+        marker = getattr(client, "_agent_root_scope_marker", None)
+        binding_marker = getattr(binding, "_root_scope_marker", None)
+        root_startup_required = (
+            isinstance(marker, Mapping)
+            and isinstance(binding_marker, Mapping)
+            and dict(marker) == dict(binding_marker)
+            and (
+                OpenAICompatibleLocalClient._is_bound_aoidots_root_turn(client)
+                or OpenAICompatibleLocalClient._is_bound_root_dialogue_turn(client)
+            )
+        )
     result: dict[str, Any] = {}
-    for name, settings in dict(mcp_servers or {}).items():
+    for name, settings in configured.items():
         if not _formal_agent_mcp_server(name, settings, context=context):
             continue
         if not isinstance(settings, Mapping):
             continue
         copied = dict(settings)
+        copied.pop("_aoitalk_root_mcp_startup_required", None)
         copied["_aoitalk_formal_agent_context"] = dict(context)
+        if codex_aoidots:
+            copied["_aoitalk_codex_aoidots_attested"] = _CODEX_AOIDOTS_MCP_ATTESTATION
+            if root_startup_required:
+                copied["_aoitalk_root_mcp_startup_required"] = True
         result[str(name)] = copied
     return result
 
@@ -599,6 +722,11 @@ def current_cli_mcp_servers(
     def available(name, settings):
         if not isinstance(settings, dict):
             return False
+        if formal_agent_context and str(name) in FORMAL_AGENT_MCP_SERVER_KEYS:
+            # AoiDots Root/Worker authority is checked by the first-party
+            # receiver on every call; ordinary mcp_enabled=false does not
+            # suppress this server-owned bridge.
+            return True
         # Match MCPPlugin: platform settings override shared metadata. The
         # gate reads explicit markers, never an external name or command.
         metadata = dict(settings)
@@ -660,10 +788,30 @@ def disabled_cli_native_features(config: Any) -> frozenset[str]:
     ) | (frozenset({"mcp"}) if Features.is_enterprise() else frozenset())
 
 
-def native_cli_feature_gate_args(backend: Any, config: Any, disabled_features=None, fallback_servers=None):
+def native_cli_feature_gate_args(
+    backend: Any,
+    config: Any,
+    disabled_features=None,
+    fallback_servers=None,
+    *,
+    client: Any | None = None,
+):
     from .tool_policy import _policy_config_get
 
     disabled = disabled_cli_native_features(config) if disabled_features is None else disabled_features
+    if getattr(client, "_agent_native_phase_required", False):
+        if _native_delegation_phase_proof(client) is None:
+            return None
+        return backend.native_delegation_phase_args()
+    if _codex_aoidots_agent_execution(client):
+        aoidots_gate = getattr(backend, "aoidots_agent_feature_gate_args", None)
+        if callable(aoidots_gate):
+            try:
+                args = aoidots_gate(disabled)
+            except Exception:
+                logger.error("AoiDots Codex capability arguments failed", exc_info=True)
+                return None
+            return None if args is None else [str(item) for item in args]
     gate = getattr(backend, "native_feature_gate_args", None)
     args = gate(disabled) if disabled and callable(gate) else ([] if not disabled else None)
     if args is None:
@@ -702,6 +850,14 @@ def native_cli_invocation_controls(
 ) -> dict | None:
     """Return enforced controls, or refuse a backend with no safe fallback."""
     from .tool_policy import _runtime_capability_for_tool
+
+    if getattr(client, "_agent_native_phase_required", False):
+        if _native_delegation_phase_proof(client) is None or backend is not client.cli_backend:
+            return None
+        try:
+            return {"extra_args": backend.native_delegation_phase_args()}
+        except (AttributeError, TypeError):
+            return None
 
     if _agent_execution_active(client):
         dialogue_policy = _agent_dialogue_policy(client)

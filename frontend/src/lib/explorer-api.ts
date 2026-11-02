@@ -857,6 +857,7 @@ function triggerNativeFormDownload(paths: string[], action: string): void {
 }
 
 const TRANSFER_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const APP_RUN_FILE_ID_PATTERN = /^af_[A-Za-z0-9_-]{32}$/;
 
 function isValidArchiveIncludePaths(value: string | null): boolean {
   if (value === null) return true;
@@ -938,6 +939,98 @@ function isValidAppArchiveUrl(value: string, rawPath: string): boolean {
   return true;
 }
 
+function isValidAppRelativePath(value: string | null): boolean {
+  if (!value || value.length > 4096 || value !== value.trim()) return false;
+  if (
+    value.includes("\\") ||
+    value.includes("\u0000") ||
+    value.startsWith("/") ||
+    /^[a-z]:/i.test(value)
+  ) return false;
+  return value.split("/").every((part) => part && part !== "." && part !== "..");
+}
+
+function isValidSimpleAppDownloadQuery(
+  value: string,
+  requiredKeys: readonly string[],
+): boolean {
+  const queryIndex = value.indexOf("?");
+  const rawQuery = queryIndex >= 0 ? value.slice(queryIndex + 1) : "";
+  if (queryIndex >= 0 && !rawQuery) return false;
+  const allowed = new Set(["project_id", ...requiredKeys]);
+  const searchParams = new URLSearchParams(rawQuery);
+  const seen = new Set<string>();
+  if (rawQuery) {
+    for (const pair of rawQuery.split("&")) {
+      const rawKey = pair.split("=", 1)[0];
+      if (!rawKey || rawKey.includes("%") || !allowed.has(rawKey)) return false;
+    }
+  }
+  for (const [key] of searchParams) {
+    if (!allowed.has(key) || seen.has(key)) return false;
+    seen.add(key);
+  }
+  for (const key of requiredKeys) {
+    if (!searchParams.has(key)) return false;
+  }
+  const projectId = searchParams.get("project_id");
+  if (projectId !== null && !TRANSFER_UUID_PATTERN.test(projectId)) return false;
+  for (const key of requiredKeys) {
+    if (key === "path" && !isValidAppRelativePath(searchParams.get(key))) return false;
+  }
+  return true;
+}
+
+function isValidAppFileUrl(value: string, rawPath: string): boolean {
+  if (
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    value.includes("#") ||
+    rawPath.includes("%")
+  ) return false;
+  const pathname = withoutBasePath(rawPath);
+  const match = pathname.match(/^\/api\/python-proxy\/apps\/([0-9a-f-]{36})\/files\/download$/i);
+  return Boolean(match && TRANSFER_UUID_PATTERN.test(match[1]) && isValidSimpleAppDownloadQuery(value, ["path"]));
+}
+
+function isValidAppArtifactUrl(value: string, rawPath: string): boolean {
+  if (
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    value.includes("#") ||
+    rawPath.includes("%")
+  ) return false;
+  const pathname = withoutBasePath(rawPath);
+  const match = pathname.match(/^\/api\/python-proxy\/apps\/([0-9a-f-]{36})\/artifacts\/([0-9a-f-]{36})\/download$/i);
+  return Boolean(
+    match &&
+      TRANSFER_UUID_PATTERN.test(match[1]) &&
+      TRANSFER_UUID_PATTERN.test(match[2]) &&
+      isValidSimpleAppDownloadQuery(value, []),
+  );
+}
+
+function isValidAppRunFileUrl(value: string, rawPath: string): boolean {
+  if (
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    value.includes("#") ||
+    rawPath.includes("%")
+  ) return false;
+  const pathname = withoutBasePath(rawPath);
+  const match = pathname.match(/^\/api\/python-proxy\/apps\/([0-9a-f-]{36})\/runs\/([0-9a-f-]{36})\/files\/([^/]+)\/download$/i);
+  return Boolean(
+    match &&
+      TRANSFER_UUID_PATTERN.test(match[1]) &&
+      TRANSFER_UUID_PATTERN.test(match[2]) &&
+      APP_RUN_FILE_ID_PATTERN.test(match[3]) &&
+      isValidSimpleAppDownloadQuery(value, []),
+  );
+}
+
 function isCompatibilityDownloadUrl(value: string): boolean {
   try {
     if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\") || value.includes("#")) return false;
@@ -948,7 +1041,11 @@ function isCompatibilityDownloadUrl(value: string): boolean {
       pathname === "/api/python-proxy/explorer/download" ||
       /^\/api\/python-proxy\/remote-servers\/[^/]+\/workspace\/download$/u.test(
         pathname,
-      ) || isValidAppArchiveUrl(value, rawPath)
+      ) ||
+      isValidAppArchiveUrl(value, rawPath) ||
+      isValidAppFileUrl(value, rawPath) ||
+      isValidAppArtifactUrl(value, rawPath) ||
+      isValidAppRunFileUrl(value, rawPath)
     );
   } catch {
     return false;
@@ -1070,6 +1167,8 @@ export async function explorerDownloadResource(
   const hasResponseContract = Boolean(
     options.expectedContentType || options.requireAttachment || options.rejectRedirects,
   );
+  const compatibilityEnabled = readFileTransferCompatibilityPreference();
+  const rawPath = url.split(/[?#]/, 1)[0];
   const isAppArchiveContract =
     options.expectedContentType?.toLowerCase() === "application/zip" &&
     options.requireAttachment === true &&
@@ -1081,11 +1180,10 @@ export async function explorerDownloadResource(
     }
   }
   if (
-    readFileTransferCompatibilityPreference() &&
+    compatibilityEnabled &&
     isAppArchiveContract &&
     isCompatibilityDownloadUrl(url)
   ) {
-    const rawPath = url.split(/[?#]/, 1)[0];
     if (isValidAppArchiveUrl(url, rawPath)) {
       await compatibilityDownload(
         url,
@@ -1102,15 +1200,47 @@ export async function explorerDownloadResource(
       return;
     }
   }
-  const requiresPreflightContract = Boolean(
-    hasResponseContract || options.signal,
-  );
+  const appAssetContract =
+    options.expectedContentType === undefined &&
+    (isValidAppFileUrl(url, rawPath) || isValidAppArtifactUrl(url, rawPath))
+      ? {
+          requireAttachment: true as const,
+          rejectRedirects: true as const,
+        }
+      : undefined;
+  const runFileContract =
+    isValidAppRunFileUrl(url, rawPath) &&
+    options.expectedContentType === undefined &&
+    options.requireAttachment === true &&
+    options.rejectRedirects === true
+      ? {
+          requireAttachment: true as const,
+          rejectRedirects: true as const,
+        }
+      : undefined;
+  const compatibilityResponseContract = appAssetContract ?? runFileContract;
+  const preflightOptions =
+    compatibilityEnabled && compatibilityResponseContract !== undefined
+      ? {
+          ...options,
+          requireAttachment: true,
+          rejectRedirects: true,
+        }
+      : options;
   if (
-    !requiresPreflightContract &&
-    readFileTransferCompatibilityPreference() &&
-    isCompatibilityDownloadUrl(url)
+    compatibilityEnabled &&
+    isCompatibilityDownloadUrl(url) &&
+    (!hasResponseContract || compatibilityResponseContract !== undefined)
   ) {
-    if (await compatibilityDownload(url, undefined, fallback)) return;
+    if (
+      await compatibilityDownload(
+        url,
+        undefined,
+        fallback,
+        compatibilityResponseContract,
+        options.signal,
+      )
+    ) return;
   }
   if (options.signal?.aborted) {
     throw new DOMException("The download was aborted", "AbortError");
@@ -1118,7 +1248,7 @@ export async function explorerDownloadResource(
   const disposition = await preflightDownload(
     url,
     { method: "GET", signal: options.signal },
-    options,
+    preflightOptions,
   );
   if (options.signal?.aborted) {
     throw new DOMException("The download was aborted", "AbortError");
@@ -1626,7 +1756,7 @@ export interface OgpData {
   success: boolean;
   title?: string;
   description?: string;
-  image?: string;
+  image?: string | null;
   url: string;
   favicon?: string;
   embed_type?: "x-post";

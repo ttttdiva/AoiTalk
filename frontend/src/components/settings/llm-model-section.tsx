@@ -25,13 +25,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatBytes } from "@/lib/utils";
 import { LlmMediaModelTabs } from "./llm-media-model-tabs";
 import { LlmProjectAutomationRouting } from "./llm-project-automation-routing";
-import { LlmAgentTeamRouting } from "./llm-agent-team-routing";
 import { LlmModelGroupsPanel } from "./llm-model-groups-panel";
 import { LlmProviderVisibilitySettings } from "./llm-provider-visibility-settings";
 import { OpenRouterProviderRouting } from "./openrouter-provider-routing";
 import { FreeTeamSettingsPanel } from "./free-team-settings-panel";
 import { LlmExternalPrivacySettings } from "./llm-external-privacy-settings";
 import { LlmCloudAdvisorSettings } from "./llm-cloud-advisor-settings";
+import { LlmModelRoles } from "./llm-model-roles";
 import { LlamaCppRuntimePanel } from "./llama-cpp-runtime-panel";
 import { StrataRuntimePanel } from "./strata-runtime-panel";
 import { ManagedLocalRuntimePanel } from "./managed-local-runtime-panel";
@@ -54,8 +54,11 @@ import {
 
 const CUSTOM_MODEL_OPTION = "__custom__";
 
-export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) {
-  const [activeSection, setActiveSection] = useState<"base" | "routing" | "agent" | "privacy" | "cloud">("base");
+type LlmSettingsSection = "roles" | "base" | "routing" | "privacy" | "cloud";
+
+export function LlmModelSection({ isAdmin = true, initialSection = "roles" }: { isAdmin?: boolean; initialSection?: LlmSettingsSection } = {}) {
+  const [activeSection, setActiveSection] = useState<LlmSettingsSection>(initialSection);
+  const modelSection = useLlmModelSection();
   const {
     expanded, setExpanded, catalog, provider, model, customModel, customPickedProvider, setCustomPickedProvider, loading, refreshing, saving,
     pulling, pullInput, setPullInput, task, deletingModel, modelSearch, setModelSearch, setModelPage,
@@ -63,8 +66,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
     llamaCppDraft, setLlamaCppDraft, llamaCppError,
     llamaCppModelRootState, llamaCppModelRootLoading, llamaCppModelRootSaving,
     llamaCppModelRootError, saveLlamaCppModelRoot,
-    delegationEnabled, setDelegationEnabled,
-    orchestrationMode, setOrchestrationMode, chatgptWeb, setChatgptWeb,
+    chatgptWeb,
     externalPrivacy, setExternalPrivacy, imageMode,
     setImageMode, videoMode, setVideoMode, mageVl, setMageVl, modelTab, setModelTab,
     classDrafts, setClassDrafts, savingRouting,
@@ -79,10 +81,9 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
     showReasoningEffort, deleteOllamaModel, saveRoutingSettings, saveExternalPrivacySettings, engineChangeError,
     localRuntimeStatus, localRuntimeTask, localRuntimeLoading, localRuntimePreparing,
     startLocalRuntimePrepare, cancelLocalRuntimePrepare,
-    agentTeamConfig, setAgentTeamConfig,
     cloudAdvisor, setCloudAdvisor, cloudAdvisorProviderIds,
     saveCloudAdvisorSettings,
-  } = useLlmModelSection();
+  } = modelSection;
 
   useEffect(() => {
     const handleTargetOpen = (event: Event) => {
@@ -159,12 +160,15 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
       : null;
   const managedLocalRuntimeProfile = selectedModel?.runtime_profile ?? null;
   const sectionItems = [
-    { id: "base" as const, label: "Base Model", description: "Providerとモデル" },
-    { id: "routing" as const, label: "Routing", description: "用途別の経路" },
-    { id: "agent" as const, label: "Execution Team", description: "Team構成" },
+    { id: "roles" as const, label: "モデル", description: "役割ごとのモデルと順番" },
+    { id: "base" as const, label: "接続・ローカル", description: "Provider の接続とローカルモデル" },
     { id: "privacy" as const, label: "Privacy & Advanced", description: "保護とRuntime" },
-    { id: "cloud" as const, label: "Cloud Advisor", description: "クラウド相談" },
   ];
+  // Routing and Cloud Advisor are reached from a role's 詳細, not from the tab bar.
+  const openDetail = (target: { section: "routing"; tab: "vision" | "audio" | "video" | "clip_ingest" | "project_automation" } | { section: "cloud" } | { section: "base" }) => {
+    setActiveSection(target.section);
+    setModelTab(target.section === "routing" ? target.tab : "language");
+  };
 
   const openSection = (section: typeof activeSection) => {
     setActiveSection(section);
@@ -237,7 +241,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
               <div
                 role="tablist"
                 aria-label="言語モデル設定"
-                className="sticky top-0 z-10 grid grid-cols-2 gap-1 rounded-md border border-border bg-card/95 p-1 shadow-sm backdrop-blur md:grid-cols-5"
+                className="sticky top-0 z-10 grid grid-cols-2 gap-1 rounded-md border border-border bg-card/95 p-1 shadow-sm backdrop-blur md:grid-cols-4"
               >
                 {sectionItems.map((item) => (
                   <button
@@ -309,6 +313,10 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                   LLMエンジン変更に失敗しました: {engineChangeError}
                 </p>
               )}
+              {activeSection === "roles" && <LlmModelRoles state={modelSection} onOpenDetail={openDetail} canManage={isAdmin} />}
+              {(activeSection === "routing" || activeSection === "cloud") && (
+                <Button type="button" variant="ghost" size="xs" onClick={() => openSection("roles")}>← 役割 → モデル へ戻る</Button>
+              )}
               <Tabs value={modelTab} onValueChange={(value) => setModelTab(value as "language" | "vision" | "audio" | "video" | "clip_ingest" | "project_automation")}>
                 {activeSection === "routing" && (
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5" aria-label="用途別Routing一覧">
@@ -357,7 +365,7 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
                     ))}
                   </div>
                 )}
-                 <TabsList variant="line" className={`w-full justify-start gap-1 rounded-none border-b border-border p-0 ${activeSection === "agent" || activeSection === "privacy" || activeSection === "cloud" ? "hidden" : ""}`}>
+                 <TabsList variant="line" className={`w-full justify-start gap-1 rounded-none border-b border-border p-0 ${activeSection === "privacy" || activeSection === "cloud" || activeSection === "roles" ? "hidden" : ""}`}>
                   {activeSection === "base" && <TabsTrigger value="language">基本モデル</TabsTrigger>}
                   {activeSection === "routing" && <TabsTrigger value="vision">画像認識</TabsTrigger>}
                   {activeSection === "routing" && <TabsTrigger value="audio">音声認識</TabsTrigger>}
@@ -869,23 +877,6 @@ export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) 
 
               {activeSection === "base" && <Separator />}
 
-              <div className={activeSection === "agent" ? "block" : "hidden"} aria-hidden={activeSection !== "agent"}>
-              <LlmAgentTeamRouting
-                catalog={selectionCatalog ?? catalog}
-                provider={provider}
-                selectedModelId={selectedModelId}
-                delegationEnabled={delegationEnabled}
-                setDelegationEnabled={setDelegationEnabled}
-                orchestrationMode={orchestrationMode}
-                setOrchestrationMode={setOrchestrationMode}
-                chatgptWeb={chatgptWeb}
-                setChatgptWeb={setChatgptWeb}
-                savingRouting={savingRouting}
-                saveRoutingSettings={() => saveRoutingSettings("agent")}
-                agentTeamConfig={agentTeamConfig}
-                setAgentTeamConfig={setAgentTeamConfig}
-              />
-              </div>
               </div>
               {sectionItems
                 .filter((item) => item.id !== activeSection)

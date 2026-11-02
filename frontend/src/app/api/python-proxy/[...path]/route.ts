@@ -31,6 +31,9 @@ async function proxyToPython(
     "personal-reminders",
     "personal-agents",
   ]).has(normalizedPath[0]);
+  const isDotsDialogueOwnerApi =
+    normalizedPath[0] === "dots" && normalizedPath[1] === "dialogue";
+  const isOwnerScopedApi = isPersonalOwnerApi || isDotsDialogueOwnerApi;
   const measureIntent =
     request.method === "POST" &&
     normalizedPath.length === 2 &&
@@ -43,7 +46,7 @@ async function proxyToPython(
   }
   // 個人データの書き込みは同一オリジン JSON 操作に限る（SameSite=Lax に加える CSRF 多層防御）。
   if (
-    isPersonalOwnerApi &&
+    isOwnerScopedApi &&
     request.method !== "GET" &&
     request.method !== "HEAD" &&
     (
@@ -82,7 +85,7 @@ async function proxyToPython(
   const forwardHeaders =
     normalizedPath.length === 2 && normalizedPath[0] === "free-team" && normalizedPath[1] === "openai-confirmation" ? ["cookie"]
       // 個人APIは本人のWebセッションをバックエンドで再検証する（内部転送マーカーだけでは認めない）。
-      : isPersonalOwnerApi ? ["cookie"]
+      : isOwnerScopedApi ? ["cookie"]
       : isMediaAssetUpload ? ["idempotency-key", "x-asset-sha256"]
       : isMediaAssetPreview || isProductDeliverable ? ["if-match"]
       : isAppArchiveDownload || isAppRunFileDownload ? ["x-aoitalk-download-preflight"]

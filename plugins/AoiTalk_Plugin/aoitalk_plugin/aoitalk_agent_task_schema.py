@@ -10,6 +10,47 @@ from mcp.types import CallToolResult, TextContent
 from typing_extensions import Required, TypedDict
 
 
+class FreeTeamTaskUsage(TypedDict, total=False):
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    requests: int
+    quota_actual: dict[str, int]
+
+
+class FreeTeamTaskSettlement(TypedDict, total=False):
+    status: str
+    actual_usage: FreeTeamTaskUsage
+
+
+class FreeTeamReservationsByStatus(TypedDict, total=False):
+    committed: int
+    uncertain: int
+    released: int
+    reserved: int
+
+
+class FreeTeamReservationsTotal(TypedDict, total=False):
+    count: int
+    by_status: FreeTeamReservationsByStatus
+    actual_usage: FreeTeamTaskUsage
+    uncertain_estimated_hold: dict[str, int]
+    truncated: bool
+
+
+class AgentTaskFreeTeam(TypedDict, total=False):
+    billing_mode: str
+    candidate: str
+    provider: str
+    model: str
+    quota_pool_ids: list[str]
+    reservation_id: str
+    settlement: FreeTeamTaskSettlement
+    wait: dict[str, Any]
+    reservations_total: FreeTeamReservationsTotal
+    non_free_reservation_detected: bool
+
+
 class AgentTaskFields(TypedDict, total=False):
     task_id: str
     status: str
@@ -31,6 +72,7 @@ class AgentTaskFields(TypedDict, total=False):
     result: Any
     failure: dict[str, Any] | None
     tool_failures: dict[str, Any] | None
+    free_team: AgentTaskFreeTeam
 
 
 class BusinessReply(TypedDict, total=False):
@@ -74,11 +116,40 @@ class ResultReply(BusinessReply, total=False):
     total_bytes: int
     offset: int
     next_offset: int | None
+    free_team: AgentTaskFreeTeam
+
+
+class FreeTeamQuota(TypedDict, total=False):
+    id: str
+    configured_daily_cap: int | float
+    effective_daily_cap: int | float
+    used: int | float
+    reserved: int | float
+    external_delta: int | float
+    remaining: int | float
+    window_end: str | None
+    status: str
+    stop_reason: str
+
+
+class FreeTeamStatusReply(BusinessReply, total=False):
+    quota_pools: list[FreeTeamQuota]
+    verification: dict[str, str]
+    openrouter_provider_observed: dict[str, str]
+    provider_blocked: bool
+    provider_block_reason_code: str
+    provider_blocked_until: str | None
+    provider_half_open: bool
+    provider_block_persistence: str
+    next_probe_at: str | None
+    probe_interval_minutes: int
+    openai_usage_actual: dict[str, object]
 
 
 REPLIES = {
     "aoitalk_agent_task_start": StartReply,
     "aoitalk_agent_task_status": TaskReply,
+    "aoitalk_free_team_status": FreeTeamStatusReply,
     "aoitalk_agent_task_tail": TailReply,
     "aoitalk_agent_task_result": ResultReply,
     "aoitalk_agent_task_cancel": TaskReply,

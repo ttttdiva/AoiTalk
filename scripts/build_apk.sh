@@ -84,22 +84,31 @@ else
   export JAVA_HOME
   export ANDROID_HOME
   export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-  BUILD_TMP_ROOT="$PROJECT_DIR/.local/mobile-build-tmp-$$"
+  temp_base="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+  if command -v cygpath >/dev/null 2>&1; then
+    temp_base="$(cygpath -u "$temp_base")"
+  fi
+  if [[ "$temp_base" != /* || ! -d "$temp_base" || -L "$temp_base" ]]; then
+    echo "[ERROR] Mobile build temp base must be an existing absolute directory."
+    exit 1
+  fi
+  temp_physical="$(cd -P -- "$temp_base" && pwd -P)"
+  if [[ "$temp_physical" == "$PROJECT_DIR" || "$temp_physical" == "$PROJECT_DIR/"* ]]; then
+    echo "[ERROR] Mobile build temp base must be outside the repository."
+    exit 1
+  fi
+  BUILD_TMP_ROOT="$(mktemp -d "$temp_physical/aoitalk-mobile-XXXXXXXX")"
+  owned_build_tmp="$BUILD_TMP_ROOT"
   export BUILD_TMP_ROOT
   export _JAVA_OPTIONS="-Djdk.net.unixdomain.tmpdir=${BUILD_TMP_ROOT}"
   export GRADLE_OPTS="-Djdk.net.unixdomain.tmpdir=${BUILD_TMP_ROOT}"
   export NODE_ENV="production"
 
-  if [ -e "$BUILD_TMP_ROOT" ]; then
-    echo "[ERROR] Owned Mobile build temp path already exists: $BUILD_TMP_ROOT"
-    exit 1
-  fi
-  mkdir -p "$BUILD_TMP_ROOT"
   cleanup_owned_build_temp() {
-    case "$BUILD_TMP_ROOT" in
-      "$PROJECT_DIR/.local/mobile-build-tmp-$$")
-        if [ -d "$BUILD_TMP_ROOT" ] && [ ! -L "$BUILD_TMP_ROOT" ]; then
-          rm -rf -- "$BUILD_TMP_ROOT"
+    case "$owned_build_tmp" in
+      "$temp_physical"/aoitalk-mobile-????????)
+        if [ -d "$owned_build_tmp" ] && [ ! -L "$owned_build_tmp" ]; then
+          rm -rf -- "$owned_build_tmp"
         fi
         ;;
       *)

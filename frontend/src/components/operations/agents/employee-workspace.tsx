@@ -13,9 +13,7 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { EmployeeField, EmployeeForm, EmployeeNotice, EmployeeSelect, EmployeeStatus, employeeInputClass } from "./employee-fields";
 import { EmployeeRole } from "./employee-role";
 import { EmployeeAssignments } from "./employee-assignments";
-import { EmployeeAutomation } from "./employee-automation";
 import { EmployeePolicies } from "./employee-policies";
-import { EmployeeIntegrations, EmployeePhone } from "./employee-integrations";
 import { type EmployeeProjection, type EmployeeSnapshot } from "./employee-observability";
 import { EmployeeOrganizationSetup } from "./employee-organization-setup";
 import { EmployeeChatActivity } from "./employee-chat-activity";
@@ -23,7 +21,7 @@ import { EmployeeDirectory } from "./employee-directory";
 import { EmployeeThumbnail, EmployeeThumbnailControl } from "./employee-thumbnail";
 import styles from "./employee-workspace.module.css";
 
-export const employeePanels = [ ["overview", "概要・有効化"], ["role", "職務・モデル"], ["assignments", "組織・所属"], ["automation", "自動化"], ["integrations", "連携・認証情報"], ["phone", "電話受付"], ["activity", "活動・要確認"] ] as const;
+export const employeePanels = [ ["overview", "概要・有効化"], ["role", "職務・モデル"], ["assignments", "組織・所属"], ["policies", "ポリシー"], ["activity", "活動・要確認"] ] as const;
 export type EmployeePanel = typeof employeePanels[number][0];
 export function employeeHref(agent: string | null, panel: EmployeePanel = "overview") {
   const params = new URLSearchParams({ tab: "agents" });
@@ -62,8 +60,8 @@ export function EmployeeWorkspace() {
   const navigate = (id: string | null, next: EmployeePanel = "overview") => router.push(employeeHref(id, next), { scroll: false });
   if (!enabled) return <EmployeeFeatureDisabled features={features} />;
   return <div className={`${styles.workspace} flex min-h-0 flex-1 flex-col gap-3`} data-testid="employee-workspace"><header className="flex shrink-0 flex-wrap items-center justify-between gap-2"><div><h1 className="inline-flex items-center gap-1 text-xl font-semibold">Agent<HelpPopover label="Agent">下書きを作成し、職務・所属・自動化を設定してから有効化します。</HelpPopover></h1></div>
-    <div className="flex flex-wrap gap-2"><Button type="button" size="sm" variant="ghost" onClick={() => { void employees.mutate(); void catalog.mutate(); void snapshot.mutate(); }}>一覧を更新</Button>{canManage && <><Button type="button" size="sm" variant="ghost" onClick={() => router.push("/operations?tab=agents&panel=organization", { scroll: false })}>Agent組織を設定</Button><Button type="button" size="sm" onClick={() => setCreating(true)}>＋ Agentを追加</Button></>}</div></header>
-    {requested === "organization" && canManage && catalog.data && <EmployeeOrganizationSetup catalog={catalog.data} onSaved={() => Promise.all([employees.mutate(), snapshot.mutate()])} />}
+    <div className="flex flex-wrap gap-2">{canManage && <Button type="button" size="sm" variant="secondary" onClick={() => router.push("/operations?tab=overview&overview_view=map&map_mode=design")}>Agent Team</Button>}<Button type="button" size="sm" variant="ghost" onClick={() => { void employees.mutate(); void catalog.mutate(); void snapshot.mutate(); }}>一覧を更新</Button>{canManage && <><Button type="button" size="sm" variant="ghost" onClick={() => router.push("/operations?tab=agents&panel=organization", { scroll: false })}>Agent組織を設定</Button><Button type="button" size="sm" onClick={() => setCreating(true)}>＋ Agentを追加</Button></>}</div></header>
+    {!creating && requested === "organization" && canManage && catalog.data && <EmployeeOrganizationSetup catalog={catalog.data} onCreate={() => setCreating(true)} onSaved={() => Promise.all([employees.mutate(), snapshot.mutate()])} />}
     <EmployeeNotice error={employees.error} reload={() => void employees.mutate()} />
     <EmployeeNotice error={snapshot.error} reload={() => void snapshot.mutate()} />
     {catalog.error?.status === 403 ? <p className="text-sm">Agentの管理には管理者権限が必要です。状態の表示のみ利用できます。</p> : <EmployeeNotice error={catalog.error} reload={() => void catalog.mutate()} />}
@@ -151,9 +149,7 @@ function EmployeeDetail({ id, panel, catalog, canManage, projection, navigate, o
     {panel === "role" && catalog && !revisions.isLoading && <EmployeeRole key={current?.id ?? "first"} agent={agent.data.agent} revisions={revisions.data?.revisions ?? []} catalog={catalog} onSaved={() => void reload()} />}
     {panel === "role" && !catalog && <p className="text-sm">管理者向けの職務カタログを取得できません。</p>}
     {panel === "assignments" && <EmployeeAssignments agentId={id} canManage={mutable} />}
-    {panel === "automation" && <>{canManage ? <><EmployeeAutomation agentId={id} revisionId={current?.id ?? null} canManage={mutable} /><EmployeePolicies agentId={id} canManage={mutable} /></> : <p>自動化の管理には管理者権限が必要です。</p>}</>}
-    {panel === "integrations" && <EmployeeIntegrations agentId={id} revisionId={current?.id ?? null} canManage={mutable} />}
-    {panel === "phone" && <EmployeePhone agentId={id} revisionId={current?.id ?? null} canManage={mutable} />}
+    {panel === "policies" && <>{canManage ? <EmployeePolicies agentId={id} canManage={mutable} /> : <p>ポリシーの管理には管理者権限が必要です。</p>}</>}
     {panel === "activity" && <><EmployeeChatActivity agentId={id} agentName={agent.data.agent.display_name} agentState={agent.data.agent.state} />{!!projection?.employee_observability?.uncertain_action_count && <p className="text-sm text-amber-700 dark:text-amber-300">要確認の操作は結果を照合するまで再実行できません。注文完了は、提供元の Receipt が存在する場合だけ確認できます。</p>}<OperationsCommandCenter view="activity" agentId={id} /></>}
   </div>;
 }

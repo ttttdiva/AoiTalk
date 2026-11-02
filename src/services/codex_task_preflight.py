@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -33,6 +34,12 @@ from ..llm.codex_proxy_websocket import CodexProxyWebSocketTransport
 
 OFFICIAL_OPENAI_BASE_URL = "https://chatgpt.com/backend-api/codex"
 OFFICIAL_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/"
+# Reviewed only for the profile-less initialize/requirements read sequence.
+# This is deliberately separate from worker execution and adoption versions.
+_READ_ONLY_PREFLIGHT_VERSIONS = ("0.166.0",)
+_READ_ONLY_USER_AGENT_RE = re.compile(
+    r"/(?:" + "|".join(re.escape(version) for version in _READ_ONLY_PREFLIGHT_VERSIONS) + r")(?:\s|$)"
+)
 _DAEMON_ENSURE_TIMEOUT_SECONDS = 15.0
 _DAEMON_ENSURE_LOCK = threading.Lock()
 
@@ -284,11 +291,11 @@ def _rpc(
             continue
         if not isinstance(message, Mapping):
             raise CodexTaskPreflightError("codex_preflight_invalid_rpc_message")
+        if "id" in message and "method" in message:
+            raise CodexTaskPreflightError("codex_preflight_unexpected_server_request")
         if message.get("id") != request_id:
             # Notifications are expected during initialize.  A response for a
             # different request would indicate a shared/foreign transport.
-            if "id" in message and "method" in message:
-                raise CodexTaskPreflightError("codex_preflight_unexpected_server_request")
             if "method" in message:
                 continue
             raise CodexTaskPreflightError("codex_preflight_foreign_rpc_response")
@@ -395,7 +402,12 @@ class CodexManagedConfigPreflight:
                 deadline=deadline,
             )
             user_agent = initialized.get("userAgent") if isinstance(initialized, Mapping) else None
-            if not is_supported_codex_user_agent(user_agent):
+            read_only_supported = (
+                profile is None
+                and isinstance(user_agent, str)
+                and _READ_ONLY_USER_AGENT_RE.search(user_agent) is not None
+            )
+            if not is_supported_codex_user_agent(user_agent) and not read_only_supported:
                 raise CodexTaskPreflightError("codex_preflight_unverified_cli_version")
             if profile is not None and initialized.get("codexHome") != str(profile.home):
                 raise CodexTaskPreflightError("codex_preflight_app_profile_home_mismatch")

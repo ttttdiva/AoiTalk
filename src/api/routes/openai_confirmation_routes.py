@@ -13,7 +13,7 @@ from ...services import openai_confirmation_service as confirmation
 
 class OpenAIConfirmationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    credential_reference: Literal["openai_api_key", "free-team:openai-complimentary"]
+    credential_reference: Literal["openai_api_key"]
     fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_record_id: str | None = None
     billing_scope_id: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_-]+$")

@@ -13,14 +13,17 @@ export type WorkExecution = Omit<
   ApiWorkExecution,
   "runs" | "events" | "tool_calls" | "work"
 > & {
-  runs: NonNullable<ApiWorkExecution["runs"]>;
+  runs: ExecutionRun[];
   events: NonNullable<ApiWorkExecution["events"]>;
   tool_calls: NonNullable<ApiWorkExecution["tool_calls"]>;
   work: Omit<ApiWorkExecution["work"], "execution_summary"> & {
     execution_summary: ExecutionSummary;
   };
 };
-export type ExecutionRun = components["schemas"]["OperationsExecutionRun"];
+export type ExecutionRun = Omit<components["schemas"]["OperationsExecutionRun"], "acting_subagent_id"> & {
+  /** Historical actor identity retained for read-only evidence. */
+  legacy?: { acting_subagent_id?: string | null } | null;
+};
 export type ExecutionPageKind = "runs" | "events" | "tools";
 
 /** Resolve Chat only from the permission-checked typed conversation source ref. */
@@ -50,7 +53,7 @@ export async function getWorkExecution(
   const result = await response.json() as ApiWorkExecution;
   return {
     ...result,
-    runs: result.runs ?? [],
+    runs: (result.runs ?? []) as ExecutionRun[],
     events: result.events ?? [],
     tool_calls: result.tool_calls ?? [],
     work: {

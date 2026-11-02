@@ -37,7 +37,7 @@ const run = z.object({
   agent_id: optionalText,
   agent_revision_id: optionalText,
   agent_display_name: optionalText,
-  acting_subagent_id: optionalText,
+  legacy: z.object({ acting_subagent_id: optionalText }).nullable().optional(),
   work_item_attempt: z.number().int().nullable().optional(),
   started_at: optionalText,
   ended_at: optionalText,
@@ -281,7 +281,7 @@ export function sourceHref(work: Pick<CanonicalWork, "ref">) {
   if (work.ref.kind === "task") return `/tasks?detail=${id}`;
   if (work.ref.kind === "opportunity")
     return `/operations?tab=opportunities&opportunity_id=${id}`;
-  return `/operations?tab=pipeline&content_item_id=${id}`;
+  return `/operations?tab=studio&stage=qa&content=${id}`;
 }
 export function usageDetailHref(cost: { usage_id?: string | null; run_id?: string | null }) {
   if (!cost.usage_id || !cost.run_id) return null;

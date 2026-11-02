@@ -69,8 +69,9 @@ async def run_case(manager, config, manifest, *, rate_edge):
         idempotency_key=case_id, actor_user_id=user_id)
     agent_id = agent["id"]
     revision = await identity.create_revision(agent_id=agent_id, display_name=agent["display_name"],
-        mission="Deterministic PostgreSQL verification only", agent_team_id="employee", execution_profile_id="manual",
-        allowed_subagent_ids=["employee_operator"], capability_ceiling=["external_action_propose"],
+        mission="Deterministic PostgreSQL verification only", capability_ceiling=["external_action_propose"],
+        model_overrides={}, tool_ids=["external_action_propose"],
+        delegate_policy={"agents": [], "workers": []},
         concurrency_policy={"max_parallel_runs": 2, "max_parallel_tasks": 2},
         idempotency_key=case_id, actor_user_id=user_id)
     await identity.upsert_organization_profile(agent_id=agent_id, actor_user_id=user_id,

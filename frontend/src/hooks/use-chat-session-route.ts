@@ -3,17 +3,22 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
+import { useDotsDialogueAvailability } from "@/hooks/use-dots-dialogue-chat";
 import type { RuntimeContextValue } from "@/contexts/runtime-context";
 import type { LlmCatalogModelOption, LlmCatalogProvider } from "@/lib/chat-api";
 import {
-  fetchAgentTeamOptions,
+  DOTS_DIALOGUE_PROVIDER_ID,
+  DOTS_DIALOGUE_ROUTE_MODEL_ID,
+  beginDotsDialogueRouteReadiness,
+  markDotsDialogueRoutePending,
+  rememberDotsDialogueRoute,
+  type DotsDialogueRouteReadinessHandle,
+} from "@/lib/dots-dialogue-chat-route";
+import {
   fetchNewChatLlmDefaultsAfterLastUsedFlush,
   fetchSessionLlmSettings,
-  FREE_TEAM_ROUTING_PROFILE_ID,
   recordLastUsedLlmRoute,
   saveSessionLlmSettings,
-  type AgentTeamExecutionProfileOption,
-  type AgentTeamOption,
   type SessionLlmSettings,
   type SessionLlmSettingsResponse,
   type SessionMainRoute,
@@ -179,11 +184,6 @@ function servedModelsForProvider(
   return uniqueModelOptions(runtimeModels);
 }
 
-export const AGENT_TEAM_SELECTOR_AUTO = "__auto__";
-export const AGENT_TEAM_SELECTOR_FREE_TEAM = "__free_team__";
-export const AGENT_TEAM_VALUE_AUTO = AGENT_TEAM_SELECTOR_AUTO;
-export const AGENT_TEAM_VALUE_FREE_TEAM = AGENT_TEAM_SELECTOR_FREE_TEAM;
-
 let displayedNewChatMainRoute: SessionMainRoute | null = null;
 let generationReadyNewChatMainRoute: SessionMainRoute | null = null;
 let newChatRouteSnapshotScopeKey: string | null = null;
@@ -311,73 +311,14 @@ export function useSyncDisplayedNewChatMainRoute(
 }
 
 const defaultSessionSettings = (): SessionLlmSettings => ({
-  agent_team_selection: {
-    mode: "auto",
-    team_id: "",
-    loaded_team_ids: [],
-  },
   main_route: {},
-  special_routing: {},
-  execution_profile_id: "",
 });
-
-function normalizeExecutionProfileId(value?: string | null): string {
-  return typeof value === "string" ? value.trim() : "";
-}
 
 function cloneSettings(settings: SessionLlmSettings): SessionLlmSettings {
   return {
-    agent_team_selection: {
-      mode: settings.agent_team_selection.mode,
-      team_id: settings.agent_team_selection.team_id,
-      loaded_team_ids: [...settings.agent_team_selection.loaded_team_ids],
-    },
     main_route: settings.main_route ? { ...settings.main_route } : {},
-    special_routing: settings.special_routing ? { ...settings.special_routing } : {},
-    execution_profile_id: normalizeExecutionProfileId(settings.execution_profile_id),
+    ...(settings.legacy ? { legacy: { ...settings.legacy } } : {}),
   };
-}
-
-function executionProfilesForTeam(
-  teamId: string,
-  teams: AgentTeamOption[],
-): AgentTeamExecutionProfileOption[] {
-  return teams.find((team) => team.team_id === teamId)?.execution_profiles ?? [];
-}
-
-function resolveExecutionProfileForTeamChange(
-  selectorValue: string,
-  currentProfileId: string | undefined,
-  teams: AgentTeamOption[],
-): string {
-  if (
-    selectorValue === AGENT_TEAM_SELECTOR_AUTO ||
-    selectorValue === AGENT_TEAM_SELECTOR_FREE_TEAM
-  ) {
-    return "";
-  }
-  const current = normalizeExecutionProfileId(currentProfileId);
-  if (!current) return "";
-  return executionProfilesForTeam(selectorValue, teams).some(
-    (profile) => profile.profile_id === current,
-  )
-    ? current
-    : "";
-}
-
-function resolveAgentTeamSelectorValue(settings: SessionLlmSettings): string {
-  if (settings.special_routing?.routing_profile_id === FREE_TEAM_ROUTING_PROFILE_ID) {
-    return AGENT_TEAM_SELECTOR_FREE_TEAM;
-  }
-  const team = settings.agent_team_selection;
-  if (team.mode === "fixed" && team.team_id.trim()) {
-    return team.team_id;
-  }
-  return AGENT_TEAM_SELECTOR_AUTO;
-}
-
-function isFreeTeamActive(settings: SessionLlmSettings): boolean {
-  return settings.special_routing?.routing_profile_id === FREE_TEAM_ROUTING_PROFILE_ID;
 }
 
 type UseChatSessionRouteArgs = {
@@ -395,6 +336,7 @@ export function useChatSessionRoute({
   // from the DB-backed global catalog metadata below.
   void userSettings;
   const userId = useCurrentUserId();
+  const dotsDialogueAvailability = useDotsDialogueAvailability(sessionId, userId);
   const routeScopeKey = `${userId ?? "__anonymous__"}\u0000${sessionId ?? "__new_chat__"}`;
   const [desiredSettings, setDesiredSettings] = useState<SessionLlmSettings>(
     defaultSessionSettings(),
@@ -406,11 +348,21 @@ export function useChatSessionRoute({
     SessionLlmSettingsResponse["effective_main"] | null
   >(null);
   const [routeLoading, setRouteLoading] = useState(false);
-  const [agentTeamOptions, setAgentTeamOptions] = useState<AgentTeamOption[]>([]);
-  const [teamsLoading, setTeamsLoading] = useState(false);
   const [resolvedRouteScopeKey, setResolvedRouteScopeKey] = useState<string | null>(null);
   const settingsRevisionRef = useRef(0);
   const desiredSettingsRef = useRef(desiredSettings);
+  const routeReadinessRef = useRef<DotsDialogueRouteReadinessHandle | null>(null);
+
+  useLayoutEffect(() => {
+    const readiness = beginDotsDialogueRouteReadiness(userId, sessionId);
+    routeReadinessRef.current = readiness;
+    return () => {
+      if (routeReadinessRef.current === readiness) {
+        routeReadinessRef.current = null;
+      }
+      readiness?.cancel();
+    };
+  }, [routeScopeKey, sessionId, userId]);
 
   // New-chat pending settings are synchronous (memory/localStorage) and must be
   // considered before the async defaults request. In particular, do not let a
@@ -445,29 +397,10 @@ export function useChatSessionRoute({
   useEffect(() => {
     let cancelled = false;
 
-    const loadTeams = async () => {
-      setTeamsLoading(true);
-      try {
-        const teams = await fetchAgentTeamOptions();
-        if (!cancelled) setAgentTeamOptions(teams);
-      } catch {
-        if (!cancelled) setAgentTeamOptions([]);
-      } finally {
-        if (!cancelled) setTeamsLoading(false);
-      }
-    };
-
-    void loadTeams();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
     const load = async () => {
       setRouteLoading(true);
+      const loadSettingsRevision = settingsRevisionRef.current;
+      const readiness = routeReadinessRef.current;
       // An effective route is scoped to the current session/user. Clear the
       // previous response while the next one is in flight so it cannot become
       // generation authority during a session A/B or user switch.
@@ -489,23 +422,56 @@ export function useChatSessionRoute({
 
           const sessionEnvelope = await fetchSessionLlmSettings(sessionId);
           if (!cancelled) {
+            // A selector PUT started after this GET must remain authoritative;
+            // never hydrate a stale route over its pending selection fence.
+            if (settingsRevisionRef.current !== loadSettingsRevision) {
+              readiness?.settleHydration("cancelled");
+              return;
+            }
+            const persistedMainRoute = sessionEnvelope.settings.main_route;
+            const persistedDotsRoute =
+              normalizedProviderId(persistedMainRoute?.provider) ===
+                DOTS_DIALOGUE_PROVIDER_ID &&
+              normalizedProviderId(persistedMainRoute?.model) ===
+                DOTS_DIALOGUE_ROUTE_MODEL_ID;
+            markDotsDialogueRoutePending(userId, sessionId, false);
+            rememberDotsDialogueRoute(userId, sessionId, persistedDotsRoute);
             setDesiredSettings(cloneSettings(sessionEnvelope.settings));
             setSessionEffectiveMain(sessionEnvelope.effective_main ?? null);
             setNewChatEffectiveMain(null);
             setResolvedRouteScopeKey(routeScopeKey);
+            readiness?.settleHydration("ready");
           }
         } else {
           const defaultsEnvelope = await fetchNewChatLlmDefaultsAfterLastUsedFlush(userId);
           if (cancelled) return;
 
           const pending = getPendingNewChatLlmSettings(userId);
+          const pendingDotsRoute =
+            normalizedProviderId(pending.main_route?.provider) ===
+              DOTS_DIALOGUE_PROVIDER_ID &&
+            normalizedProviderId(pending.main_route?.model) ===
+              DOTS_DIALOGUE_ROUTE_MODEL_ID;
+          const inheritedDotsRoute =
+            normalizedProviderId(defaultsEnvelope.effective_main?.provider) ===
+              DOTS_DIALOGUE_PROVIDER_ID;
           setDesiredSettings(cloneSettings(pending));
           setSessionEffectiveMain(null);
-          setNewChatEffectiveMain(defaultsEnvelope.effective_main ?? null);
+          // An inherited GPT dots effective route is not an explicit draft
+          // selection. Keep the selector unselected until this owner chooses
+          // the dedicated provider in the current new-chat draft.
+          setNewChatEffectiveMain(
+            inheritedDotsRoute && !pendingDotsRoute
+              ? null
+              : defaultsEnvelope.effective_main ?? null,
+          );
           setResolvedRouteScopeKey(routeScopeKey);
         }
       } catch {
-        if (!cancelled) {
+        if (
+          !cancelled &&
+          settingsRevisionRef.current === loadSettingsRevision
+        ) {
           setDesiredSettings(
             sessionId
               ? defaultSessionSettings()
@@ -514,6 +480,11 @@ export function useChatSessionRoute({
           setSessionEffectiveMain(null);
           setNewChatEffectiveMain(null);
           setResolvedRouteScopeKey(routeScopeKey);
+          readiness?.settleHydration("failed");
+        } else if (settingsRevisionRef.current !== loadSettingsRevision) {
+          // A newer selector save owns the route now. Do not let a failed
+          // stale hydrate replace its settings or leave the send fence stuck.
+          readiness?.settleHydration("cancelled");
         }
       } finally {
         if (!cancelled) setRouteLoading(false);
@@ -525,9 +496,6 @@ export function useChatSessionRoute({
       cancelled = true;
     };
   }, [routeScopeKey, sessionId, userId]);
-
-  const freeTeamActive = isFreeTeamActive(routeSettings);
-  const agentTeamSelectionValue = resolveAgentTeamSelectorValue(routeSettings);
 
   const runtimeRouteProof = !sessionId
     ? getReadyRuntimeRouteProof(runtime)
@@ -561,13 +529,34 @@ export function useChatSessionRoute({
       ...displayedRoute,
       effort: resolveDisplayedEffort({
         ...routeContext,
-        freeTeamActive,
       }),
     },
   )?.effort ?? "";
 
   const catalogProviders = useMemo(() => {
     const persistedProviders = runtime.llmCatalog?.providers ?? [];
+    const chatStatusProviders = runtime.llmCatalog?.chat_providers ?? [];
+    const chatStatusProviderIds = new Set(
+      chatStatusProviders
+        .filter((provider) => provider.chat_status?.selectable === false)
+        .map((provider) => normalizedProviderId(provider.id))
+        .filter((providerId): providerId is string => Boolean(providerId)),
+    );
+    const dotsStatusProvider = chatStatusProviders.find(
+      (provider) => normalizedProviderId(provider.id) === "gpt-dots",
+    );
+    const dotsSessionSelectable = Boolean(
+      sessionId &&
+        dotsDialogueAvailability.selectable &&
+        dotsDialogueAvailability.conversationId === sessionId,
+    );
+    const dotsDraftSelectable = Boolean(
+      !sessionId &&
+        userId &&
+        dotsDialogueAvailability.selectable &&
+        dotsDialogueAvailability.state === "connection_ready",
+    );
+    const dotsSelectable = dotsSessionSelectable || dotsDraftSelectable;
     const runtimeByProvider = new Map<
       string,
       RuntimeContextValue["llmEngines"]
@@ -623,7 +612,12 @@ export function useChatSessionRoute({
       providers.map((provider) => normalizedProviderId(provider.id)),
     );
     for (const [providerId, engines] of runtimeByProvider) {
-      if (knownProviders.has(providerId)) continue;
+      if (
+        knownProviders.has(providerId) ||
+        chatStatusProviderIds.has(providerId)
+      ) {
+        continue;
+      }
       const first = engines[0];
       if (!first) continue;
       const options = engines
@@ -649,6 +643,41 @@ export function useChatSessionRoute({
       });
     }
 
+    if (dotsSelectable) {
+      const dotsProvider =
+        dotsStatusProvider ??
+        ({
+          id: DOTS_DIALOGUE_PROVIDER_ID,
+          label: "GPT dots",
+          models: [],
+          chat_models: [],
+        } satisfies LlmCatalogProvider);
+      const connectedDotsProvider: LlmCatalogProvider = {
+        ...dotsProvider,
+        available: true,
+        disabled: false,
+        unavailable: false,
+        availability: { state: "available", error: null, message: null },
+        models: [],
+        chat_models: [{ id: DOTS_DIALOGUE_ROUTE_MODEL_ID, label: "GPT dots" }],
+        available_models: [{ id: DOTS_DIALOGUE_ROUTE_MODEL_ID, label: "GPT dots" }],
+        chat_status: {
+          ...dotsProvider.chat_status,
+          state: "available",
+          label: "専用接続",
+          selectable: true,
+          message: dotsDialogueAvailability.message,
+          latest_request_id: dotsDialogueAvailability.latestRequestId ?? undefined,
+          latest_request_state: dotsDialogueAvailability.latestRequestState ?? undefined,
+        },
+      };
+      const dotsIndex = providers.findIndex(
+        (provider) => normalizedProviderId(provider.id) === "gpt-dots",
+      );
+      if (dotsIndex >= 0) providers[dotsIndex] = connectedDotsProvider;
+      else providers.push(connectedDotsProvider);
+    }
+
     // The engine endpoint can legitimately succeed while the richer catalog
     // is still loading or has timed out. Preserve a non-strict effective
     // route as a selectable LKG candidate in that window. Strict runtimes
@@ -670,7 +699,9 @@ export function useChatSessionRoute({
         ));
     if (
       runtimeHasProof &&
-      runtimeRoute
+      runtimeRoute &&
+      runtimeProviderId !== null &&
+      !chatStatusProviderIds.has(runtimeProviderId)
     ) {
       const existingIndex = providers.findIndex(
         (provider) => normalizedProviderId(provider.id) === runtimeProviderId,
@@ -705,6 +736,9 @@ export function useChatSessionRoute({
     // remains diagnostic until a served alternative is advertised.
     if (
       authoritativeRouteProvider &&
+      !chatStatusProviderIds.has(
+        normalizedProviderId(authoritativeRouteProvider) ?? "",
+      ) &&
       !providers.some(
         (provider) =>
           normalizedProviderId(provider.id) ===
@@ -758,7 +792,7 @@ export function useChatSessionRoute({
         ? [authoritativeProvider, ...available]
         : available;
 
-    return filterVisibleProviders(
+    const visibleCandidates = filterVisibleProviders(
       candidates,
       runtime.llmCatalog?.provider_visibility,
       [],
@@ -769,14 +803,49 @@ export function useChatSessionRoute({
           normalizedProviderId(authoritativeRouteProvider) ||
         (item.available !== false && item.disabled !== true),
     );
+    const unavailableChatStatuses = chatStatusProviders
+      .filter((provider) => normalizedProviderId(provider.id) !== "gpt-dots" || !dotsSelectable)
+      .map((provider) =>
+        normalizedProviderId(provider.id) === "gpt-dots"
+          ? {
+              ...provider,
+              chat_status: {
+                ...provider.chat_status,
+                state: dotsDialogueAvailability.state,
+                label: dotsDialogueAvailability.selectable ? "専用接続" : "利用不可",
+                selectable: false,
+                message: dotsDialogueAvailability.message,
+                ...(normalizedProviderId(provider.id) === "gpt-dots"
+                  ? {
+                      latest_request_id: dotsDialogueAvailability.latestRequestId ?? undefined,
+                      latest_request_state: dotsDialogueAvailability.latestRequestState ?? undefined,
+                    }
+                  : {}),
+              },
+            }
+          : provider,
+      );
+    const visibleChatStatuses = filterVisibleProviders(
+      unavailableChatStatuses.filter(
+        (provider) => provider.chat_status?.selectable === false,
+      ),
+      runtime.llmCatalog?.provider_visibility,
+      [],
+      (item) => item.id,
+    );
+    return [...visibleCandidates, ...visibleChatStatuses];
   }, [
     authoritativeRouteProvider,
     runtime.llmEngines,
     runtime.llmCatalog?.providers,
+    runtime.llmCatalog?.chat_providers,
     runtime.llmCatalog?.provider_visibility,
     runtime.llmDeployment,
     runtime.currentLlm,
     runtime.effectiveLlm,
+    dotsDialogueAvailability,
+    sessionId,
+    userId,
   ]);
 
   useSyncDisplayedNewChatMainRoute(
@@ -788,7 +857,6 @@ export function useChatSessionRoute({
   );
 
   const effortOptions = useMemo(() => {
-    if (freeTeamActive) return [];
     const fromCatalog = getModelEffortOptionsFromCatalog(
       runtime.llmCatalog,
       effectiveProvider,
@@ -812,7 +880,6 @@ export function useChatSessionRoute({
     effectiveEffort,
     effectiveModel,
     effectiveProvider,
-    freeTeamActive,
     runtime.llmCatalog,
     runtime.llmEngines,
     sessionId,
@@ -842,32 +909,33 @@ export function useChatSessionRoute({
 
   const hasSessionScopedRoute = sessionId
     ? hasExplicitSessionRoute(routeSettings.main_route) ||
-      Boolean(scopedSessionEffectiveMain?.provider && scopedSessionEffectiveMain?.model) ||
-      freeTeamActive
-    : hasExplicitSessionRoute(routeSettings.main_route) || freeTeamActive;
+      Boolean(scopedSessionEffectiveMain?.provider && scopedSessionEffectiveMain?.model)
+    : hasExplicitSessionRoute(routeSettings.main_route);
 
   const persistDesiredSettings = useCallback(
     async (nextSettings: SessionLlmSettings): Promise<SessionLlmSettingsResponse | null> => {
       const snapshot = cloneSettings(nextSettings);
-      if (!snapshot.special_routing?.routing_profile_id?.trim()) {
-        delete snapshot.special_routing;
-      }
-      snapshot.execution_profile_id = normalizeExecutionProfileId(
-        snapshot.execution_profile_id,
-      );
       const revision = settingsRevisionRef.current + 1;
       settingsRevisionRef.current = revision;
 
       if (sessionId) {
-        const saved = await enqueueSessionLlmSettingsSave(sessionId, () =>
-          saveSessionLlmSettings(sessionId, snapshot),
-        );
-        if (settingsRevisionRef.current === revision) {
-          setDesiredSettings(cloneSettings(saved.settings));
-          setSessionEffectiveMain(saved.effective_main ?? null);
-          setResolvedRouteScopeKey(routeScopeKey);
+        const readiness = routeReadinessRef.current;
+        const mutationToken = readiness?.beginMutation() ?? null;
+        try {
+          const saved = await enqueueSessionLlmSettingsSave(sessionId, () =>
+            saveSessionLlmSettings(sessionId, snapshot),
+          );
+          readiness?.settleMutation(mutationToken, "ready");
+          if (settingsRevisionRef.current === revision) {
+            setDesiredSettings(cloneSettings(saved.settings));
+            setSessionEffectiveMain(saved.effective_main ?? null);
+            setResolvedRouteScopeKey(routeScopeKey);
+          }
+          return saved;
+        } catch (error) {
+          readiness?.settleMutation(mutationToken, "failed");
+          throw error;
         }
-        return saved;
       }
 
       if (!userId) return null;
@@ -875,7 +943,14 @@ export function useChatSessionRoute({
       if (settingsRevisionRef.current === revision) {
         setDesiredSettings(snapshot);
       }
-      if (hasExplicitSessionRoute(snapshot.main_route)) {
+      // GPT dots is an owner-scoped pending draft route. Selecting it must
+      // not rewrite the account's inherited last-used route before a real
+      // Chat UUID exists; the handoff is persisted and verified after create.
+      if (
+        hasExplicitSessionRoute(snapshot.main_route) &&
+        normalizedProviderId(snapshot.main_route?.provider) !==
+          DOTS_DIALOGUE_PROVIDER_ID
+      ) {
         const defaults = await recordLastUsedLlmRoute(snapshot.main_route, {
           userId,
         });
@@ -903,10 +978,28 @@ export function useChatSessionRoute({
 
   const updateProvider = useCallback(
     (nextProvider: string) => {
+      const providerId = normalizedProviderId(nextProvider);
+      if (
+        providerId === "gpt-dots" &&
+        (!userId ||
+          (sessionId
+            ? !dotsDialogueAvailability.selectable ||
+              dotsDialogueAvailability.conversationId !== sessionId
+            : !dotsDialogueAvailability.selectable ||
+              dotsDialogueAvailability.state !== "connection_ready"))
+      ) {
+        toast.error(
+          sessionId
+            ? "GPT dotsは承認済みの既存Chatで、有効なホスト購読がある場合だけ選択できます。"
+            : "GPT dotsは認証済みの新規Chat下書きで選択できます。",
+        );
+        return;
+      }
       const provider = catalogProviders.find(
         (item) =>
           normalizedProviderId(item.id) === normalizedProviderId(nextProvider),
       );
+      if (provider?.chat_status?.selectable === false) return;
       const availableModels = servedModelsForProvider(
         provider,
         runtime.llmEngines,
@@ -928,7 +1021,7 @@ export function useChatSessionRoute({
         return;
       }
 
-      applyDesiredSettings((current) => {
+      const buildNextSettings = (current: SessionLlmSettings): SessionLlmSettings => {
         const previousEffort = current.main_route?.effort;
         const nextEffort = resolveEffortForModel(
           runtime.llmCatalog,
@@ -943,15 +1036,128 @@ export function useChatSessionRoute({
         if (nextEffort) {
           mainRoute.effort = nextEffort;
         }
-        return {
-          agent_team_selection: current.agent_team_selection,
-          main_route: mainRoute,
-          special_routing: {},
-          execution_profile_id: current.execution_profile_id ?? "",
-        };
-      });
+        return { main_route: mainRoute };
+      };
+
+      if (providerId === "gpt-dots") {
+        if (!userId) return;
+        if (!sessionId) {
+          if (
+            !dotsDialogueAvailability.selectable ||
+            dotsDialogueAvailability.state !== "connection_ready"
+          ) {
+            toast.error("GPT dots接続を確認できないため、新規Chatでは選択できません。");
+            return;
+          }
+          applyDesiredSettings((current) =>
+            buildNextSettings(cloneSettings(current)),
+          );
+          const pending = getPendingNewChatLlmSettings(userId);
+          if (
+            normalizedProviderId(pending.main_route?.provider) !==
+              DOTS_DIALOGUE_PROVIDER_ID ||
+            normalizedProviderId(pending.main_route?.model) !==
+              DOTS_DIALOGUE_ROUTE_MODEL_ID
+          ) {
+            toast.error("GPT dotsの新規Chat選択を保存できませんでした。");
+            return;
+          }
+          return;
+        }
+        return (async () => {
+          const requestedRevision = settingsRevisionRef.current + 1;
+          // The backend gates DOTS sends on the persisted session route. Keep
+          // this route fenced while its PUT is in flight so a fast composer
+          // click cannot use the previous persisted route by accident.
+          markDotsDialogueRoutePending(
+            userId,
+            sessionId,
+            true,
+            requestedRevision,
+          );
+          rememberDotsDialogueRoute(userId, sessionId, false);
+          try {
+            const saved = await persistDesiredSettings(
+              buildNextSettings(cloneSettings(desiredSettingsRef.current)),
+            );
+            if (settingsRevisionRef.current !== requestedRevision) {
+              // A later non-DOTS settings save may supersede this PUT. Clear
+              // only this attempt's fence; a newer DOTS attempt owns its own
+              // revision and remains pending.
+              markDotsDialogueRoutePending(
+                userId,
+                sessionId,
+                false,
+                requestedRevision,
+              );
+              return;
+            }
+            const persistedProvider = normalizedProviderId(
+              saved?.settings.main_route?.provider,
+            );
+            const persistedModel = normalizedProviderId(
+              saved?.settings.main_route?.model,
+            );
+            if (
+              persistedProvider !== "gpt-dots" ||
+              persistedModel !== DOTS_DIALOGUE_ROUTE_MODEL_ID
+            ) {
+              markDotsDialogueRoutePending(
+                userId,
+                sessionId,
+                false,
+                requestedRevision,
+              );
+              rememberDotsDialogueRoute(userId, sessionId, false);
+              toast.error("GPT dotsのProvider設定を保存できなかったため、選択を反映しませんでした。");
+              return;
+            }
+            markDotsDialogueRoutePending(
+              userId,
+              sessionId,
+              false,
+              requestedRevision,
+            );
+            rememberDotsDialogueRoute(userId, sessionId, true);
+          } catch {
+            if (settingsRevisionRef.current !== requestedRevision) {
+              markDotsDialogueRoutePending(
+                userId,
+                sessionId,
+                false,
+                requestedRevision,
+              );
+              return;
+            }
+            markDotsDialogueRoutePending(
+              userId,
+              sessionId,
+              false,
+              requestedRevision,
+            );
+            rememberDotsDialogueRoute(userId, sessionId, false);
+            toast.error("GPT dotsのProvider設定を保存できなかったため、選択を反映しませんでした。");
+          }
+        })();
+      }
+
+      if (sessionId) {
+        markDotsDialogueRoutePending(userId, sessionId, false);
+        rememberDotsDialogueRoute(userId, sessionId, false);
+      }
+      applyDesiredSettings((current) => buildNextSettings(current));
     },
-    [applyDesiredSettings, catalogProviders, runtime.llmCatalog, runtime.llmEngines],
+    [
+      applyDesiredSettings,
+      catalogProviders,
+      dotsDialogueAvailability,
+      desiredSettingsRef,
+      persistDesiredSettings,
+      runtime.llmCatalog,
+      runtime.llmEngines,
+      sessionId,
+      userId,
+    ],
   );
 
   const updateModel = useCallback(
@@ -992,12 +1198,7 @@ export function useChatSessionRoute({
         if (nextEffort) {
           mainRoute.effort = nextEffort;
         }
-        return {
-          agent_team_selection: current.agent_team_selection,
-          main_route: mainRoute,
-          special_routing: {},
-          execution_profile_id: current.execution_profile_id ?? "",
-        };
+        return { main_route: mainRoute };
       });
     },
     [
@@ -1019,7 +1220,6 @@ export function useChatSessionRoute({
       if (!normalizedEffort) return;
 
       applyDesiredSettings((current) => {
-        if (isFreeTeamActive(current)) return current;
         const { provider, model } = resolveUnderlyingRoute({
           sessionId,
           mainRoute: current.main_route,
@@ -1031,14 +1231,7 @@ export function useChatSessionRoute({
         if (!provider || !model) return current;
 
         return {
-          agent_team_selection: current.agent_team_selection,
-          main_route: {
-            provider,
-            model,
-            effort: normalizedEffort,
-          },
-          special_routing: current.special_routing,
-          execution_profile_id: current.execution_profile_id ?? "",
+          main_route: { provider, model, effort: normalizedEffort },
         };
       });
     },
@@ -1052,101 +1245,15 @@ export function useChatSessionRoute({
     ],
   );
 
-  const updateAgentTeamSelection = useCallback(
-    (selectorValue: string) => {
-      if (!userId && !sessionId) return;
-
-      applyDesiredSettings((current) => {
-        if (selectorValue === AGENT_TEAM_SELECTOR_AUTO) {
-          return {
-            agent_team_selection: {
-              mode: "auto",
-              team_id: "",
-              loaded_team_ids: current.agent_team_selection.loaded_team_ids,
-            },
-            main_route: current.main_route ? { ...current.main_route } : {},
-            special_routing: {},
-            execution_profile_id: "",
-          };
-        }
-
-        if (selectorValue === AGENT_TEAM_SELECTOR_FREE_TEAM) {
-          return {
-            agent_team_selection: {
-              mode: "auto",
-              team_id: "",
-              loaded_team_ids: [],
-            },
-            main_route: current.main_route ? { ...current.main_route } : {},
-            special_routing: {
-              routing_profile_id: FREE_TEAM_ROUTING_PROFILE_ID,
-            },
-            execution_profile_id: "",
-          };
-        }
-
-        return {
-          agent_team_selection: {
-            mode: "fixed",
-            team_id: selectorValue,
-            loaded_team_ids: [],
-          },
-          main_route: current.main_route ? { ...current.main_route } : {},
-          special_routing: {},
-          execution_profile_id: resolveExecutionProfileForTeamChange(
-            selectorValue,
-            current.execution_profile_id,
-            agentTeamOptions,
-          ),
-        };
-      });
-    },
-    [agentTeamOptions, applyDesiredSettings, sessionId, userId],
-  );
-
-  const updateExecutionProfile = useCallback(
-    (profileId: string) => {
-      if (!userId && !sessionId) return;
-      applyDesiredSettings((current) => ({
-        agent_team_selection: current.agent_team_selection,
-        main_route: current.main_route ? { ...current.main_route } : {},
-        special_routing: current.special_routing
-          ? { ...current.special_routing }
-          : {},
-        execution_profile_id: normalizeExecutionProfileId(profileId),
-      }));
-    },
-    [applyDesiredSettings, sessionId, userId],
-  );
-
   const flushPendingSave = useCallback(async () => {
     if (!sessionId) return;
     await awaitSessionLlmSettingsReady(sessionId);
   }, [sessionId]);
 
-  const settingsLoading = routeLoading || teamsLoading;
-  const summaryLabel = freeTeamActive
-    ? "Free Team"
-    : underlyingProvider && underlyingModel
-      ? formatRouteLabel(underlyingProvider, underlyingModel)
-      : "";
-
-  const executionProfileOptions = useMemo(() => {
-    if (
-      agentTeamSelectionValue === AGENT_TEAM_SELECTOR_AUTO ||
-      agentTeamSelectionValue === AGENT_TEAM_SELECTOR_FREE_TEAM
-    ) {
-      return [] as AgentTeamExecutionProfileOption[];
-    }
-    const current = normalizeExecutionProfileId(desiredSettings.execution_profile_id);
-    const profiles = executionProfilesForTeam(agentTeamSelectionValue, agentTeamOptions);
-    const enabled = profiles.filter((profile) => profile.enabled !== false);
-    if (current && !enabled.some((profile) => profile.profile_id === current)) {
-      const selected = profiles.find((profile) => profile.profile_id === current);
-      if (selected) return [...enabled, selected];
-    }
-    return enabled;
-  }, [agentTeamOptions, agentTeamSelectionValue, desiredSettings.execution_profile_id]);
+  const settingsLoading = routeLoading;
+  const summaryLabel = underlyingProvider && underlyingModel
+    ? formatRouteLabel(underlyingProvider, underlyingModel)
+    : "";
 
   return {
     catalogProviders,
@@ -1163,23 +1270,13 @@ export function useChatSessionRoute({
     isLoading: settingsLoading,
     routeLoading: settingsLoading,
     settingsLoading,
-    teamsLoading,
-    agentTeamOptions,
-    agentTeamSelectorValue: agentTeamSelectionValue,
-    agentTeamSelectionValue,
-    agentTeamDisabled: settingsLoading,
-    executionProfileId: normalizeExecutionProfileId(desiredSettings.execution_profile_id),
-    executionProfileOptions,
-    executionProfileDisabled: settingsLoading,
-    updateExecutionProfile,
     providerDisabled: settingsLoading,
     // A provider can remain selected while its current model is stale or the
     // catalog is temporarily unavailable.  Keep the model control interactive
     // whenever at least one served/LKG alternative is advertised; an explicit
     // empty/error projection with no alternatives is the only empty lockout.
     modelDisabled: settingsLoading || !effectiveProvider || modelOptions.length === 0,
-    effortDisabled: settingsLoading || effortOptions.length === 0 || freeTeamActive,
-    freeTeamActive,
+    effortDisabled: settingsLoading || effortOptions.length === 0,
     summaryLabel,
     desiredSettings,
     sessionSettings: sessionId ? desiredSettings : null,
@@ -1187,8 +1284,6 @@ export function useChatSessionRoute({
     updateProvider,
     updateModel,
     updateEffort,
-    updateAgentTeamValue: updateAgentTeamSelection,
-    updateAgentTeamSelection,
     flushPendingSave,
     persistSettings: persistDesiredSettings,
   };

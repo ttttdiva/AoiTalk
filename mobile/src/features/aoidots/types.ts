@@ -56,3 +56,20 @@ export type AoiDotsCommand =
       expected_control_revision: number;
       instruction?: string;
     };
+
+export type AoiDotsHistoryFenceCandidate = {
+  workItemId: string;
+  safeErrorCode: string | null;
+};
+
+export type AoiDotsHistoryFenceReview = {
+  workItemId: string;
+  safeErrorCode: string | null;
+  status: "dry_run_ok" | "already_fenced" | "already_releasable" | "unavailable";
+  stateDigest: string | null;
+  runStatus: string | null;
+  childWorkStates: string[];
+  errorCode: string | null;
+  errorStatus: number | null;
+  errorMessage?: string;
+};

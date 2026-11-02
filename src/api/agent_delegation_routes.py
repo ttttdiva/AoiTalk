@@ -11,11 +11,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..services.agent_delegation_service import AgentDelegationService, DelegationError
+from .agent_identity_routes import CreateRevisionRequest
+from ..services.agent_delegation_service import AgentDelegationService, DelegationError, MediaInputPinDTO, OperationsSourceRefDTO
 from ..services.agent_identity_service import AgentIdentityError
 from ..services.agent_organization_service import AgentOrganizationService
-from ..services.agent_delegation_planning import DelegationPlanningPolicy, PlannedAssignment
-from .agent_identity_routes import CreateRevisionRequest
+from ..services.agent_delegation_planning import DelegationPlanningPolicy, PlannedAssignment, PlanningRosterEntry
+from ..services.agent_team_graph_admission import TeamGraphRef
 
 
 class _SafeDelegationRoute(APIRoute):
@@ -30,14 +31,23 @@ class _SafeDelegationRoute(APIRoute):
         return safe_handler
 
 
+class GraphPlanningInput(DelegationPlanningPolicy):
+    roster: list[PlanningRosterEntry] | None = Field(default=None, min_length=2, max_length=32)
+    graph_constraints: None = None
+
+    @model_validator(mode="after")
+    def unique_keys(self):
+        return self if self.roster is None else super().unique_keys()
+
+
 class DelegationCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     delegator_agent_id: UUID
     delegator_revision_id: UUID
-    worker_agent_id: UUID
-    worker_revision_id: UUID
-    reviewer_agent_id: UUID
-    reviewer_revision_id: UUID
+    worker_agent_id: UUID | None = None
+    worker_revision_id: UUID | None = None
+    reviewer_agent_id: UUID | None = None
+    reviewer_revision_id: UUID | None = None
     project_id: UUID
     persona_id: UUID | None = None
     parent_delegation_id: UUID | None = None
@@ -46,7 +56,28 @@ class DelegationCreateRequest(BaseModel):
     instruction: str = Field(min_length=1, max_length=12000)
     work_role: Literal["researcher", "writer", "data_worker", "general_worker", "code_worker"]
     idempotency_key: str = Field(min_length=1, max_length=255)
-    planning: DelegationPlanningPolicy | None = None
+    planning: DelegationPlanningPolicy | GraphPlanningInput | None = None
+    media_input_pins: list[MediaInputPinDTO] | None = Field(default=None, max_length=8)
+    operations_source_ref: OperationsSourceRefDTO | None = None
+    team_graph_ref: TeamGraphRef | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_graph_fields(cls, value):
+        if isinstance(value, dict) and isinstance(value.get("planning"), dict):
+            planning = value["planning"]
+            if "graph_constraints" in planning or (value.get("team_graph_ref") and "roster" in planning):
+                raise ValueError("server controlled graph fields")
+        return value
+
+    @model_validator(mode="after")
+    def validate_graph_input(self):
+        if self.team_graph_ref:
+            if self.planning is None or self.planning.roster is not None or self.planning.graph_constraints is not None:
+                raise ValueError("invalid graph planning")
+        elif any(getattr(self, name) is None for name in ("worker_agent_id", "worker_revision_id", "reviewer_agent_id", "reviewer_revision_id")) or isinstance(self.planning, GraphPlanningInput):
+            raise ValueError("delegation identifiers and roster required")
+        return self
 
 
 class DelegationRetryRequest(BaseModel):
@@ -99,6 +130,8 @@ class DelegationDTO(BaseModel):
     artifacts: dict[str, DelegationArtifactDTO]
     children: list[DelegationChildDTO]
     planning: dict[str, Any]
+    media_input_pins: list[MediaInputPinDTO] = Field(default_factory=list)
+    operations_source_ref: OperationsSourceRefDTO | None = None
 
 
 class DelegationResponse(BaseModel):
@@ -130,15 +163,27 @@ class DelegationArtifactResponse(BaseModel):
     artifact: DelegationArtifactContentDTO
 
 
+class OrganizationGraphResponse(BaseModel):
+    success: bool = True
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, str]]
+
+
 class OrganizationSetupEmployee(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
     key: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9_.-]*$")
     agent_id: UUID | None = None
-    slug: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9_.-]*$")
+    slug: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9][a-z0-9_.-]*$",
+    )
     display_name: str = Field(min_length=1, max_length=160)
     manager_key: str | None = Field(default=None, max_length=100)
     job_title: str = Field(default="", max_length=160)
-    responsibility_summary: str = Field(default="", max_length=10000)
+    responsibility_summary: str = Field(default="", max_length=10_000)
     revision: CreateRevisionRequest | None = None
     activate: bool = False
 
@@ -151,13 +196,8 @@ class OrganizationSetupEmployee(BaseModel):
 
 class OrganizationSetupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
     employees: list[OrganizationSetupEmployee] = Field(min_length=1, max_length=64)
-
-
-class OrganizationGraphResponse(BaseModel):
-    success: bool = True
-    nodes: list[dict[str, Any]]
-    edges: list[dict[str, str]]
 
 
 class OrganizationSetupResponse(BaseModel):
@@ -172,10 +212,6 @@ def create_agent_delegation_routers(*, get_db_manager, get_user_from_request, re
     organization_router = APIRouter(prefix="/api/agent-organization", tags=["Agent Organization"], route_class=_SafeDelegationRoute)
 
     async def context(request: Request, _=Depends(require_auth_dependency)):
-        try:
-            AgentDelegationService.require_enabled()
-        except DelegationError as exc:
-            raise HTTPException(exc.status_code, exc.code) from None
         user = get_user_from_request(request)
         user = await user if inspect.isawaitable(user) else user
         def field(key, default=None):
@@ -202,7 +238,7 @@ def create_agent_delegation_routers(*, get_db_manager, get_user_from_request, re
     @delegation_router.post("", response_model=DelegationResponse, operation_id="employee_create_delegation")
     async def create_delegation(payload: DelegationCreateRequest, ctx=Depends(context)):
         actor, manager = ctx
-        order = await invoke(AgentDelegationService(manager, config=config).create(actor_user_id=actor, **payload.model_dump()))
+        order = await invoke(AgentDelegationService(manager, config=config).create(actor_user_id=actor, **payload.model_dump(mode="json", exclude_unset=True)))
         return {"success": True, "delegation": order}
 
     @delegation_router.get("", response_model=DelegationListResponse, operation_id="employee_list_delegations")
@@ -242,6 +278,8 @@ def create_agent_delegation_routers(*, get_db_manager, get_user_from_request, re
     async def setup_employee_organization(payload: OrganizationSetupRequest, ctx=Depends(context)):
         actor, manager = ctx
         return {"success": True, **await invoke(AgentOrganizationService(manager, config=config).setup(
-            actor_user_id=actor, employees=[entry.model_dump(exclude_unset=True) for entry in payload.employees]))}
+            actor_user_id=actor,
+            employees=[entry.model_dump(exclude_unset=True) for entry in payload.employees],
+        ))}
 
     return delegation_router, organization_router

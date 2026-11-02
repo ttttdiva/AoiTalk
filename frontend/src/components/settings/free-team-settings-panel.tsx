@@ -42,7 +42,8 @@ type QuotaPool = {
   limit: number;
   consumed: number;
   reserved: number;
-  available: number;
+  available: number | null;
+  availability_state?: "provider_managed" | "local";
   daily_cap?: number;
   configured_daily_cap?: number;
   effective_daily_cap?: number;
@@ -51,6 +52,7 @@ type QuotaPool = {
   provider_external_delta?: number;
   model_group?: string | null;
   stop_reason?: string;
+  reset_policy?: { kind?: string; timezone?: string; day?: number; hour?: number; billing_scope_id?: string; [key: string]: unknown };
   safety_margin_ratio: number;
   safety_margin_units: number;
   window_end?: string | null;
@@ -58,25 +60,30 @@ type QuotaPool = {
   status: string;
 };
 
-type LlmProfile = {
-  profile_id?: string;
-  name?: string;
-  target_type?: "inherit" | "static" | "pool";
-  pool_id?: string;
-  provider?: string;
-  model?: string;
-  effort_policy?: string;
-  effort?: string;
-  routing_profile_id?: string;
-};
+type QuotaDraft = Partial<QuotaPool> & { billing_scope_id?: string };
+
 
 type FreeTeamProfile = {
   display_name: string;
   enabled: boolean;
   main_pool_id: string;
   max_fallbacks: number;
+  openrouter_free_tier?: 50 | 1000;
   pools: Record<string, { candidate_ids?: string[] }>;
-  llm_profiles: Record<string, LlmProfile>;
+};
+
+type OpenAIUsageActualGroup = {
+  actual_usage: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  input_cached_tokens: number | null;
+  requests: number | null;
+  limit: number;
+  ratio: number | null;
+  source: "ledger" | "openai_usage_api";
+  actual_usage_state: string;
+  last_synced_at: string | null;
+  external_usage_estimate: number | null;
 };
 
 type FreeTeamResponse = {
@@ -85,6 +92,7 @@ type FreeTeamResponse = {
   candidates: Candidate[];
   quota_pools: QuotaPool[];
   verification?: { status: string; stop_reason: string; external_usage_visibility: string };
+  openai_usage_actual?: { groups?: Partial<Record<"sol" | "luna", OpenAIUsageActualGroup>> };
 };
 
 const stopReasonLabels: Record<string, string> = {
@@ -124,19 +132,21 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
   const [data, setData] = useState<FreeTeamResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [savingProfile, setSavingProfile] = useState(false);
+  const [openRouterTierDraft, setOpenRouterTierDraft] = useState<50 | 1000 | null>(null);
+  const [savingOpenRouterTier, setSavingOpenRouterTier] = useState(false);
   const [refreshingOpenRouter, setRefreshingOpenRouter] = useState(false);
   const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
   const [candidateDrafts, setCandidateDrafts] = useState<Record<string, Partial<Candidate>>>({});
-  const [quotaDrafts, setQuotaDrafts] = useState<Record<string, Partial<QuotaPool>>>({});
+  const [quotaDrafts, setQuotaDrafts] = useState<Record<string, QuotaDraft>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const [settings, usage] = await Promise.all([
         pyFetch<Omit<FreeTeamResponse, "quota_pools">>("/free-team/settings"),
-        pyFetch<Pick<FreeTeamResponse, "quota_pools" | "verification">>("/free-team/usage"),
+        pyFetch<Pick<FreeTeamResponse, "quota_pools" | "verification" | "openai_usage_actual">>("/free-team/usage"),
       ]);
-      setData({ ...settings, quota_pools: usage.quota_pools, verification: usage.verification ?? settings.verification });
+      setData({ ...settings, quota_pools: usage.quota_pools, verification: usage.verification ?? settings.verification, openai_usage_actual: usage.openai_usage_actual });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "無料Team設定を取得できませんでした");
     } finally {
@@ -145,7 +155,11 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
   }, []);
 
   useEffect(() => {
-    void load();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (!cancelled) void load();
+    });
+    return () => { cancelled = true; };
   }, [load]);
 
   const poolIds = useMemo(() => Object.keys(data?.profile.pools ?? {}), [data]);
@@ -191,14 +205,29 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
 
   const saveQuota = async (quota: QuotaPool) => {
     const draft = quotaDrafts[quota.id] ?? {};
+    const trimmedScope = quota.id === "gemini-promo-monthly-usd" ? draft.billing_scope_id?.trim() : undefined;
+    const currentScope = quota.reset_policy?.billing_scope_id ?? "";
+    // Omit unchanged or empty scope so the existing ID or backend default is retained.
+    const scope = trimmedScope && trimmedScope !== currentScope ? trimmedScope : undefined;
+    if (scope !== undefined) {
+      if (scope.length > 100 || ["default", "unknown", "none"].includes(scope.toLowerCase())) {
+        toast.error("ローカル帳簿のscope IDは1〜100文字で、default / unknown / none 以外を指定してください");
+        return;
+      }
+      if (!quota.reset_policy || typeof quota.reset_policy !== "object" || Array.isArray(quota.reset_policy)) {
+        toast.error("既存のリセット設定を取得できませんでした");
+        return;
+      }
+    }
     try {
       await pyFetch(`/free-team/quota-pools/${encodeURIComponent(quota.id)}`, {
         method: "PATCH",
         body: JSON.stringify({
-          limit: draft.limit ?? quota.limit,
+          ...(quota.availability_state !== "provider_managed" || draft.limit !== undefined ? { limit: draft.limit ?? quota.limit } : {}),
           safety_margin_ratio: draft.safety_margin_ratio ?? quota.safety_margin_ratio,
           safety_margin_units: draft.safety_margin_units ?? quota.safety_margin_units,
           ...(draft.daily_cap !== undefined ? { daily_cap: draft.daily_cap } : {}),
+          ...(scope !== undefined ? { reset_policy: { ...quota.reset_policy, billing_scope_id: scope } } : {}),
         }),
       });
       toast.success(`${quota.id} を保存しました`);
@@ -220,7 +249,6 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
           main_pool_id: data.profile.main_pool_id,
           max_fallbacks: data.profile.max_fallbacks,
           pools: data.profile.pools,
-          llm_profiles: data.profile.llm_profiles ?? {},
         }),
       });
       setData((current) => current ? { ...current, profile: response.profile } : current);
@@ -229,6 +257,33 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
       toast.error(error instanceof Error ? error.message : "ルーティング設定を保存できませんでした");
     } finally {
       setSavingProfile(false);
+    }
+  };
+
+  const saveOpenRouterTier = async () => {
+    setSavingOpenRouterTier(true);
+    let tierSaved = false;
+    try {
+      const response = await pyFetch<{ profile: FreeTeamProfile }>("/free-team/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          openrouter_free_tier: openRouterTierDraft ?? data?.profile.openrouter_free_tier ?? 1000,
+        }),
+      });
+      tierSaved = true;
+      setData((current) => current ? { ...current, profile: response.profile } : current);
+      setOpenRouterTierDraft(null);
+      const usage = await pyFetch<Pick<FreeTeamResponse, "quota_pools">>("/free-team/usage");
+      setData((current) => current ? { ...current, ...usage } : current);
+      toast.success("OpenRouter無料枠tierを保存しました");
+    } catch (error) {
+      toast.error(
+        tierSaved
+          ? "OpenRouter無料枠tierは保存しましたがquota状態を再読できませんでした"
+          : error instanceof Error ? error.message : "OpenRouter無料枠tierを保存できませんでした",
+      );
+    } finally {
+      setSavingOpenRouterTier(false);
     }
   };
 
@@ -253,18 +308,6 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
   const updateProfile = (patch: Partial<FreeTeamProfile>) => {
     setData((current) => current ? { ...current, profile: { ...current.profile, ...patch } } : current);
   };
-  const updateLlmProfile = (profileId: string, patch: Partial<LlmProfile>) => {
-    setData((current) => current ? {
-      ...current,
-      profile: {
-        ...current.profile,
-        llm_profiles: {
-          ...(current.profile.llm_profiles ?? {}),
-          [profileId]: { ...current.profile.llm_profiles?.[profileId], ...patch },
-        },
-      },
-    } : current);
-  };
 
   return (
     <div className="space-y-4 rounded-md border border-emerald-500/40 bg-emerald-500/5 p-3" data-testid="free-team-settings">
@@ -280,7 +323,7 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
                 <>
                   <p>無料API枠を優先し、予約できない場合だけプロモーション・CLIへ移ります。通常課金への自動移行は行いません。</p>
                   <p>Sol群は970,000・Luna群は9,970,000 token/日で停止する初期値です。組織全体の同一model groupで共有し、00:00 UTCにリセットします。未確認の資格情報を有効化してもAPI実行は許可されません。</p>
-                  <p>planner・worker・reviewerのモデルとeffortは、既存Execution TeamのExecution Profileから変更できます。</p>
+                  <p>planner・worker・reviewerのモデルとeffortは、設定 → 言語モデル → モデル役割とAgentの職務・モデルで管理します。</p>
                 </>
               )}
             </HelpPopover>
@@ -312,48 +355,53 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
       <div className="space-y-1 rounded border p-2 text-xs" role="status">
         <p>OpenAI無料枠: {data.verification?.status === "verified" ? "確認済み" : "確認待ち（API実行停止）"}</p>
         <p>{data.verification?.status === "verified" && !data.verification.stop_reason ? "対象組織・Projectの確認情報に基づき最大予約量を確認します" : stopReasonLabels[data.verification?.stop_reason || "complimentary_unverified"] || data.verification?.stop_reason}</p>
-        <p className="text-muted-foreground">残量はこの台帳と確認済み観測値に基づきます。同じ組織の他アプリによる同時消費は見えず、無課金を完全には保証できません。使用量不明の予約は解放せず保持します。</p>
+        <p className="text-muted-foreground">OpenAIはローカル台帳と組織全体のUsage API実績の大きい方で残量を判定します。実績が未取得・古い場合は状態に応じた安全余裕を適用します。使用量不明の予約は精算できるものを照合し、期間windowの終了後は猶予を置いて解放します。</p>
       </div>
 
-      <OpenRouterQuotaObservation />
+      <OpenRouterQuotaObservation key={data.profile.openrouter_free_tier ?? 1000} />
+
+      <section className="space-y-2 rounded border p-2">
+        <div className="inline-flex items-center gap-1 text-xs font-medium">
+          OpenRouter無料枠tier
+          <HelpPopover label="OpenRouter無料枠tier">
+            選択tierはOpenRouter側の日次資格です。実効上限は「ローカルの日次停止cap」と「tier上限から安全余白2件を引いた値」の小さい方です。既存の日次停止cap・quota上限・安全設定はtier変更では書き換えません。OpenRouter無料枠は20 requests/minute、日次resetはUTC 00:00です。1000件tierは累計10 USD購入済みのアカウント向けです。
+          </HelpPopover>
+        </div>
+        <label className="block max-w-xs space-y-1 text-[10px] text-muted-foreground">
+          <span>アカウントtier</span>
+          <AppSelect
+            aria-label="OpenRouter無料枠tier"
+            value={String(openRouterTierDraft ?? data.profile.openrouter_free_tier ?? 1000)}
+            onValueChange={(value) => setOpenRouterTierDraft(Number(value) as 50 | 1000)}
+            className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+          >
+            <option value="50">50 requests/day</option>
+            <option value="1000">1000 requests/day（累計10 USD購入済み）</option>
+          </AppSelect>
+        </label>
+        <Button size="sm" variant="outline" onClick={() => void saveOpenRouterTier()} disabled={savingOpenRouterTier}>
+          {savingOpenRouterTier ? <Loader2 className="mr-1 size-3 animate-spin" /> : <Save className="mr-1 size-3" />}
+          OpenRouter tierを保存
+        </Button>
+      </section>
 
       <OpenAIConfirmationPanel onChanged={async () => {
-        const usage = await pyFetch<Pick<FreeTeamResponse, "quota_pools" | "verification">>("/free-team/usage");
+        const usage = await pyFetch<Pick<FreeTeamResponse, "quota_pools" | "verification" | "openai_usage_actual">>("/free-team/usage");
         setData((current) => current ? { ...current, ...usage } : current);
       }} />
 
       {!quotaOnly && <>
       <section className="space-y-2">
-        <div className="inline-flex items-center gap-1 text-xs font-medium">
-          LLM Profile
-          <HelpPopover label="LLM Profile">
-            Execution TeamのSubagentが参照するProfileに対して、無料候補プールへのroutingだけを重ねます。TeamやSubagentの構成はここでは変更しません。
-          </HelpPopover>
-        </div>
-        <div className="grid gap-2 lg:grid-cols-2">
-          {Object.entries(data.profile.llm_profiles ?? {}).map(([profileId, profile]) => (
-            <div key={profileId} className="space-y-2 rounded border p-2">
-              <div className="flex items-center justify-between gap-2"><span className="text-xs font-medium">{profile.name || profileId}</span><Badge variant="outline">LLM Profile</Badge></div>
-              <div className="grid gap-2 sm:grid-cols-2">
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>対象</span><AppSelect value={profile.target_type || (profile.pool_id ? "pool" : profile.provider ? "static" : "inherit")} onChange={(event) => updateLlmProfile(profileId, { target_type: event.target.value as LlmProfile["target_type"] })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"><option value="inherit">メインを継承</option><option value="static">固定モデル</option><option value="pool">無料Teamの候補プール</option></AppSelect></label>
-                {(profile.target_type || "pool") === "pool" ? <label className="space-y-1 text-[10px] text-muted-foreground"><span>プール</span><AppSelect value={profile.pool_id || ""} onChange={(event) => updateLlmProfile(profileId, { pool_id: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm">{poolIds.map((id) => <option key={id} value={id}>{id}</option>)}</AppSelect></label> : profile.target_type === "static" ? <div className="grid grid-cols-2 gap-1"><Input value={profile.provider || ""} onChange={(event) => updateLlmProfile(profileId, { provider: event.target.value })} placeholder="provider" className="h-8" /><Input value={profile.model || ""} onChange={(event) => updateLlmProfile(profileId, { model: event.target.value })} placeholder="model" className="h-8" /></div> : null}
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>effort policy</span><AppSelect value={profile.effort_policy || "same"} onChange={(event) => updateLlmProfile(profileId, { effort_policy: event.target.value })} className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"><option value="same">メインと同じ</option><option value="lower">低い設定</option><option value="explicit">明示</option><option value="default">既定値</option></AppSelect></label>
-                {profile.effort_policy === "explicit" ? <label className="space-y-1 text-[10px] text-muted-foreground"><span>explicit effort</span><Input value={profile.effort || ""} onChange={(event) => updateLlmProfile(profileId, { effort: event.target.value })} placeholder="effort" className="h-8" /></label> : null}
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="space-y-2">
         <div className="text-xs font-medium">CredentialProfile</div>
         <div className="grid gap-2 lg:grid-cols-2">
-          {data.credentials.map((credential) => (
+          {data.credentials
+            .filter((credential) => credential.id !== "openai-complimentary")
+            .map((credential) => (
             <div key={credential.id} className="space-y-2 rounded border p-2">
               <div className="flex items-center justify-between gap-2"><div className="flex items-start gap-2"><Checkbox aria-label={`${credential.display_name}を有効化`} checked={credential.enabled} onCheckedChange={(checked) => setData((current) => current ? { ...current, credentials: current.credentials.map((item) => item.id === credential.id ? { ...item, enabled: checked === true } : item) } : current)} /><div><div className="text-xs font-medium">{credential.display_name}</div><div className="text-[10px] text-muted-foreground">{credential.id} · {credential.billing_mode}</div></div></div><Badge variant={credential.configured ? "default" : "outline"}>{credential.configured ? "設定済み" : "未設定"}</Badge></div>
               <div className="flex gap-2"><Input aria-label={`${credential.display_name}のAPIキー`} type="password" value={apiKeys[credential.id] || ""} onChange={(event) => setApiKeys((current) => ({ ...current, [credential.id]: event.target.value }))} placeholder={credential.provider.endsWith("-cli") ? "CLI認証を使用" : "新しいAPIキー（空なら維持）"} disabled={credential.provider.endsWith("-cli")} className="h-8" /><Button size="sm" variant="outline" onClick={() => void saveCredential(credential)}>保存</Button></div>
             </div>
-          ))}
+            ))}
         </div>
       </section>
 
@@ -369,6 +417,29 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
 
       </>}
       <section className="space-y-2">
+        <div className="text-xs font-medium">OpenAI 組織の今日の使用量（UTC）</div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {(["sol", "luna"] as const).map((name) => {
+            const group = data.openai_usage_actual?.groups?.[name];
+            const isCurrent = group?.actual_usage_state === "ok" && group.source === "openai_usage_api";
+            return (
+              <div key={name} className="rounded border p-2 text-xs" role="status">
+                <div className="font-medium">{name}</div>
+                {isCurrent ? (
+                  <div>{formatValue(group.actual_usage ?? 0, "tokens")} / {formatValue(group.limit, "tokens")} tokens</div>
+                ) : (
+                  <div>実績未取得（{group?.actual_usage_state ?? "unavailable"}） · 上限 {formatValue(group?.limit ?? 0, "tokens")}</div>
+                )}
+                <div className="text-[10px] text-muted-foreground">取得時刻: {isCurrent ? group.last_synced_at || "不明" : "不明"}</div>
+                {isCurrent && (group.external_usage_estimate ?? 0) > 0 && (
+                  <div className="text-[10px]">AoiTalk 外を含む差分推定: {formatValue(group.external_usage_estimate ?? 0, "tokens")}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+      <section className="space-y-2">
         <div className="text-xs font-medium">QuotaPool</div>
         <div className="space-y-2">
           {data.quota_pools.map((quota) => {
@@ -379,19 +450,20 @@ export function FreeTeamSettingsPanel({ quotaOnly = false }: { quotaOnly?: boole
                   <div className="text-xs font-medium">{quota.id}</div>
                   <div className="text-[10px] text-muted-foreground">{quota.model_group ? `${quota.model_group}共有群 · ` : ""}{quota.metric_type} · reset (UTC) {quota.window_end || "なし"} · sync {quota.last_provider_sync_at || "未実行"}</div>
                   <div id={`${panelId}-${quota.id}-effective-cap`} aria-label={`${quota.id}の実効日次停止cap`} className="text-[10px]">
-                    現在の実効cap: {formatValue(quota.effective_daily_cap ?? quota.daily_cap ?? dailyCap(quota), quota.metric_type)}
+                    現在の実効cap: {quota.availability_state === "provider_managed" ? "Provider管理／上限未取得" : formatValue(quota.effective_daily_cap ?? quota.daily_cap ?? dailyCap(quota), quota.metric_type)}
                     {quota.cap_restriction_reason === "usage_tier" && <div>利用Tier（{quota.usage_tier}）による上限制限</div>}
                   </div>
                   {(quota.provider_external_delta ?? 0) > 0 && <div className="text-[10px]">外部観測分 {formatValue(quota.provider_external_delta ?? 0, quota.metric_type)} を残量から控除</div>}
-                  <div className="text-[10px]" role="status">停止理由: {quota.stop_reason ? stopReasonLabels[quota.stop_reason] || quota.stop_reason : "なし（最大予約量を事前確認）"}</div>
+                  <div className="text-[10px]" role="status">停止理由: {quota.stop_reason ? stopReasonLabels[quota.stop_reason] || quota.stop_reason : quota.availability_state === "provider_managed" ? "なし（Provider管理）" : "なし（最大予約量を事前確認）"}</div>
                 </div>
                 <div className="text-xs"><span className="block text-[10px] text-muted-foreground">使用済み</span>{formatValue(quota.consumed, quota.metric_type)}</div>
                 <div className="text-xs"><span className="block text-[10px] text-muted-foreground">予約中</span>{formatValue(quota.reserved, quota.metric_type)}</div>
-                <div className="text-xs"><span className="block text-[10px] text-muted-foreground">残量</span>{formatValue(quota.available, quota.metric_type)}</div>
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>上限</span><Input aria-label={`${quota.id}の上限`} type="number" min={0} value={draft.limit ?? quota.limit} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], limit: Number(event.target.value) } }))} className="h-8" /></label>
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>日次停止cap（設定値）</span><Input aria-label={`${quota.id}の日次停止cap`} aria-describedby={`${panelId}-${quota.id}-effective-cap`} type="number" min={0} max={draft.limit ?? quota.limit} value={draft.daily_cap ?? dailyCap(quota)} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], daily_cap: Number(event.target.value), safety_margin_ratio: 0, safety_margin_units: (current[quota.id]?.limit ?? quota.limit) - Number(event.target.value) } }))} className="h-8" /></label>
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>安全率</span><Input aria-label={`${quota.id}の安全率`} type="number" min={0} max={1} step={0.01} value={draft.safety_margin_ratio ?? quota.safety_margin_ratio} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], safety_margin_ratio: Number(event.target.value), daily_cap: undefined } }))} className="h-8" /></label>
-                <label className="space-y-1 text-[10px] text-muted-foreground"><span>安全量</span><Input aria-label={`${quota.id}の安全量`} type="number" min={0} value={draft.safety_margin_units ?? quota.safety_margin_units} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], safety_margin_units: Number(event.target.value), daily_cap: undefined } }))} className="h-8" /></label>
+                <div className="text-xs"><span className="block text-[10px] text-muted-foreground">{quota.id === "gemini-promo-monthly-usd" ? "ローカル台帳残額（Google実credit未確認）" : "残量"}</span>{quota.availability_state === "provider_managed" ? "上限未取得" : formatValue(quota.available ?? 0, quota.metric_type)}</div>
+                <label className="space-y-1 text-[10px] text-muted-foreground"><span>{quota.id === "openrouter-free-rpd" ? "ローカル上限" : "上限"}</span><Input aria-label={`${quota.id}の上限`} type="number" min={0} value={draft.limit ?? (quota.availability_state === "provider_managed" ? "" : quota.limit)} placeholder={quota.availability_state === "provider_managed" ? "Provider管理" : undefined} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], limit: event.target.value === "" ? undefined : Number(event.target.value) } }))} className="h-8" /></label>
+                {(quota.availability_state !== "provider_managed" || draft.limit !== undefined) && <label className="space-y-1 text-[10px] text-muted-foreground"><span>{quota.id === "openrouter-free-rpd" ? "日次停止cap（ローカル上限）" : "日次停止cap（設定値）"}</span><Input aria-label={`${quota.id}の日次停止cap`} aria-describedby={`${panelId}-${quota.id}-effective-cap`} type="number" min={0} max={quota.id === "openrouter-free-rpd" ? Math.max(0, (draft.limit ?? quota.limit) - 2) : draft.limit ?? quota.limit} value={draft.daily_cap ?? dailyCap(quota)} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], daily_cap: Number(event.target.value), safety_margin_ratio: 0, safety_margin_units: (current[quota.id]?.limit ?? quota.limit) - Number(event.target.value) } }))} className="h-8" /></label>}
+                {quota.id !== "openrouter-free-rpd" && <label className="space-y-1 text-[10px] text-muted-foreground"><span>安全率</span><Input aria-label={`${quota.id}の安全率`} type="number" min={0} max={1} step={0.01} value={draft.safety_margin_ratio ?? quota.safety_margin_ratio} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], safety_margin_ratio: Number(event.target.value), daily_cap: undefined } }))} className="h-8" /></label>}
+                {quota.id !== "openrouter-free-rpd" && <label className="space-y-1 text-[10px] text-muted-foreground"><span>安全量</span><Input aria-label={`${quota.id}の安全量`} type="number" min={0} value={draft.safety_margin_units ?? quota.safety_margin_units} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], safety_margin_units: Number(event.target.value), daily_cap: undefined } }))} className="h-8" /></label>}
+                {quota.id === "gemini-promo-monthly-usd" && <label className="space-y-1 text-[10px] text-muted-foreground"><span>ローカル帳簿のscope ID（Google実creditではない）</span><Input aria-label="ローカル帳簿のscope ID（Google実creditではない）" type="text" maxLength={100} placeholder="自動（未設定時）: freeteam-gemini-promo" value={draft.billing_scope_id ?? quota.reset_policy?.billing_scope_id ?? ""} onChange={(event) => setQuotaDrafts((current) => ({ ...current, [quota.id]: { ...current[quota.id], billing_scope_id: event.target.value } }))} className="h-8" /><span className="block">空欄は現在設定を維持、未設定時自動</span></label>}
                 <Button size="sm" variant="outline" onClick={() => void saveQuota(quota)}>予算を保存</Button>
               </div>
             );

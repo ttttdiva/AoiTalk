@@ -1,7 +1,6 @@
 "use client";
 
-import { revenueEvidenceClass, revenueCurrency, revenueAmountText, revenueCostClass, revenueProfitAmount, REVENUE_COST_SCOPE_NOTE } from "@/lib/media-revenue-display";
-
+import Link from "next/link";
 import {
   useCallback,
   useEffect,
@@ -10,46 +9,21 @@ import {
   type FormEvent,
 } from "react";
 import {
-  BarChart3,
-  CalendarDays,
-  Check,
-  CircleDot,
-  CircleDollarSign,
-  FileText,
-  FlaskConical,
   Loader2,
   Pencil,
   Plus,
-  RefreshCw,
-  Search,
   Save,
-  Sparkles,
   Upload,
-  Users,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import {
   mediaOperationsApi,
   MediaOperationsApiError,
-  type CharacterCreateInput,
   type CharacterPatchInput,
-  type CharacterDashboardCalendarEntry,
-  type CharacterDashboardConnectedAccount,
-  type CharacterDashboardLearningItem,
-  type CharacterDashboardMetricItem,
-  type CharacterDashboardPage,
-  type CharacterDashboardRecipe,
-  type CharacterDashboardRevenueItem,
-  type CharacterDashboardResearchCandidate,
-  type CharacterDashboardRun,
-  type MediaCharacter,
-  type MediaCharacterDashboard,
   type MediaCharacterDetail,
   type MediaPersonaResource,
   type MediaPlatform,
-  type RevenueCostProjection,
-  type RevenueCostRecord,
 } from "@/lib/media-operations-api";
 import { operationsApi } from "@/lib/operations-api";
 import { Button } from "@/components/ui/button";
@@ -61,11 +35,9 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { HelpPopover } from "@/components/ui/help-popover";
+import { workspaceHref } from "@/lib/persona-workspace-model";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { CostEntriesPanel } from "./cost-entries-panel";
-import { RevenueCostEditor } from "./revenue-cost-editor";
-import { RevenueCostSummary } from "./revenue-cost-summary";
 import { PlatformAccountPanel } from "@/components/operations/media/platform-account-panel";
 
 const PLATFORMS: readonly MediaPlatform[] = [
@@ -89,33 +61,6 @@ const PLATFORM_LABELS: Record<MediaPlatform, string> = {
   fanza: "FANZA",
   tiktok: "TikTok",
 };
-
-const SAFE_CAPABILITY_KEYS = new Set([
-  "identity",
-  "publish",
-  "media",
-  "analytics",
-  "text",
-  "image",
-  "video",
-  "schedule",
-  "edit",
-  "delete",
-  "revenue",
-  "refresh",
-  "revoke",
-]);
-
-const SAFE_CAPABILITY_STATUSES = new Set([
-  "available",
-  "automatable",
-  "unavailable",
-  "unsupported",
-  "manual",
-  "unverified",
-  "verified",
-  "unknown",
-]);
 
 type CharacterForm = {
   display_name: string;
@@ -175,7 +120,6 @@ const CHARACTER_REVISION_FIELDS = [
 
 type CharacterRevisionField = (typeof CHARACTER_REVISION_FIELDS)[number];
 
-const CHARACTER_LIST_PAGE_SIZE = 100;
 const MAX_AVATAR_BYTES = 25 * 1024 * 1024;
 
 function emptyForm(): CharacterForm {
@@ -378,29 +322,6 @@ function dirtyFieldsFor(base: CharacterForm, current: CharacterForm): Set<Charac
   );
 }
 
-function createInputFromForm(form: CharacterForm): CharacterCreateInput {
-  const displayName = String(serializeRevisionField("display_name", form));
-  const input: Record<string, unknown> = {
-    display_name: displayName,
-    summary: serializeRevisionField("summary", form),
-    voice: serializeRevisionField("voice", form),
-    audience: serializeRevisionField("audience", form),
-    platforms: serializeRevisionField("platforms", form),
-    content_pillars: serializeRevisionField("content_pillars", form),
-  };
-
-  // Keep the historical create payload compact for untouched optional fields,
-  // while still allowing every advanced revision field to be authored.
-  for (const key of CHARACTER_REVISION_FIELDS) {
-    if (key === "display_name" || key === "summary" || key === "voice" || key === "audience" || key === "platforms" || key === "content_pillars") continue;
-    const value = serializeRevisionField(key, form);
-    const isEmpty = value === null || (Array.isArray(value) && value.length === 0) || (typeof value === "object" && value !== null && Object.keys(value).length === 0);
-    if (!isEmpty) input[key] = value;
-  }
-
-  return input as CharacterCreateInput;
-}
-
 function patchInputFromForm(
   detail: MediaCharacterDetail,
   form: CharacterForm,
@@ -416,61 +337,6 @@ function patchInputFromForm(
     if (dirtyFields.has(key)) input[key] = serializeRevisionField(key, form);
   }
   return input as CharacterPatchInput;
-}
-
-function formatDate(value: string | null | undefined): string {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString("ja-JP", {
-    dateStyle: "short",
-    timeStyle: "short",
-  });
-}
-
-function statusLabel(value: string | null | undefined): string {
-  const status = value?.trim().toLowerCase();
-  if (!status) return "未設定";
-
-  const labels: Record<string, string> = {
-    active: "Active",
-    available: "利用可能",
-    automatable: "利用可能",
-    configured: "設定済み",
-    connected: "接続済み",
-    disabled: "無効",
-    draft: "Draft",
-    pending: "保留",
-    triaged: "保留",
-    discovered: "保留",
-    pending_review: "レビュー待ち",
-    proposed: "提案",
-    running: "実行中",
-    succeeded: "成功",
-    failed: "失敗",
-    unavailable: "利用不可",
-    unsupported: "非対応",
-    manual: "手動",
-    unverified: "未検証",
-    verified: "検証済み",
-    unknown: "不明",
-    expired: "期限切れ",
-    accepted: "採用",
-    rejected: "却下",
-  };
-
-  return labels[status] ?? value ?? "未設定";
-}
-
-function StatusPill({ status }: { status: string | null | undefined }) {
-  return (
-    <span
-      className="inline-flex items-center rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
-      data-character-status={status ?? "unknown"}
-    >
-      {statusLabel(status)}
-    </span>
-  );
 }
 
 function ErrorNotice({ error }: { error: unknown }) {
@@ -494,709 +360,7 @@ function EmptyState({ children }: { children: React.ReactNode }) {
   );
 }
 
-function CharacterCard({
-  character,
-  selected,
-  onSelect,
-}: {
-  character: MediaCharacter;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const revision = character.current_revision;
-
-  return (
-    <button
-      type="button"
-      data-testid={`character-card-${character.id}`}
-      aria-pressed={selected}
-      onClick={onSelect}
-      className={`group rounded-lg border p-3 text-left transition-colors ${
-        selected
-          ? "border-primary bg-primary/5"
-          : "border-border bg-card/40 hover:bg-muted/40"
-      }`}
-    >
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
-            <Users className="size-3.5" aria-hidden="true" />
-          </span>
-          <span className="min-w-0 truncate text-sm font-semibold">
-            {revision.display_name}
-          </span>
-        </div>
-        <StatusPill status={character.state} />
-      </div>
-
-      <p className="mt-2 line-clamp-2 min-h-8 text-xs text-muted-foreground">
-        {revision.summary || "概要はまだ登録されていません。"}
-      </p>
-
-      <div className="mt-2 flex flex-wrap gap-1.5">
-        {(revision.platforms ?? []).slice(0, 4).map((platform) => (
-          <span
-            key={platform}
-            className="rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground"
-          >
-            {PLATFORM_LABELS[platform]}
-          </span>
-        ))}
-      </div>
-
-      <span className="mt-3 block text-[10px] text-muted-foreground group-hover:text-foreground">
-        Persona ID: {character.id}
-      </span>
-    </button>
-  );
-}
-
-function DashboardSection({
-  title,
-  icon: Icon,
-  testId,
-  children,
-}: {
-  title: string;
-  icon: typeof Users;
-  testId: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section
-      className="rounded-lg border border-border/70 bg-background/40 p-3"
-      data-testid={testId}
-    >
-      <div className="flex items-center gap-2">
-        <Icon className="size-3.5 text-primary" aria-hidden="true" />
-        <h4 className="text-xs font-semibold">{title}</h4>
-      </div>
-      <div className="mt-2">{children}</div>
-    </section>
-  );
-}
-
-function ConnectedAccounts({
-  accounts,
-}: {
-  accounts: CharacterDashboardConnectedAccount[];
-}) {
-  if (!accounts.length) return <p className="text-xs text-muted-foreground">接続済みアカウントはありません。</p>;
-
-  return (
-    <ul className="space-y-1.5">
-      {accounts.map((account) => {
-        const capabilityEntries = Object.entries(account.capabilities ?? {})
-          .filter(([key, value]) =>
-            SAFE_CAPABILITY_KEYS.has(key) &&
-            typeof value === "string" &&
-            SAFE_CAPABILITY_STATUSES.has(value.trim().toLowerCase()),
-          )
-          .slice(0, 4);
-        const observedCapabilityEntries = Object.entries(account.observed_capabilities ?? {})
-          .filter(([key, value]) =>
-            SAFE_CAPABILITY_KEYS.has(key) &&
-            typeof value === "string" &&
-            SAFE_CAPABILITY_STATUSES.has(value.trim().toLowerCase()),
-          )
-          .slice(0, 4);
-        return (
-          <li
-            key={account.id}
-            className="rounded-md border border-border/60 px-2.5 py-2 text-xs"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="min-w-0 truncate">
-                {PLATFORM_LABELS[account.platform as MediaPlatform] ?? account.platform}
-                {account.account_ref ? ` · ${account.account_ref}` : ""}
-              </span>
-              <StatusPill status={account.capability_status ?? account.connection_status ?? account.status} />
-            </div>
-            {capabilityEntries.length ? (
-              <p className="mt-1 line-clamp-2 text-[10px] text-muted-foreground">
-                {capabilityEntries.map(([key, value]) => `${key}: ${statusLabel(value)}`).join(" · ")}
-                {account.adapter_ready === true ? " · adapter: ready" : ""}
-              </p>
-            ) : account.adapter_ready === true ? (
-              <p className="mt-1 text-[10px] text-muted-foreground">adapter: ready</p>
-            ) : null}
-            {observedCapabilityEntries.length ? (
-              <p className="mt-1 line-clamp-2 text-[10px] text-muted-foreground">
-                観測: {observedCapabilityEntries.map(([key, value]) => `${key}: ${statusLabel(value)}`).join(" · ")}
-              </p>
-            ) : null}
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
-
-function ResearchCandidates({
-  candidates,
-}: {
-  candidates: CharacterDashboardResearchCandidate[];
-}) {
-  if (!candidates.length) return <p className="text-xs text-muted-foreground">Research candidateはありません。</p>;
-
-  return (
-    <ul className="space-y-2">
-      {candidates.map((candidate) => (
-        <li key={candidate.id} className="rounded-md border border-border/60 px-2.5 py-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-xs font-medium">{candidate.title}</span>
-            <StatusPill status={candidate.review_state ?? candidate.status} />
-          </div>
-          {candidate.summary ? (
-            <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">
-              {candidate.summary}
-            </p>
-          ) : null}
-          {candidate.reason ? (
-            <p className="mt-1 line-clamp-2 text-[10px] text-muted-foreground">
-              判定理由: {candidate.reason}
-            </p>
-          ) : null}
-          <p className="mt-1 text-[10px] text-muted-foreground">
-            発見 {formatDate(candidate.discovered_at)}
-            {candidate.expires_at ? ` · 期限 ${formatDate(candidate.expires_at)}` : ""}
-            {candidate.decision_version ? ` · decision v${candidate.decision_version}` : ""}
-          </p>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function GenerationSummary({
-  generation,
-}: {
-  generation: MediaCharacterDashboard["generation"];
-}) {
-  const recipes: CharacterDashboardRecipe[] = generation?.recipes ?? [];
-  const runs: CharacterDashboardRun[] = generation?.runs ?? [];
-
-  if (!recipes.length && !runs.length) {
-    return <p className="text-xs text-muted-foreground">Generation履歴はありません。</p>;
-  }
-
-  return (
-    <div className="space-y-2">
-      {recipes.length ? (
-        <div>
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Recipes</p>
-          <ul className="mt-1 space-y-1">
-            {recipes.map((recipe) => (
-              <li key={recipe.id} className="flex items-center justify-between gap-2 text-xs">
-                <span className="truncate">{recipe.name}</span>
-                <span className="shrink-0 text-[10px] text-muted-foreground">{formatDate(recipe.created_at)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {runs.length ? (
-        <div>
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Runs</p>
-          <ul className="mt-1 space-y-1">
-            {runs.map((run) => (
-              <li key={run.id} className="flex items-center justify-between gap-2 text-xs">
-                <span className="font-mono text-[10px]">{run.id}</span>
-                <span className="flex shrink-0 items-center gap-1.5">
-                  <StatusPill status={run.status} />
-                  <span className="text-[10px] text-muted-foreground">{formatDate(run.finished_at ?? run.started_at)}</span>
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function CalendarSummary({
-  entries,
-}: {
-  entries: CharacterDashboardCalendarEntry[];
-}) {
-  if (!entries.length) return <p className="text-xs text-muted-foreground">予定はありません。</p>;
-
-  return (
-    <ul className="space-y-1.5">
-      {entries.map((entry) => (
-        <li key={entry.id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
-          <span className="min-w-0 truncate">
-            <span className="mr-1.5 rounded border border-border px-1 py-0.5 text-[10px] text-muted-foreground">{entry.kind}</span>
-            {entry.title}
-          </span>
-          <span className="flex shrink-0 items-center gap-1.5">
-            <StatusPill status={entry.status} />
-            <span className="text-[10px] text-muted-foreground">{formatDate(entry.starts_at)}</span>
-          </span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function LearningSummary({
-  learning,
-}: {
-  learning: MediaCharacterDashboard["learning"];
-}) {
-  const items: CharacterDashboardLearningItem[] = learning?.items ?? [];
-
-  return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap gap-2 text-xs">
-        <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">{learning?.count ?? 0}件</span>
-        <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">レビュー待ち {learning?.pending_review_count ?? 0}件</span>
-      </div>
-      {items.length ? (
-        <ul className="space-y-1.5">
-          {items.map((item) => (
-            <li key={item.id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
-              <span className="min-w-0 truncate">{item.title}</span>
-              <span className="flex shrink-0 items-center gap-1.5"><StatusPill status={item.status} /><span className="text-[10px] text-muted-foreground">{formatDate(item.created_at)}</span></span>
-            </li>
-          ))}
-        </ul>
-      ) : <p className="text-xs text-muted-foreground">Learning proposalはありません。</p>}
-    </div>
-  );
-}
-
-const MAX_DASHBOARD_BUCKETS = 20;
-const MAX_DASHBOARD_METRIC_KEYS = 8;
-const MAX_DASHBOARD_TEXT_LENGTH = 164;
-const SAFE_DASHBOARD_METRIC_KEYS = new Set([
-  "impressions",
-  "reach",
-  "views",
-  "likes",
-  "comments",
-  "shares",
-  "saves",
-  "clicks",
-  "conversions",
-  "followers",
-  "watch_time_seconds",
-  "engagement_rate",
-  "click_through_rate",
-  "conversion_rate",
-  "sample_size",
-]);
-
-function safeDashboardNumber(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  if (Math.abs(value) > 1_000_000_000_000) return null;
-  return value;
-}
-
-function safeDashboardText(value: unknown, fallback: string): string {
-  if (typeof value !== "string") return fallback;
-  const normalized = value
-    .replace(/[\u0000-\u001f\u007f]/gu, "")
-    .trim();
-  if (!normalized || normalized.length > MAX_DASHBOARD_TEXT_LENGTH) {
-    return fallback;
-  }
-  return normalized;
-}
-
-function shortDashboardRef(value: unknown, fallback: string): string {
-  const text = safeDashboardText(value, fallback);
-  if (text === fallback || text.length <= 40) return text;
-  return `${text.slice(0, 36)}…`;
-}
-
-function dashboardPageItems<T>(
-  page: CharacterDashboardPage<T> | null | undefined,
-): T[] {
-  return Array.isArray(page?.items) ? page.items.slice(0, 100) : [];
-}
-
-function formatMetricEntries(metrics: Record<string, number> | undefined): string {
-  if (!metrics || typeof metrics !== "object" || Array.isArray(metrics)) return "値なし";
-  const entries = Object.entries(metrics)
-    .map(([key, value]) => [safeDashboardText(key, ""), safeDashboardNumber(value)] as const)
-    .filter(([key, value]) => Boolean(key) && SAFE_DASHBOARD_METRIC_KEYS.has(key) && value !== null)
-    .slice(0, MAX_DASHBOARD_METRIC_KEYS);
-  if (!entries.length) return "値なし";
-  return entries
-    .map(([key, value]) => `${key}: ${new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 2 }).format(value as number)}`)
-    .join(" · ");
-}
-
-function safeDashboardMetricMap(value: unknown): Record<string, number> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const result: Record<string, number> = {};
-  for (const [key, rawValue] of Object.entries(value)) {
-    if (!SAFE_DASHBOARD_METRIC_KEYS.has(key)) continue;
-    const number = safeDashboardNumber(rawValue);
-    if (number !== null) result[key] = number;
-  }
-  return result;
-}
-
-type DashboardMetricBucket = {
-  key: string;
-  label: string;
-  snapshotCount: number;
-  metrics: Record<string, number>;
-};
-
-type MetricDimension = "platform" | "account" | "content";
-
-function dashboardAccountMap(
-  accounts: CharacterDashboardConnectedAccount[],
-): Map<string, CharacterDashboardConnectedAccount> {
-  const result = new Map<string, CharacterDashboardConnectedAccount>();
-  for (const account of accounts) {
-    const ref = safeDashboardText(account.account_ref, "");
-    if (ref) result.set(ref, account);
-    const id = safeDashboardText(account.id, "");
-    if (id) result.set(id, account);
-  }
-  return result;
-}
-
-function metricDimension(
-  item: CharacterDashboardMetricItem,
-  dimension: MetricDimension,
-  accountsByRef: Map<string, CharacterDashboardConnectedAccount>,
-): { key: string; label: string } {
-  const accountRef = safeDashboardText(item.platform_account_ref, "");
-  const account = accountRef ? accountsByRef.get(accountRef) : undefined;
-  if (dimension === "platform") {
-    const platform = safeDashboardText(item.platform ?? account?.platform, "");
-    return platform
-      ? { key: platform, label: PLATFORM_LABELS[platform as MediaPlatform] ?? platform }
-      : { key: "__unknown_platform", label: "媒体未設定" };
-  }
-  if (dimension === "account") {
-    return accountRef
-      ? { key: accountRef, label: shortDashboardRef(accountRef, "アカウント未設定") }
-      : { key: "__unknown_account", label: "アカウント未設定" };
-  }
-  const contentRef = safeDashboardText(item.content_variant_ref, "");
-  return contentRef
-    ? { key: contentRef, label: shortDashboardRef(contentRef, "コンテンツ未設定") }
-    : { key: "__unknown_content", label: "コンテンツ未設定" };
-}
-
-function metricBuckets(
-  items: CharacterDashboardMetricItem[],
-  dimension: MetricDimension,
-  accountsByRef: Map<string, CharacterDashboardConnectedAccount>,
-): DashboardMetricBucket[] {
-  const buckets = new Map<string, DashboardMetricBucket>();
-  for (const item of items) {
-    const { key, label } = metricDimension(item, dimension, accountsByRef);
-    const bucket = buckets.get(key) ?? { key, label, snapshotCount: 0, metrics: {} };
-    bucket.snapshotCount += 1;
-    const rawMetrics = item.metrics;
-    if (!rawMetrics || typeof rawMetrics !== "object" || Array.isArray(rawMetrics)) {
-      buckets.set(key, bucket);
-      continue;
-    }
-    for (const [metricKey, rawValue] of Object.entries(rawMetrics)) {
-      const normalizedKey = safeDashboardText(metricKey, "");
-      const value = safeDashboardNumber(rawValue);
-      if (!normalizedKey || !SAFE_DASHBOARD_METRIC_KEYS.has(normalizedKey) || value === null) continue;
-      const next = (bucket.metrics[normalizedKey] ?? 0) + value;
-      if (Number.isFinite(next) && Math.abs(next) <= 1_000_000_000_000) {
-        bucket.metrics[normalizedKey] = next;
-      }
-    }
-    buckets.set(key, bucket);
-  }
-  return Array.from(buckets.values())
-    .sort((left, right) => right.snapshotCount - left.snapshotCount || left.label.localeCompare(right.label, "ja"))
-    .slice(0, MAX_DASHBOARD_BUCKETS);
-}
-
-type DashboardRevenueBucket = RevenueCostProjection & {
-  key: string;
-  label: string;
-  eventCount: number;
-  gross: number | null;
-  net: number | null;
-  authorityLabel: string;
-  eventLabel: string;
-  revenueAuthority: string;
-  currency: string | null;
-};
-
-type RevenueDimension = "platform" | "account" | "currency" | "content";
-
-function revenueDimension(
-  item: CharacterDashboardRevenueItem,
-  dimension: RevenueDimension,
-  accountsByRef: Map<string, CharacterDashboardConnectedAccount>,
-): { key: string; label: string } {
-  const currency = revenueCurrency(item.currency) ?? "";
-  const withCurrency = (key: string, label: string) =>
-    currency ? { key: `${key}|${currency}`, label: `${label} · ${currency}` } : { key, label };
-  const accountRef = safeDashboardText(item.platform_account_ref, "");
-  const account = accountRef ? accountsByRef.get(accountRef) : undefined;
-  if (dimension === "platform") {
-    const platform = safeDashboardText(item.platform ?? account?.platform, "");
-    return platform
-      ? withCurrency(platform, PLATFORM_LABELS[platform as MediaPlatform] ?? platform)
-      : withCurrency("__unknown_platform", "媒体未設定");
-  }
-  if (dimension === "account") {
-    return accountRef
-      ? withCurrency(accountRef, shortDashboardRef(accountRef, "アカウント未設定"))
-      : withCurrency("__unknown_account", "アカウント未設定");
-  }
-  if (dimension === "currency") {
-    return currency
-      ? { key: currency, label: currency }
-      : { key: "__unknown_currency", label: "通貨未設定" };
-  }
-  const contentRef = safeDashboardText(item.content_ref, "");
-  return contentRef
-    ? withCurrency(contentRef, shortDashboardRef(contentRef, "コンテンツ未設定"))
-    : withCurrency("__unknown_content", "コンテンツ未設定");
-}
-
-function revenueBuckets(
-  items: CharacterDashboardRevenueItem[],
-  dimension: RevenueDimension,
-  accountsByRef: Map<string, CharacterDashboardConnectedAccount>,
-): DashboardRevenueBucket[] {
-  const buckets = new Map<string, DashboardRevenueBucket>();
-  for (const item of items) {
-    const dimensionValue = revenueDimension(item, dimension, accountsByRef);
-    const { authority, eventType, authorityLabel, eventLabel } = revenueEvidenceClass(item.revenue_authority, item.event_type);
-    const costClass = revenueCostClass(item.cost_authority);
-    const key = JSON.stringify([dimensionValue.key, authority, eventType, costClass.authority]);
-    const bucket = buckets.get(key) ?? {
-      key, label: dimensionValue.label, eventCount: 0, gross: 0, net: 0,
-      authorityLabel, eventLabel, revenueAuthority: authority, currency: revenueCurrency(item.currency),
-      fee_amount: 0, production_cost_amount: 0, human_cost_amount: 0, human_minutes: 0,
-      profit_amount: 0, profit_status: "calculated_input_scope", cost_authority: costClass.authority,
-    };
-    bucket.eventCount += 1;
-    const currencyKnown = revenueCurrency(item.currency) !== null;
-    for (const [total, raw] of [["gross", item.gross_amount], ["net", item.net_amount]] as const) {
-      const value = safeDashboardNumber(raw);
-      bucket[total] = !currencyKnown || value === null || bucket[total] === null
-        ? null : safeDashboardNumber(bucket[total] + value);
-    }
-    for (const field of ["fee_amount", "production_cost_amount", "human_cost_amount", "human_minutes", "profit_amount"] as const) {
-      const raw = field === "profit_amount" ? revenueProfitAmount(item.profit_amount, item.profit_status, item.currency) : item[field];
-      const value = safeDashboardNumber(raw);
-      const total = bucket[field];
-      bucket[field] = (field !== "human_minutes" && !currencyKnown) || value === null || total == null
-        ? null : safeDashboardNumber(total + value);
-    }
-    if (item.profit_status !== "calculated_input_scope") bucket.profit_status = item.profit_status ?? "unavailable_cost_record";
-    buckets.set(key, bucket);
-  }
-  return Array.from(buckets.values())
-    .sort((left, right) => right.eventCount - left.eventCount || left.label.localeCompare(right.label, "ja"))
-    .slice(0, MAX_DASHBOARD_BUCKETS);
-}
-
-function MetricBucketList({ buckets }: { buckets: DashboardMetricBucket[] }) {
-  if (!buckets.length) return <p className="text-[11px] text-muted-foreground">該当する観測はありません。</p>;
-  return (
-    <ul className="space-y-1.5">
-      {buckets.map((bucket) => (
-        <li key={bucket.key} className="rounded-md border border-border/60 px-2.5 py-2">
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="min-w-0 truncate font-medium">{bucket.label}</span>
-            <span className="shrink-0 text-[10px] text-muted-foreground">{bucket.snapshotCount}件</span>
-          </div>
-          <p className="mt-1 text-[10px] text-muted-foreground">{formatMetricEntries(bucket.metrics)}</p>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function RevenueBucketList({ buckets }: { buckets: DashboardRevenueBucket[] }) {
-  if (!buckets.length) return <p className="text-[11px] text-muted-foreground">該当するRevenue eventはありません。</p>;
-  return (
-    <ul className="space-y-1.5">
-      {buckets.map((bucket) => (
-        <li key={bucket.key} className="rounded-md border border-border/60 px-2.5 py-2">
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="min-w-0 truncate font-medium">{bucket.label}</span>
-            <span className="shrink-0 text-[10px] text-muted-foreground">{bucket.eventCount}件</span>
-          </div>
-          <p className="mt-1 text-[10px] tabular-nums text-muted-foreground">
-            {bucket.eventLabel} · {bucket.authorityLabel}<br />
-            総額 {revenueAmountText(bucket.gross)} · 手取り {revenueAmountText(bucket.net)}
-          </p>
-          <RevenueCostSummary item={bucket} currency={bucket.currency} revenueAuthority={bucket.revenueAuthority} />
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function CharacterResultsSummary({ dashboard }: { dashboard: MediaCharacterDashboard }) {
-  const [selectedRevenueId, setSelectedRevenueId] = useState<string | null>(null);
-  const [costReadbacks, setCostReadbacks] = useState<Record<string, RevenueCostRecord | null>>({});
-  const results = dashboard.results ?? { snapshot_count: 0, metrics: {}, last_observed_at: null };
-  const accountsByRef = dashboardAccountMap(dashboard.connected_accounts ?? []);
-  const metricPage = dashboard.metrics ?? dashboard.metrics_page;
-  const revenuePage = dashboard.revenue ?? dashboard.revenue_page;
-  const experimentPage = dashboard.experiments ?? dashboard.experiments_page;
-  const metricItems = dashboardPageItems(metricPage);
-  const revenueItems = dashboardPageItems(revenuePage).map((item) => {
-    if (!Object.prototype.hasOwnProperty.call(costReadbacks, item.id)) return item;
-    const record = costReadbacks[item.id];
-    if ((item.cost_revision ?? 0) > (record?.revision ?? 0)) return item;
-    return { ...item,
-      fee_amount: record?.fee_amount ?? null, production_cost_amount: record?.production_cost_amount ?? null,
-      human_cost_amount: record?.human_cost_amount ?? null, human_minutes: record?.human_minutes ?? null,
-      profit_amount: record?.profit_amount ?? null, profit_status: record?.profit_status ?? "unavailable_cost_record",
-      cost_authority: record?.cost_authority ?? "unknown", cost_record_id: record?.id ?? null, cost_revision: record?.revision ?? null,
-    };
-  });
-  const selectedRevenue = revenueItems.find((item) => item.id === selectedRevenueId);
-  const experimentItems = dashboardPageItems(experimentPage);
-  const fallbackMetrics = safeDashboardMetricMap(results.metrics);
-  const metricCount = Object.keys(fallbackMetrics).length;
-  const metricTotal = metricPage?.count ?? results.snapshot_count;
-  const revenueTotal = revenuePage?.count ?? 0;
-  const experimentTotal = experimentPage?.count ?? 0;
-  const dimensions: Array<{ key: MetricDimension; label: string }> = [
-    { key: "platform", label: "媒体" },
-    { key: "account", label: "アカウント" },
-    { key: "content", label: "コンテンツ" },
-  ];
-  const revenueDimensions: Array<{ key: RevenueDimension; label: string }> = [
-    { key: "platform", label: "媒体" },
-    { key: "account", label: "アカウント" },
-    { key: "currency", label: "通貨" },
-    { key: "content", label: "コンテンツ" },
-  ];
-
-  return (
-    <div className="space-y-3">
-      <div className="grid grid-cols-3 gap-2 text-xs">
-        <div><p className="text-[10px] text-muted-foreground">Snapshots</p><p className="mt-0.5 font-semibold">{results.snapshot_count ?? 0}</p></div>
-        <div><p className="text-[10px] text-muted-foreground">Metrics</p><p className="mt-0.5 font-semibold">{metricCount}</p></div>
-        <div><p className="text-[10px] text-muted-foreground">最終観測</p><p className="mt-0.5 font-semibold">{formatDate(results.last_observed_at)}</p></div>
-      </div>
-
-      <section data-testid="character-dashboard-metrics" className="rounded-md border border-border/60 p-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <h5 className="flex items-center gap-1.5 text-xs font-semibold"><BarChart3 className="size-3" aria-hidden="true" />Metrics（媒体 / アカウント / コンテンツ）</h5>
-          <span className="text-[10px] text-muted-foreground">{metricTotal}件{metricPage?.has_more ? "（続きあり）" : ""}</span>
-        </div>
-        {metricItems.length ? (
-          <div className="mt-2 grid gap-2 md:grid-cols-3">
-            {dimensions.map(({ key, label }) => (
-              <div key={key}>
-                <p className="mb-1 text-[10px] font-medium text-muted-foreground">{label}別</p>
-                <MetricBucketList buckets={metricBuckets(metricItems, key, accountsByRef)} />
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="mt-2 text-[11px] text-muted-foreground">
-            {metricCount ? `集計値: ${formatMetricEntries(fallbackMetrics)}` : "詳細なMetric snapshotはまだありません。"}
-          </p>
-        )}
-      </section>
-
-      <section data-testid="character-dashboard-revenue" className="rounded-md border border-border/60 p-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <h5 className="flex items-center gap-1.5 text-xs font-semibold"><CircleDollarSign className="size-3" aria-hidden="true" />Revenue（媒体 / アカウント / 通貨 / コンテンツ）</h5>
-          <span className="text-[10px] text-muted-foreground">{revenueTotal}件{revenuePage?.has_more ? "（続きあり）" : ""}</span>
-        </div>
-        <p className="mt-2 text-[11px] text-muted-foreground">表示中の{revenueItems.length}件を通貨・記録種別ごとに集計。通貨未指定の金額Metricは集計対象外です。{REVENUE_COST_SCOPE_NOTE}</p>
-        {revenueItems.length ? (
-          <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-            {revenueDimensions.map(({ key, label }) => (
-              <div key={key}>
-                <p className="mb-1 text-[10px] font-medium text-muted-foreground">{label}別</p>
-                <RevenueBucketList buckets={revenueBuckets(revenueItems, key, accountsByRef)} />
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="mt-2 text-[11px] text-muted-foreground">Personaに紐づくRevenue eventはまだありません。</p>
-        )}
-        {revenueItems.length ? <div className="mt-3 space-y-2">
-          <h6 className="text-xs font-semibold">売上ごとの費用記録</h6>
-          <ul className="space-y-2">{revenueItems.map((item) => {
-            const classification = revenueEvidenceClass(item.revenue_authority, item.event_type);
-            return <li key={item.id} className="rounded-md border border-border/60 p-2 text-xs">
-              <p>{item.event_at ? formatDate(item.event_at) : "日時不明"} · {item.platform ?? "媒体未設定"} · {classification.eventLabel} · {classification.authorityLabel}</p>
-              <p>売上 {item.id} · {item.content_ref ?? "コンテンツ未設定"} · {revenueCurrency(item.currency) ?? "通貨不明"} · 手取り {revenueAmountText(revenueCurrency(item.currency) ? item.net_amount : null)}</p>
-              <Button type="button" variant="outline" size="sm" className="mt-1" onClick={() => setSelectedRevenueId(item.id)} aria-label={`売上 ${item.id} の費用記録を開く`}>費用記録・訂正履歴</Button>
-            </li>;
-          })}</ul>
-          {selectedRevenue ? <RevenueCostEditor key={selectedRevenue.id} event={selectedRevenue} onClose={() => setSelectedRevenueId(null)} onReadback={(record) => setCostReadbacks((current) => ({ ...current, [selectedRevenue.id]: record }))} /> : null}
-        </div> : null}
-        <CostEntriesPanel dashboard={dashboard} revenueItems={revenueItems} onAllocated={(eventId, record) => setCostReadbacks((current) => ({ ...current, [eventId]: record }))} />
-      </section>
-
-      <section data-testid="character-dashboard-experiments" className="rounded-md border border-border/60 p-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <h5 className="flex items-center gap-1.5 text-xs font-semibold"><FlaskConical className="size-3" aria-hidden="true" />Experiments</h5>
-          <span className="text-[10px] text-muted-foreground">{experimentTotal}件{experimentPage?.has_more ? "（続きあり）" : ""}</span>
-        </div>
-        {experimentItems.length ? (
-          <ul className="mt-2 space-y-1.5">
-            {experimentItems.map((experiment) => (
-              <li key={experiment.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 px-2.5 py-2 text-xs">
-                <span className="min-w-0 truncate font-medium">{safeDashboardText(experiment.name, "Experiment")}</span>
-                <span className="flex shrink-0 items-center gap-1.5"><StatusPill status={experiment.status} /><span className="text-[10px] text-muted-foreground">結果 {Array.isArray(experiment.results) ? experiment.results.length : 0}件</span></span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="mt-2 text-[11px] text-muted-foreground">Personaに紐づくExperimentはまだありません。</p>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function CharacterDashboard({
-  dashboard,
-}: {
-  dashboard: MediaCharacterDashboard;
-}) {
-  return (
-    <div className="space-y-3" data-testid="character-dashboard">
-      <div className="grid gap-3 sm:grid-cols-2">
-        <DashboardSection title="接続アカウント" icon={CircleDot} testId="character-dashboard-connected-accounts">
-          <ConnectedAccounts accounts={dashboard.connected_accounts ?? []} />
-        </DashboardSection>
-        <DashboardSection title="Research candidates" icon={Sparkles} testId="character-dashboard-research-candidates">
-          <ResearchCandidates candidates={dashboard.research_candidates ?? []} />
-        </DashboardSection>
-        <DashboardSection title="Generation" icon={FileText} testId="character-dashboard-generation">
-          <GenerationSummary generation={dashboard.generation ?? { recipes: [], runs: [] }} />
-        </DashboardSection>
-        <DashboardSection title="カレンダー" icon={CalendarDays} testId="character-dashboard-calendar">
-          <CalendarSummary entries={dashboard.calendar ?? []} />
-        </DashboardSection>
-        <DashboardSection title="Results" icon={BarChart3} testId="character-dashboard-results">
-          <CharacterResultsSummary key={dashboard.character.id} dashboard={dashboard} />
-        </DashboardSection>
-        <DashboardSection title="Learning" icon={Check} testId="character-dashboard-learning">
-          <LearningSummary learning={dashboard.learning ?? { count: 0, pending_review_count: 0, items: [] }} />
-        </DashboardSection>
-      </div>
-    </div>
-  );
-}
-
 function CharacterFormPanel({
-  detail,
   form,
   editing,
   saving,
@@ -1205,7 +369,6 @@ function CharacterFormPanel({
   onSubmit,
   onCancel,
 }: {
-  detail: MediaCharacterDetail | null;
   form: CharacterForm;
   editing: boolean;
   saving: boolean;
@@ -1396,37 +559,32 @@ function CharacterFormPanel({
           </details>
 
           <div className="flex justify-end gap-2">
-            {editing ? <Button type="button" variant="ghost" size="sm" onClick={onCancel}>キャンセル</Button> : null}
+            {editing ? <Button type="button" variant="ghost" size="sm" disabled={dirtyFields.size === 0} onClick={onCancel}>変更を戻す</Button> : null}
             <Button type="submit" size="sm" disabled={saving || (editing && dirtyFields.size === 0)}>
               {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
-              {editing ? "更新" : "作成"}
+              {editing ? "設定を保存" : "作成"}
             </Button>
           </div>
           </fieldset>
         </form>
 
-        {detail ? <p className="mt-3 text-[10px] text-muted-foreground">更新対象: {detail.id}</p> : null}
       </CardContent>
     </Card>
   );
 }
 
-export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: string } = {}) {
-  const [characters, setCharacters] = useState<MediaCharacter[]>([]);
-  const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(initialPersonaId ?? null);
+/**
+ * Settings of one persona (reached from its 人格 view). The persona list and
+ * its production status live only in the 人格 view, so neither is repeated here.
+ */
+export function MediaPersonaPanel({ personaId }: { personaId: string }) {
   const [detail, setDetail] = useState<MediaCharacterDetail | null>(null);
-  const [dashboard, setDashboard] = useState<MediaCharacterDashboard | null>(null);
   const [form, setForm] = useState<CharacterForm>(emptyForm);
   const [baseForm, setBaseForm] = useState<CharacterForm>(emptyForm);
   const [dirtyFields, setDirtyFields] = useState<Set<CharacterRevisionField>>(new Set());
   const [conflict, setConflict] = useState<{ canonical: MediaCharacterDetail; dirtyFields: CharacterRevisionField[] } | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [searchInput, setSearchInput] = useState("");
-  const [hasMore, setHasMore] = useState(false);
   const [resources, setResources] = useState<MediaPersonaResource[]>([]);
   const [resourceLoading, setResourceLoading] = useState(false);
   const [avatarUploading, setAvatarUploading] = useState(false);
@@ -1434,55 +592,7 @@ export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: str
   const characterRequestRef = useRef(0);
   const resourceRequestRef = useRef(0);
   const activeCharacterIdRef = useRef<string | null>(null);
-  const listRequestRef = useRef(0);
   const avatarInputRef = useRef<HTMLInputElement>(null);
-  const charactersRef = useRef<MediaCharacter[]>([]);
-  const nextOffsetRef = useRef(0);
-  const searchRef = useRef("");
-
-  const loadCharacters = useCallback(async ({ reset = true, searchTerm } : { reset?: boolean; searchTerm?: string } = {}) => {
-    const requestId = ++listRequestRef.current;
-    if (reset) setLoading(true);
-    else setLoadingMore(true);
-    setError(null);
-
-    try {
-      const effectiveSearch = searchTerm ?? searchRef.current;
-      const offset = reset ? 0 : nextOffsetRef.current;
-      const nextCharacters = await mediaOperationsApi.listCharacters({
-        search: effectiveSearch.trim() || undefined,
-        limit: CHARACTER_LIST_PAGE_SIZE,
-        offset,
-      });
-      if (requestId !== listRequestRef.current) return;
-      const deduped = Array.from(new Map((reset ? nextCharacters : [...charactersRef.current, ...nextCharacters]).map((item) => [item.id, item])).values());
-      charactersRef.current = deduped;
-      setCharacters(deduped);
-      searchRef.current = effectiveSearch;
-      nextOffsetRef.current = offset + nextCharacters.length;
-      setHasMore(nextCharacters.length >= CHARACTER_LIST_PAGE_SIZE);
-      if (reset) {
-        setSelectedCharacterId((current) => {
-          if (current && deduped.some((item) => item.id === current)) return current;
-          const nextId = initialPersonaId ? null : deduped[0]?.id ?? null;
-          if (!nextId) {
-            setDetail(null);
-            setDashboard(null);
-            setEditing(false);
-            setResources([]);
-          }
-          return nextId;
-        });
-      }
-    } catch (loadError) {
-      if (requestId === listRequestRef.current) setError(loadError);
-    } finally {
-      if (requestId === listRequestRef.current) {
-        if (reset) setLoading(false);
-        else setLoadingMore(false);
-      }
-    }
-  }, [initialPersonaId]);
 
   const loadResources = useCallback(async (characterId: string) => {
     const requestId = ++resourceRequestRef.current;
@@ -1507,21 +617,15 @@ export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: str
     activeCharacterIdRef.current = characterId;
     setDetailLoading(true);
     setError(null);
-
     try {
-      const [nextDetail, nextDashboard] = await Promise.all([
-        mediaOperationsApi.getCharacter(characterId),
-        mediaOperationsApi.getCharacterDashboard(characterId),
-      ]);
+      const nextDetail = await mediaOperationsApi.getCharacter(characterId);
       if (requestId !== characterRequestRef.current) return;
       setDetail(nextDetail);
-      setDashboard(nextDashboard);
       const nextForm = formFromDetail(nextDetail);
       setForm(nextForm);
       setBaseForm(nextForm);
       setDirtyFields(new Set());
       setConflict(null);
-      setEditing(true);
       void loadResources(characterId);
     } catch (loadError) {
       if (requestId === characterRequestRef.current) setError(loadError);
@@ -1532,39 +636,21 @@ export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: str
 
   useEffect(() => {
     const task = window.setTimeout(() => {
-      void loadCharacters();
+      void loadCharacter(personaId);
     }, 0);
     return () => window.clearTimeout(task);
-  }, [loadCharacters]);
-
-  useEffect(() => {
-    if (!selectedCharacterId) return;
-    const task = window.setTimeout(() => {
-      void loadCharacter(selectedCharacterId);
-    }, 0);
-    return () => window.clearTimeout(task);
-  }, [loadCharacter, selectedCharacterId]);
-
-  const beginCreate = () => {
-    characterRequestRef.current += 1;
-    resourceRequestRef.current += 1;
-    activeCharacterIdRef.current = null;
-    setSelectedCharacterId(null);
-    setDetail(null);
-    setDashboard(null);
-    const nextForm = emptyForm();
-    setForm(nextForm);
-    setBaseForm(nextForm);
-    setDirtyFields(new Set());
-    setConflict(null);
-    setResources([]);
-    setEditing(false);
-    setError(null);
-  };
+  }, [loadCharacter, personaId]);
 
   const updateForm = (next: CharacterForm) => {
     setForm(next);
     setDirtyFields(dirtyFieldsFor(baseForm, next));
+    setConflict(null);
+    setError(null);
+  };
+
+  const revertForm = () => {
+    setForm(baseForm);
+    setDirtyFields(new Set());
     setConflict(null);
     setError(null);
   };
@@ -1589,50 +675,33 @@ export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: str
 
   const submitCharacter = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const displayName = form.display_name.trim();
-    if (!displayName) {
+    if (!detail || !dirtyFields.size) return;
+    if (!form.display_name.trim()) {
       setError(new Error("表示名を入力してください"));
       return;
     }
-
     setSaving(true);
     setError(null);
     try {
-      let saved: MediaCharacterDetail;
-      if (editing && detail) {
-        if (!dirtyFields.size) return;
-        const patch = patchInputFromForm(detail, form, dirtyFields);
-        saved = await mediaOperationsApi.patchCharacter(detail.id, patch, newIdempotencyKey());
-        toast.success("Personaを更新しました");
-      } else {
-        const input: CharacterCreateInput = createInputFromForm(form);
-        saved = await mediaOperationsApi.createCharacter(
-          input,
-          newIdempotencyKey(),
-        );
-        toast.success("Personaを作成しました");
-      }
-
+      const patch = patchInputFromForm(detail, form, dirtyFields);
+      const saved = await mediaOperationsApi.patchCharacter(detail.id, patch, newIdempotencyKey());
+      toast.success("人格の設定を保存しました");
       setDetail(saved);
       const nextForm = formFromDetail(saved);
       setForm(nextForm);
       setBaseForm(nextForm);
       setDirtyFields(new Set());
       setConflict(null);
-      setEditing(true);
-      setSelectedCharacterId(saved.id);
-      await loadCharacters({ reset: true });
     } catch (saveError) {
-      if (editing && detail && saveError instanceof MediaOperationsApiError && saveError.status === 409) {
-        const pendingFields = new Set(dirtyFields);
+      if (saveError instanceof MediaOperationsApiError && saveError.status === 409) {
         try {
-          await refreshCanonicalAfterConflict(detail.id, pendingFields);
+          await refreshCanonicalAfterConflict(detail.id, new Set(dirtyFields));
           setError(saveError);
         } catch (reloadError) {
           setError(reloadError);
         }
       } else {
-      setError(saveError);
+        setError(saveError);
       }
     } finally {
       setSaving(false);
@@ -1696,156 +765,62 @@ export function MediaPersonaPanel({ initialPersonaId }: { initialPersonaId?: str
     if (file) void uploadAvatar(file);
   };
 
-  const submitSearch = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    void loadCharacters({ reset: true, searchTerm: searchInput });
-  };
-
-  const loadMoreCharacters = () => {
-    if (loadingMore || !hasMore) return;
-    void loadCharacters({ reset: false });
-  };
-
   return (
-    <div className="space-y-5" data-testid="media-persona-panel">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">
-            Persona（発信人格）
-            <HelpPopover label="Persona（発信人格）">
-              Persona（発信人格）のうち、固定slotに紐づかないものを管理します。会話用Characterとは別です。接続・調査・生成・予定・結果・学習をPersona単位で確認できます。
-            </HelpPopover>
-          </h2>
-        </div>
-        <div className="flex gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={() => void loadCharacters()} disabled={loading}>
-            <RefreshCw className={loading ? "size-3.5 animate-spin" : "size-3.5"} />
-            更新
-          </Button>
-          <Button type="button" size="sm" onClick={beginCreate} data-testid="character-create-button">
-            <Plus className="size-3.5" /> Personaを追加
-          </Button>
-        </div>
+    <div className="space-y-4" data-testid="media-persona-panel">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h1 className="min-w-0 break-words text-xl font-semibold">{detail?.current_revision.display_name ?? "人格"} の設定</h1>
+        <Link href={workspaceHref(personaId)} className="text-xs text-primary hover:underline">人格に戻る</Link>
       </div>
 
       <ErrorNotice error={error} />
+      {conflict ? (
+        <div role="alert" data-testid="character-conflict" className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+          サーバー側でRevisionが更新されました。最新値を読み込みましたが、未保存の変更（{conflict.dirtyFields.join(", ")}）は保持しています。内容を確認して保存してください。
+        </div>
+      ) : null}
 
-      <Card size="sm" data-testid="character-list-card">
-        <CardHeader className="border-b border-border/70">
-          <CardTitle className="inline-flex items-center gap-1 text-sm">
-            Persona（発信人格）
-            <HelpPopover label="Persona一覧">slotなしPersonaの一覧です。</HelpPopover>
-          </CardTitle>
-          <p className="text-sm text-muted-foreground">{characters.length}件</p>
-        </CardHeader>
-        <CardContent className="pt-4">
-          <form className="mb-4 flex gap-2" aria-label="Character search" onSubmit={submitSearch}>
-            <Input
-              value={searchInput}
-              aria-label="Personaを検索"
-              placeholder="名前・概要で検索"
-              onChange={(event) => setSearchInput(event.target.value)}
+      {detailLoading && !detail ? (
+        <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 読み込み中…</div>
+      ) : !detail ? (
+        <EmptyState>この人格を読み込めませんでした。人格の画面から開き直してください。</EmptyState>
+      ) : (
+        <div className="grid min-w-0 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
+          <CharacterFormPanel form={form} editing saving={saving} dirtyFields={dirtyFields} onChange={updateForm} onSubmit={submitCharacter} onCancel={revertForm} />
+          <div className="min-w-0 space-y-4">
+            <section className="rounded-xl border bg-card p-4" data-testid="character-resources">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="inline-flex items-center gap-1 text-sm font-semibold">
+                  参照画像
+                  <HelpPopover label="参照画像">アップロード済みのサーバー素材だけを表示します。</HelpPopover>
+                </h2>
+                <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={onAvatarInput} />
+                <Button type="button" size="sm" variant="outline" onClick={() => avatarInputRef.current?.click()} disabled={avatarUploading}>
+                  {avatarUploading ? <Loader2 className="size-3.5 animate-spin" /> : <Upload className="size-3.5" />}
+                  {avatarUploading ? "アップロード中…" : "画像を追加"}
+                </Button>
+              </div>
+              {resourceLoading ? (
+                <p className="mt-3 text-xs text-muted-foreground">素材を読み込み中…</p>
+              ) : resources.length ? (
+                <ul className="mt-3 space-y-1.5">
+                  {resources.map((resource) => (
+                    <li key={resource.id} data-testid={`character-resource-${resource.id}`} className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 px-2.5 py-2 text-xs">
+                      <span className="font-medium">{resource.label || resource.resource_kind}</span>
+                      <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[10px]">{resource.resource_kind}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-3 text-xs text-muted-foreground">保存済み素材はありません。</p>
+              )}
+            </section>
+            <PlatformAccountPanel
+              characterId={detail.id}
+              onChanged={() => void loadCharacter(detail.id)}
             />
-            <Button type="submit" variant="outline" size="sm" disabled={loading}>
-              <Search className="size-3.5" /> 検索
-            </Button>
-          </form>
-          {loading && !characters.length ? (
-            <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 読み込み中…</div>
-          ) : characters.length ? (
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {characters.map((character) => (
-                <CharacterCard key={character.id} character={character} selected={selectedCharacterId === character.id} onSelect={() => setSelectedCharacterId(character.id)} />
-              ))}
-            </div>
-          ) : (
-            <EmptyState>Personaはまだありません。「Personaを追加」から作成してください。</EmptyState>
-          )}
-          {hasMore ? (
-            <div className="mt-4 flex justify-center">
-              <Button type="button" variant="outline" size="sm" onClick={loadMoreCharacters} disabled={loadingMore}>
-                {loadingMore ? <Loader2 className="size-3.5 animate-spin" /> : null}
-                {loadingMore ? "読み込み中…" : "さらに読み込む"}
-              </Button>
-            </div>
-          ) : null}
-        </CardContent>
-      </Card>
-
-      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(18rem,26rem)_minmax(0,1fr)]">
-        <CharacterFormPanel detail={detail} form={form} editing={editing} saving={saving} dirtyFields={dirtyFields} onChange={updateForm} onSubmit={submitCharacter} onCancel={beginCreate} />
-
-        <Card size="sm" data-testid="character-detail-card">
-          <CardHeader className="border-b border-border/70">
-            <CardTitle className="flex items-center gap-2 text-sm"><Users className="size-3.5" /><span className="inline-flex items-center gap-1">Persona dashboard<HelpPopover label="Persona dashboard">選択したPersonaの状態を関連するMedia Operationsから集約します。</HelpPopover></span></CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4 pt-4">
-            {detailLoading ? (
-              <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 読み込み中…</div>
-            ) : detail && dashboard ? (
-              <>
-                {conflict ? (
-                  <div role="alert" data-testid="character-conflict" className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
-                    サーバー側でRevisionが更新されました。最新値を読み込みましたが、未保存の変更（{conflict.dirtyFields.join(", ")}）は保持しています。内容を確認して再度保存してください。
-                  </div>
-                ) : null}
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h3 className="text-base font-semibold">{detail.current_revision.display_name}</h3>
-                    <p className="mt-1 whitespace-pre-wrap text-sm text-muted-foreground">{detail.current_revision.summary || "概要なし"}</p>
-                  </div>
-                  <StatusPill status={detail.state} />
-                </div>
-                <CharacterDashboard dashboard={dashboard} />
-                <section className="rounded-lg border border-border/70 bg-background/40 p-3" data-testid="character-resources">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <h4 className="inline-flex items-center gap-1 text-xs font-semibold">
-                        Avatar / Persona resources
-                        <HelpPopover label="Avatar / Persona resources">アップロード済みのサーバー素材のみ表示します。</HelpPopover>
-                      </h4>
-                    </div>
-                    <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={onAvatarInput} />
-                    <Button type="button" size="sm" variant="outline" onClick={() => avatarInputRef.current?.click()} disabled={avatarUploading}>
-                      {avatarUploading ? <Loader2 className="size-3.5 animate-spin" /> : <Upload className="size-3.5" />}
-                      {avatarUploading ? "アップロード中…" : "画像を追加"}
-                    </Button>
-                  </div>
-                  {resourceLoading ? (
-                    <p className="mt-3 text-xs text-muted-foreground">素材を読み込み中…</p>
-                  ) : resources.length ? (
-                    <ul className="mt-3 space-y-1.5">
-                      {resources.map((resource) => (
-                        <li key={resource.id} data-testid={`character-resource-${resource.id}`} className="rounded-md border border-border/60 px-2.5 py-2 text-xs">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="font-medium">{resource.label || resource.resource_kind}</span>
-                            <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[10px]">{resource.resource_kind}</span>
-                          </div>
-                          {resource.provenance.type === "stored_artifact" ? (
-                            <p className="mt-1 font-mono text-[10px] text-muted-foreground">stored artifact: {resource.provenance.artifact_id}</p>
-                          ) : resource.provenance.type === "artifact" ? (
-                            <p className="mt-1 font-mono text-[10px] text-muted-foreground">sha256:{resource.provenance.sha256.slice(0, 16)}… · {resource.provenance.mime_type}</p>
-                          ) : null}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="mt-3 text-xs text-muted-foreground">保存済み素材はありません。</p>
-                  )}
-                </section>
-                <PlatformAccountPanel
-                  characterId={detail.id}
-                  onChanged={() => void loadCharacter(detail.id)}
-                />
-              </>
-            ) : detail ? (
-              <div className="py-8 text-center text-sm text-muted-foreground">Dashboardを読み込めませんでした。</div>
-            ) : (
-              <div className="py-8 text-center text-sm text-muted-foreground">Personaを選択するか、新しいPersonaを作成してください。</div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

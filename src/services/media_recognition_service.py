@@ -29,7 +29,7 @@ from openai import AsyncOpenAI
 from src.llm.multimodal import data_url_to_bytes, normalize_image_payloads, openai_content_parts
 from src.llm.conversation_context import normalize_usage
 from src.llm.sglang_url import resolve_sglang_base_url
-from src.services.agent_team_service import config_get
+from src.services.runtime_policy_utils import config_get
 from src.services.llm_model_catalog import model_supports_vision
 from src.services.mage_vl_service import (
     MageVLRecognition,

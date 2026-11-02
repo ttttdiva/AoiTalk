@@ -1,8 +1,6 @@
-"""Bounded, tool-free semantic evaluation for an existing AgentRun.
+"""Bounded semantic automation using an exact AgentRevision v2 route.
 
-The caller owns revision/run/ACL and action-registry validation. Team/Profile
-IDs must come from that exact revision, never from model or message content.
-This service neither creates runs nor proposes/executes actions.
+Execution resolves the pinned ``summarize`` role through model_roles.
 """
 
 from __future__ import annotations
@@ -17,25 +15,8 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from .agent_model_routing import AgentModelRouteError, AgentRoutingPins, resolve_agent_role_route
 
-from .agent_team_v3 import (
-    AGENT_TEAM_DEFAULT_TEAMS,
-    _apply_execution_route,
-    agent_team_v3_teams,
-)
-from .execution_profile_service import (
-    _config_get,
-    list_team_execution_profiles,
-    resolve_execution_main_route,
-)
-from .session_llm_runtime_context import (
-    bind_session_agent_team_selection,
-    bind_session_execution_profile_id,
-    bind_session_main_route_override,
-    reset_session_agent_team_selection,
-    reset_session_execution_profile_id,
-    reset_session_main_route_override,
-)
 
 MAX_SOURCE_CHARS = 16000
 MAX_CONTEXT_CHARS = 8000
@@ -99,70 +80,43 @@ def _require_text_model(provider: Any, model: Any) -> None:
         raise AutomationInvocationError("semantic_model_unsupported")
 
 
-def resolve_route(config: Any, team_id: str, profile_id: str) -> dict[str, Any]:
-    """Resolve the *classifier default route* of a pinned Team Profile.
+def resolve_route(
+    config: Any,
+    revision: Any,
+) -> dict[str, Any]:
+    """Resolve the semantic classifier's exact AgentRevision v2 route."""
 
-    Classifier-only: a tool-free semantic match/extraction runs on the
-    Profile's Default Subagent Route (or Main for ``manual``) because no
-    Subagent acts.  Actual Operations work (deliverables, drafts, reviews)
-    must use ``agent_model_routing.resolve_agent_role_route`` /
-    ``resolve_agent_subagent_route`` so per-Subagent overrides apply; never
-    reuse this function for worker output.
-
-    Resolves supported pins without creating clients, loading Config or I/O.
-    This checks structural transport support, not credentials/server health.
-    An ambient conversation's Main override must not affect employee routing.
-    """
-    for pin in (team_id, profile_id):
-        if type(pin) is not str or not pin.strip() or len(pin) > 128 or pin != pin.strip():
-            raise AutomationInvocationError("semantic_route_invalid")
-    token = bind_session_main_route_override(None)
-    failure = None
+    if revision is None:
+        raise AutomationInvocationError("semantic_revision_required")
     try:
-        teams = dict(AGENT_TEAM_DEFAULT_TEAMS)
-        teams.update({item["team_id"]: item for item in agent_team_v3_teams(config)})
-        team = teams.get(team_id)
-        profile = next((item for item in list_team_execution_profiles(config, team_id) if item["profile_id"] == profile_id), None)
-        if not team or not team.get("enabled", True) or (profile is not None and not profile.get("enabled", True)):
-            raise AutomationInvocationError("semantic_route_invalid")
-        if profile_id == "free-team":
-            raise AutomationInvocationError("semantic_free_team_unsupported")
-        if profile_id == "manual":
-            provider = _config_get(config, "llm_provider", "openai")
-            selected_model = _config_get(config, "llm_model") or _config_get(config, f"{provider}.model")
-            # Legacy retirement normalization also recognizes names such as
-            # gpt-4o-mini-transcribe. Never silently replace a selected audio
-            # endpoint with an unrelated text model at this boundary.
-            _require_text_model(provider, selected_model)
-            route = resolve_execution_main_route(config)
-        elif profile is not None:
-            selected = profile["default_route"]
-            if selected.get("inherit_model") is False:
-                _require_text_model(selected.get("provider"), selected.get("model"))
-            route = _apply_execution_route(
-                profile["default_route"],
-                resolve_execution_main_route(config),
-                config=config,
-            )
-        else:
-            raise AutomationInvocationError("semantic_route_invalid")
-        if route.get("provider") not in _SUPPORTED_PROVIDERS or not route.get("model"):
-            raise AutomationInvocationError("semantic_provider_unsupported")
-        _require_text_model(route["provider"], route["model"])
-        return {key: route[key] for key in ("provider", "model", "effort") if route.get(key)}
-    except AutomationInvocationError as exc:
-        failure = exc
-    except Exception:
-        failure = AutomationInvocationError("semantic_route_invalid")
-    finally:
-        reset_session_main_route_override(token)
-    raise failure from None
+        route = resolve_agent_role_route(
+            config,
+            AgentRoutingPins.from_revision(revision),
+            "summarize",
+        )
+    except AgentModelRouteError as exc:
+        raise AutomationInvocationError("semantic_route_unavailable") from exc
+    if route.backend != "api" or route.provider not in _SUPPORTED_PROVIDERS or not route.model:
+        raise AutomationInvocationError("semantic_provider_unsupported")
+    _require_text_model(route.provider, route.model)
+    return {
+        key: value
+        for key, value in {
+            "provider": route.provider,
+            "model": route.model,
+            "effort": route.effort,
+        }.items()
+        if value
+    }
 
 
-def readiness(config: Any, team_id: str, profile_id: str) -> dict[str, Any]:
+def readiness(
+    config: Any,
+    revision: Any,
+) -> dict[str, Any]:
     """Public activation preflight; never performs network/client construction."""
     try:
-        route = resolve_route(config, team_id, profile_id)
+        route = resolve_route(config, revision)
         return {"supported": True, "error_code": None, **route}
     except AutomationInvocationError as exc:
         return {"supported": False, "error_code": exc.code}
@@ -358,21 +312,15 @@ def _usage(response: Any) -> dict[str, Any]:
     return result
 
 
-# Explicit name for callers: the automation classifier uses the Profile's
-# default route, which is distinct from a worker Subagent route.
+# Explicit name for callers: the automation classifier uses the exact
+# revision's ``summarize`` model role route.
 resolve_classifier_default_route = resolve_route
 
 
 class AgentAutomationInvoker:
-    """Use the pinned Team Profile's default route for a single classifier call.
+    """Use the exact AgentRevision v2 summarize route for one classifier call.
 
-No subagent is selected: per-subagent overrides are irrelevant to this
-    classifier call only.  Work that produces output for the Agent (drafts,
-    deliverables, reviews) resolves a Subagent route through
-    ``agent_model_routing`` instead and must not reuse this default route.
-    Built-in Teams remain available in older configurations; explicit disabled
-    overrides win. System manual uses configured Main. Other missing/disabled
-    pins fail closed, without falling back to an active profile.
+    The classifier is tool-free and does not create durable AgentRuns.
 ``client_factory`` is a test seam with manager.create_llm_client_for_target's
 signature. Production always defaults to that manager factory.
 """
@@ -381,13 +329,13 @@ signature. Production always defaults to that manager factory.
         self._config = config
         self._client_factory = client_factory
 
-    def validate_route(self, *, agent_team_id: str, execution_profile_id: str) -> dict[str, Any]:
+    def validate_route(self, *, agent_revision: Any) -> dict[str, Any]:
         """Synchronous activation check; no client/network/config writes.
 
         Return supported route metadata or raise AutomationInvocationError.
         This verifies structural support, not live credentials/server health.
         """
-        route = resolve_route(self._config, agent_team_id, execution_profile_id)
+        route = resolve_route(self._config, agent_revision)
         return {"supported": True, "error_code": None, **route}
 
     async def evaluate(
@@ -396,9 +344,8 @@ signature. Production always defaults to that manager factory.
         run_id: str | None,
         agent_id: str,
         agent_revision_id: str,
+        agent_revision: Any | None = None,
         rule_revision_id: str,
-        agent_team_id: str,
-        execution_profile_id: str,
         situation_description: str,
         positive_examples: Sequence[str],
         negative_examples: Sequence[str],
@@ -408,7 +355,9 @@ signature. Production always defaults to that manager factory.
     ) -> AutomationDecision:
         # Evaluate-only diagnostics deliberately have no durable AgentRun.
         # No other authority/revision pin may be omitted.
-        pins = (agent_id, agent_revision_id, rule_revision_id, agent_team_id, execution_profile_id)
+        if agent_revision is None:
+            raise AutomationInvocationError("semantic_revision_required")
+        pins = (agent_id, agent_revision_id, rule_revision_id)
         if run_id is not None:
             pins = (run_id, *pins)
         for pin in pins:
@@ -442,11 +391,6 @@ signature. Production always defaults to that manager factory.
             "If required extraction cannot be determined, refuse rather than fabricate. "
             "The exact output JSON Schema is: " + json.dumps(_response_schema(schema))
         )
-        team_token = bind_session_agent_team_selection({
-            "mode": "fixed", "team_id": agent_team_id, "loaded_team_ids": [agent_team_id],
-        })
-        profile_token = bind_session_execution_profile_id(execution_profile_id)
-        main_token = bind_session_main_route_override(None)
         client = None
         usage: dict[str, Any] = {}
         failure = None
@@ -457,7 +401,10 @@ signature. Production always defaults to that manager factory.
                 from ..config import Config
 
                 config = Config()
-            route = resolve_route(config, agent_team_id, execution_profile_id)
+            route = resolve_route(
+                config,
+                agent_revision,
+            )
             factory = self._client_factory
             if factory is None:
                 from ..llm.manager import create_llm_client_for_target
@@ -479,6 +426,13 @@ signature. Production always defaults to that manager factory.
             decision = _decision(output, schema, usage)
         except AutomationInvocationError as exc:
             failure = exc
+        except asyncio.TimeoutError:
+            # ``asyncio.TimeoutError`` is a distinct class on Python 3.10,
+            # while it aliases ``TimeoutError`` on newer Python versions.
+            # Keep both runtimes retryable without exposing provider details.
+            failure = AutomationInvocationError(
+                "semantic_provider_error", retryable=True, usage=usage
+            )
         except Exception as exc:
             from ..llm.generation_error import classify_generation_error
 
@@ -515,9 +469,7 @@ signature. Production always defaults to that manager factory.
                             except Exception:
                                 pass
             finally:
-                reset_session_main_route_override(main_token)
-                reset_session_execution_profile_id(profile_token)
-                reset_session_agent_team_selection(team_token)
+                pass
         # Raise outside the provider except block: even __context__ must not
         # retain a provider exception/body for generic runtime audit consumers.
         if failure is not None:
@@ -612,9 +564,15 @@ signature. Production always defaults to that manager factory.
                 base_url=client.base_url, source_kind="agent_automation", model=route["model"],
             )
         else:
+            consumer_id = None
+            if provider == "openai":
+                from .provider_key_attribution_service import consumer_model_suffix
+
+                consumer_id = f"employee_decision:{consumer_model_suffix(route['model'])}"
             response = await client._execute_model_request(
                 payload, transport=transport, sender=sender,
                 source_kind="agent_automation", gateway=gateway,
+                provider_key_consumer_id=consumer_id,
             )
         usage = _usage(response)
         if provider == "openai":

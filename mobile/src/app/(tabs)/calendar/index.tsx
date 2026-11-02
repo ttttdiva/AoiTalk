@@ -940,7 +940,14 @@ export default function CalendarScreen() {
                   firstDay={0}
                   horizontal
                   pagingEnabled
-                  staticHeader
+                  // Keep each month label and weekday row attached to its
+                  // page. CalendarList's static header follows the first
+                  // viewable item, which can lag during fast re-grabs.
+                  staticHeader={false}
+                  // Android can detach the current page while a fast horizontal
+                  // fling is being re-grabbed, leaving the pager temporarily
+                  // empty even though its neighboring month is in range.
+                  removeClippedSubviews={false}
                   hideArrows={false}
                   animateScroll={false}
                   pastScrollRange={CALENDAR_MONTH_SCROLL_RANGE}

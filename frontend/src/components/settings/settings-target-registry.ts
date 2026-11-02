@@ -227,7 +227,7 @@ export const SETTINGS_TARGET_REGISTRY: readonly SettingsTargetDefinition[] = [
   },
   { id: "audio-player", targetId: "audio-player", category: "appearance", label: "音楽プレイヤー", icon: Keyboard, keywords: ["音楽", "再生", "プレイヤー"] },
   { id: "search-provider", targetId: "search-provider", category: "knowledge", label: "検索プロバイダ", icon: Search },
-  { id: "pc-bridge", targetId: "pc-bridge", category: "knowledge", label: "PC接続", icon: Workflow },
+  { id: "pc-bridge", targetId: "pc-bridge", category: "knowledge", label: "他の PC の制御", icon: Workflow, keywords: ["PC接続", "Bridge", "リモート", "別のPC"] },
   { id: "browser-agent", targetId: "browser-agent", category: "knowledge", label: "ブラウザ操作", icon: Workflow, adminOnly: true },
   { id: "clip-ingest", targetId: "clip-ingest", category: "knowledge", label: "クリップ取り込み", icon: Database },
   { id: "mcp", targetId: "mcp", category: "integrations", label: "MCP", icon: Plug },

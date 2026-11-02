@@ -443,12 +443,17 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--minimum-recall", type=float, default=0.8)
     parser.add_argument("--index-load-vectors", type=int, default=2048)
-    parser.add_argument("--output", type=Path, default=ROOT / ".local/embeddinggemma2-evaluation.json")
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     if min(args.batch_size, args.top_k, args.repeats) <= 0 or args.index_load_vectors < 0 or not 0 <= args.minimum_recall <= 1:
         parser.error("positive batch/top-k/repeats and minimum-recall within [0,1] are required")
-    scratch = ROOT / ".local"
-    scratch.mkdir(exist_ok=True)
+    scratch = Path(tempfile.gettempdir()).resolve()
+    repo = ROOT.resolve()
+    if scratch == repo or repo in scratch.parents:
+        raise RuntimeError("embedding_evaluation_temp_inside_repo")
+    if args.output is None:
+        report_dir = Path(tempfile.mkdtemp(prefix="eg2-evaluation-report-", dir=scratch))
+        args.output = report_dir / "embeddinggemma2-evaluation.json"
     started = time.perf_counter()
     try:
         with tempfile.TemporaryDirectory(prefix="eg2-evaluation-", dir=scratch) as directory:

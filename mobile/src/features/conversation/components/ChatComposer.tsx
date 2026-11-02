@@ -54,6 +54,9 @@ export type ChatComposerProps = {
   /** Embedded fixed-Agent surfaces keep model/effort under Agent settings. */
   hideModelSelector?: boolean;
   hideEffortSelector?: boolean;
+  /** Preserve the draft while a session-level route write is being confirmed. */
+  blockSends?: boolean;
+  modelSelectorDisabled?: boolean;
 };
 
 export const ChatComposer = React.memo(function ChatComposer({
@@ -78,6 +81,8 @@ export const ChatComposer = React.memo(function ChatComposer({
   onStartDeepResearch,
   hideModelSelector = false,
   hideEffortSelector = false,
+  blockSends = false,
+  modelSelectorDisabled = false,
 }: ChatComposerProps) {
   conversationPerformanceDiagnostics.recordRender("ChatComposer");
   const voiceRef = useRef<ChatVoiceHandle>(null);
@@ -165,7 +170,7 @@ export const ChatComposer = React.memo(function ChatComposer({
     setCommandSheetVisible(false);
   }, [setActiveCommand, setInput]);
   const handleIntentSend = useCallback(async (candidate: ChatIntentCandidate): Promise<boolean> => {
-    if (!hydrated || submissionRef.current || intentSubmissionRef.current || !sendEnabled || /^\/masking(?:\s|$)/i.test(input.trim())) return false;
+    if (!hydrated || submissionRef.current || intentSubmissionRef.current || blockSends || !sendEnabled || /^\/masking(?:\s|$)/i.test(input.trim())) return false;
     const submission = resolveMobileCommandSubmission(input, activeCommand);
     if (submission.error) { setComposerError(submission.error); return false; }
     if (!submission.content) return false;
@@ -211,19 +216,19 @@ export const ChatComposer = React.memo(function ChatComposer({
       }
       return false;
     } finally { intentSubmissionRef.current = false; }
-  }, [acceptSubmission, activeCommand, beginSubmission, directResponseActive, hydrated, input, intentScope, onSend, rejectSubmission, sendEnabled]);
+  }, [acceptSubmission, activeCommand, beginSubmission, blockSends, directResponseActive, hydrated, input, intentScope, onSend, rejectSubmission, sendEnabled]);
   const intent = useChatIntent({
     text: input,
     scopeKey: JSON.stringify([intentScope, activeCommand, isAuthenticated, intentPreference.scope]),
     sessionId: voiceContext?.sessionIsLocalOnly || voiceContext?.sessionId.startsWith("local-") || voiceContext?.sessionId === "new"
       ? null : voiceContext?.sessionId,
     projectId: voiceContext?.projectId,
-    enabled: isAuthenticated && hydrated && sendEnabled && !/^\/masking(?:\s|$)/i.test(input.trim()),
+    enabled: isAuthenticated && hydrated && sendEnabled && !blockSends && !/^\/masking(?:\s|$)/i.test(input.trim()),
     onSend: handleIntentSend,
   });
 
   const handleSend = useCallback(() => {
-    if (!hydrated || submissionRef.current || intentSubmissionRef.current || !intentPreference.loaded || intentPreference.saving) return;
+    if (!hydrated || submissionRef.current || intentSubmissionRef.current || blockSends || !intentPreference.loaded || intentPreference.saving) return;
     const submission = resolveMobileCommandSubmission(input, activeCommand);
     if (submission.error) {
       setComposerError(submission.error);
@@ -282,15 +287,16 @@ export const ChatComposer = React.memo(function ChatComposer({
       restoreRejectedDraft(error);
     }
     queueMicrotask(() => { submissionRef.current = false; });
-  }, [acceptSubmission, activeCommand, beginSubmission, directResponseActive, hydrated, input, intent.open, intentPreference.enabled, intentPreference.loaded, intentPreference.saving, isAuthenticated, onSend, rejectSubmission, sendEnabled]);
+  }, [acceptSubmission, activeCommand, beginSubmission, blockSends, directResponseActive, hydrated, input, intent.open, intentPreference.enabled, intentPreference.loaded, intentPreference.saving, isAuthenticated, onSend, rejectSubmission, sendEnabled]);
 
   const submitDeepResearch = useCallback(() => {
+    if (blockSends) return;
     const query = deepResearchQuery.trim() || input.trim();
     if (!query) return;
     setDeepResearchVisible(false);
     setDeepResearchQuery("");
     void onStartDeepResearch(query);
-  }, [deepResearchQuery, input, onStartDeepResearch]);
+  }, [blockSends, deepResearchQuery, input, onStartDeepResearch]);
 
   return (
     <>
@@ -396,6 +402,7 @@ export const ChatComposer = React.memo(function ChatComposer({
               ) : null}
               {!hideModelSelector ? <Pressable
                 style={styles.composerSelector}
+                disabled={modelSelectorDisabled}
                 onPress={() => {
                   conversationPerformanceDiagnostics.measureInteraction(
                     "ChatComposer.open-response-model",
@@ -407,6 +414,7 @@ export const ChatComposer = React.memo(function ChatComposer({
                 }}
                 accessibilityRole="button"
                 accessibilityLabel={`モデルを選択。現在は${currentResponseModelLabel}`}
+                accessibilityState={{ disabled: modelSelectorDisabled }}
               >
                 <Text style={styles.composerSelectorText} numberOfLines={1}>
                   {compactLabel(currentResponseModelLabel)}

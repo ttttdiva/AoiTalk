@@ -58,8 +58,10 @@ def session_main_route_override() -> dict[str, str] | None:
         return None
     fragment = {
         key: str(raw.get(key) or "").strip()
-        for key in ("provider", "model", "effort")
+        for key in ("provider", "model", "effort", "pool_id")
     }
+    if not fragment.get("pool_id"):
+        fragment.pop("pool_id", None)
     if not any(fragment.values()):
         return None
     return fragment
@@ -110,7 +112,10 @@ def bind_session_main_route_override(
         "effort": str(
             main_route.get("effort") or main_route.get("reasoning_effort") or ""
         ).strip(),
+        "pool_id": str(main_route.get("pool_id") or "").strip(),
     }
+    if not fragment.get("pool_id"):
+        fragment.pop("pool_id", None)
     if not any(fragment.values()):
         return _SESSION_MAIN_ROUTE_OVERRIDE.set(None)
     return _SESSION_MAIN_ROUTE_OVERRIDE.set(fragment)

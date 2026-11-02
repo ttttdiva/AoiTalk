@@ -165,6 +165,13 @@ def dialogue_provider_input_components(
     allowance before those input components are paid.
     """
 
+    from .image_budget import bounded_image_text_tokens, initial_image_tokens, sanitize_image_payload
+
+    image_tokens = initial_image_tokens()
+    if image_tokens is not None and payload is not None:
+        payload, image_tokens = sanitize_image_payload(payload, payload.get("model"))
+        return {"wire_text": bounded_image_text_tokens(payload), "image_input": image_tokens,
+                "tool_schemas": 0}
     components: dict[str, int] = {
         "current_input": _dialogue_estimated_tokens(user_input),
         "system_instructions": 0,
@@ -172,6 +179,8 @@ def dialogue_provider_input_components(
         "context": 0,
         "tool_schemas": 0,
     }
+    if image_tokens is not None:
+        components["image_input"] = image_tokens
     if isinstance(payload, Mapping) and isinstance(payload.get("messages"), (list, tuple)):
         # At the provider boundary the serialized request is authoritative.
         # Include the complete continuation transcript (including tool
@@ -269,6 +278,22 @@ def dialogue_provider_invocation_budget(
             "tool_schema_tokens": 0,
             "reasoning_tokens": 0,
         }
+    from .image_budget import (
+        bind_image_cost_limit, current_image_cost_limit, current_image_price,
+        quote_image_cost_micros,
+    )
+
+    image_price = current_image_price()
+    has_image_cost = image_price is not None and (
+        raw.get("max_cost_micros") is not None or raw.get("provider_reserved_cost_micros") is not None
+    )
+    if has_image_cost:
+        try:
+            bind_image_cost_limit(raw)
+        except ValueError as exc:
+            from ..services.free_team_service import ComplimentaryMediaUnboundedError
+
+            raise ComplimentaryMediaUnboundedError() from exc
     components = dialogue_provider_input_components(value, user_input, payload)
     input_tokens = sum(components.values())
     try:
@@ -282,9 +307,11 @@ def dialogue_provider_invocation_budget(
         )
     except (TypeError, ValueError, OverflowError):
         reasoning_reserve = 0
-    total_cap = raw.get("provider_max_output_tokens")
-    if total_cap in (None, "") and raw.get("max_tokens") is not None:
-        total_cap = raw.get("remaining_tokens")
+    total_cap = (
+        raw.get("remaining_tokens")
+        if raw.get("remaining_tokens") is not None
+        else raw.get("max_tokens")
+    )
     try:
         total_cap = max(0, int(total_cap)) if total_cap is not None else None
     except (TypeError, ValueError, OverflowError):
@@ -297,7 +324,7 @@ def dialogue_provider_invocation_budget(
     # A cost-only ceiling can still derive a token cap when the server rate
     # card is present.  This path uses the reserved cost for this Run, so
     # sibling reservations cannot silently enlarge the provider allowance.
-    if total_cap is None and raw.get("max_cost_micros") is not None:
+    if total_cap is None and raw.get("max_cost_micros") is not None and not has_image_cost:
         rate_card = raw.get("server_rate_card")
         try:
             output_rate = Decimal(str(rate_card.get("output_per_1k")))
@@ -349,6 +376,36 @@ def dialogue_provider_invocation_budget(
         )
         if requested is not None and requested > 0:
             output_cap = min(output_cap, int(requested))
+    try:
+        output_limit = raw.get("provider_max_output_tokens")
+        output_limit = (
+            max(0, int(output_limit)) if output_limit not in (None, "") else None
+        )
+    except (TypeError, ValueError, OverflowError):
+        output_limit = None
+    if output_limit is not None:
+        output_cap = output_limit if output_cap is None else min(output_cap, output_limit)
+    if has_image_cost:
+        from .openai_model_context_registry import openai_model_context_spec
+
+        try:
+            available = current_image_cost_limit()
+            if available is None:
+                raise ValueError("image cost limit missing")
+            spec = openai_model_context_spec(image_price["model"])
+            maximum = output_cap if output_cap is not None else spec.max_output_tokens
+            lo, hi = 0, max(0, int(maximum))
+            while lo < hi:
+                middle = (lo + hi + 1) // 2
+                if quote_image_cost_micros(image_price, input_tokens, middle) <= available:
+                    lo = middle
+                else:
+                    hi = middle - 1
+            output_cap = lo
+            cap_source = "image_cost"
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            output_cap = 0
+            cap_source = "image_cost"
     return {
         "max_output_tokens": output_cap,
         "input_tokens": input_tokens,
@@ -510,6 +567,24 @@ def dialogue_provider_usage_with_rate_card(
     if not isinstance(usage, Mapping):
         return None
     result = dict(usage)
+    from .image_budget import actual_image_cost_micros, current_image_price
+
+    image_price = current_image_price()
+    if image_price is not None:
+        if not isinstance(rate_card, Mapping) or rate_card.get("image_price") != image_price:
+            result.pop("cost_micros", None)
+            return result
+        actual = actual_image_cost_micros(image_price, result)
+        if actual is None:
+            result.pop("cost_micros", None)
+            return result
+        reported = result.get("cost_micros")
+        if reported is not None and (type(reported) is not int or reported < 0):
+            result.pop("cost_micros", None)
+            return result
+        result["cost_micros"] = actual if reported is None else reported
+        result["cost_currency"] = "USD"
+        return result
     if result.get("cost_micros") is not None:
         return result
     reported_cost = result.get("cost", result.get("provider_reported_cost"))
@@ -560,6 +635,43 @@ def dialogue_provider_usage_with_rate_card(
         return result
     except (InvalidOperation, TypeError, ValueError, OverflowError):
         return result
+
+
+def dialogue_provider_observed_output(ledger: Any) -> int | None:
+    """Count only confirmed output, including separately reported reasoning."""
+    if getattr(ledger, "usage_unknown", False):
+        return None
+    records = getattr(ledger, "usage_records", {})
+    total = 0
+    for usage in records.values():
+        if usage.get("output_tokens") is None:
+            return None
+        try:
+            amount = int(usage["output_tokens"])
+            if amount < 0:
+                return None
+            if usage.get("output_includes_reasoning") is None:
+                if (
+                    usage.get("reasoning_tokens")
+                    or usage.get("total_tokens_source") != "reported"
+                    or usage.get("input_tokens") is None
+                    or usage.get("total_tokens") is None
+                    or int(usage["total_tokens"]) != int(usage["input_tokens"]) + amount
+                ):
+                    return None
+            if usage.get("output_includes_reasoning") is False:
+                amount += int(usage.get("reasoning_tokens") or 0)
+            if (
+                usage.get("total_tokens_source") == "reported"
+                and usage.get("input_tokens") is not None
+                and usage.get("total_tokens") is not None
+                and int(usage["total_tokens"]) > int(usage["input_tokens"]) + amount
+            ):
+                return None
+            total += amount
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return total
 
 
 def dialogue_provider_observed_tokens(
@@ -878,6 +990,8 @@ class OpenAIToolCallRecord:
     argument_rejection: dict[str, str] | None = None
     # Safe fixed code for a framework policy refusal before execution.
     policy_denial: dict[str, str] | None = None
+    # Safe framework authority decision evidence for a denied tool invocation.
+    authority_denial: dict[str, Any] | None = None
 
     @property
     def call_id(self) -> str:
@@ -1594,6 +1708,11 @@ def _openai_tool_call_record_from_unified(tool_result: Any) -> OpenAIToolCallRec
             if getattr(tool_result, "policy_denial", None)
             else None
         ),
+        authority_denial=(
+            dict(getattr(tool_result, "authority_denial"))
+            if getattr(tool_result, "authority_denial", None)
+            else None
+        ),
     )
 
 
@@ -1672,9 +1791,15 @@ def run_openai_tool_call_loop(
     ).strip().casefold()
     initial_usage_unknown = (
         budget_client is not None
-        and budget_provider_label == "openai_compatible_local"
         and initial_usage is None
+        and not getattr(ledger, "usage_records", None)
+        and (
+            budget_provider_label == "openai_compatible_local"
+            or (budget_raw is not None and budget_raw.get("provider_max_output_tokens") is not None)
+        )
     )
+    if initial_usage_unknown:
+        ledger.mark_usage_unknown()
     if initial_usage is not None and isinstance(budget_raw, Mapping):
         initial_usage = dialogue_provider_usage_with_rate_card(
             initial_usage,
@@ -1696,6 +1821,7 @@ def run_openai_tool_call_loop(
         )
     budget_total = None
     budget_spent = 0
+    budget_output_total = None
     budget_cost_total = None
     budget_cost_spent = 0
     budget_cost_base = 0
@@ -1703,15 +1829,28 @@ def run_openai_tool_call_loop(
     budget_usage_unknown = initial_usage_unknown
     active_reservation: str | None = None
     if budget_raw is not None:
-        budget_total = budget_raw.get("provider_max_output_tokens")
-        if budget_total in (None, "") and budget_raw.get("max_tokens") is not None:
-            budget_total = budget_raw.get("remaining_tokens")
+        budget_total = (
+            budget_raw.get("remaining_tokens")
+            if budget_raw.get("remaining_tokens") is not None
+            else budget_raw.get("max_tokens")
+        )
+        try:
+            raw_output = budget_raw.get("provider_max_output_tokens")
+            budget_output_total = (
+                max(0, int(raw_output)) if raw_output not in (None, "") else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            budget_output_total = None
         try:
             budget_total = max(0, int(budget_total)) if budget_total is not None else None
         except (TypeError, ValueError, OverflowError):
             budget_total = None
         provider_reserved_cost = budget_raw.get("provider_reserved_cost_micros")
         budget_cost_total = provider_reserved_cost or budget_raw.get("max_cost_micros")
+        from .image_budget import current_image_cost_limit
+        image_cost_limit = current_image_cost_limit()
+        if image_cost_limit is not None:
+            budget_cost_total = image_cost_limit
         try:
             budget_cost_total = (
                 max(0, int(budget_cost_total))
@@ -1720,7 +1859,7 @@ def run_openai_tool_call_loop(
             )
         except (TypeError, ValueError, OverflowError):
             budget_cost_total = None
-        if provider_reserved_cost in (None, ""):
+        if provider_reserved_cost in (None, "") and image_cost_limit is None:
             try:
                 budget_cost_base = max(0, int(budget_raw.get("cost_micros") or 0))
                 if budget_cost_total is not None:
@@ -1735,21 +1874,29 @@ def run_openai_tool_call_loop(
     def apply_budget_before_provider(payload: dict[str, Any] | None = None) -> bool:
         """Clamp each follow-up request to the currently observed remainder."""
 
+        from .image_budget import initial_image_tokens
+
         nonlocal budget_spent, active_reservation
-        if budget_client is None or budget_total is None:
+        if budget_client is None or (budget_total is None and budget_output_total is None):
             # Cost-only ceilings have no token total, but still require the
             # same provider-entry gate when a trusted rate card is present.
             if budget_client is None or budget_cost_total is None:
                 return True
-        if (provider_calls or getattr(ledger, "usage_records", None)) and (
-            budget_usage_unknown or ledger.usage_unknown
-        ):
+        if budget_usage_unknown or ledger.usage_unknown:
             # Missing usage is not zero. A provider that cannot return a
             # receipt cannot safely receive another budgeted invocation.
             return False
         observed = dialogue_provider_observed_tokens(budget_client, ledger)
         if observed is not None:
             budget_spent = max(budget_spent, observed)
+        output_spent = dialogue_provider_observed_output(ledger)
+        if budget_output_total is not None and output_spent is None:
+            return False
+        remaining_output = (
+            max(0, budget_output_total - output_spent - int(ledger.reserved_tokens or 0))
+            if budget_output_total is not None
+            else None
+        )
         remaining = (
             max(0, budget_total - budget_spent)
             if budget_total is not None
@@ -1758,7 +1905,8 @@ def run_openai_tool_call_loop(
         if remaining is not None:
             remaining = max(
                 0,
-                remaining - int(getattr(ledger, "reserved_tokens", 0) or 0),
+                remaining - int(getattr(ledger, "reserved_tokens", 0) or 0)
+                - int(getattr(ledger, "reserved_input_tokens", 0) or 0),
             )
         invocation = dialogue_provider_invocation_budget(
             budget_client,
@@ -1799,6 +1947,8 @@ def run_openai_tool_call_loop(
                     max(0, int(token_cap or 0)),
                     max(0, remaining - input_tokens - reasoning_tokens),
                 )
+        if remaining_output is not None:
+            cap = min(cap, remaining_output)
         try:
             cap = int(cap)
         except (TypeError, ValueError, OverflowError):
@@ -1806,7 +1956,27 @@ def run_openai_tool_call_loop(
         if cap <= 0:
             return False
         reservation_cost = 0
-        if cap_source == "cost":
+        if cap_source == "image_cost" and budget_cost_total is not None:
+            from .image_budget import current_image_price, quote_image_cost_micros
+
+            price = current_image_price()
+            cost_remaining = max(0, budget_cost_total - budget_cost_spent
+                                 - int(getattr(ledger, "reserved_cost_micros", 0) or 0))
+            try:
+                lo, hi = 0, cap
+                while lo < hi:
+                    middle = (lo + hi + 1) // 2
+                    if quote_image_cost_micros(price, input_tokens, middle) <= cost_remaining:
+                        lo = middle
+                    else:
+                        hi = middle - 1
+                cap = lo
+                if cap <= 0:
+                    return False
+                reservation_cost = quote_image_cost_micros(price, input_tokens, cap)
+            except (TypeError, ValueError, OverflowError):
+                return False
+        elif cap_source == "cost":
             try:
                 reservation_cost = max(
                     0,
@@ -1818,6 +1988,8 @@ def run_openai_tool_call_loop(
         active_reservation = ledger.reserve_provider_budget(
             cap,
             total_tokens=budget_total,
+            output_tokens=budget_output_total,
+            input_tokens=(input_tokens if initial_image_tokens() is not None else 0),
             total_cost_micros=budget_cost_total,
             cost_micros=reservation_cost,
         )
@@ -1847,6 +2019,8 @@ def run_openai_tool_call_loop(
         return True
 
     def update_budget_after_provider(response: Any | None = None) -> None:
+        from .image_budget import current_image_price, normalize_openai_image_response
+
         nonlocal budget_spent, budget_cost_spent, provider_calls, active_reservation, budget_usage_unknown
         provider_calls += 1
         provider_name = (
@@ -1867,15 +2041,13 @@ def run_openai_tool_call_loop(
             if response is not None and not isinstance(response, Mapping)
             else (response.get("model") if isinstance(response, Mapping) else None)
         )
-        usage = (
-            _dialogue_response_usage(
-                response,
-                provider=str(provider_name or ""),
-                resolved_model=str(resolved_model or "") or None,
-            )
-            if response is not None
-            else None
-        )
+        image_price = current_image_price()
+        usage = (normalize_openai_image_response(response, image_price)
+                 if response is not None and image_price is not None and budget_cost_total is not None
+                 else _dialogue_response_usage(
+                     response, provider=str(provider_name or ""),
+                     resolved_model=str(resolved_model or "") or None,
+                 ) if response is not None else None)
         if (
             usage is not None
             and str(provider_name or "").strip().casefold()
@@ -1893,7 +2065,7 @@ def run_openai_tool_call_loop(
             )
         ):
             usage = None
-        if usage is None and response is not None:
+        if usage is None and response is not None and not (image_price is not None and budget_cost_total is not None):
             usage = dialogue_provider_latest_usage(budget_client)
         if usage is not None and budget_cost_total is not None:
             usage = dialogue_provider_usage_with_rate_card(
@@ -1917,7 +2089,16 @@ def run_openai_tool_call_loop(
                 try:
                     enrich(int(usage["cost_micros"]))
                 except (TypeError, ValueError, OverflowError):
+                    budget_usage_unknown = True
                     ledger.mark_usage_unknown()
+            if image_price is not None and budget_cost_total is not None:
+                records = getattr(ledger, "usage_records", None)
+                last = next(reversed(records.values()), None) if isinstance(records, dict) else None
+                if not isinstance(last, Mapping) or last.get("cost_micros") != usage["cost_micros"]:
+                    budget_usage_unknown = True
+                    ledger.mark_usage_unknown()
+        if budget_usage_unknown and image_price is not None and budget_cost_total is not None:
+            ledger.mark_usage_unknown()
         if usage is not None:
             observed = dialogue_provider_observed_tokens(budget_client, ledger)
             if observed is not None:
@@ -1929,7 +2110,7 @@ def run_openai_tool_call_loop(
                 )
             except (TypeError, ValueError, OverflowError):
                 budget_cost_spent = 0
-        if active_reservation is not None:
+        if active_reservation is not None and not (budget_usage_unknown and image_price is not None):
             ledger.settle_provider_budget(active_reservation, usage)
             active_reservation = None
 
@@ -1994,6 +2175,7 @@ def run_openai_tool_call_loop(
                 max_tool_result_chars=max_tool_result_chars,
                 message_content=message_content,
                 config=config,
+                client=budget_client,
                 user_input=effective_user_input,
                 enforce_tool_policy=enforce_tool_policy,
                 final_response_check=combined_final_response_check(
@@ -2446,6 +2628,54 @@ def _should_hint_direct_memory_tools(user_input: str, registry: ToolRegistry) ->
     return False
 
 
+_EXPLANATORY_QUESTION_TERMS = (
+    "作り方", "やり方", "書き方", "使い方", "付け方", "選び方", "進め方", "考え方",
+    "方法", "コツ", "仕組み", "違い", "おすすめ", "ベストプラクティス",
+)
+_EXPLANATORY_QUESTION_RE = re.compile(
+    r"(?<!こ)とは|って(?:何|なに)|"
+    r"\b(?:what(?:'s| is| are) (?:a|an)\b|how to\b|how (?:do|can|should) (?:i|you|we|one)\b|"
+    r"explain\b|tips?\b|best practices?\b|difference between\b)",
+    flags=re.ASCII,
+)
+_OWNED_DATA_REFERENCE_TERMS = (
+    "私の", "自分の", "僕の", "俺の", "うちの", "弊社の", "この", "その", "あの",
+    "既存", "保存し", "保存さ", "保存済", "にある", "に入って", "登録し", "登録さ",
+    "ワークスペース", "リポジトリ", "プロジェクト", "案件",
+    "今日", "明日", "今週", "来週", "期限切れ", "未完了", "残って",
+)
+_OWNED_DATA_REFERENCE_RE = re.compile(
+    r"\b(?:my|mine|our|this|these|that|those|existing|saved|stored|workspace|repository|repo|"
+    r"project|today|tomorrow|this week|overdue|due|unfinished|upcoming)\b|"
+    r"(?:files|docs)(?:に|で|の|から|内)|"
+    # Concrete paths only: a drive, a rooted or ./ ../ ~/ prefix, two or more
+    # separators, or a filename with an extension. A lone slash between topic
+    # nouns ("file/folder") is punctuation, not an existing path.
+    r"\b[a-z]:[/\\]|(?:^|\s)(?:\.{1,2}|~)?[/\\][\w.-]|"
+    r"[\w.-]+(?:[/\\][\w.-]+){2,}|[\w-]\.[a-z0-9]{1,5}\b",
+    flags=re.ASCII,
+)
+
+
+def _is_general_explanatory_question(text: str) -> bool:
+    """Return True for how-to/definition/advice wording about generic nouns.
+
+    "PDFファイルの作り方を教えて" or "What is a file system?" mention a file or a
+    task only as a topic; they do not ask to retrieve the user's existing data.
+    Any owner, workspace, location, path or concrete-data reference keeps the
+    retrieval lane, so ambiguous wording falls back to the previous behavior.
+    """
+    explanatory = bool(_EXPLANATORY_QUESTION_RE.search(text)) or any(
+        term in text for term in _EXPLANATORY_QUESTION_TERMS
+    )
+    if not explanatory:
+        return False
+    owned = bool(_OWNED_DATA_REFERENCE_RE.search(text)) or any(
+        term in text for term in _OWNED_DATA_REFERENCE_TERMS
+    )
+    return not owned
+
+
 def _should_hint_direct_filesystem_tools(user_input: str, registry: ToolRegistry) -> bool:
     """Guide ordinary questions about existing workspace files to read tools.
 
@@ -2458,10 +2688,13 @@ def _should_hint_direct_filesystem_tools(user_input: str, registry: ToolRegistry
     # Attachments have their own trusted read guidance. Their synthetic path
     # markers must not be mistaken for a request to browse the workspace.
     text = re.sub(r"(?m)^\s*\[添付(?:ファイル|画像|音声):[^\r\n]*$", "", text)
+    # Judge generic intent without the synthetic attachment paths, but before
+    # the participle stripping below removes "保存した" (an existing-data cue).
+    general_question = _is_general_explanatory_question(text)
     # A past participle describes an existing file ("保存した仕様書"), not a
     # request to write; imperative forms ("保存して") remain write intent.
     text = re.sub(r"保存(?:した|され(?:た|ている|ていた)|済み?)", "", text)
-    if not _retrieval_requested(text):
+    if not _retrieval_requested(text) or general_question:
         return False
     if re.search(
         r"\b(?:create|add|update|delete|edit|write|modify|save|apply|reflect)\b",
@@ -2491,7 +2724,12 @@ def _should_hint_direct_filesystem_tools(user_input: str, registry: ToolRegistry
 def _should_hint_direct_task_read_tools(user_input: str, registry: ToolRegistry) -> bool:
     """Route factual questions about existing tasks to project read tools only."""
     text = _retrieval_user_text(user_input).casefold()
-    if not _retrieval_requested(text):
+    # Synthetic attachment markers are metadata; their paths are not an
+    # owned-data cue for judging a generic explanatory question.
+    general_question = _is_general_explanatory_question(
+        re.sub(r"(?m)^\s*\[添付(?:ファイル|画像|音声):[^\r\n]*$", "", text)
+    )
+    if not _retrieval_requested(text) or general_question:
         return False
     mentions_tasks = bool(
         re.search(

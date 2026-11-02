@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 import re
+import time
 from typing import Any, Literal, TypeAlias, Union
 from uuid import UUID
 
@@ -16,6 +18,27 @@ import httpx
 from typing_extensions import NotRequired, TypedDict
 
 from . import aoitalk, aoitalk_auth
+
+logger = logging.getLogger(__name__)
+
+# Exact types only: unrecognized subclasses must never contribute log text.
+HTTPX_EXCEPTION_CATEGORIES = {
+    httpx.ConnectTimeout: "ConnectTimeout",
+    httpx.ReadTimeout: "ReadTimeout",
+    httpx.WriteTimeout: "WriteTimeout",
+    httpx.PoolTimeout: "PoolTimeout",
+    httpx.ConnectError: "ConnectError",
+    httpx.ReadError: "ReadError",
+    httpx.WriteError: "WriteError",
+    httpx.CloseError: "CloseError",
+    httpx.RemoteProtocolError: "RemoteProtocolError",
+    httpx.LocalProtocolError: "LocalProtocolError",
+    httpx.ProxyError: "ProxyError",
+    httpx.UnsupportedProtocol: "UnsupportedProtocol",
+    httpx.DecodingError: "DecodingError",
+    httpx.TooManyRedirects: "TooManyRedirects",
+    httpx.HTTPStatusError: "HTTPStatusError",
+}
 
 MIN_DOC_PAGE_CHARS = 4096
 MAX_DOC_PAGE_CHARS = 32000
@@ -267,6 +290,7 @@ class ManageClient(aoitalk.Client):
                    mutation: bool | None = None,
                    **kwargs: Any) -> tuple[int, Any, httpx.Headers]:
         is_mutation = method.upper() in {"PUT", "POST", "PATCH", "DELETE"} if mutation is None else mutation
+        started = time.monotonic()
         try:
             async with self.http.stream(method, path, **kwargs) as response:
                 status = response.status_code
@@ -281,7 +305,12 @@ class ManageClient(aoitalk.Client):
                     chunks.append(part)
         except ManageError:
             raise
-        except (httpx.HTTPError, OSError):
+        except (httpx.HTTPError, OSError) as exc:
+            category = HTTPX_EXCEPTION_CATEGORIES.get(type(exc))
+            if category is None:
+                category = "HTTPError" if isinstance(exc, httpx.HTTPError) else "OSError"
+            logger.warning("HTTP request failed: exception=%s elapsed=%.3fs",
+                           category, time.monotonic() - started)
             raise ManageError("connection_error", uncertain=is_mutation) from None
 
         if 300 <= status < 400:

@@ -179,9 +179,21 @@ def create_local_agent_task_router(
     require_admin: Callable[..., Any],
     get_manager: Callable[[], Optional[LocalAgentTaskManager]],
     get_user_id: Callable[[Request], Any] | None = None,
+    restart_work_dependency: Callable[..., Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/local-agent", tags=["local-agent"],
                        dependencies=[Depends(require_admin)])
+
+    async def _no_restart_admission_for_standalone_router() -> None:
+        return None
+
+    require_restart_work = restart_work_dependency or _no_restart_admission_for_standalone_router
+
+    async def _require_local_task_admission(
+        _admin: None = Depends(require_admin),
+        _admission: None = Depends(require_restart_work),
+    ):
+        yield None
 
     def _manager() -> LocalAgentTaskManager:
         manager = get_manager()
@@ -337,7 +349,12 @@ def create_local_agent_task_router(
     async def local_agent_status() -> dict[str, Any]:
         return _manager().describe()
 
-    @router.post("/tasks", status_code=202, operation_id="local_agent_task_create")
+    @router.post(
+        "/tasks",
+        status_code=202,
+        operation_id="local_agent_task_create",
+        dependencies=[Depends(_require_local_task_admission)],
+    )
     async def local_agent_task_create(
         body: LocalAgentTaskCreateRequest,
         request: Request,

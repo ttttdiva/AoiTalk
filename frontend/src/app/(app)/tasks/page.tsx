@@ -736,7 +736,7 @@ export default function TasksPage() {
       <div className="ao-tasks-mobile-header shrink-0 space-y-3 border-b border-border bg-card dark:bg-background px-3 py-3 md:hidden md:px-4 md:py-3">
         <div className="flex items-end justify-between gap-3 md:hidden">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">タスク</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">Tasks</h1>
             <p className="mt-0.5 text-sm text-muted-foreground">
               {currentScopeLabel}
             </p>

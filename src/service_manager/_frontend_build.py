@@ -17,14 +17,23 @@ from urllib.parse import unquote
 
 from ._process_utils import _IS_WINDOWS, _read_log_tail
 
-_FRONTEND_BUILD_FINGERPRINT_VERSION = 4
-_FRONTEND_BUILD_FINGERPRINT_REL_PATH = Path(".next") / "aoitalk-build-fingerprint.json"
+_FRONTEND_BUILD_FINGERPRINT_VERSION = 5
+_FRONTEND_BUILD_FINGERPRINT_NAME = "aoitalk-build-fingerprint.json"
+_FRONTEND_BUILD_FINGERPRINT_REL_PATH = Path(".next") / _FRONTEND_BUILD_FINGERPRINT_NAME
+# The next production build is made here while the served `.next` keeps
+# running, then swapped in while Next.js is stopped (restart downtime only).
+STAGED_FRONTEND_DIST_DIR = ".next-staged"
+PREVIOUS_FRONTEND_DIST_DIR = ".next-previous"
 _SEETHROUGH_RIG_RUNTIME_REL_PATH = (
     Path("resources") / "seethrough-rig" / "runtime"
 )
 _CHAT_BACKGROUND_REL_PATH = Path("resources") / "chat-background"
 _FRONTEND_BUILD_EXCLUDED_DIR_NAMES = {
     ".git",
+    # Private QA/build fixtures under the frontend are not production source.
+    # In particular, generated Next dist trees here can contain thousands of
+    # files and make the production fingerprint drift during unrelated QA.
+    ".local",
     ".next",
     ".turbo",
     "coverage",
@@ -135,8 +144,8 @@ def _ensure_frontend_dependencies(project_root: Path, log_path: Path) -> None:
         )
 
 
-def _frontend_build_fingerprint_path(frontend_dir: Path) -> Path:
-    return frontend_dir / _FRONTEND_BUILD_FINGERPRINT_REL_PATH
+def _frontend_build_fingerprint_path(frontend_dir: Path, dist_dir: str = ".next") -> Path:
+    return frontend_dir / dist_dir / _FRONTEND_BUILD_FINGERPRINT_NAME
 
 
 def _is_frontend_build_input(path: Path, frontend_dir: Path) -> bool:
@@ -502,10 +511,14 @@ def _frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object]:
     }
 
 
-def _read_frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object] | None:
+def _read_frontend_build_fingerprint(
+    frontend_dir: Path, dist_dir: str = ".next"
+) -> dict[str, object] | None:
     try:
         return json.loads(
-            _frontend_build_fingerprint_path(frontend_dir).read_text(encoding="utf-8")
+            _frontend_build_fingerprint_path(frontend_dir, dist_dir).read_text(
+                encoding="utf-8"
+            )
         )
     except (OSError, json.JSONDecodeError):
         return None
@@ -514,8 +527,9 @@ def _read_frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object] | 
 def _write_frontend_build_fingerprint(
     frontend_dir: Path,
     fingerprint: dict[str, object],
+    dist_dir: str = ".next",
 ) -> None:
-    path = _frontend_build_fingerprint_path(frontend_dir)
+    path = _frontend_build_fingerprint_path(frontend_dir, dist_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(
@@ -623,8 +637,10 @@ def _missing_next_static_assets(next_dir: Path) -> list[str]:
     return sorted(missing)
 
 
-def _frontend_static_build_invalid_reason(frontend_dir: Path) -> str | None:
-    next_dir = frontend_dir / ".next"
+def _frontend_static_build_invalid_reason(
+    frontend_dir: Path, dist_dir: str = ".next"
+) -> str | None:
+    next_dir = frontend_dir / dist_dir
     required_paths = [
         next_dir,
         next_dir / "BUILD_ID",
@@ -761,3 +777,141 @@ def _ensure_frontend_build(
         )
 
     _write_frontend_build_fingerprint(frontend_dir, fingerprint)
+
+
+def _remove_dist_dir(frontend_dir: Path, dist_dir: str) -> None:
+    """Remove one known ``frontend/.next-*`` output without following links."""
+    target = frontend_dir / dist_dir
+    if not dist_dir.startswith(".next-") or "/" in dist_dir or "\\" in dist_dir:
+        raise ValueError("only a frontend/.next-* output can be removed")
+    if target.is_symlink() or target.is_junction():
+        raise OSError(f"Frontend output directory is redirected: {dist_dir}")
+    if target.exists():
+        # rmtree removes nested links (Next's node_modules junctions) without
+        # descending into their targets.
+        shutil.rmtree(target)
+
+
+def build_staged_frontend(project_root: Path, log_path: Path, env: dict[str, str]) -> str:
+    """Build the next production frontend beside the served ``.next``.
+
+    Returns ``"current"`` when the served build already matches the tree, or
+    ``"staged"`` when a verified build waits in ``.next-staged``.  The served
+    ``.next`` is never touched, so this runs while AoiTalk keeps serving.
+    """
+    frontend_dir = project_root / "frontend"
+    reason, fingerprint = _frontend_build_rebuild_reason(frontend_dir)
+    if not reason:
+        _remove_dist_dir(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+        return "current"
+    if (
+        _read_frontend_build_fingerprint(frontend_dir, STAGED_FRONTEND_DIST_DIR) == fingerprint
+        and not _frontend_static_build_invalid_reason(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+    ):
+        return "staged"
+
+    _remove_dist_dir(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    build_env = dict(env)
+    build_env["NEXT_DIST_DIR"] = STAGED_FRONTEND_DIST_DIR
+    build_env["NODE_ENV"] = "production"
+    with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+        log_file.write(f"{reason}; building {STAGED_FRONTEND_DIST_DIR} beside the served build.\n")
+        log_file.flush()
+        result = subprocess.run(
+            [_npm_command(), "run", "build:production"],
+            cwd=str(frontend_dir),
+            env=build_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    invalid = (
+        "npm run build:production failed"
+        if result.returncode != 0
+        else _frontend_static_build_invalid_reason(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+    )
+    if invalid:
+        _remove_dist_dir(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+        raise RuntimeError(
+            f"Staged frontend build failed: {invalid}.\n"
+            f"frontend build log tail:\n{_read_log_tail(log_path)}"
+        )
+    _write_frontend_build_fingerprint(frontend_dir, fingerprint, STAGED_FRONTEND_DIST_DIR)
+    return "staged"
+
+
+def _retarget_staged_output(next_dir: Path, old: str, new: str) -> None:
+    """Point the build's recorded distDir at the directory it will be served from.
+
+    Next.js bakes ``distDir`` into server route chunks and its config records
+    (always as a quoted literal or a quoted path prefix).  Any remaining
+    reference after the rewrite means an unknown form, so promotion refuses.
+    """
+    old_bytes, new_bytes = old.encode(), new.encode()
+    replacements = [
+        (b'"' + old_bytes + b'"', b'"' + new_bytes + b'"'),
+        (b'"' + old_bytes + b"/", b'"' + new_bytes + b"/"),
+        (b'"' + old_bytes + b"\\\\", b'"' + new_bytes + b"\\\\"),
+    ]
+    leftovers: list[str] = []
+    for root, dirs, files in os.walk(next_dir):
+        if Path(root) == next_dir:
+            # Compiler cache is not served and is rebuilt as needed.
+            dirs[:] = [name for name in dirs if name != "cache"]
+        for name in files:
+            path = Path(root) / name
+            data = path.read_bytes()
+            if old_bytes not in data:
+                continue
+            updated = data
+            for before, after in replacements:
+                updated = updated.replace(before, after)
+            if old_bytes in updated:
+                leftovers.append(str(path.relative_to(next_dir)))
+            elif updated != data:
+                path.write_bytes(updated)
+    if leftovers:
+        raise RuntimeError(
+            f"Staged frontend build has unknown {old} references: {', '.join(leftovers[:5])}"
+        )
+
+
+def promote_staged_frontend_build(project_root: Path) -> str:
+    """Swap a verified ``.next-staged`` into ``.next``; call only while Next.js is stopped.
+
+    Returns ``"promoted"``, ``"none"`` (nothing staged) or ``"stale"`` (the
+    staged build no longer matches the tree and was discarded).  On a failed
+    swap the previous ``.next`` is put back before the error propagates.
+    """
+    frontend_dir = project_root / "frontend"
+    staged = frontend_dir / STAGED_FRONTEND_DIST_DIR
+    if not staged.exists():
+        return "none"
+    fingerprint = _frontend_build_fingerprint(frontend_dir)
+    if (
+        _read_frontend_build_fingerprint(frontend_dir, STAGED_FRONTEND_DIST_DIR) != fingerprint
+        or _frontend_static_build_invalid_reason(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+    ):
+        _remove_dist_dir(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+        return "stale"
+
+    current = frontend_dir / ".next"
+    previous = frontend_dir / PREVIOUS_FRONTEND_DIST_DIR
+    if current.is_symlink() or current.is_junction():
+        raise OSError("Frontend output directory is redirected")
+    try:
+        _retarget_staged_output(staged, STAGED_FRONTEND_DIST_DIR, ".next")
+    except Exception:
+        _remove_dist_dir(frontend_dir, STAGED_FRONTEND_DIST_DIR)
+        raise
+    _remove_dist_dir(frontend_dir, PREVIOUS_FRONTEND_DIST_DIR)
+    if current.exists():
+        os.replace(current, previous)
+    try:
+        os.replace(staged, current)
+    except OSError:
+        if previous.exists() and not current.exists():
+            os.replace(previous, current)
+        raise
+    return "promoted"

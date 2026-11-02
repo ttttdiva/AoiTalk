@@ -75,6 +75,16 @@ class PersonalDraftPage(BaseModel):
     next_cursor: UUID | None
 
 
+class PersonalDraftEvidenceItem(BaseModel):
+    evidence_ref: UUID
+    proposal: DraftProposal
+    source_text: str
+
+
+class PersonalDraftEvidencePage(BaseModel):
+    items: list[PersonalDraftEvidenceItem]
+
+
 class PersonalDraftAcceptanceResponse(BaseModel):
     draft_id: UUID
     status: Literal["accepted", "materialized_requires_verification"]
@@ -124,6 +134,11 @@ def register_personal_draft_routes(
     async def list_drafts(limit: int = Query(50, ge=1, le=50), cursor: UUID | None = None,
                           owner_id: str = Depends(owner)):
         return await invoke(drafts.list_drafts, owner_id, limit=limit, cursor=cursor)
+
+    @app.get("/api/personal-drafts/evidence", response_model=PersonalDraftEvidencePage)
+    async def list_unproposed_evidence(limit: int = Query(100, ge=1, le=100),
+                                       owner_id: str = Depends(owner)):
+        return await invoke(drafts.list_unproposed_evidence, owner_id, limit=limit)
 
     @app.get("/api/personal-drafts/{draft_id}", response_model=PersonalDraftView)
     async def get_draft(draft_id: UUID, owner_id: str = Depends(owner)):

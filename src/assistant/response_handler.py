@@ -23,7 +23,7 @@ from src.llm.turn_stream_events import (
     bind_stream_callback_loop,
     make_sync_stream_emitter,
 )
-from src.services.agent_team_service import (
+from src.services.runtime_policy_utils import (
     apply_continuation_delta,
     continuation_state_for_prompt,
     get_current_continuation_state,

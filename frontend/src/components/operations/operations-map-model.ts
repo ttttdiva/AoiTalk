@@ -52,7 +52,7 @@ export const operationsMapKinds: Record<OperationsMapKind, { label: string; shor
 
 export const operationsMapRelations: Record<OperationsMapRelation, { label: string; description: string; color: string; dash?: string }> = {
   supervision: { label: "上司 → Agent", description: "取得済みのAgent IDで確認できる上司・部下関係", color: "#e2ba7c" },
-  membership: { label: "所属・アクセス", description: "記録された所属やアクセス範囲", color: "#81919e" },
+  membership: { label: "所属・アクセス", description: "記録された所属やアクセス範囲", color: "#81919e", dash: "5 4" },
   assignment: { label: "担当", description: "仕事・操作に記録された担当", color: "#68a4db" },
   parent: { label: "仕事の委任", description: "Workに記録された親子・委任関係。上司・部下関係とは別です", color: "#b49cdc" },
   approval: { label: "提案・外部操作", description: "記録された提案元と外部操作の関連。承認済みを意味しません", color: "#cf9cdc", dash: "3 4" },

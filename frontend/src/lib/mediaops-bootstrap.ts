@@ -12,7 +12,14 @@ export type BootstrapAction = {
 export type BootstrapPlan = {
   schema: "mediaops-bootstrap/v1"; scope_key: string; expected_owner_user_id: string;
   mode: "research_only"; requested_image_model: string; model_substitution_allowed: false;
-  role_bindings: Record<string, { agent_team_id: string; execution_profile_id: string; allowed_subagent_ids?: string[]; resolved_provider: string; resolved_model_id: string }>;
+  role_bindings: Record<string, {
+    resolved_provider: string;
+    resolved_model_id: string;
+    model_overrides?: ObjectValue | null;
+    tool_ids?: string[] | null;
+    delegate_policy?: ObjectValue | null;
+    legacy?: { agent_team_id?: string | null; execution_profile_id?: string | null; allowed_subagent_ids?: string[] | null } | null;
+  }>;
   actions: BootstrapAction[]; blocked: ObjectValue[]; plan_hash: string;
 };
 export type Binding = { id: string; payload_hash: string; readback_hash: string; created: boolean };
@@ -107,8 +114,10 @@ export async function parseBootstrapPlan(text: string): Promise<BootstrapPlan> {
     const payload = object(action.payload);
     if (action.key.startsWith("revision:")) {
       const binding = plan.role_bindings[action.key.slice(9)];
-      if (!binding || payload.agent_team_id !== binding.agent_team_id || payload.execution_profile_id !== binding.execution_profile_id
-          || canonical(payload.allowed_subagent_ids || []) !== canonical(binding.allowed_subagent_ids || [])) throw new Error("revisionと確認済みモデルbindingが一致しません");
+      if (!binding) throw new Error("revisionと確認済みモデルbindingが一致しません");
+      for (const key of ["model_overrides", "tool_ids", "delegate_policy"] as const) {
+        if (binding[key] !== undefined && canonical(payload[key] ?? null) !== canonical(binding[key] ?? null)) throw new Error("revisionと確認済みモデルbindingが一致しません");
+      }
     }
     if (["actor_user_id", "owner_user_id", "permissions", "authorization", "role"].some(k => k in payload)) throw new Error("主体指定・権限変更は取り込めません");
     if (payload.enabled === true || (payload.state !== undefined && payload.state !== "draft")) throw new Error("自動起動・有効化は取り込めません");
@@ -190,18 +199,8 @@ export class BootstrapRunner {
     if (auth.authenticated !== true || user.id !== this.plan.expected_owner_user_id || user.password_reset_required === true) throw new Error("認証済みownerがplanと一致しません。書き込みは行いません");
   }
   async verifyCatalog(): Promise<void> {
-    const bindings = Object.entries(this.plan.role_bindings || {});
-    if (!bindings.length) return;
-    const catalog = object(await this.api("GET", "/api/agents/catalog"));
-    for (const [role, binding] of bindings) {
-      const teams = Array.isArray(catalog.teams) ? catalog.teams.map(object) : [];
-      const team = teams.find(t => t.team_id === binding.agent_team_id);
-      const profiles = team && Array.isArray(team.execution_profiles) ? team.execution_profiles.map(object) : [];
-      const profile = profiles.find(p => p.profile_id === binding.execution_profile_id);
-      const members = binding.allowed_subagent_ids || [];
-      const routes = profile && Array.isArray(profile.routes) ? profile.routes.map(object).filter(r => members.includes(String(r.subagent_id))) : [];
-      if (!members.length || routes.length !== members.length || routes.some(r => r.provider !== binding.resolved_provider || r.model !== binding.resolved_model_id)) throw new Error(`モデル経路が未解決または変更されています: ${role}`);
-    }
+    // P5 revisions carry their own model/tool/delegate projection.  The old
+    // Team/Profile catalog was a second source of truth and is no longer read.
   }
   async read(action: BootstrapAction, id: string): Promise<ObjectValue> {
     if (!ID.test(id)) throw new Error("登録IDが不正です");

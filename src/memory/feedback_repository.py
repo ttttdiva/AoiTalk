@@ -211,7 +211,11 @@ class FeedbackRepository:
             int: Number of entries migrated
         """
         if jsonl_path is None:
-            jsonl_path = Path(__file__).parent.parent.parent / "logs" / "feedback_logs.jsonl"
+            from src.runtime_release_contract import persistent_path
+
+            jsonl_path = persistent_path(
+                "logs/feedback_logs.jsonl", Path(__file__).parent.parent.parent
+            )
         
         if not jsonl_path.exists():
             logger.info("No JSONL file to migrate")

@@ -553,7 +553,7 @@ allowed=set(m.get('allowed_image_repositories') or [])
 required_allowed={'pgvector/pgvector','qdrant/qdrant','caddy','busybox','curlimages/curl','rocm/vllm','lmsysorg/sglang','ghcr.io/ggml-org/llama.cpp','node','python'}
 if allowed != required_allowed: fail('allowed image repositories are not the canonical set')
 repro=m.get('build_reproducibility') or {}; bases=repro.get('dockerfile_base_images') or {}; node_setup=repro.get('nodesource_setup') or {}
-if bases.get('node')!='node@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436' or bases.get('python')!='python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2': fail('Dockerfile base image reproducibility pins are missing')
+if bases.get('node')!='node@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d' or bases.get('python')!='python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2': fail('Dockerfile base image reproducibility pins are missing')
 if node_setup.get('url')!='https://deb.nodesource.com/setup_22.x' or node_setup.get('sha256')!='575583bbac2fccc0b5edd0dbc03e222d9f9dc8d724da996d22754d6411104fd1' or node_setup.get('https_required') is not True: fail('NodeSource setup HTTPS/hash contract is missing')
 expected_apt_policy='HTTPS apt repositories only; package indexes are resolved inside the pinned Debian base and no mutable Docker FROM tags are accepted'
 if repro.get('apt_policy') != expected_apt_policy:
@@ -588,7 +588,7 @@ else:
 if '--network' in build_command:
     fail('target build command must not contain a network bypass')
 expected_refs={'postgres':'pgvector/pgvector@sha256:a36250871de0833b8757561c72f2477ef1ddd1101afa4e617fb552e0de514c6b','qdrant':'qdrant/qdrant@sha256:94728574965d17c6485dd361aa3c0818b325b9016dac5ea6afec7b4b2700865f','caddy':'caddy@sha256:834468128c7696cec0ceea6172f7d692daf645ae51983ca76e39da54a97c570d','busybox':'busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662','curl':'curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b','gemma-vllm':'rocm/vllm@sha256:394194d36edcf9b36bcb563e143b21b80e64e7d04f33a447b448c0c0c00c04a8','sglang':'lmsysorg/sglang@sha256:16aba8925507e631e1dc1e23d95d026533602591775f6a8db68b74ee99746155','deepseek-llamacpp':'ghcr.io/ggml-org/llama.cpp@sha256:5a7d34c5a378b6f3b542e71690bd82db7b5bf31fd77d9d1582cc7f2c9043ad8c'}
-expected_bases={'dockerfile-node':'node@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436','dockerfile-python':'python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2'}
+expected_bases={'dockerfile-node':'node@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d','dockerfile-python':'python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2'}
 pins=m.get('image_pins'); seen=set()
 if not isinstance(pins,list): fail('handoff image_pins is missing')
 app_name = brand_slug
@@ -617,7 +617,7 @@ if seen != {app_name,*expected_refs,*expected_bases}: fail('image pin set is inc
 dockerfile=root/'source'/'Dockerfile'
 if not dockerfile.is_file() or dockerfile.is_symlink(): fail('sanitized Dockerfile is missing/symlinked')
 docker_text=dockerfile.read_text(encoding='utf-8')
-if validation_mode == 'strict' and not re.search(r'^FROM\s+node@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436\s+AS\s+enterprise-node-base\s*$', docker_text, re.MULTILINE|re.IGNORECASE):
+if validation_mode == 'strict' and not re.search(r'^FROM\s+node@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d\s+AS\s+enterprise-node-base\s*$', docker_text, re.MULTILINE|re.IGNORECASE):
     fail('Dockerfile is missing the pinned enterprise-node-base stage')
 for image in expected_bases.values():
     repo,digest=image.split('@',1)

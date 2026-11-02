@@ -133,6 +133,11 @@ def reset_turn_generation_metadata(llm_client: Any) -> None:
 
     if llm_client is None:
         return
+    from ..services.session_llm_generation import (
+        reset_session_generation_route_metadata_for,
+    )
+
+    reset_session_generation_route_metadata_for(llm_client)
     empty_values = {
         "_last_model_transcript": [],
         "_history_authoritative_model_transcript": [],
@@ -422,17 +427,60 @@ class ChatTurnPersistence:
         if not safe_content:
             return None
         message_identity = {"message_id": message_id} if message_id else {}
-        return await self.memory_manager.add_message_to_session(
-            session_id=session_id,
-            role="assistant",
-            content=safe_content,
-            metadata=metadata or {},
-            sender_type=sender_type,
-            sender_id=sender_id,
-            sender_display_name=sender_display_name,
-            defer_cross_session_index=True,
-            **message_identity,
+        normalized_metadata = metadata or {}
+        muse_chat_turn = (
+            str(normalized_metadata.get("provider") or "").strip().lower()
+            == "muse-remote"
+            and str(normalized_metadata.get("model") or "").strip().lower()
+            == "muse-chat"
         )
+
+        def matches_existing(message: Any) -> bool:
+            return bool(
+                message is not None
+                and str(getattr(message, "session_id", "")) == str(session_id)
+                and str(getattr(message, "role", "")) == "assistant"
+                and str(getattr(message, "content", "")) == safe_content
+            )
+
+        # Muse uses the persisted Human message as its stable idempotency
+        # anchor. A retry can therefore reach this save point after an earlier
+        # attempt committed the identical assistant row. Adopt that row rather
+        # than surfacing the primary-key conflict as a missing Chat reply.
+        # Other providers retain the existing insert behavior.
+        if muse_chat_turn and message_id:
+            existing = await self.load_message(str(message_id))
+            if existing is not None:
+                if matches_existing(existing):
+                    return existing
+                raise ValueError("Muse Chat assistant message identity conflict")
+
+        try:
+            return await self.memory_manager.add_message_to_session(
+                session_id=session_id,
+                role="assistant",
+                content=safe_content,
+                metadata=normalized_metadata,
+                sender_type=sender_type,
+                sender_id=sender_id,
+                sender_display_name=sender_display_name,
+                defer_cross_session_index=True,
+                **message_identity,
+            )
+        except Exception as error:
+            if not (muse_chat_turn and message_id):
+                raise
+            from sqlalchemy.exc import IntegrityError
+
+            if not isinstance(error, IntegrityError):
+                raise
+            # A concurrent identical Muse save may win after the preflight
+            # read. ConversationRepository rolls back its failed transaction;
+            # reload through the normal persistence seam before deciding.
+            existing = await self.load_message(str(message_id))
+            if matches_existing(existing):
+                return existing
+            raise
 
     async def load_prompt_history(
         self,

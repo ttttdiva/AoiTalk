@@ -9,6 +9,8 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 import yaml
 
+from .embedding_cache import resolve_embedding_cache
+
 
 DEFAULT_COLLECTION_NAME = "aoitalk_knowledge"
 
@@ -76,6 +78,7 @@ class EmbeddingConfig:
     idle_timeout_seconds: float = 300.0  # Zero keeps the worker until manual release/close.
 
     def __post_init__(self):
+        self.cache_dir = resolve_embedding_cache(self.cache_dir)
         if not math.isfinite(self.idle_timeout_seconds) or self.idle_timeout_seconds < 0:
             raise ValueError("idle_timeout_seconds must be finite and non-negative")
 
@@ -90,7 +93,7 @@ class EmbeddingConfig:
         return cls(
             batch_size=max(1, int(data.get('batch_size', cls.batch_size))),
             device=data.get('device', cls.device),
-            cache_dir=data.get('cache_dir') or os.environ.get('AOITALK_EMBEDDING_CACHE'),
+            cache_dir=data.get('cache_dir'),
             local_files_only=bool(data.get('local_files_only', True)),
             worker_python=data.get('worker_python') or os.environ.get('AOITALK_EMBEDDING_WORKER_PYTHON'),
             request_timeout_seconds=max(1.0, float(data.get('request_timeout_seconds',180))),
@@ -236,7 +239,10 @@ def get_rag_config(config_path: Optional[str] = None) -> RagConfig:
     if _rag_config is None:
         if config_path is None:
             # Default config path
-            config_path = str(Path(__file__).parents[2] / "config" / "config.yaml")
+            from src.runtime_release_contract import config_path as runtime_config_path
+
+            source_root = Path(__file__).parents[2]
+            config_path = str(runtime_config_path("config/config.yaml", source_root))
         
         _rag_config = RagConfig.from_yaml(config_path)
     

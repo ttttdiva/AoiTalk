@@ -49,7 +49,6 @@ import {
 import { GenerationProfileSelector } from "@/components/chat/generation-profile-selector";
 import { Button } from "@/components/ui/button";
 import { HelpPopover } from "@/components/ui/help-popover";
-import { AgentCliSessionLauncher } from "@/components/chat/agent-cli-session-launcher";
 import {
   Popover,
   PopoverContent,
@@ -159,22 +158,6 @@ import {
 } from "@/components/chat/chat-model-settings-fields";
 import { characterOptionLabel } from "@/lib/character-options";
 import {
-  agentRuntimeScope,
-  canUseConversationIngress,
-  executionAvailabilityLabel,
-  executionIngressLabel,
-  normalizeRuntimeProfileId,
-  providerReadinessLabel,
-  resolvedRuntimeProfile,
-  runtimeProfileById,
-  selectedRuntimeProfileId,
-  type AgentRuntimeSelection,
-} from "@/lib/agent-runtime-selection";
-import {
-  useAgentRoleRuntime,
-  type AgentRoleRuntime,
-} from "@/hooks/use-agent-role-runtime";
-import {
   useOptionalRuntimeContext,
   type RuntimeContextValue,
   type RuntimeLlmEngine,
@@ -248,10 +231,10 @@ export type ChatComposerSendOptions = {
   onSessionPromoted?: (sessionId: string) => void;
   /** Reuse a durable idempotency key when restoring a failed send. */
   clientMessageId?: string;
+  /** True only when this composer explicitly changed the generation profile. */
+  generationProfileChangedByUser?: boolean;
   /** Replay the route selected when an uncertain draft was first submitted. */
   dispatchMode?: ChatComposerDispatchMode;
-  /** Runtime for the bound Agent; null/omitted keeps the role revision default. */
-  executionProfileId?: string | null;
 };
 
 const intentAttachmentIds = new WeakMap<File, number>();
@@ -386,12 +369,10 @@ type QueuedChatMessage = {
   // メモリ上の snapshot として扱い、draft storage には含めない。
   attachedFiles: File[];
   generationProfile: GenerationProfile;
+  generationProfileChangedByUser: boolean;
   mentions: MentionItem[];
   capabilities: ChatCommandCapability[];
   toolsRequired?: boolean;
-  // Runtime captured when the request was queued (null = role default);
-  // undefined for a Chat without an Agent, which sends no runtime at all.
-  executionProfileId?: string | null;
   appContext: ChatAppContextSelection | null;
   draftSnapshot: ChatComposerDraft;
   // enqueue 中も下書きを localStorage に保持するための専用スコープ。
@@ -660,14 +641,10 @@ function ContextWindowDetails({
   );
 }
 
-const ROLE_DEFAULT_RUNTIME_VALUE = "__role_default__";
-
 type ChatSettingsItem =
   | "provider"
   | "model"
   | "effort"
-  | "agentTeam"
-  | "executionProfile"
   | "character";
 
 type ChatSettingsItemState = {
@@ -699,12 +676,6 @@ function ModelControl({
   onComposerFocusRequest,
   onLlmModeRefresh,
   agentId,
-  projectId,
-  roleRuntime,
-  roleRuntimeLoading = false,
-  roleRuntimeError = null,
-  runtimeProfileId = null,
-  onRuntimeProfileChange,
 }: {
   runtime: RuntimeContextValue;
   userSettings: UserSettings | null | undefined;
@@ -723,12 +694,6 @@ function ModelControl({
   onComposerFocusRequest?: () => void;
   onLlmModeRefresh?: () => Promise<void>;
   agentId?: string | null;
-  projectId?: string | null;
-  roleRuntime?: AgentRoleRuntime | null;
-  roleRuntimeLoading?: boolean;
-  roleRuntimeError?: string | null;
-  runtimeProfileId?: string | null;
-  onRuntimeProfileChange?: (profileId: string | null) => void;
 }) {
   const normalizedAgentId = agentId?.trim() || null;
   const agentBound = Boolean(normalizedAgentId);
@@ -744,8 +709,6 @@ function ModelControl({
     effortOptions: sessionEffortOptions,
     effortDisabled: routeEffortDisabled,
     hasSessionScopedRoute,
-    agentTeamDisabled,
-    executionProfileDisabled,
     providerDisabled: routeProviderDisabled,
     modelDisabled: routeModelDisabled,
     settingsLoading: routeSettingsLoading,
@@ -757,16 +720,6 @@ function ModelControl({
     ...routeFields
   } = routeState;
   const [modeRefreshing] = useState(false);
-  const runtimeProfileOptions = roleRuntime?.catalog.profiles ?? [];
-  const roleDefaultProfile = roleRuntime?.defaultProfileId ?? null;
-  const roleDefault = runtimeProfileById(roleRuntime?.catalog, roleDefaultProfile);
-  const selectedProfile = resolvedRuntimeProfile(roleRuntime?.catalog, runtimeProfileId);
-  const roleDefaultLabel = roleRuntimeLoading
-    ? "取得中"
-    : roleDefault?.name || roleDefaultProfile || "なし";
-  const selectedProfileLabel = runtimeProfileId
-    ? selectedProfile?.name || runtimeProfileId
-    : `Agent既定（${roleDefaultLabel}）`;
 
   const available = filterAvailableProviders(
     runtime.llmEngines,
@@ -1083,12 +1036,6 @@ function ModelControl({
             },
           ]
         : []),
-      ...(!agentBound
-        ? [
-            { id: "agentTeam" as const, disabled: agentTeamDisabled },
-            { id: "executionProfile" as const, disabled: executionProfileDisabled },
-          ]
-        : []),
       ...(characterControlVisible
         ? [
             {
@@ -1100,12 +1047,10 @@ function ModelControl({
     ],
     [
       agentBound,
-      agentTeamDisabled,
       characterControlVisible,
       characterDisabled,
       effectiveOptions.length,
       effortDisabled,
-      executionProfileDisabled,
       fixedDeployment,
       modelDisabled,
       providerDisabled,
@@ -1656,7 +1601,7 @@ function ModelControl({
               <div className="truncate text-[10px] text-muted-foreground">
                 {agentBound
                   ? "Agent設定 · Character"
-                  : "provider · model · effort · team · execution profile · character"}
+                  : "provider · model · effort · character"}
               </div>
             </div>
             {runtime.llmChangeError && (
@@ -1672,123 +1617,19 @@ function ModelControl({
               className="space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2 text-xs"
             >
               <p className="inline-flex items-center gap-1 font-medium">
-                Agentの役割と今回の実行先
-                <HelpPopover label="Agentの役割と今回の実行先">
-                  AgentとRevisionが職務を固定します。Execution Profileは今回使う登録済み実行先です。選択してもAgent、Revision、Character、ACLは変更されません。
+                Agentの役割
+                <HelpPopover label="Agentの役割">
+                  AgentとRevisionが職務と利用するモデルを固定します。モデルの選択はこのChatのセッション設定で行います。
                 </HelpPopover>
               </p>
               <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
                 <dt className="text-muted-foreground">Agent</dt>
-                <dd className="truncate" title={roleRuntime?.agentId || normalizedAgentId || undefined}>
-                  {roleRuntime?.agentName || normalizedAgentId || "取得中"}
+                <dd className="truncate" title={normalizedAgentId || undefined}>
+                  {normalizedAgentId || "取得中"}
                 </dd>
-                <dt className="text-muted-foreground">Revision</dt>
-                <dd className="truncate" title={roleRuntime?.revisionId}>
-                  {roleRuntime
-                    ? `${roleRuntime.revisionVersion ? `v${roleRuntime.revisionVersion} · ` : ""}${roleRuntime.revisionId}`
-                    : "取得中"}
-                </dd>
-                <dt className="text-muted-foreground">Agent既定</dt>
-                <dd>{roleDefaultLabel}</dd>
-                <dt className="text-muted-foreground">今回の選択</dt>
-                <dd>{selectedProfileLabel}</dd>
+                <dt className="text-muted-foreground">実行</dt>
+                <dd>Agent の現在の版</dd>
               </dl>
-              <label className="grid gap-1 text-xs text-muted-foreground">
-                <span>会話/APIのExecution Profile</span>
-                <AppSelect
-                  aria-label="実行環境 Execution Profile"
-                  data-testid="agent-runtime-profile-select"
-                  value={runtimeProfileId ?? ROLE_DEFAULT_RUNTIME_VALUE}
-                  onChange={(event) => {
-                    // A stray empty value must not reset the choice; only the
-                    // explicit role-default option may reset the choice.
-                    const next = event.target.value;
-                    if (next === ROLE_DEFAULT_RUNTIME_VALUE) onRuntimeProfileChange?.(null);
-                    else {
-                      const normalized = normalizeRuntimeProfileId(next);
-                      const candidate = runtimeProfileById(roleRuntime?.catalog, normalized);
-                      if (normalized && canUseConversationIngress(candidate)) {
-                        onRuntimeProfileChange?.(normalized);
-                      }
-                    }
-                  }}
-                  disabled={roleRuntimeLoading || !roleRuntime}
-                  className={cn(runtimeSelectClassName, "w-full")}
-                  container={selectPortalHostRef}
-                >
-                  <option
-                    value={ROLE_DEFAULT_RUNTIME_VALUE}
-                    disabled={Boolean(roleDefault && !canUseConversationIngress(roleDefault))}
-                  >
-                    {`Agent既定（${roleDefaultLabel}）`}
-                  </option>
-                  {runtimeProfileId &&
-                  !runtimeProfileOptions.some((profile) => profile.profile_id === runtimeProfileId) ? (
-                    <option value={runtimeProfileId} disabled>{`${runtimeProfileId}（catalogにありません）`}</option>
-                  ) : null}
-                  {runtimeProfileOptions
-                    .filter((profile) => profile.ingress === "api")
-                    .map((profile) => (
-                    <option
-                      key={profile.profile_id}
-                      value={profile.profile_id}
-                      disabled={!canUseConversationIngress(profile)}
-                    >
-                      {profile.name || profile.profile_id}
-                    </option>
-                  ))}
-                </AppSelect>
-              </label>
-              {roleRuntimeError ? (
-                <p role="alert" className="text-[10px] text-destructive">
-                  {roleRuntimeError}。実行先を確認できないため送信しません。
-                </p>
-              ) : null}
-              {roleRuntime ? (
-                <div className="space-y-1" data-testid="agent-execution-profile-catalog">
-                  {runtimeProfileOptions.map((profile) => (
-                    <div key={profile.profile_id} className="rounded border bg-card/70 p-2">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="truncate font-medium">
-                            {profile.name} {profile.is_default ? "· 既定" : ""}
-                          </p>
-                          <p className="text-[10px] text-muted-foreground">
-                            {executionIngressLabel(profile.ingress)} · {profile.provider}
-                            {profile.model ? ` / ${profile.model}` : ""}
-                            {profile.effort ? ` / ${profile.effort}` : ""}
-                          </p>
-                          <p className="text-[10px]">
-                            {executionAvailabilityLabel(profile)}
-                            {profile.availability_reason ? ` · ${profile.availability_reason}` : ""}
-                          </p>
-                          <p className="text-[10px] text-muted-foreground">
-                            {providerReadinessLabel(profile.provider_readiness)}
-                            {profile.provider_readiness_reason
-                              ? ` · ${profile.provider_readiness_reason}`
-                              : ""}
-                          </p>
-                        </div>
-                        {profile.ingress === "cli_session" ? (
-                          <AgentCliSessionLauncher
-                            agentId={roleRuntime.agentId}
-                            agentRevisionId={roleRuntime.revisionId}
-                            profile={profile}
-                            {...(sessionId?.trim()
-                              ? { sessionId: sessionId.trim() }
-                              : { projectId: projectId?.trim() || null })}
-                          />
-                        ) : null}
-                      </div>
-                    </div>
-                  ))}
-                  {roleRuntime.catalog.diagnostics.map((diagnostic) => (
-                    <p key={`${diagnostic.profile_id}:${diagnostic.reason}`} role="status" className="text-[10px] text-muted-foreground">
-                      {diagnostic.profile_id}: {diagnostic.reason}
-                    </p>
-                  ))}
-                </div>
-              ) : null}
               {normalizedAgentId ? (
                 <Link
                   className="inline-block text-primary underline-offset-2 hover:underline"
@@ -1883,12 +1724,6 @@ function ModelControl({
             fixedDeployment={fixedDeployment}
             modelBusy={modelBusy}
             route={{
-              agentTeamOptions: routeFields.agentTeamOptions,
-              agentTeamSelectorValue: routeFields.agentTeamSelectorValue,
-              agentTeamDisabled,
-              executionProfileId: routeFields.executionProfileId,
-              executionProfileOptions: routeFields.executionProfileOptions,
-              executionProfileDisabled,
               catalogProviders: routeFields.catalogProviders,
               effectiveProvider: sessionProvider,
               effectiveModel: sessionModel,
@@ -1900,8 +1735,6 @@ function ModelControl({
               // richer catalog is transiently unavailable.
               modelDisabled: routeModelDisabled,
               settingsLoading: routeSettingsLoading,
-              updateAgentTeamValue: routeFields.updateAgentTeamValue,
-              updateExecutionProfile: routeFields.updateExecutionProfile,
               updateProvider: routeFields.updateProvider,
               updateModel: routeFields.updateModel,
             }}
@@ -2372,70 +2205,7 @@ export function ChatComposer({
   // AppLayout の getSession() で確定した ID を使い、認証状態の再取得待ちで
   // 新規チャット下書きが別スコープへ移る競合を避ける。
   const draftUserId = useCurrentUserId();
-  // Runtime (ExecutionProfile) chosen for an Agent-bound Chat. The selection is
-  // scoped to user/session/agent, so another Chat or account never inherits it.
-  const runtimeScope = agentRuntimeScope(draftUserId, sessionId, agentId?.trim() || null);
-  const roleRuntimeState = useAgentRoleRuntime(agentId, { sessionId, projectId });
-  const [runtimeSelection, setRuntimeSelection] = useState<AgentRuntimeSelection | null>(null);
-  const runtimeProfileId = agentId?.trim()
-    ? selectedRuntimeProfileId(runtimeSelection, runtimeScope)
-    : null;
-  const handleRuntimeProfileChange = (profileId: string | null) => {
-    setRuntimeSelection(profileId ? { scope: runtimeScope, profileId } : null);
-  };
-  // Every submit path funnels through here so the choice is captured once, at
-  // first submit; later retries replay the outbox value instead.
-  const onSend = useCallback<ChatComposerProps["onSend"]>(
-    (...args) => {
-      const agentBound = Boolean(agentId?.trim());
-      const hasCapturedProfile = Boolean(
-        args[7] && Object.prototype.hasOwnProperty.call(args[7], "executionProfileId"),
-      );
-      const profileId = hasCapturedProfile
-        ? normalizeRuntimeProfileId(args[7]?.executionProfileId)
-        : runtimeProfileId;
-      if (agentBound) {
-        if (roleRuntimeState.loading) {
-          toast.error("Agentの実行先を確認中です。確認後にもう一度送信してください。");
-          return false;
-        }
-        if (roleRuntimeState.error || !roleRuntimeState.runtime) {
-          toast.error("Agentの実行先を確認できないため送信しませんでした。");
-          return false;
-        }
-        const selected = profileId
-          ? runtimeProfileById(roleRuntimeState.runtime.catalog, profileId)
-          : resolvedRuntimeProfile(roleRuntimeState.runtime.catalog, null);
-        if (!selected) {
-          toast.error("選択したExecution Profileをcatalogで確認できないため送信しませんでした。");
-          return false;
-        }
-        if (selected.ingress !== "api") {
-          toast.error(
-            selected.ingress === "cli_session"
-              ? "このExecution ProfileはCLIセッション入口から開始してください。会話送信は実行していません。"
-              : "このExecution ProfileのRemote Agent入口は利用できません。会話送信は実行していません。",
-          );
-          return false;
-        }
-        if (!canUseConversationIngress(selected)) {
-          toast.error(
-            `${executionAvailabilityLabel(selected)}${
-              selected.availability_reason ? ` (${selected.availability_reason})` : ""
-            }。会話送信は実行していません。`,
-          );
-          return false;
-        }
-      }
-      if (!profileId || hasCapturedProfile) {
-        return onSendProp(...args);
-      }
-      const sendArgs = [...args] as Parameters<ChatComposerProps["onSend"]>;
-      sendArgs[7] = { ...args[7], executionProfileId: profileId };
-      return onSendProp(...sendArgs);
-    },
-    [agentId, onSendProp, roleRuntimeState, runtimeProfileId],
-  );
+  const onSend = onSendProp;
   const composerDraftKey =
     draftKey ?? sessionId ?? NEW_CHAT_COMPOSER_DRAFT_KEY;
   const composerDraft = useSyncExternalStore(
@@ -2460,7 +2230,7 @@ export function ChatComposer({
           ...current,
           content,
           ...(content !== current.content
-            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined }
             : {}),
         };
       }),
@@ -2485,7 +2255,7 @@ export function ChatComposer({
           ...current,
           mentions,
           ...(changed
-            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined }
             : {}),
         };
       }),
@@ -2503,7 +2273,7 @@ export function ChatComposer({
           ...current,
           activeCommand,
           ...(changed
-            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined }
             : {}),
         };
       }),
@@ -2518,7 +2288,7 @@ export function ChatComposer({
           ...current,
           toolFreeMode,
           ...(toolFreeMode !== current.toolFreeMode
-            ? { clientMessageId: undefined, dispatchMode: undefined, executionProfileId: undefined }
+            ? { clientMessageId: undefined, dispatchMode: undefined }
             : {}),
         };
       }),
@@ -2536,7 +2306,7 @@ export function ChatComposer({
           ...current,
           dispatchMode,
           ...(currentMode !== dispatchMode
-            ? { clientMessageId: undefined, executionProfileId: undefined }
+            ? { clientMessageId: undefined }
             : {}),
         };
       });
@@ -2640,7 +2410,6 @@ export function ChatComposer({
                 ...current,
                 clientMessageId: undefined,
                 dispatchMode: undefined,
-                executionProfileId: undefined,
               }
             : current,
       );
@@ -3037,16 +2806,16 @@ export function ChatComposer({
       ] as const;
       let result: ReturnType<ChatComposerProps["onSend"]>;
       try {
-        // The queued request replays its own captured runtime (explicit null
-        // included); the composer's current selection must not leak in.
-        result =
-          next.executionProfileId !== undefined
-            ? onSend(...args, next.appContext ?? undefined, {
-                executionProfileId: next.executionProfileId,
+        result = next.generationProfileChangedByUser
+          ? onSend(...args, next.appContext ?? undefined, {
+              generationProfileChangedByUser: true,
+            })
+          : next.appContext
+            ? onSend(...args, next.appContext, {
+                generationProfileChangedByUser:
+                  next.generationProfileChangedByUser,
               })
-            : next.appContext
-              ? onSend(...args, next.appContext)
-              : onSend(...args);
+            : onSend(...args);
       } catch {
         result = false;
       }
@@ -3286,11 +3055,11 @@ export function ChatComposer({
       let promotionSourceScope: typeof latestIntentScopeRef.current | null = null;
       const sendArgs: Parameters<ChatComposerProps["onSend"]> = [...args];
       const sendOptions: ChatComposerSendOptions = { ...args[7] };
+      if (generationProfileChangedByUser) {
+        sendOptions.generationProfileChangedByUser = true;
+      }
       if (submittedDraft?.clientMessageId) {
         sendOptions.clientMessageId = submittedDraft.clientMessageId;
-      }
-      if (submittedDraft?.executionProfileId !== undefined) {
-        sendOptions.executionProfileId = submittedDraft.executionProfileId;
       }
       if (
         submittedDraft?.dispatchMode ||
@@ -3440,7 +3209,8 @@ export function ChatComposer({
         .catch(restoreAfterFailure);
     },
     [clearComposerAfterSendStart, composerDraftKey, draftUserId,
-      onAttachedFilesChange, onSend, prepareComposerDispatch],
+      generationProfileChangedByUser, onAttachedFilesChange, onSend,
+      prepareComposerDispatch],
   );
 
   const enqueue = useCallback((candidate?: ChatIntentCandidate): boolean => {
@@ -3469,8 +3239,6 @@ export function ChatComposer({
       mentions: [...mentions],
       activeCommand,
       toolFreeMode,
-      // A restored failed queue item keeps the runtime it was submitted with.
-      ...(agentId?.trim() ? { executionProfileId: runtimeProfileId } : {}),
     };
     const draftStorageKey = `${composerDraftKey}::queued:${id}`;
     // 通常の composer draft を空にしても、送信完了までは専用スコープへ
@@ -3484,13 +3252,13 @@ export function ChatComposer({
         content: candidate ? appendChatIntent(submission.content, candidate) : submission.content,
         attachedFiles: [...attachedFiles],
         generationProfile,
+        generationProfileChangedByUser,
         mentions: [...mentions],
         capabilities: submission.capabilities ?? [],
         toolsRequired: resolveChatToolsRequired(
           submission.capabilities,
           toolFreeMode,
         ),
-        executionProfileId: agentId?.trim() ? runtimeProfileId : undefined,
         appContext,
         draftSnapshot,
         draftStorageKey,
@@ -3519,11 +3287,10 @@ export function ChatComposer({
     value,
     activeCommand,
     generationProfile,
+    generationProfileChangedByUser,
     mentions,
     onAttachedFilesChange,
     sessionId,
-    agentId,
-    runtimeProfileId,
     toolFreeMode,
     setActiveCommand,
     setMentions,
@@ -3554,7 +3321,6 @@ export function ChatComposer({
       toolFreeMode,
       clientMessageId: composerDraft.clientMessageId,
       dispatchMode: composerDraft.dispatchMode,
-      executionProfileId: composerDraft.executionProfileId,
     };
     const preparedDispatch = prepareComposerDispatch(
       currentSubmittedDraft,
@@ -3569,11 +3335,11 @@ export function ChatComposer({
     try {
       const isNewChatIntent = composerDraftKey === NEW_CHAT_COMPOSER_DRAFT_KEY && !sessionId;
       const options: ChatComposerSendOptions = {
+        ...(generationProfileChangedByUser
+          ? { generationProfileChangedByUser: true }
+          : {}),
         ...(submittedDraft.clientMessageId
           ? { clientMessageId: submittedDraft.clientMessageId }
-          : {}),
-        ...(submittedDraft.executionProfileId !== undefined
-          ? { executionProfileId: submittedDraft.executionProfileId }
           : {}),
         ...(submittedDraft.dispatchMode
           ? { dispatchMode: submittedDraft.dispatchMode }
@@ -3674,8 +3440,9 @@ export function ChatComposer({
       }
     } finally { intentSubmissionRef.current = false; }
   }, [activeCommand, appContext, attachedFiles, clearComposerAfterSendStart,
-    composerDraft.clientMessageId, composerDraft.dispatchMode, composerDraft.executionProfileId, disabled, enqueue,
-    generationProfile, isSteeringMode, mentions, onAttachedFilesChange, onSend,
+    composerDraft.clientMessageId, composerDraft.dispatchMode, disabled, enqueue,
+    generationProfile, generationProfileChangedByUser, isSteeringMode,
+    mentions, onAttachedFilesChange, onSend,
     onAttachmentsPromoted, prepareComposerDispatch, projectId, projectScopeReady,
     composerDraftKey, draftUserId, sessionId, toolFreeMode, value]);
   const intent = useChatIntent({
@@ -3764,7 +3531,6 @@ export function ChatComposer({
         toolFreeMode,
         clientMessageId: composerDraft.clientMessageId,
         dispatchMode: composerDraft.dispatchMode,
-      executionProfileId: composerDraft.executionProfileId,
       };
       if (appContext) {
         invokeSend(submittedDraft, true, ...args, appContext);
@@ -3785,7 +3551,6 @@ export function ChatComposer({
       attachedFiles,
       composerDraft.clientMessageId,
       composerDraft.dispatchMode,
-      composerDraft.executionProfileId,
       mentions,
       generationProfile,
       activeCommand,
@@ -4815,12 +4580,6 @@ export function ChatComposer({
               onComposerFocusRequest={() => textareaRef.current?.focus()}
               onLlmModeRefresh={refreshLlmMode}
               agentId={agentId}
-              projectId={projectId}
-              roleRuntime={roleRuntimeState.runtime}
-              roleRuntimeLoading={roleRuntimeState.loading}
-              roleRuntimeError={roleRuntimeState.errorMessage}
-              runtimeProfileId={runtimeProfileId}
-              onRuntimeProfileChange={handleRuntimeProfileChange}
             />
           )}
 

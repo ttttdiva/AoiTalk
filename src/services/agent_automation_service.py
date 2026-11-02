@@ -440,9 +440,7 @@ class AgentAutomationService:
             from ..config import Config
 
             config = Config()
-        return readiness(
-            config, agent_revision.agent_team_id, agent_revision.execution_profile_id
-        )
+        return readiness(config, agent_revision)
 
     def require_semantic_readiness(self, agent_revision):
         state = self.semantic_readiness(agent_revision)

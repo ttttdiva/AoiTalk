@@ -1,6 +1,5 @@
 import {
   saveSessionLlmSettings,
-  FREE_TEAM_ROUTING_PROFILE_ID,
   type SessionLlmSettings,
   type SessionLlmSettingsResponse,
 } from "@/lib/chat-llm-settings";
@@ -24,14 +23,7 @@ export const NEW_CHAT_LLM_SETTINGS_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
 const ANONYMOUS_SCOPE = "__anonymous__";
 
 const defaultSessionSettings = (): SessionLlmSettings => ({
-  agent_team_selection: {
-    mode: "auto",
-    team_id: "",
-    loaded_team_ids: [],
-  },
   main_route: {},
-  special_routing: {},
-  execution_profile_id: "",
 });
 
 type PersistedNewChatLlmSettings = {
@@ -114,19 +106,6 @@ function bumpRevision(scopeKey: string): number {
   return next;
 }
 
-function isAgentTeamSelection(
-  value: unknown,
-): value is SessionLlmSettings["agent_team_selection"] {
-  if (!value || typeof value !== "object") return false;
-  const selection = value as Record<string, unknown>;
-  return (
-    (selection.mode === "auto" || selection.mode === "fixed") &&
-    typeof selection.team_id === "string" &&
-    Array.isArray(selection.loaded_team_ids) &&
-    selection.loaded_team_ids.every((item) => typeof item === "string")
-  );
-}
-
 function isSessionMainRoute(
   value: unknown,
 ): value is NonNullable<SessionLlmSettings["main_route"]> {
@@ -136,17 +115,6 @@ function isSessionMainRoute(
     (route.provider === undefined || typeof route.provider === "string") &&
     (route.model === undefined || typeof route.model === "string") &&
     (route.effort === undefined || typeof route.effort === "string")
-  );
-}
-
-function isSpecialRouting(
-  value: unknown,
-): value is NonNullable<SessionLlmSettings["special_routing"]> {
-  if (!value || typeof value !== "object") return false;
-  const routing = value as Record<string, unknown>;
-  return (
-    routing.routing_profile_id === undefined ||
-    typeof routing.routing_profile_id === "string"
   );
 }
 
@@ -213,29 +181,10 @@ function bindDraftLifecycle(scope: SettingsScope): void {
   draftLifecycleBindings.set(scope.userId, unsubscribe);
 }
 
-function unbindDraftLifecycle(userId: string | null): void {
-  if (!userId) return;
-  const unsubscribe = draftLifecycleBindings.get(userId);
-  if (!unsubscribe) return;
-  unsubscribe();
-  draftLifecycleBindings.delete(userId);
-}
-
 function cloneSettings(settings: SessionLlmSettings): SessionLlmSettings {
   return {
-    agent_team_selection: {
-      mode: settings.agent_team_selection.mode,
-      team_id: settings.agent_team_selection.team_id,
-      loaded_team_ids: [...settings.agent_team_selection.loaded_team_ids],
-    },
     main_route: settings.main_route ? { ...settings.main_route } : {},
-    special_routing: settings.special_routing
-      ? { ...settings.special_routing }
-      : {},
-    execution_profile_id:
-      typeof settings.execution_profile_id === "string"
-        ? settings.execution_profile_id
-        : "",
+    ...(settings.legacy ? { legacy: { ...settings.legacy } } : {}),
   };
 }
 
@@ -261,48 +210,19 @@ function parsePersistedSettings(value: unknown): SessionLlmSettings | null {
     record.settings && typeof record.settings === "object"
       ? (record.settings as Record<string, unknown>)
       : record;
-  if (
-    !isAgentTeamSelection(rawSettings.agent_team_selection) ||
-    (rawSettings.main_route !== undefined &&
-      !isSessionMainRoute(rawSettings.main_route)) ||
-    (rawSettings.special_routing !== undefined &&
-      !isSpecialRouting(rawSettings.special_routing)) ||
-    (rawSettings.execution_profile_id !== undefined &&
-      typeof rawSettings.execution_profile_id !== "string")
-  ) {
+  if (rawSettings.main_route !== undefined && !isSessionMainRoute(rawSettings.main_route)) {
     return null;
   }
 
   const settings: SessionLlmSettings = {
-    agent_team_selection: {
-      mode: rawSettings.agent_team_selection.mode,
-      team_id: rawSettings.agent_team_selection.team_id,
-      loaded_team_ids: [...rawSettings.agent_team_selection.loaded_team_ids],
-    },
     main_route: rawSettings.main_route ? { ...rawSettings.main_route } : {},
-    execution_profile_id:
-      typeof rawSettings.execution_profile_id === "string"
-        ? rawSettings.execution_profile_id
-        : "",
   };
-  if (rawSettings.special_routing) {
-    settings.special_routing = { ...rawSettings.special_routing };
-  }
   return settings;
 }
 
 function hasMeaningfulPending(settings: SessionLlmSettings): boolean {
   const route = settings.main_route;
-  const hasRoute = Boolean(route?.provider?.trim() || route?.model?.trim());
-  const team = settings.agent_team_selection;
-  const hasCustomTeam =
-    team.mode !== "auto" ||
-    Boolean(team.team_id.trim()) ||
-    team.loaded_team_ids.length > 0;
-  const hasFreeTeam =
-    settings.special_routing?.routing_profile_id?.trim() === FREE_TEAM_ROUTING_PROFILE_ID;
-  const hasExecutionProfile = Boolean(settings.execution_profile_id?.trim());
-  return hasRoute || hasCustomTeam || hasFreeTeam || hasExecutionProfile;
+  return Boolean(route?.provider?.trim() || route?.model?.trim());
 }
 
 function mergeSettings(
@@ -310,24 +230,13 @@ function mergeSettings(
   patch: Partial<SessionLlmSettings>,
 ): SessionLlmSettings {
   const next: SessionLlmSettings = {
-    agent_team_selection:
-      patch.agent_team_selection ?? current.agent_team_selection,
     main_route:
       patch.main_route !== undefined
         ? { ...current.main_route, ...patch.main_route }
         : current.main_route,
-    execution_profile_id:
-      patch.execution_profile_id !== undefined
-        ? patch.execution_profile_id
-        : (current.execution_profile_id ?? ""),
   };
-  if (patch.special_routing !== undefined) {
-    next.special_routing = patch.special_routing
-      ? { ...patch.special_routing }
-      : undefined;
-  } else if (current.special_routing) {
-    next.special_routing = { ...current.special_routing };
-  }
+  if (patch.legacy !== undefined) next.legacy = patch.legacy;
+  else if (current.legacy) next.legacy = { ...current.legacy };
   return next;
 }
 
@@ -473,9 +382,6 @@ export function updatePendingNewChatLlmSettings(
 ): void {
   const scope = getSettingsScope(NEW_CHAT_LLM_SETTINGS_KEY, userId);
   if (!scope.userId) return;
-  if (patch.agent_team_selection && !scope.userId) {
-    return;
-  }
   loadSettingsFromStorage(scope);
   const current = getPendingNewChatLlmSettings(userId);
   const next = mergeSettings(current, patch);

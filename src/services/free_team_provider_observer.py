@@ -1,8 +1,9 @@
 """OpenRouter無料モデル日次リクエスト枠のProvider実測観測。
 
 ``GET /api/v1/key`` の ``data.free_model_daily_requests{used,limit,remaining}``
-（UTC日次）を明示的なrefreshでのみ取得する。観測値は表示専用で、cap・DB・
-routing・課金経路には一切影響させない。``is_free_tier`` は実Tier判定に使わない。
+（UTC日次）を認証済みの明示refresh、または明示Free Team API taskの
+preflightでのみ取得する。成功した観測は既存の
+``openrouter-free-rpd`` quota rowへ同期する。``is_free_tier`` は実Tier判定に使わない。
 
 状態は ``ObservationStore`` が登録App単位で保持し、現在のcredential binding
 （profile・有効状態・キーのprocess内限定fingerprint）と一致する場合だけ返す。
@@ -77,6 +78,33 @@ def is_official_endpoint(base_url: str | None) -> bool:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def quota_binding_fingerprint(
+    profile_id: str,
+    enabled: bool,
+    api_key: str,
+    base_url: str | None,
+    revision: str = "",
+    credential_source: str = "dedicated",
+) -> str | None:
+    """Stable internal credential revision for the existing quota ledger.
+
+    The digest is stored only in ``provider_sync_state`` and is never returned
+    by the API. It lets routing reject a persisted /key observation after key
+    rotation, including after the process-local observation cache is rebuilt.
+    """
+
+    if ObservationStore.unusable_reason(enabled, api_key, base_url):
+        return None
+    endpoint = str(base_url).strip().rstrip("/")
+    revision_text = str(revision or "")
+    source_text = str(credential_source or "dedicated").strip().lower()
+    payload = (
+        f"aoi-free-team-openrouter-v2\0{profile_id}\0{endpoint}\0"
+        f"{source_text}\0{revision_text}\0{str(api_key).strip()}"
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -197,7 +225,13 @@ class ObservationStore:
         return "" if is_official_endpoint(base_url) else "unsupported_endpoint"
 
     def binding(
-        self, profile_id: str, enabled: bool, api_key: str, base_url: str | None
+        self,
+        profile_id: str,
+        enabled: bool,
+        api_key: str,
+        base_url: str | None,
+        revision: str = "",
+        credential_source: str = "dedicated",
     ) -> str | None:
         """現在のcredential revision（endpoint identity込み）。送信不可はNone。値は外部へ出さない。"""
 
@@ -205,8 +239,12 @@ class ObservationStore:
             return None
         key = str(api_key).strip()
         endpoint = str(base_url).strip().rstrip("/")
+        revision_text = str(revision or "")
+        source_text = str(credential_source or "dedicated").strip().lower()
         digest = hmac.new(
-            self._salt, f"{profile_id}\0{endpoint}\0{key}".encode(), hashlib.sha256
+            self._salt,
+            f"{profile_id}\0{endpoint}\0{source_text}\0{revision_text}\0{key}".encode(),
+            hashlib.sha256,
         )
         return digest.hexdigest()
 
@@ -276,3 +314,9 @@ class ObservationStore:
             return self.status(binding, now=observed_at)
         # 新しい取得が先に確定済み。古い結果は適用せず最新の状態を返す。
         return self.status(binding, now=now)
+
+    def invalidate(self, *, now: datetime | None = None) -> None:
+        """Advance the generation and discard cached evidence without I/O."""
+
+        ticket = self.begin()
+        self.commit(ticket, None, None, "missing_key", now or _utcnow())

@@ -13,10 +13,11 @@ returned as an operations payload.
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
-import math
 from datetime import datetime
+from itertools import islice
 from typing import Any, Dict
 
 from sqlalchemy import (
@@ -61,7 +62,7 @@ AGENT_WORK_ACTOR_KINDS = frozenset({"human", "agent", "service"})
 # Numeric usage counters are not secrets even though their names contain "token".
 # Non-secret execution controls whose names contain a secret marker ("token").
 # Exact key + strict integer (not bool) in range only; nothing else is exempt.
-EXECUTION_CONTROL_INT_RANGES = {"tool_generation_max_tokens": (1, 4096)}
+EXECUTION_CONTROL_INT_RANGES = {"tool_generation_max_tokens": (1, 4096), "max_tokens": (1, 2**63 - 1)}
 
 
 def is_execution_control_value(key: str, value: Any) -> bool:
@@ -107,15 +108,21 @@ _SENSITIVE_URL_RE = re.compile(
     r"[^\s&]+|@[^\s/]+)",
     re.IGNORECASE,
 )
+_BEARER_CREDENTIAL_RE = re.compile(r"(?<!\w)bearer\s+\S+", re.IGNORECASE)
 _PATH_RE = re.compile(r"(?:^|[\\/])(?:users?|home|tmp|var|etc|appdata)(?:[\\/]|$)", re.I)
 _ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|/)")
 # Durable metadata keeps the absolute workspace the task was admitted for.
 _STORED_PATH_LIMIT = 4096
+# Match the established 10k-node payload budget; ordinary nesting has no cutoff.
+_SAFE_JSON_NODE_LIMIT = 10_000
 
 
-_SAFE_INTEGRATION_REASON_CODES = frozenset({
+_SAFE_FIXED_REASON_CODES = frozenset({
     "integration_credential_unverified",
     "integration_credential_changed",
+    "dialogue_token_budget_exhausted",
+    "dialogue_authorization_invalid",
+    "worker_scope_authorization_invalid",
 })
 
 
@@ -156,37 +163,58 @@ def _safe_text(value: Any, *, limit: int, keep_paths: bool = False) -> str | Non
         return value if len(value) <= _STORED_PATH_LIMIT else None
     # Exact server-owned reason codes are metadata, not credential material.
     # Prefixes/suffixes and arbitrary credential-bearing text still fail below.
-    if value in _SAFE_INTEGRATION_REASON_CODES:
+    if value in _SAFE_FIXED_REASON_CODES:
         return value[:limit]
     lowered = value.casefold()
     if any(marker in lowered for marker in _SAFE_KEY_MARKERS):
         return None
-    if _SENSITIVE_URL_RE.search(value) or _PATH_RE.search(value):
+    if _BEARER_CREDENTIAL_RE.search(value) or _SENSITIVE_URL_RE.search(value) or _PATH_RE.search(value):
         return None
     return value[:limit]
 
 
-def _safe_json(value: Any, *, depth: int = 0, keep_paths: bool = False) -> Any:
-    """Return a tiny JSON projection suitable for operator-facing DTOs."""
-
-    if depth > 3:
-        return None
+def _safe_json_leaf(value: Any, *, keep_paths: bool) -> Any:
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
         return _safe_text(value, limit=512, keep_paths=keep_paths)
-    if isinstance(value, (list, tuple, set, frozenset)):
-        result: list[Any] = []
-        for item in list(value)[:64]:
-            projected = _safe_json(item, depth=depth + 1, keep_paths=keep_paths)
-            if projected is not None:
-                result.append(projected)
-        return result
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for raw_key, item in list(value.items())[:64]:
+    return None
+
+
+def _safe_json(value: Any, *, keep_paths: bool = False) -> Any:
+    """Return a bounded, redacted JSON projection without recursive traversal."""
+
+    def is_container(item: Any) -> bool:
+        return isinstance(item, (dict, list, tuple, set, frozenset))
+
+    def output_for(item: Any) -> dict[str, Any] | list[Any]:
+        return {} if isinstance(item, dict) else []
+
+    def iterator_for(item: Any) -> Any:
+        entries = item.items() if isinstance(item, dict) else item
+        return iter(islice(entries, 64))
+
+    if not is_container(value):
+        return _safe_json_leaf(value, keep_paths=keep_paths)
+
+    root = output_for(value)
+    active_containers = {id(value)}
+    stack = [(value, iterator_for(value), root)]
+    visited_nodes = 1
+
+    while stack:
+        source, entries, projected_container = stack[-1]
+        try:
+            entry = next(entries)
+        except StopIteration:
+            active_containers.remove(id(source))
+            stack.pop()
+            continue
+
+        if isinstance(source, dict):
+            raw_key, item = entry
             key = str(raw_key)
             lowered = key.casefold()
             numeric_counter = (
@@ -194,13 +222,45 @@ def _safe_json(value: Any, *, depth: int = 0, keep_paths: bool = False) -> Any:
                 and isinstance(item, (int, float))
                 and not isinstance(item, bool)
             )
-            if not numeric_counter and not is_execution_control_value(key, item) and any(marker in lowered for marker in _SAFE_KEY_MARKERS):
+            if (
+                not numeric_counter
+                and not is_execution_control_value(key, item)
+                and any(marker in lowered for marker in _SAFE_KEY_MARKERS)
+            ):
                 continue
-            projected = _safe_json(item, depth=depth + 1, keep_paths=keep_paths)
-            if projected is not None:
-                result[key[:96]] = projected
-        return result
-    return None
+            output_key = key[:96]
+        else:
+            item = entry
+            output_key = None
+
+        visited_nodes += 1
+        if visited_nodes > _SAFE_JSON_NODE_LIMIT:
+            raise ValueError(
+                f"Agent work JSON projection exceeds {_SAFE_JSON_NODE_LIMIT} nodes"
+            )
+
+        if is_container(item):
+            identity = id(item)
+            if identity in active_containers:
+                raise ValueError("Agent work JSON projection does not accept cyclic values")
+            child_container = output_for(item)
+            if isinstance(source, dict):
+                projected_container[output_key] = child_container
+            else:
+                projected_container.append(child_container)
+            active_containers.add(identity)
+            stack.append((item, iterator_for(item), child_container))
+            continue
+
+        projected = _safe_json_leaf(item, keep_paths=keep_paths)
+        if projected is None:
+            continue
+        if isinstance(source, dict):
+            projected_container[output_key] = projected
+        else:
+            projected_container.append(projected)
+
+    return root
 
 
 def _iso(value: datetime | None) -> str | None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import hashlib
 import inspect
 import json
@@ -39,6 +40,7 @@ from ..memory.models import (
     AgentDialogueInput,
     AgentDialogueReservation,
     AgentDialogueUsage,
+    AgentExecutionBinding,
     AGENT_DIALOGUE_INPUT_KINDS,
     AgentWorkEvent,
     AgentWorkItem,
@@ -49,17 +51,14 @@ from ..memory.models import (
     User,
 )
 from ..memory.models.operations import _normalized_security_key, sanitize_source_url
-from .agent_team_v3 import (
-    AGENT_TEAM_CAPABILITY_CATALOG,
-    AGENT_TEAM_DEFAULT_TEAMS,
-    AGENT_TEAM_SUBAGENT_CATALOG,
-)
+from .agent_capabilities import AGENT_CAPABILITY_CATALOG
 from .agent_resource_mutations import (
     DOCS_MUTATION_OPERATIONS,
     TASK_MUTATION_OPERATIONS,
     build_agent_resource_mutations,
 )
 from .agent_run_operation_identity import canonical_event_operation_key
+from .agent_delegate_policy import revision_has_new_delegate_policy
 from .agent_dialogue_answer import (
     AgentDialogueAnswerError,
     build_agent_dialogue_question_contract,
@@ -105,11 +104,18 @@ _AGENT_RUN_USAGE_FIELDS = (
     "reasoning_tokens",
     "cached_tokens",
     "total_tokens",
+    "cost_micros",
 )
 _RESOURCE_MUTATION_TOOL_NAMES = frozenset(
     (*TASK_MUTATION_OPERATIONS, *DOCS_MUTATION_OPERATIONS)
 )
 _PREPROVIDER_SAFE_ERROR_CODE = "agent_dialogue_provider_not_started"
+
+
+def _generic_agent_dialogue_revision(revision: Any) -> bool:
+    """Whether a pinned revision carries both optional P2 policy columns."""
+
+    return revision_has_new_delegate_policy(revision)
 
 
 @dataclass(frozen=True)
@@ -286,7 +292,7 @@ def _normalized_agent_run_usage(value: Any) -> dict[str, Any] | None:
         usage["output_includes_reasoning"] = value[
             "output_includes_reasoning"
         ]
-    if value.get("total_tokens_source") in {"reported", "derived"}:
+    if value.get("total_tokens_source") in {"reported", "derived", "mixed"}:
         usage["total_tokens_source"] = value["total_tokens_source"]
     reasoning_is_separate = not bool(
         usage.get("output_includes_reasoning", False)
@@ -325,10 +331,15 @@ def _merge_agent_run_usage(
         merged["output_includes_reasoning"] = left_flag
     left_source = left.get("total_tokens_source")
     right_source = right.get("total_tokens_source")
-    if left_source == right_source and left_source in {"reported", "derived"}:
-        merged["total_tokens_source"] = left_source
-    elif right_source in {"reported", "derived"}:
+    usage_sources = {"reported", "derived", "mixed"}
+    if left_source in usage_sources and right_source in usage_sources:
+        merged["total_tokens_source"] = (
+            left_source if left_source == right_source else "mixed"
+        )
+    elif right_source in usage_sources:
         merged["total_tokens_source"] = right_source
+    elif left_source in usage_sources:
+        merged["total_tokens_source"] = left_source
     return merged
 
 
@@ -341,8 +352,14 @@ def dispatch_client_message_key(client_message_id: str) -> str:
         raise ValueError("client_message_id is too long")
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-AGENT_TEAM_TOOL_SUBAGENTS = {
+_LEGACY_HISTORY_TOOL_SUBAGENTS = {
     "agent_team_delegate": "agent_team",
+}
+
+_LEGACY_HISTORY_SUBAGENT_LABELS = {
+    "agent_team": "Agent Team",
+    "story_writer": "執筆",
+    "story_import": "Story取り込み",
 }
 
 # Read-only history compatibility.  These names are never registered by the
@@ -414,6 +431,32 @@ _STATUS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 _STATUS_LOCKS_GUARD = threading.Lock()
 
 
+class _RunStatusDeadlock(Exception):
+    """A Run status transaction lost a database deadlock and may be retried."""
+
+
+def _is_database_deadlock(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if (
+            getattr(current, "sqlstate", None) == "40P01"
+            or type(current).__name__ == "DeadlockDetectedError"
+        ):
+            return True
+        pending.extend(
+            [getattr(current, "orig", None), current.__cause__, current.__context__]
+        )
+    return False
+
+
+_RUN_STATUS_DEADLOCK_ATTEMPTS = 4
+
+
 def _status_lock(run_id: uuid.UUID) -> asyncio.Lock:
     """Serialize same-run status transitions in one event loop."""
 
@@ -466,55 +509,18 @@ def _validate_typed_agent_actor(
             raise ValueError("Agent IDs must not be stored in user_id")
     if not acting_subagent_id:
         return
-    normalized = str(acting_subagent_id).strip()
-    known_subagent_ids = set(AGENT_TEAM_SUBAGENT_CATALOG)
-    if config is not None:
-        try:
-            from .agent_team_v3 import agent_team_v3_subagents
-
-            known_subagent_ids.update(
-                str(item.get("subagent_id"))
-                for item in agent_team_v3_subagents(config)
-                if isinstance(item, Mapping) and item.get("subagent_id")
-            )
-        except Exception:
-            pass
-    if normalized not in known_subagent_ids:
-        raise ValueError("unknown acting_subagent_id")
-    # Historical human/chat runs may carry a specialist marker without a
-    # typed AgentRevision.  Preserve that compatibility path; the strict
-    # revision/team binding applies whenever an autonomous Agent identity is
-    # present.
+    # ``acting_subagent_id`` is retained as an immutable historical run
+    # marker. New Agent runs use v2 role/tool policy and cannot start through
+    # the retired Team/Subagent execution selector.
     if agent_id is None:
         return
     if agent_revision is None:
         raise ValueError("acting_subagent_id requires an exact AgentRevision")
-    allowed = {
-        str(item).strip()
-        for item in (getattr(agent_revision, "allowed_subagent_ids", None) or [])
-        if str(item).strip()
-    }
-    team_id = str(getattr(agent_revision, "agent_team_id", "") or "")
-    team = AGENT_TEAM_DEFAULT_TEAMS.get(team_id) or {}
-    if config is not None:
-        try:
-            from .agent_team_v3 import agent_team_v3_teams
+    from .agent_revision_v2 import revision_v2_fields_present
 
-            configured_teams = {
-                str(item.get("team_id")): item
-                for item in agent_team_v3_teams(config)
-                if isinstance(item, Mapping) and item.get("team_id")
-            }
-            team = configured_teams.get(team_id) or team
-        except Exception:
-            # An unavailable/malformed optional config must not broaden the
-            # default Team membership.
-            pass
-    team_members = {
-        str(item).strip() for item in (team.get("subagent_ids") or []) if str(item).strip()
-    }
-    if normalized not in allowed or normalized not in team_members:
-        raise ValueError("acting_subagent_id is not allowed by the pinned AgentRevision")
+    if not revision_v2_fields_present(agent_revision):
+        raise ValueError("acting_subagent_id requires a current AgentRevision v2 route")
+    raise ValueError("acting_subagent_id is reserved for historical AgentRun records")
 
 
 def _validate_manifest_bindings(
@@ -573,22 +579,11 @@ async def _pin_session_agent_binding(
     requested_agent_id: str | None = None,
     requested_revision_id: str | None = None,
     config: Any | None = None,
-    execution_profile_id: str | None = None,
 ) -> tuple[uuid.UUID | None, uuid.UUID | None, Any | None]:
-    """Create one exact immutable turn snapshot in the caller transaction.
-
-    ``execution_profile_id`` (``None`` = revision default) is the optional
-    server-validated runtime selection for this turn only.
-    """
+    """Create one exact immutable P2 turn snapshot in the caller transaction."""
 
     canonical_agent_id = getattr(conversation, "agent_id", None)
     if canonical_agent_id is None:
-        if execution_profile_id is not None:
-            # A runtime selection needs a canonical Agent; never ignore it.
-            raise AgentChatAdmissionError(
-                "ExecutionProfile selection requires a session Agent",
-                code="agent_execution_profile_unavailable",
-            )
         if requested_agent_id:
             raise DispatchConflictError(
                 "session Agent binding is required for chat execution",
@@ -648,6 +643,19 @@ async def _pin_session_agent_binding(
                 code="agent_permission_denied",
             )
 
+    allow_pinned_revision = False
+    if (requested_revision_id and isinstance(conversation.context, Mapping)
+            and conversation.context.get("team_graph_dispatch") is True):
+        dialogue = await session.scalar(select(AgentDialogue).where(
+            AgentDialogue.worker_session_id == conversation.id,
+            AgentDialogue.owner_user_id == actor_uuid,
+            AgentDialogue.worker_agent_id == agent.id,
+            AgentDialogue.worker_agent_revision_id == parse_uuid(requested_revision_id)))
+        auth = dialogue.authorization_json if dialogue is not None else None
+        if isinstance(auth, Mapping) and isinstance(auth.get("team_graph"), Mapping):
+            digest = hashlib.sha256(json.dumps(auth, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode()).hexdigest()
+            allow_pinned_revision = digest == dialogue.authorization_hash
     binding = await pin_conversation_agent_turn(
         db_session=session,
         session_id=conversation.id,
@@ -656,7 +664,7 @@ async def _pin_session_agent_binding(
         actor_user_id=actor_uuid,
         actor_role=actor_role,
         config=config,
-        **({} if execution_profile_id is None else {"execution_profile_id": execution_profile_id}),
+        allow_pinned_revision=allow_pinned_revision,
     )
     if not getattr(binding, "binding_id", None) or not getattr(binding, "snapshot_hash", None):
         raise AgentChatAdmissionError(
@@ -670,17 +678,6 @@ async def _pin_session_agent_binding(
             "conversation Agent binding snapshot is incomplete",
             code="agent_binding_changed",
         )
-    if execution_profile_id is not None:
-        selection = getattr(binding, "execution_selection", None)
-        if (
-            selection is None
-            or not selection.is_explicit
-            or selection.selected_execution_profile_id != execution_profile_id
-        ):
-            raise AgentChatAdmissionError(
-                "conversation Agent binding selection is inconsistent",
-                code="agent_binding_changed",
-            )
     return resolved_agent, resolved_revision, binding
 
 
@@ -1132,6 +1129,7 @@ _EXECUTION_MANIFEST_ALLOWED_KEYS = frozenset(
         "source",
         "route_snapshot",
         "execution_selection",
+        "software_graph",
     }
 )
 _EXECUTION_MANIFEST_SECRET_MARKERS = frozenset(
@@ -1156,6 +1154,12 @@ def _bounded_execution_manifest(value: Any) -> dict[str, Any] | None:
         if key not in _EXECUTION_MANIFEST_ALLOWED_KEYS:
             continue
         if any(marker in key.casefold() for marker in _EXECUTION_MANIFEST_SECRET_MARKERS):
+            continue
+        if key == "software_graph":
+            from .agent_work_runtime import _safe_json
+            if not isinstance(raw_item, dict) or _safe_json(raw_item) != raw_item:
+                return None
+            clean[key] = raw_item
             continue
         if key == "route_snapshot":
             from .agent_model_routing import safe_route_snapshot
@@ -1210,7 +1214,7 @@ def _bounded_execution_manifest(value: Any) -> dict[str, Any] | None:
                         or any(marker in item.casefold() for marker in _EXECUTION_MANIFEST_SECRET_MARKERS)
                     ):
                         return None
-                    if key == "capabilities" and item not in AGENT_TEAM_CAPABILITY_CATALOG:
+                    if key == "capabilities" and item not in AGENT_CAPABILITY_CATALOG:
                         return None
                 values.append(item)
             clean[key] = list(dict.fromkeys(values))
@@ -2511,12 +2515,12 @@ def _actor_for_tool(tool_name: str) -> dict[str, str | None]:
             "actor_key": "spotify",
             "actor_label": "Spotify連携",
         }
-    subagent_id = AGENT_TEAM_TOOL_SUBAGENTS.get(clean_name)
+    subagent_id = _LEGACY_HISTORY_TOOL_SUBAGENTS.get(clean_name)
     if subagent_id:
         return {
             "actor_type": "agent_team",
             "actor_key": subagent_id,
-            "actor_label": AGENT_TEAM_SUBAGENT_CATALOG.get(subagent_id, {}).get("name", subagent_id),
+            "actor_label": _LEGACY_HISTORY_SUBAGENT_LABELS.get(subagent_id, subagent_id),
         }
     if clean_name:
         return {
@@ -2550,7 +2554,7 @@ def _actor_for_event(run: AgentRun, event: AgentRunEvent) -> dict[str, str | Non
             "actor_label": str(
                 payload.get("agent_label")
                 or payload.get("actor_label")
-                or AGENT_TEAM_SUBAGENT_CATALOG.get(actor_key, {}).get("name", actor_key)
+                or _LEGACY_HISTORY_SUBAGENT_LABELS.get(actor_key, actor_key)
             ),
         }
 
@@ -3279,6 +3283,70 @@ class AgentRunService:
         self._db_manager = db_manager
         self.config = config
 
+    async def _delegation_return_source(self, session: Any, dialogue: Any, delivery: Any, message: Any) -> Any | None:
+        """Reprove a host return; unmarked messages retain ordinary chat rules."""
+        metadata = getattr(message, "message_metadata", None)
+        if not isinstance(metadata, Mapping) or not ({"agent_delegation_return", "agent_delegation_outcome", "agent_team_media_return", "agent_team_media_outcome"} & metadata.keys()):
+            return None
+        from .agent_delegation_dialogue_return import (
+            original_source_run_work, validate_delegation_return_message,
+        )
+        from .agent_delegation_service import AgentDelegationService, DelegationError
+        from ..memory.models import AgentDelegation
+
+        try:
+            if "agent_team_media_outcome" in metadata:
+                from .agent_team_media_terminal_outcome import validate_team_media_outcome_message
+                proof = await validate_team_media_outcome_message(
+                    session, AgentDelegationService(self._get_db_manager(), config=self.config),
+                    dialogue, delivery, message, allow_acked_replay=True, config=self.config)
+                source = proof.as_dict()["source"]
+                run = await session.get(AgentRun, parse_uuid(source["source_run_id"]))
+                work = await session.get(AgentWorkItem, parse_uuid(source["source_work_item_id"]))
+                if run is None or work is None:
+                    raise DelegationError("team_media_outcome_invalid", 403)
+                return run, work
+            if "agent_team_media_return" in metadata:
+                from .agent_team_media_dialogue_return import validate_team_media_return_message
+                proof = await validate_team_media_return_message(
+                    session, AgentDelegationService(self._get_db_manager(), config=self.config),
+                    dialogue, delivery, message, allow_acked_replay=True, config=self.config)
+                source = proof.as_dict()["source"]
+                run = await session.get(AgentRun, parse_uuid(source["source_run_id"]))
+                work = await session.get(AgentWorkItem, parse_uuid(source["source_work_item_id"]))
+                if run is None or work is None:
+                    raise DelegationError("team_media_return_invalid", 403)
+                return run, work
+            from .agent_delegation_terminal_outcome import validate_delegation_outcome_message
+
+            validator = (validate_delegation_outcome_message if "agent_delegation_outcome" in metadata
+                         else validate_delegation_return_message)
+            projection = await validator(
+                session, AgentDelegationService(self._get_db_manager(), config=self.config),
+                dialogue, delivery, message,
+            )
+            order = await session.get(AgentDelegation, parse_uuid(projection.as_dict()["order_id"]))
+            if order is None:
+                raise DelegationError("delegation_return_invalid", 403)
+            return await original_source_run_work(session, order)
+        except DelegationError as exc:
+            raise AgentChatAdmissionError(
+                "delegation return proof is invalid", code="dialogue_source_invalid"
+            ) from exc
+
+    async def _proved_dialogue_worker_source(self, session: Any, dialogue: Any, delivery: Any) -> bool:
+        """Apply the transport's existing P5 terminal-worker proof."""
+        authorization = getattr(dialogue, "authorization_json", None)
+        if (not isinstance(authorization, Mapping)
+                or not isinstance(authorization.get("delegate_worker"), Mapping)
+                or str(getattr(delivery, "kind", "") or "").casefold() not in {"event", "response"}):
+            return False
+        from .agent_dialogue_transport import AgentDialogueTransport
+
+        transport = AgentDialogueTransport(self._get_db_manager(), config=self.config)
+        await transport._validate_delivery_source(session, dialogue, delivery)
+        return True
+
     def _get_db_manager(self) -> Any:
         return self._db_manager or get_database_manager()
 
@@ -3537,6 +3605,14 @@ class AgentRunService:
         cached_rate = highest_per_1k("cached_input")
         if cached_rate is not None:
             card["cached_per_1k"] = cached_rate
+        if normalized_provider.lower() == "openai" and normalized_model.lower() in {"gpt-5.6-sol", "gpt-5.6"}:
+            from src.llm.image_budget import serialize_image_price_rule
+
+            try:
+                card["image_price"] = serialize_image_price_rule(rule, normalized_model)
+            except ValueError:
+                # Old/text-only cards remain usable; image requests fail closed.
+                pass
         return card
 
     async def _admit_root_dialogue_budget_in_session(
@@ -4300,6 +4376,49 @@ class AgentRunService:
                 include_body=include_body,
                 _seen_runs=seen_runs,
             )
+        original_run_id = parse_uuid(getattr(dialogue, "human_run_id", None))
+        if canonical_human_message and original_run_id is not None and original_run_id != source_run_id:
+            root_session = await db_session.get(ConversationSession, session_uuid)
+            if (
+                owner_uuid != parse_uuid(getattr(dialogue, "owner_user_id", None))
+                or session_uuid != parse_uuid(getattr(dialogue, "root_session_id", None))
+                or parse_uuid(getattr(source_run, "agent_id", None))
+                != parse_uuid(getattr(dialogue, "root_agent_id", None))
+                or parse_uuid(getattr(dialogue, "root_agent_id", None)) is None
+                or root_session is None
+                or parse_uuid(getattr(root_session, "user_id", None)) != owner_uuid
+                or (getattr(root_session, "agent_id", None) is not None
+                    and parse_uuid(root_session.agent_id) != parse_uuid(dialogue.root_agent_id))
+            ):
+                raise AgentChatAdmissionError(
+                    "dialogue Root Human source does not match its owner or Root",
+                    code="dialogue_source_human_anchor_invalid",
+                )
+            original_run = await db_session.get(AgentRun, original_run_id)
+            original_work_id = parse_uuid(getattr(dialogue, "human_work_item_id", None))
+            original_work = (
+                await db_session.get(AgentWorkItem, original_work_id)
+                if original_work_id is not None else None
+            )
+            if (original_run is None
+                or parse_uuid(getattr(original_run, "user_id", None)) != owner_uuid
+                or parse_uuid(getattr(original_run, "trigger_message_id", None))
+                != parse_uuid(getattr(dialogue, "human_message_id", None))
+                or parse_uuid(getattr(original_run, "work_item_id", None)) != original_work_id
+                or (original_work_id is not None and original_work is None)):
+                raise AgentChatAdmissionError(
+                    "dialogue original Human authority reference changed",
+                    code="dialogue_source_human_anchor_changed",
+                )
+            anchor = await self._build_dialogue_human_anchor(
+                db_session, source_run=original_run, source_work=original_work,
+                include_body=include_body, dialogue=dialogue, _seen_runs=seen_runs,
+            )
+            current = await self._build_dialogue_human_anchor(
+                db_session, source_run=source_run, source_work=source_work,
+                include_body=True, dialogue=None, _seen_runs=_seen_runs,
+            )
+            return {**anchor, "current_refs": current["refs"], "current_body": current["body"]}
         if not canonical_human_message:
             # A receipt-triggered Agent message is evidence of an earlier
             # admitted Delivery.  Follow its Dialogue/original Human Run
@@ -4792,10 +4911,57 @@ class AgentRunService:
                 raise AgentChatAdmissionError("receiver session binding mismatch", code="dialogue_receiver_session_mismatch")
             if str(receiver_session.user_id or "") != str(owner_uuid):
                 raise AgentChatAdmissionError("receiver session owner mismatch", code="dialogue_receiver_owner_mismatch")
-            # AoiDots' root is deliberately projectless.  A validated hint is
-            # stored on the dialogue/work projection only.
-            if root_session.project_id is not None:
+            generic_agent_dialogue = _generic_agent_dialogue_revision(anchor_revision)
+            if root_session.project_id is not None and not generic_agent_dialogue:
                 raise AgentChatAdmissionError("dialogue root session must be projectless", code="dialogue_root_project_forbidden")
+            if generic_agent_dialogue:
+                if parse_uuid(root_session.project_id) != parse_uuid(source_run.project_id):
+                    raise AgentChatAdmissionError(
+                        "source Run and Agent session Project binding mismatch",
+                        code="dialogue_source_project_mismatch",
+                    )
+                source_binding = (
+                    await db_session.execute(
+                        select(AgentExecutionBinding)
+                        .where(
+                            AgentExecutionBinding.session_id == source_session_uuid,
+                            AgentExecutionBinding.agent_id == source_agent_uuid,
+                            AgentExecutionBinding.agent_revision_id == source_revision_uuid,
+                        )
+                        .order_by(AgentExecutionBinding.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if source_binding is None:
+                    raise AgentChatAdmissionError(
+                        "exact source Agent binding is unavailable",
+                        code="dialogue_source_binding_invalid",
+                    )
+                if root_session.project_id is not None:
+                    if not await ProjectRepository.has_permission(
+                        db_session,
+                        root_session.project_id,
+                        owner_uuid,
+                        "read",
+                    ):
+                        raise AgentChatAdmissionError(
+                            "source Agent Project access was revoked",
+                            code="dialogue_source_project_access_denied",
+                        )
+                    from .agent_authority import AgentAuthorityResolver
+
+                    source_authority = await AgentAuthorityResolver(
+                        config=self.config
+                    ).resolve(
+                        agent_id=source_agent_uuid,
+                        revision_id=source_revision_uuid,
+                        project_id=root_session.project_id,
+                    )
+                    if not source_authority.allowed:
+                        raise AgentChatAdmissionError(
+                            "source Agent Project grant is no longer valid",
+                            code="dialogue_source_project_grant_denied",
+                        )
             await self._validate_dialogue_project_hint(
                 db_session,
                 project_id=requested_project_uuid,
@@ -5147,6 +5313,15 @@ class AgentRunService:
                         value = server_rate_card.get(key)
                         if value not in (None, ""):
                             safe_rate_card[key] = str(value)[:160]
+                    if "image_price" in server_rate_card:
+                        from src.llm.image_budget import validate_image_price_projection
+
+                        try:
+                            safe_rate_card["image_price"] = validate_image_price_projection(
+                                server_rate_card["image_price"]
+                            )
+                        except ValueError:
+                            pass
                     if "input_per_1k" in safe_rate_card and "output_per_1k" in safe_rate_card:
                         budget_projection["server_rate_card"] = safe_rate_card
                 # A deployment may pin a smaller provider tool-loop budget
@@ -5348,6 +5523,7 @@ class AgentRunService:
         def value(row: Any, name: str, default: Any = None) -> Any:
             return row.get(name, default) if isinstance(row, Mapping) else getattr(row, name, default)
 
+        authorization = value(dialogue, "authorization_json")
         dialogue_id = parse_uuid(value(dialogue, "id"))
         delivery_id = parse_uuid(value(delivery, "id"))
         source_session_id = parse_uuid(value(delivery, "source_session_id"))
@@ -5451,6 +5627,17 @@ class AgentRunService:
             if isinstance(getattr(dialogue, "authorization_json", None), Mapping)
             else {}
         )
+        graph = authorization.get("team_graph")
+        if isinstance(graph, Mapping):
+            authorization_digest = hashlib.sha256(json.dumps(
+                authorization, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest()
+            if authorization_digest != getattr(dialogue, "authorization_hash", None):
+                raise AgentChatAdmissionError("dialogue authorization invalid", code="dialogue_authorization_invalid")
+            refs["team_graph_ref"] = dict(graph.get("ref") or {})
+            refs["team_graph_compiled"] = dict(graph.get("compiled") or {})
+            refs["team_graph_execution_kind"] = graph.get("execution_kind", "generic")
+            refs["case_key"] = graph.get("case_key")
         causal_chain = (
             authorization.get("causal_chain")
             if isinstance(authorization.get("causal_chain"), Mapping)
@@ -5500,10 +5687,18 @@ class AgentRunService:
                     code="dialogue_project_hint_invalid",
                 )
             refs["context_project_hint_id"] = str(receiver_context_project_hint_id)
+        return_origin = await self._delegation_return_source(
+            session, dialogue, delivery, source_message
+        )
+        p5_source = (
+            await self._proved_dialogue_worker_source(session, dialogue, delivery)
+            if return_origin is None else False
+        )
+        anchor_run, anchor_work = return_origin or (source_run, source_work)
         source_human_anchor = await self._build_dialogue_human_anchor(
             session,
-            source_run=source_run,
-            source_work=source_work,
+            source_run=anchor_run,
+            source_work=anchor_work,
             include_body=False,
             dialogue=dialogue,
         )
@@ -5512,8 +5707,8 @@ class AgentRunService:
             "body_digest": source_human_anchor["body_digest"],
         }
         source_run_dialogue_metadata = (
-            getattr(source_run, "run_metadata", {}).get("agent_dialogue")
-            if isinstance(getattr(source_run, "run_metadata", None), Mapping)
+            getattr(anchor_run, "run_metadata", {}).get("agent_dialogue")
+            if isinstance(getattr(anchor_run, "run_metadata", None), Mapping)
             else None
         )
         if isinstance(source_run_dialogue_metadata, Mapping):
@@ -5580,7 +5775,21 @@ class AgentRunService:
                 if answer_uuid is not None
                 else None
             )
-            if str(value(delivery, "kind") or "").casefold() == "event":
+            if str(value(delivery, "kind") or "").casefold() == "event" and return_origin is not None:
+                # The host event is caused by the proved origin's incoming
+                # Delivery, not by an AgentDialogueInput or producer Chat Run.
+                origin_metadata = anchor_run.run_metadata or {}
+                origin_dialogue = origin_metadata.get("agent_dialogue") or {}
+                incoming_id = parse_uuid(origin_dialogue.get("delivery_id"))
+                if incoming_id is None or incoming_id != input_uuid:
+                    raise AgentChatAdmissionError(
+                        "delegation return causation does not match its origin",
+                        code="dialogue_event_predecessor_provenance_invalid",
+                    )
+                input_row = None
+                answer_uuid = None
+                answer_message = None
+            elif str(value(delivery, "kind") or "").casefold() == "event" and not p5_source:
                 causation = value(delivery, "causation_id")
                 if causation in (None, ""):
                     raise AgentChatAdmissionError(
@@ -5700,8 +5909,12 @@ class AgentRunService:
                         == dialogue.worker_agent_revision_id
                         and previous_delivery.receiver_run_id == source_run_id
                         and previous_delivery.receiver_work_item_id == source_work_id
-                        and previous_delivery.receiver_message_id
-                        == source_run.trigger_message_id
+                        and (previous_delivery.receiver_message_id == source_run.trigger_message_id
+                             or (str(previous_delivery.state or "").casefold() in {"acked", "failed"}
+                                 and previous_delivery.receiver_message_id == source_message_id
+                                 and isinstance(source_run.run_metadata, Mapping)
+                                 and isinstance(source_run.run_metadata.get("agent_dialogue"), Mapping)
+                                 and str(source_run.run_metadata["agent_dialogue"].get("delivery_id")) == str(previous_delivery.id)))
                     ) or (
                         previous_kind == "response"
                         and previous_delivery.source_session_id
@@ -6102,6 +6315,105 @@ class AgentRunService:
         sender_name = str(
             getattr(source_message, "sender_display_name", None) or "Agent"
         )[:160]
+        if "delegate_worker" in authorization and str(value(delivery, "kind") or "").casefold() in {"request", "control"}:
+            from .cli_development_sessions import CLIDevelopmentSessionService
+            from .delegate_worker_runtime import DelegateWorkerRuntime
+
+            marker = authorization["delegate_worker"]
+            if not isinstance(marker, Mapping):
+                raise AgentChatAdmissionError("invalid worker authorization", code="worker_scope_authorization_invalid")
+            previous_attempts = await session.scalar(select(func.count(func.distinct(AgentDialogueDelivery.receiver_run_id))).where(
+                AgentDialogueDelivery.dialogue_id == dialogue_id,
+                AgentDialogueDelivery.kind.in_(("request", "control")),
+                AgentDialogueDelivery.receiver_run_id.is_not(None),
+                AgentDialogueDelivery.id != delivery_id,
+            ))
+            attempt_number = int(previous_attempts or 0) + 1
+            client_key = f"agent-dialogue:{delivery_id}"
+            trigger = (await session.execute(select(ConversationMessage).where(
+                ConversationMessage.session_id == receiver_session_id,
+                ConversationMessage.client_message_id == client_key,
+            ).with_for_update())).scalars().first()
+            created = trigger is None
+            if created:
+                now = datetime.utcnow()
+                trigger = ConversationMessage(
+                    id=uuid.uuid4(), session_id=receiver_session_id, role="user",
+                    content=str(content), client_message_id=client_key,
+                    sender_type="agent", sender_id=str(source_agent_id),
+                    sender_display_name=sender_name,
+                    message_metadata={"agent_dialogue": _jsonable(refs)},
+                    created_at=now, updated_at=now,
+                    is_active_branch=True, branch_index=0,
+                )
+                session.add(trigger)
+                await session.execute(update(ConversationSession).where(
+                    ConversationSession.id == receiver_session_id
+                ).values(message_count=ConversationSession.message_count + 1,
+                         last_activity=_monotonic_activity(now)))
+                await session.flush()
+            elif (trigger.content != str(content) or trigger.role != "user"
+                  or trigger.sender_type != "agent" or trigger.sender_id != str(source_agent_id)
+                  or (trigger.message_metadata or {}).get("agent_dialogue") != _jsonable(refs)):
+                raise AgentChatAdmissionError("dialogue trigger mismatch", code="dialogue_trigger_mismatch")
+            runtime = DelegateWorkerRuntime(
+                cli_session_service=CLIDevelopmentSessionService(self._get_db_manager(), config=self.config),
+                db_manager=self._get_db_manager(), config=self.config,
+            )
+            result = await runtime.start_session(
+                str(receiver_session_id), dialogue_id=str(dialogue_id), instruction=str(content),
+                budgets=marker.get("budgets"), workspace_scope=marker.get("workspace_scope"),
+                timeout_seconds=marker.get("timeout_seconds"),
+                attempt=attempt_number,
+                _control_revision=(int(value(delivery, "expected_control_revision"))
+                                   if str(value(delivery, "kind")).casefold() == "control" else None),
+                _db_session=session, _trigger_message=trigger,
+            )
+            from .agent_dialogue_budget import (
+                DialogueBudgetError,
+                budget_from_dialogue,
+                get_dialogue_budget_owner,
+                reserve_dialogue_budget,
+            )
+
+            budget_owner = await get_dialogue_budget_owner(session, dialogue, lock=True)
+            owner_budget = budget_from_dialogue(budget_owner)
+            local_budget = budget_from_dialogue(dialogue)
+            def remaining(row: Any, budget: Any, maximum: str, used: str, reserved: str) -> int | None:
+                limit = getattr(budget, maximum)
+                if limit is None:
+                    return None
+                return max(0, int(limit) - int(getattr(row, used, 0) or 0)
+                           - int(getattr(row, reserved, 0) or 0))
+
+            token_values = [v for v in (
+                remaining(budget_owner, owner_budget, "max_tokens", "total_tokens", "reserved_tokens"),
+                remaining(dialogue, local_budget, "max_tokens", "total_tokens", "reserved_tokens"),
+            ) if v is not None]
+            cost_values = [v for v in (
+                remaining(budget_owner, owner_budget, "max_cost_micros", "cost_micros", "reserved_cost_micros"),
+                remaining(dialogue, local_budget, "max_cost_micros", "cost_micros", "reserved_cost_micros"),
+            ) if v is not None]
+            if token_values and min(token_values) <= 0:
+                raise DialogueBudgetError("dialogue token budget exhausted", code="dialogue_token_budget_exhausted")
+            if cost_values and min(cost_values) <= 0:
+                raise DialogueBudgetError("dialogue cost budget exhausted", code="dialogue_cost_budget_exhausted")
+            await reserve_dialogue_budget(
+                session, dialogue_id, turns=1, attempts=1,
+                tokens=min(token_values) if token_values else 0,
+                cost_micros=min(cost_values) if cost_values else 0,
+                reservation_key=f"run:{result['run_id']}", run_id=result["run_id"],
+            )
+            trigger.message_metadata = {
+                **trigger.message_metadata, "agent_run_id": result["run_id"],
+            }
+            await session.flush()
+            return {**result, "receiver_run_id": result["run_id"],
+                    "receiver_work_item_id": result["work_item_id"],
+                    "receiver_message_id": result["message_id"], "created": created,
+                    "parent_run_id": None, "session_id": str(receiver_session_id),
+                    "user_id": str(value(dialogue, "owner_user_id")),
+                    "agent_id": str(receiver_agent_id), "agent_revision_id": str(receiver_revision_id)}
         result, message_id, created = await self.create_or_get_dispatch_turn(
             session_id=str(receiver_session_id),
             client_message_id=(
@@ -6401,7 +6713,10 @@ class AgentRunService:
             # durable failed-Run/blocked-Work question pause is accepted as a
             # settled source, while ordinary mismatched failures remain
             # rejected. Import lazily to avoid the service module cycle.
-            from .agent_dialogue_transport import _run_work_state_matches
+            from .agent_dialogue_transport import (
+                _run_succeeded_work_settling,
+                _run_work_state_matches,
+            )
 
             source_work_settled = (
                 source_run_status in RUN_TERMINAL_STATUSES
@@ -6410,14 +6725,29 @@ class AgentRunService:
                 and not getattr(source_work, "lease_owner", None)
                 and not getattr(source_work, "lease_token", None)
                 and getattr(source_work, "lease_expires_at", None) is None
-            )
+            ) or _run_succeeded_work_settling(source_run, source_work)
+            # An owner control hands its Delivery over beside the Root Run it
+            # created, so that Run's Work may not have been claimed yet.
             source_work_active = (
                 source_work_active_run_id == source_run_identity
                 and source_run_status not in RUN_TERMINAL_STATUSES
-                and source_work_state in {"pending", "claimed", "running"}
-                and source_work_lease_active
+                and (
+                    source_work_state == "pending"
+                    or (
+                        source_work_state in {"claimed", "running"}
+                        and source_work_lease_active
+                    )
+                )
+            )
+            return_origin = await self._delegation_return_source(
+                db_session, dialogue, delivery, source_message
+            ) if source_message is not None else None
+            p5_source = (
+                await self._proved_dialogue_worker_source(db_session, dialogue, delivery)
+                if return_origin is None else False
             )
             if (
+                (return_origin is None and not p5_source and (
                 source_run is None
                 or source_run.session_id != delivery.source_session_id
                 or source_run.agent_id != delivery.source_agent_id
@@ -6446,6 +6776,9 @@ class AgentRunService:
                 or str(source_message.role or "").casefold() != "assistant"
                 or str(source_message.sender_type or "").casefold() != "agent"
                 or parse_uuid(source_message.sender_id) != delivery.source_agent_id
+                ))
+                or parse_uuid(run.user_id) is None
+                or parse_uuid(run.user_id) != dialogue_owner_uuid
                 or source_revision is None
                 or source_revision.agent_id != delivery.source_agent_id
                 or receiver_revision is None
@@ -6466,6 +6799,7 @@ class AgentRunService:
                 or str(message.sender_type or "").casefold() != "agent"
                 or parse_uuid(message.sender_id) != delivery.source_agent_id
                 or message.id != delivery.receiver_message_id
+                or (return_origin is not None and message.content != source_message.content)
             ):
                 raise AgentChatAdmissionError(
                     "dialogue callback Agent sender or receiver binding is invalid",
@@ -6939,6 +7273,11 @@ class AgentRunService:
                 dialogue.owner_user_id,
             )
             root_session = await db_session.get(ConversationSession, run.session_id)
+            root_revision = await db_session.get(
+                AgentRevision,
+                parse_uuid(dialogue.root_agent_revision_id),
+            )
+            generic_agent_dialogue = _generic_agent_dialogue_revision(root_revision)
             if (
                 parse_uuid(run.user_id) != owner_uuid
                 or str(outbox.user_id or "") != str(owner_uuid)
@@ -6948,7 +7287,15 @@ class AgentRunService:
                 or dialogue.root_agent_revision_id != run.agent_revision_id
                 or root_session is None
                 or root_session.deleted_at is not None
-                or root_session.project_id is not None
+                or (
+                    root_session.project_id is not None
+                    and not generic_agent_dialogue
+                )
+                or (
+                    generic_agent_dialogue
+                    and parse_uuid(root_session.project_id)
+                    != parse_uuid(run.project_id)
+                )
                 or parse_uuid(root_session.user_id) != owner_uuid
                 or parse_uuid(root_session.agent_id) != run.agent_id
             ):
@@ -6956,6 +7303,17 @@ class AgentRunService:
                     "dialogue Human root owner or Agent binding changed",
                     code="dialogue_human_binding_invalid",
                 )
+            if generic_agent_dialogue and root_session.project_id is not None:
+                if not await ProjectRepository.has_permission(
+                    db_session,
+                    root_session.project_id,
+                    owner_uuid,
+                    "read",
+                ):
+                    raise AgentChatAdmissionError(
+                        "generic Agent Dialogue Project access was revoked",
+                        code="dialogue_source_project_access_denied",
+                    )
             stored_run_marker = (
                 run.run_metadata.get("agent_dialogue")
                 if isinstance(run.run_metadata, Mapping)
@@ -7551,8 +7909,7 @@ class AgentRunService:
                     from_state=old_state,
                     to_state="blocked",
                     actor_kind="service",
-                    actor_id="aoitalk.dialogue",
-                    actor_service_key="aoitalk.dialogue",
+                    actor_service_key="aoitalk.system",
                     agent_run_id=run_uuid,
                     safe_error_code="dialogue_input_pending",
                     message="dialogue input pending",
@@ -8173,10 +8530,31 @@ class AgentRunService:
                 .with_for_update()
             )
         ).scalars().first()
-        if root_session is None or root_session.project_id is not None:
+        root_revision = (
+            await db_session.get(
+                AgentRevision,
+                parse_uuid(dialogue.root_agent_revision_id),
+            )
+            if root_session is not None
+            else None
+        )
+        generic_agent_dialogue = _generic_agent_dialogue_revision(root_revision)
+        if root_session is None or (
+            root_session.project_id is not None and not generic_agent_dialogue
+        ):
             raise AgentChatAdmissionError(
-                "dialogue root session must remain projectless",
+                "dialogue root session project scope is invalid",
                 code="dialogue_root_project_forbidden",
+            )
+        if root_session.project_id is not None and not await ProjectRepository.has_permission(
+            db_session,
+            root_session.project_id,
+            owner_uuid,
+            "read",
+        ):
+            raise AgentChatAdmissionError(
+                "generic Agent Dialogue Project access was revoked",
+                code="dialogue_source_project_access_denied",
             )
         root_agent_uuid = parse_uuid(root_session.agent_id)
         if root_agent_uuid is None or root_agent_uuid != parse_uuid(dialogue.root_agent_id):
@@ -8738,14 +9116,38 @@ class AgentRunService:
                         .with_for_update()
                     )
                 ).scalars().first()
+                root_revision = (
+                    await db_session.get(
+                        AgentRevision,
+                        parse_uuid(dialogue.root_agent_revision_id),
+                    )
+                    if root_session is not None
+                    else None
+                )
+                generic_agent_dialogue = _generic_agent_dialogue_revision(
+                    root_revision
+                )
                 if (
                     root_session is None
                     or parse_uuid(root_session.agent_id) != actor_agent_uuid
-                    or root_session.project_id is not None
+                    or (
+                        root_session.project_id is not None
+                        and not generic_agent_dialogue
+                    )
                 ):
                     raise AgentChatAdmissionError(
                         "root Agent session binding is invalid",
                         code="dialogue_control_agent_binding_invalid",
+                    )
+                if root_session.project_id is not None and not await ProjectRepository.has_permission(
+                    db_session,
+                    root_session.project_id,
+                    owner_uuid,
+                    "read",
+                ):
+                    raise AgentChatAdmissionError(
+                        "generic Agent Dialogue Project access was revoked",
+                        code="dialogue_source_project_access_denied",
                     )
                 actor_source_run = (
                     await db_session.execute(
@@ -9226,6 +9628,20 @@ class AgentRunService:
                         control_delivery,
                         now,
                     )
+            if normalized_action in {"stop", "cancel"}:
+                from .agent_dialogue_transport import AgentDialogueTransport
+
+                terminal_transport = AgentDialogueTransport(
+                    self._get_db_manager(),
+                    dispatch_bridge=self,
+                    config=self.config,
+                    worker_id="dialogue-control",
+                )
+                await terminal_transport.supersede_terminal_dialogue_deliveries(
+                    dialogue_id=str(dialogue.id),
+                    terminal_status="cancelled",
+                    session=db_session,
+                )
             await db_session.commit()
             return {
                 "dialogue_id": str(dialogue_uuid),
@@ -9805,6 +10221,46 @@ class AgentRunService:
             )
         return receipts
 
+    async def _issue_default_routing_snapshot(self, session, run, conversation):
+        """Issue server-owned routing metadata only for a newly created Root candidate."""
+        from .default_team_graph_service import RUN_SNAPSHOT_KEY
+
+        metadata = dict(run.run_metadata or {})
+        metadata.pop(RUN_SNAPSHOT_KEY, None)
+        run.run_metadata = metadata
+        if not (run.run_type == "chat_turn" and run.parent_run_id is None
+                and run.project_id is None and run.app_id is None and run.app_target_id is None
+                and run.task_id is None and run.acting_subagent_id is None
+                and metadata.get("dispatch_source") in {"conversation_dispatch", "server_fallback"}
+                and run.user_id and run.session_id and run.agent_id and run.agent_revision_id
+                and conversation is not None and conversation.project_id is None
+                and not conversation.is_group_chat
+                and str(conversation.user_id) == str(run.user_id)
+                and conversation.agent_id == run.agent_id):
+            return
+
+        from ..memory.models import AgentPrivateRoot
+        from .default_team_graph_service import DefaultTeamGraphService, encode_run_snapshot
+
+        context = None
+        try:
+            async with session.begin_nested():
+                root = await session.scalar(select(AgentPrivateRoot.id).where(
+                    AgentPrivateRoot.owner_user_id == parse_uuid(run.user_id),
+                    AgentPrivateRoot.session_id == run.session_id,
+                    AgentPrivateRoot.agent_id == run.agent_id,
+                    AgentPrivateRoot.purpose == "aoidots",
+                    AgentPrivateRoot.state == "active",
+                ))
+                if root is None:
+                    return
+                context = await DefaultTeamGraphService(None).get_in_session(
+                    session, owner_user_id=run.user_id, root_session_id=run.session_id
+                )
+        except Exception:
+            pass
+        run.run_metadata = {**metadata, RUN_SNAPSHOT_KEY: encode_run_snapshot(run, context)}
+
     async def create_run(
         self,
         *,
@@ -9838,8 +10294,9 @@ class AgentRunService:
         previous_attempt_run_id: str | None = None,
         execution_manifest: Dict[str, Any] | None = None,
         execution_manifest_hash: str | None = None,
+        db_session: Any = None,
     ) -> Dict[str, Any]:
-        session = await self._session()
+        session = db_session if db_session is not None else await self._session()
         try:
             now = datetime.utcnow()
             context_hint_uuid = parse_uuid(context_project_hint_id)
@@ -10091,6 +10548,10 @@ class AgentRunService:
             if context_hint_uuid is not None:
                 metadata = dict(metadata or {})
                 metadata["context_project_hint_id"] = str(context_hint_uuid)
+            from .default_team_graph_service import RUN_SNAPSHOT_KEY
+
+            metadata = dict(metadata or {})
+            metadata.pop(RUN_SNAPSHOT_KEY, None)
             safe_objective = str(objective or "")
             safe_title = str(title or "")[:255]
             if _is_cloud_advisor_run_type(normalized_run_type):
@@ -10174,6 +10635,7 @@ class AgentRunService:
                 client_message_id=client_message_id,
                 metadata=metadata,
             )
+            await self._issue_default_routing_snapshot(session, run, locked_conversation)
             if run.root_run_id is None:
                 run.root_run_id = run.id
             session.add(
@@ -10187,10 +10649,15 @@ class AgentRunService:
                     created_at=now,
                 )
             )
-            await session.commit()
-            await session.refresh(run)
+            if db_session is None:
+                await session.commit()
+                await session.refresh(run)
+            else:
+                await session.flush()
             return run.to_dict()
         except IntegrityError as exc:
+            if db_session is not None:
+                raise
             await session.rollback()
             # The partial unique index is the cross-process idempotency fence
             # for one WorkItem attempt. If another worker committed first,
@@ -10215,12 +10682,15 @@ class AgentRunService:
                 logger.exception("Failed to create agent run")
             raise
         except Exception as exc:
+            if db_session is not None:
+                raise
             await session.rollback()
             if not (client_message_id and isinstance(exc, IntegrityError)):
                 logger.exception("Failed to create agent run")
             raise
         finally:
-            await session.close()
+            if db_session is None:
+                await session.close()
 
     async def get_dispatch_run(
         self,
@@ -10323,7 +10793,6 @@ class AgentRunService:
         execution_manifest: Dict[str, Any] | None = None,
         execution_manifest_hash: str | None = None,
         session: Any | None = None,
-        execution_profile_id: str | None = None,
     ) -> tuple[Dict[str, Any], str, bool]:
         """Create message, run and durable outbox in one transaction.
 
@@ -10403,7 +10872,6 @@ class AgentRunService:
                     requested_agent_id=agent_id,
                     requested_revision_id=agent_revision_id,
                     config=self.config,
-                    execution_profile_id=execution_profile_id,
                 )
                 if resolved_agent_uuid is not None:
                     agent_id = str(resolved_agent_uuid)
@@ -10681,7 +11149,10 @@ class AgentRunService:
                 "persisted_user_message_id": str(message_uuid),
                 "skip_user_persistence": True,
             }
+            from .default_team_graph_service import RUN_SNAPSHOT_KEY
+
             run_metadata = dict(metadata or {})
+            run_metadata.pop(RUN_SNAPSHOT_KEY, None)
             run_values = dict(
                 id=run_id,
                 root_run_id=run_id,
@@ -10786,6 +11257,7 @@ class AgentRunService:
             else:
                 outbox.status = "cancelled"
                 outbox.updated_at = now
+            await self._issue_default_routing_snapshot(db_session, run, conversation)
             db_session.add_all(
                 [
                     outbox,
@@ -10848,12 +11320,34 @@ class AgentRunService:
                         code="dialogue_source_provenance_incomplete",
                     )
                 source_run = await db_session.get(AgentRun, parent_uuid)
+                edge_delivery = await db_session.get(AgentDialogueDelivery, parse_uuid(dialogue_ref.get("delivery_id")))
+                edge_dialogue = await db_session.get(AgentDialogue, parse_uuid(dialogue_ref.get("dialogue_id")))
+                edge_message = await db_session.get(ConversationMessage, parse_uuid(dialogue_ref.get("source_message_id")))
+                return_origin = (
+                    await self._delegation_return_source(db_session, edge_dialogue, edge_delivery, edge_message)
+                    if edge_dialogue is not None and edge_delivery is not None and edge_message is not None
+                    else None
+                )
+                p5_source = (
+                    await self._proved_dialogue_worker_source(db_session, edge_dialogue, edge_delivery)
+                    if return_origin is None and edge_dialogue is not None and edge_delivery is not None
+                    else False
+                )
                 if (
                     source_run is None
-                    or source_run.parent_run_id is not None
-                    or source_run.agent_id != source_agent_uuid
-                    or source_run.session_id != source_session_uuid
-                    or str(source_run.user_id or "") != normalized_user_id
+                    or ((return_origin is not None or p5_source) and (
+                        edge_delivery.source_run_id != parent_uuid
+                        or edge_delivery.source_agent_id != source_agent_uuid
+                        or edge_delivery.source_session_id != source_session_uuid
+                        or str(edge_dialogue.owner_user_id) != normalized_user_id
+                        or str(edge_delivery.source_work_item_id) != str(dialogue_ref.get("source_work_item_id"))
+                    ))
+                    or (return_origin is None and not p5_source and (
+                        source_run.parent_run_id is not None
+                        or source_run.agent_id != source_agent_uuid
+                        or source_run.session_id != source_session_uuid
+                        or str(source_run.user_id or "") != normalized_user_id
+                    ))
                 ):
                     raise AgentChatAdmissionError(
                         "dialogue source provenance is invalid",
@@ -11647,8 +12141,10 @@ class AgentRunService:
         if run_uuid is None:
             return None
 
-        normalized_provider = str(provider or "").strip()
+        normalized_provider = str(provider or "").strip().lower()
         normalized_model = str(model or "").strip()
+        if normalized_model.casefold() == "default":
+            normalized_model = ""
         normalized_route_source = str(route_source or "").strip()
         normalized_effort = str(reasoning_effort or "").strip()
 
@@ -11657,19 +12153,35 @@ class AgentRunService:
             run = await session.get(AgentRun, run_uuid)
             if run is None:
                 return None
-
-            if normalized_provider:
-                run.provider = normalized_provider
-            if normalized_model:
-                run.model = normalized_model
+            if str(run.status or "").casefold() in RUN_TERMINAL_STATUSES:
+                # Route correction is best-effort live-run metadata only.
+                # A delayed update must never rewrite a terminal historical
+                # run after cancellation or completion.
+                return None
 
             metadata = (
                 dict(run.run_metadata)
                 if isinstance(run.run_metadata, dict)
                 else {}
             )
-            if normalized_route_source:
-                metadata["route_source"] = normalized_route_source
+            route_resolved = bool(normalized_provider and normalized_model)
+            resolved_source = (
+                (normalized_route_source or "runtime_main")
+                if route_resolved
+                else "pending"
+            )
+            run.provider = normalized_provider if route_resolved else None
+            run.model = normalized_model if route_resolved else None
+            metadata["route"] = {
+                "provider": run.provider,
+                "model": run.model,
+                "route_source": resolved_source,
+                "resolution": "resolved" if route_resolved else "pending",
+            }
+            metadata["route_source"] = resolved_source
+            metadata["route_resolution"] = (
+                "resolved" if route_resolved else "pending"
+            )
             if normalized_effort:
                 metadata["reasoning_effort"] = normalized_effort
             run.run_metadata = _safe_audit_metadata(
@@ -11869,7 +12381,17 @@ class AgentRunService:
             if key in projected:
                 projected[key] = _activity_timestamp(projected[key])
         manifest = run.get("execution_manifest") or run.get("resolved_execution_manifest")
+        legacy = (
+            dict(run.get("legacy"))
+            if isinstance(run.get("legacy"), Mapping)
+            else {}
+        )
         if isinstance(manifest, Mapping):
+            manifest_legacy = manifest.get("legacy")
+            if isinstance(manifest_legacy, Mapping):
+                for key, value in manifest_legacy.items():
+                    if value not in (None, "", []) and legacy.get(key) in (None, "", []):
+                        legacy[str(key)] = value
             projected_manifest = {
                 key: manifest.get(key)
                 for key in (
@@ -11877,8 +12399,6 @@ class AgentRunService:
                     "agent_id",
                     "agent_revision_id",
                     "agent_revision_version",
-                    "team_id",
-                    "execution_profile_id",
                     "source",
                     "run_scope_hash",
                     "authority_hash",
@@ -11888,6 +12408,21 @@ class AgentRunService:
             }
             if projected_manifest:
                 projected["execution_manifest"] = projected_manifest
+            for key, source_keys in (
+                ("agent_team_id", ("agent_team_id", "team_id")),
+                ("execution_profile_id", ("execution_profile_id",)),
+                ("allowed_subagent_ids", ("allowed_subagent_ids",)),
+                ("acting_subagent_id", ("acting_subagent_id", "subagent_id")),
+            ):
+                if legacy.get(key) not in (None, "", []):
+                    continue
+                for source_key in source_keys:
+                    value = manifest.get(source_key)
+                    if value not in (None, "", []):
+                        legacy[key] = value
+                        break
+        if legacy:
+            projected["legacy"] = legacy
         result = run.get("result")
         if isinstance(result, Mapping):
             refs: list[dict[str, Any]] = []
@@ -12935,12 +13470,17 @@ class AgentRunService:
         normalized_code = str(safe_error_code or "").strip().casefold()
         if (
             not re.fullmatch(r"[a-z][a-z0-9_]{0,95}", normalized_code)
-            or not normalized_code.startswith(
-                (
-                    "agent_route_",
-                    "interactive_admission_",
-                    "agent_dialogue_budget_",
+            or not (
+                normalized_code.startswith(
+                    (
+                        "agent_route_",
+                        "interactive_admission_",
+                        "agent_dialogue_budget_",
+                        "dialogue_source_human_",
+                        "dialogue_worker_provenance_",
+                    )
                 )
+                or normalized_code in {"dialogue_worker_run_invalid", "dialogue_worker_run_not_found"}
             )
         ):
             return None
@@ -12992,6 +13532,9 @@ class AgentRunService:
                     "agent_route_",
                     "interactive_admission_",
                     "agent_dialogue_budget_",
+                    "dialogue_source_human_",
+                    "dialogue_worker_provenance_",
+                    "dialogue_worker_run_",
                 )
             )
             and run_error != normalized_code
@@ -14942,6 +15485,74 @@ class AgentRunService:
         )
         return usage is None
 
+    async def _typed_worker_dialogue_for_usage(self, session: Any, run: AgentRun) -> Any:
+        """Resolve accounting ownership from durable typed-worker receipts."""
+        from .agent_dialogue_transport import sha256_digest
+        from .cli_development_sessions import (
+            CLI_SESSION_ADAPTER_KEY,
+            CLI_SESSION_SOURCE_TYPE,
+            MUSE_REMOTE_ADAPTER_KEY,
+            REMOTE_SESSION_SOURCE_TYPE,
+            _delegate_worker_audit_marker,
+        )
+
+        metadata = run.run_metadata if isinstance(run.run_metadata, Mapping) else {}
+        cli = metadata.get("cli_development")
+        audit = cli.get("delegate_worker") if isinstance(cli, Mapping) else None
+        dialogue_id = parse_uuid(audit.get("dialogue_id")) if isinstance(audit, Mapping) else None
+        if dialogue_id is None:
+            return None
+        dialogue = await session.get(AgentDialogue, dialogue_id)
+        auth = dialogue.authorization_json if dialogue is not None else None
+        marker = auth.get("delegate_worker") if isinstance(auth, Mapping) else None
+        if not isinstance(marker, Mapping) or not dialogue.authorization_hash or sha256_digest(auth) != dialogue.authorization_hash:
+            return None
+        expected = _delegate_worker_audit_marker(marker)
+        if audit != {"attempt": audit.get("attempt"), **expected} or type(audit.get("attempt")) is not int:
+            return None
+        work = await session.get(AgentWorkItem, run.work_item_id) if run.work_item_id else None
+        work_meta = work.metadata_json if work is not None and isinstance(work.metadata_json, Mapping) else {}
+        manifest = run.resolved_execution_manifest if isinstance(run.resolved_execution_manifest, Mapping) else {}
+        delivery = await session.scalar(select(AgentDialogueDelivery).where(
+            AgentDialogueDelivery.dialogue_id == dialogue_id,
+            AgentDialogueDelivery.kind.in_(("request", "control")),
+            AgentDialogueDelivery.receiver_run_id == run.id,
+            AgentDialogueDelivery.receiver_work_item_id == run.work_item_id,
+        ).limit(1))
+        source_run = await session.get(AgentRun, delivery.source_run_id) if delivery and delivery.source_run_id else None
+        source_work = await session.get(AgentWorkItem, delivery.source_work_item_id) if delivery and delivery.source_work_item_id else None
+        source_message = await session.get(ConversationMessage, delivery.source_message_id) if delivery and delivery.source_message_id else None
+        adapters = {
+            CLI_SESSION_SOURCE_TYPE: CLI_SESSION_ADAPTER_KEY,
+            REMOTE_SESSION_SOURCE_TYPE: MUSE_REMOTE_ADAPTER_KEY,
+        }
+        if (delivery is None or work is None
+            or run.run_type not in adapters or work.source_type != run.run_type
+            or work.execution_adapter != adapters.get(run.run_type)
+            or (run.run_type == REMOTE_SESSION_SOURCE_TYPE) != (marker.get("kind") == "muse")
+            or work_meta.get("delegate_worker") != audit
+            or manifest.get("delegate_worker") != audit
+            or parse_uuid(marker.get("dialogue_id")) != dialogue.id
+            or str(marker.get("owner_id")) != str(dialogue.owner_user_id)
+            or parse_uuid(marker.get("agent_id")) != dialogue.worker_agent_id
+            or parse_uuid(marker.get("agent_revision_id")) != dialogue.worker_agent_revision_id
+            or not isinstance(marker.get("workspace_scope"), Mapping)
+            or sha256_digest(marker["workspace_scope"]) != marker.get("workspace_scope_sha256")
+            or str(run.user_id) != str(dialogue.owner_user_id)
+            or run.agent_id != dialogue.worker_agent_id or run.agent_revision_id != dialogue.worker_agent_revision_id
+            or run.session_id != dialogue.worker_session_id
+            or delivery.receiver_session_id != run.session_id or delivery.receiver_agent_id != run.agent_id
+            or delivery.receiver_agent_revision_id != run.agent_revision_id
+            or str(work.source_id) != str(run.id) or work.conversation_session_id != run.session_id
+            or work.assigned_agent_id != run.agent_id or work.agent_revision_id != run.agent_revision_id
+            or source_run is None or source_work is None or source_message is None
+            or source_run.work_item_id != source_work.id
+            or str(source_work.source_id) != str(source_run.id)
+            or source_message.session_id != delivery.source_session_id
+            or source_run.session_id != delivery.source_session_id):
+            return None
+        return dialogue
+
     async def _record_agent_dialogue_usage_in_session(
         self,
         session: Any,
@@ -14971,6 +15582,11 @@ class AgentRunService:
         )
         if isinstance(marker, Mapping):
             dialogue_role = str(marker.get("role") or "").strip().casefold() or None
+        if dialogue_id is None:
+            worker_dialogue = await self._typed_worker_dialogue_for_usage(session, run)
+            if worker_dialogue is not None:
+                dialogue_id = worker_dialogue.id
+                dialogue_role = "worker"
         if dialogue_id is None:
             # The initial Human-root Run predates Dialogue creation and has no
             # marker.  The durable human_run_id anchor is its typed ownership
@@ -15287,6 +15903,16 @@ class AgentRunService:
                 return
             raise
 
+    async def record_typed_worker_usage_in_session(self, session: Any, *, run_id: str | uuid.UUID) -> None:
+        """Settle a proven terminal typed worker in the receipt transaction."""
+        run_uuid = parse_uuid(run_id)
+        run = await session.get(AgentRun, run_uuid) if run_uuid else None
+        if run is None or str(run.status or "").casefold() not in RUN_TERMINAL_STATUSES:
+            raise ValueError("typed worker Run is not terminal")
+        if await self._typed_worker_dialogue_for_usage(session, run) is None:
+            raise ValueError("typed worker accounting identity mismatch")
+        await self._record_agent_dialogue_usage_in_session(session, run)
+
     async def record_agent_dialogue_source_usage_in_session(
         self,
         session: Any,
@@ -15325,7 +15951,129 @@ class AgentRunService:
         )
         return True
 
+    async def _record_terminal_dialogue_usage_or_mark_unavailable(
+        self,
+        session: Any,
+        run: AgentRun,
+        *,
+        result: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        preprovider_proof: PreproviderFailureProof | None = None,
+    ) -> None:
+        """Settle usage without letting a typed budget conflict block Run completion.
+
+        The SAVEPOINT keeps a failed accounting attempt from partially changing
+        counters or reservations while preserving the enclosing terminal Run
+        transaction. An unavailable marker makes a repeated terminal callback
+        idempotent instead of retrying the same impossible receipt forever.
+        """
+
+        from .agent_dialogue_budget import DialogueBudgetError
+
+        unavailable_event_type = "run.dialogue_usage_unavailable"
+        prior_unavailable_event = await session.scalar(
+            select(AgentRunEvent.id)
+            .where(
+                AgentRunEvent.run_id == run.id,
+                AgentRunEvent.event_type == unavailable_event_type,
+            )
+            .limit(1)
+        )
+        if prior_unavailable_event is not None or any(
+            isinstance(event, AgentRunEvent)
+            and event.run_id == run.id
+            and event.event_type == unavailable_event_type
+            for event in session.new
+        ):
+            return
+        run_metadata = dict(
+            run.run_metadata if isinstance(run.run_metadata, Mapping) else {}
+        )
+        if "agent_dialogue_usage_recording" in run_metadata:
+            run_metadata.pop("agent_dialogue_usage_recording", None)
+            run.run_metadata = _safe_audit_metadata(
+                run_metadata,
+                run_type=run.run_type,
+            )
+
+        try:
+            async with session.begin_nested():
+                await self._record_agent_dialogue_usage_in_session(
+                    session,
+                    run,
+                    result=result,
+                    metadata=metadata,
+                    preprovider_proof=preprovider_proof,
+                )
+        except DialogueBudgetError as exc:
+            reason_code = str(getattr(exc, "code", "") or "")
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason_code):
+                reason_code = "dialogue_usage_recording_failed"
+            dialogue_marker = run_metadata.get("agent_dialogue")
+            dialogue_id = (
+                parse_uuid(dialogue_marker.get("dialogue_id"))
+                if isinstance(dialogue_marker, Mapping)
+                else None
+            )
+            if dialogue_id is not None:
+                dialogue = await session.get(AgentDialogue, dialogue_id)
+                if dialogue is not None:
+                    dialogue.usage_state = "unknown"
+                    budget_root_id = parse_uuid(
+                        getattr(dialogue, "budget_root_dialogue_id", None)
+                    )
+                    if budget_root_id is not None:
+                        budget_root = await session.get(
+                            AgentDialogueBudgetRoot,
+                            budget_root_id,
+                        )
+                        if budget_root is not None:
+                            budget_root.usage_state = "unknown"
+            updated_metadata = dict(run_metadata)
+            updated_metadata["agent_dialogue_usage_recording"] = {
+                "state": "unavailable",
+                "reason_code": reason_code,
+            }
+            run.run_metadata = _safe_audit_metadata(
+                updated_metadata,
+                run_type=run.run_type,
+            )
+            await self._append_event(
+                session,
+                run,
+                unavailable_event_type,
+                status=run.status,
+                payload={"reason_code": reason_code},
+            )
+            logger.warning(
+                "AgentDialogue terminal usage unavailable for Run %s: %s",
+                run.id,
+                reason_code,
+            )
+
     async def _set_status(
+        self,
+        run_id: str | None,
+        status: str,
+        event_type: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any] | None:
+        """Update a Run status, retrying when the transaction loses a deadlock."""
+
+        for attempt in range(1, _RUN_STATUS_DEADLOCK_ATTEMPTS + 1):
+            try:
+                return await self._set_status_once(run_id, status, event_type, **kwargs)
+            except _RunStatusDeadlock:
+                if attempt >= _RUN_STATUS_DEADLOCK_ATTEMPTS:
+                    logger.error(
+                        "Agent run status update kept losing database deadlocks: %s",
+                        run_id,
+                    )
+                    return None
+                await asyncio.sleep(0.05 * attempt + random.random() * 0.1)
+        return None
+
+    async def _set_status_once(
         self,
         run_id: str | None,
         status: str,
@@ -15349,8 +16097,9 @@ class AgentRunService:
         await status_lock.acquire()
         try:
             session = await self._session()
-        except Exception:
-            status_lock.release()
+        except BaseException:
+            # session 取得中の例外・キャンセルでも同一 Run の後続更新を塞がない。
+            _release_status_lock(run_uuid, status_lock)
             raise
         try:
             if ended and status in {"failed", "cancelled"}:
@@ -15432,7 +16181,7 @@ class AgentRunService:
                 # Same-status retries are idempotent and must not append a
                 # duplicate terminal event or rewrite ended_at/result.
                 if ended and run.status in RUN_TERMINAL_STATUSES:
-                    await self._record_agent_dialogue_usage_in_session(
+                    await self._record_terminal_dialogue_usage_or_mark_unavailable(
                         session,
                         run,
                         result=result if isinstance(result, Mapping) else None,
@@ -15518,7 +16267,7 @@ class AgentRunService:
                     run_type=run.run_type,
                 )
             if ended and status in RUN_TERMINAL_STATUSES:
-                await self._record_agent_dialogue_usage_in_session(
+                await self._record_terminal_dialogue_usage_or_mark_unavailable(
                     session,
                     run,
                     result=safe_result if isinstance(safe_result, Mapping) else None,
@@ -15578,13 +16327,19 @@ class AgentRunService:
             await session.commit()
             await session.refresh(run)
             return run.to_dict()
-        except Exception:
+        except Exception as exc:
             await session.rollback()
+            if _is_database_deadlock(exc):
+                logger.warning("Agent run status update lost a database deadlock: %s", run_id)
+                raise _RunStatusDeadlock() from exc
             logger.exception("Failed to update agent run status: %s", run_id)
             return None
         finally:
-            await session.close()
-            _release_status_lock(run_uuid, status_lock)
+            try:
+                await session.close()
+            finally:
+                # close の例外・キャンセルでも同一 Run の status lock を残さない。
+                _release_status_lock(run_uuid, status_lock)
 
     async def _append_event(
         self,

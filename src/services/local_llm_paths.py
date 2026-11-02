@@ -18,6 +18,8 @@ from pathlib import Path
 from pathlib import PureWindowsPath
 from typing import Any, Iterable, Mapping
 
+from src.runtime_release_contract import CONFIG_ROOT_ENV, is_runtime_release_active
+
 
 _LOCAL_LLM_STORAGE_NAME = ".aoitalk-local-llm"
 _RUNTIME_ENV_NAMES = ("AOITALK_LOCAL_LLM_RUNTIME_ROOT",)
@@ -49,6 +51,10 @@ def llama_cpp_executable_setting(configured: Any = None) -> tuple[str, str]:
 
 def repository_root() -> Path:
     """Return the repository root independently of the process CWD."""
+
+    runtime_root = os.environ.get(CONFIG_ROOT_ENV, "").strip()
+    if is_runtime_release_active():
+        return Path(runtime_root).resolve(strict=True)
 
     # ``src/services/local_llm_paths.py`` -> ``<repo>/src/services``.
     return Path(__file__).resolve().parents[2]

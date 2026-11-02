@@ -11,9 +11,13 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from src.runtime_release_contract import config_path as runtime_config_path
+
 logger = logging.getLogger(__name__)
 
-WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "config" / "workflows"
+WORKFLOWS_DIR = runtime_config_path(
+    "config/workflows", Path(__file__).resolve().parents[2]
+)
 
 
 @dataclass

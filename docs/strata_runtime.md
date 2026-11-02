@@ -7,38 +7,29 @@ Agent委譲（正準 prefix `/api/agent-tasks`）でStrataを推論に使う場�
 ## 対応環境と固定source
 
 - Windows 10/11、Linux x86-64。NVIDIA専用GPU、または公式対応AMD Radeon（HIP）が必要
-- 統合GPUは公式非対応。Strix Halo等の統合GPU端末ではStrataを導入・起動しない
-- 公式release: [Strata v0.1.41](https://github.com/Niko1221/Strata/releases/tag/v0.1.41)（2026-10-08）
-- 固定source: [`fb58e0dbc8399662c0e47c76578c6e878b14f6cf`](https://github.com/Niko1221/Strata/tree/fb58e0dbc8399662c0e47c76578c6e878b14f6cf)。2026-10-09に公式tagのSHA、archive、`CMakeLists.txt`のversionと`setup.py`の`MIN_ENGINE=(0,1,41)`を確認
-- 管理engineは **0.1.41に固定**。minimumを満たす別版へ自動追従しない
-- [公式INSTALL](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/docs/INSTALL.md)はWindows/Linux両方のAMD HIPに対応。AMDのCPU visionはLinuxのみで、Windows AMDは画像なし
+- 上流v0.2.9はStrix Haloに対応する（[公式INSTALL](https://github.com/Niko1221/Strata/blob/v0.2.9/docs/INSTALL.md)）。AoiTalkの既管理profileの対象は上記の専用GPUのままで、今回の実機更新ではStrix Haloの対応・導入を未検証
+- 公式release: [Strata v0.2.9](https://github.com/Niko1221/Strata/releases/tag/v0.2.9)
+- 固定source: [`c62d5e3a15b40ea51c96aae9e8d36928965f53ab`](https://github.com/Niko1221/Strata/tree/c62d5e3a15b40ea51c96aae9e8d36928965f53ab)
+- 管理engineは **0.1.55に固定**。setupの `MIN_ENGINE=(0,1,46)` は最低条件であり、管理版の代わりにはならない。BUILDと実行fileのversionは完全一致を要求する。
 
-source・engineの固定値の正本は `src/llm/strata_manifest.py`。
-旧source pin `99f3dbd0b21d1401b3769e0c0d963913607f380b` とminimum engine 0.1.38は旧実装の情報であり、実マシンで稼働したengine版の証拠ではない。
-この更新のcommit/pushは配置準備の完了であり、実機のengine交換・モデル起動・本番反映は別工程として扱う。
+source・engineの固定値の正本は `src/llm/strata_manifest.py`。この変更は配置準備であり、実機のengine交換・モデル起動は未実施。
 
-| 検証値 | v0.1.41 |
+| 検証値 | v0.2.9 |
 | --- | --- |
-| source archive SHA-256 | `0e1d7e8fbb50eebfdb28b60dcff029bfa371215958d59605825746713a0ef034` |
-| 展開tree SHA-256 | `4430385813d593db27fe4e7dd40979c2e0053065cf7b8214bc56285e71c2e006` |
-| Windows正規化tree SHA-256 | `dc7b46f300f78bee4c0bdfca55836d4d3f0efe19983dce06607237fd8fb5b832` |
-| source file count | 2,422 |
-| 展開 / 正規化byte count | 38,603,272 / 38,603,031 |
+| source archive SHA-256 | `ed63c4da7a87694641e958c5d20c8cb35ae9edeb6b2fcb82d92e785ed4ebf147` |
+| 展開tree SHA-256 | `bcb1a95b3303cd3740eaf2c7955ace7266a74bb2a1b72f0498592c79b88cdefd` |
+| Windows正規化tree SHA-256 | `f259f0b78e091ede4be75d16ef9aad1fd432dff4cfa6b38dc5d3f4791b32dd49` |
+| source file count | 5,319 |
+| 展開 / 正規化byte count | 86,361,397 / 86,360,395 |
+| archive bytes | 31,632,890 |
 
-tree digestはPOSIX相対pathでsortし、各fileのpath、NUL、十進byte長、NUL、本文、NULを連結してSHA-256を計算する。
-Windows正規化は `.bat/.cmd/.ps1/.sh` のCRLF/CR→LFだけに限定する。両形式とも件数・byte countまで照合する。
-2026-10-09の再検証では、codeload archive（17,353,269 bytes）を未展開のままtar memberから直接読み出してraw値を再現した。
-同じSHAをno-checkoutでcloneし `git ls-tree -r --long` と `git cat-file --batch` で読んだGit blobは2,422 files / 38,603,031 bytesで、正規化treeのhashと完全一致する。
-差241 bytesは `.bat` 7 filesのCRLFだけ（SETUP:3、START-HERE:52、UPDATE:80、benchの3本:5/7/7、tools/hip/build_windows:87）。
-全fileが改行正規化後のblobと一致し、それ以外の差はなかった。archive/raw tree checksumは手元の展開・改行変換から作った値ではない。
-公式 [.gitattributes](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/.gitattributes) は `*.bat text eol=crlf` / `*.sh text eol=lf` を指定する。
-`core.autocrlf=false, core.eol=lf` を明示したclean checkoutでもbatはCRLFとなり、raw/正規化の両値と一致した（`git status --porcelain` は空、`git ls-files --eol` はbatについて `i/lf w/crlf attr/text eol=crlf`）。
+tree digestはPOSIX相対pathの昇順で、path、NUL、十進byte長、NUL、本文、NULを連結してSHA-256を計算する。Windows正規化は `.bat/.cmd/.ps1/.sh` のCRLF/CR→LFに限定する。
 管理archiveのmarkerはrevision・release・engine版・archive/tree checksum・件数・容量・source file一覧を持つ。
 setupが生成するvenv・engine・configをsource一覧へ混ぜず、再試行・起動時にも元のsource fileを照合する。
 markerを持たないgit checkoutは固定HEAD、clean状態、追跡fileのtree digestのすべてを確認する。
 管理導入の標準経路はchecksum済みarchiveとする。任意のWindows git checkoutは `core.autocrlf=true` によりpy/cpp/mdまでCRLFとなるため、cleanでも現行のscript専用正規化では受け付けない。
 その場合はtree不一致と改行条件を具体的に診断する。既存checkoutを変換せず、archiveを使うか、別folderへ
-`git -c core.autocrlf=false -c core.eol=lf clone --depth 1 --branch v0.1.41 https://github.com/Niko1221/Strata.git <new-root>` でLF checkoutを準備する。
+`git -c core.autocrlf=false -c core.eol=lf clone --depth 1 --branch v0.2.9 https://github.com/Niko1221/Strata.git <new-root>` でLF checkoutを準備する。
 通常のbat=CRLF/sh=LFは公式.gitattributesに従い維持する。
 
 モデルは公式Qwen3.8-Flash-NextのQ2_0、IQ2_XS、IQ3_XXS、IQ3_Sを候補表示する。
@@ -56,9 +47,9 @@ served IDは `qwen3.8-flash-next-iq2_xs` 等。既存llama.cppの `qwen3.8-flash
 source folderが空なら、管理runtime領域へ固定revisionの小さなsource archiveを取得する。
 既存folderを指定する場合は同じrevisionのclean checkoutが必要。既存の別revisionや変更済みsourceは上書きしない。
 公式 `START-HERE.bat` / `setup.sh` に `--setup --no-start --yes`、選択設定、
-`--prebuilt https://github.com/Niko1221/Strata/releases/download/v0.1.41/` を渡す。
+`--prebuilt https://github.com/Niko1221/Strata/releases/download/v0.2.9/` を渡す。
 子processの `STRATA_PREBUILT_URL` も同じURLへ固定し、最新releaseへのfallbackを防ぐ。
-prepare完了時とmanaged起動直前に `BUILD.json` のversionと実行fileの `--version` の双方が0.1.41であることを確認する。
+prepare完了時とmanaged起動直前に `BUILD.json` のversionと実行fileの `--version` の双方が0.1.55であることを確認する。
 不足・別版・実version不明なら起動を拒否する。通常の候補一覧・readiness pollではversion probeを繰り返さない。
 LinuxでPython/venvや管理者権限が必要な場合など、非対話実行できない依存導入は失敗として報告する。
 必要なOS前提条件は公式INSTALLを参照し、整えた後に同じ操作で再試行する。
@@ -100,14 +91,14 @@ HDD上のままでは起動やprompt読込みが遅くなり得る。保存先�
 - JSON変更の反映には管理中のStrata Python serverの再起動が必要。native engineの自動再起動は記憶済みの引数を再利用する。処理中の要求と所有者を確認し、通常の停止・起動経路で切り替え、重複serverを起動しない
 - 切替後はprocess引数・engine logの実パス、health/model ID、実リクエストを確認する。コピー・検証・起動が失敗したら元ファイルを残し、旧configへ戻せる状態を保つ
 
-根拠: [固定sourceのデータ再利用](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/setup.py#L3509-L3640)、
+旧v0.1.41での参考: [sourceのデータ再利用](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/setup.py#L3509-L3640)、
 [生成config](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/setup.py#L5452-L5460)、
 [PLE読込み](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/src/prefill/prefill.cpp)、
 [serverの再起動](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/serve/server.py)。
 
 ### VRAM余裕とrequest watchdog
 
-固定sourceは全ロード後の空きVRAMが256 MiB未満なら警告する。通常は `LOW: requests may stall` とreserveの提案値を記録するが、
+旧v0.1.41では全ロード後の空きVRAMが256 MiB未満なら警告する。通常は `LOW: requests may stall` とreserveの提案値を記録するが、
 小容量GPU向けにreserveを自動縮小した場合は、他のGPU利用を減らすかcontextを下げるよう案内する。
 これは不足リスクの警告であり、OOMや停止原因を確定するものではない。実効 `args` と他のGPU利用を確認する。
 `--expert-cache auto` なら、生成JSONの `args` の `--vram-reserve-mib` を調整してexpert cacheを小さくできる。
@@ -116,7 +107,7 @@ HDD上のままでは起動やprompt読込みが遅くなり得る。保存先�
 固定数のexpert cacheではreserve変更だけに頼らず、実効cache設定も確認する。AoiTalkの既定設定は自動変更しない。
 
 `issue #29` はrequestの進行が一定時間止まったときのwatchdog表示であり、元issueと同じ原因とは限らない。
-固定sourceの進行watchdogの既定は60秒。0.1.41ではfile tierのI/O進行がある間は `STRATA_WATCHDOG_IO_S`（既定はその10倍）まで待つ。
+旧0.1.41の進行watchdogの既定は60秒で、file tierのI/O進行がある間は `STRATA_WATCHDOG_IO_S`（既定はその10倍）まで待つ。
 調査のために `STRATA_WATCHDOG_S=0` で無効化したり、失敗requestを自動で繰り返したりしない。
 engine version、直前の要求時刻、完全なstall report（stage、pool、verify、memory、2秒後の値）と実効引数を保存し、
 生成処理の停止と初回ロード待ちを分けて調べる。thread dumpは公開前に内容と共有範囲を確認する。
@@ -127,12 +118,14 @@ engine version、直前の要求時刻、完全なstall report（stage、pool、
 [watchdog](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/src/program/generate.cpp#L8064-L8105)、
 [Windowsを含むPLEのRAM読込み](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/src/program/generate.cpp#L2843-L2846)。
 
-### v0.1.41の既定変更と反映・切戻し
+### v0.1.41の既定変更（参考）
+
+以下は旧版の記録であり、v0.2.9の挙動は実機で未確認。
 
 - CPU prefill支援: 単一NVIDIA GPU・batchなし・1,024 token未満のchunkで既定有効。回答の末尾bitが変わり得る。既存 `env.STRATA_PREFILL_CPU_SHARE` を維持し、旧回答との一致を比較する場合だけoperatorが `"0"` を明示する。AoiTalkは未設定時に無効値を追加しない
 - batch groups: layer splitの `--batch` は各GPU stageへgroupを分配するautoが既定。既存の `--batch`、`--batch-groups`、`--batch-mtp` をsetup後も維持する。未指定のbatchを勝手に有効にしない。従来の1 group比較は `--batch-groups 1` を使う
 - server stall watchdog: `STRATA_ENGINE_STALL_S` は既定90秒で、無出力かつCPU・disk・GPUがidleのengineを終了する。動作中の遅い処理と区別し、`psutil` が必要。この変数はserver processの環境で指定する（configの `env` はnative engine向けなのでserverの既定値は変えない）。既存のprocess環境と、native watchdog/CPU shareを含むconfigの `env` を保持する
-- WindowsのRAM不足時のfile tier改善は上流の評価結果。現在のSSD、context32768、prefill256、reserve2048、expert cache autoを保持して実機で再評価し、速度向上や既存stallの解消を単体テストから推定しない
+- WindowsのRAM不足時のfile tier改善は上流の評価結果。現行の実設定を保持して実機で再評価し、速度向上や既存stallの解消を単体テストから推定しない
 
 公式setupは手動 `args` 全体をmergeしない（[carry_over](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/setup.py#L3658-L3663)）。
 例外は別名で実在する `--expert-profile` と未生成の `--expert-profile-save`（[carry_profile_args](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/setup.py#L3695-L3715)）。
@@ -143,20 +136,14 @@ PLEはdisk/RAM条件で `ram` が追加される（[setup判定](https://github.
 [CPU share](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/src/prefill/prefill.cpp#L157-L176)、
 [server stall条件](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/serve/server.py#L233-L246)。
 
-実機の配置は、既存Strata軽量化担当の終了と親の差分レビュー・反映調整の後に実施する。
-モデル削除・再取得を前提とせず、次の順で切り替える。
+実機更新は通常managerで次の順に行う。旧runtime `cache/local-llm-runtime/strata/fb58e0dbc8399662c0e47c76578c6e878b14f6cf` と旧configを保持する。
 
-1. 現在のsource_root、DBのStrata設定、生成configと `env/args`、engineの `BUILD.json` と実 `--version`、所有process/active leaseを記録する。現用configとruntimeを保持し、GGUF/pack/MTP/tokenizerを削除しない
-2. 新しい固定revision専用runtime folderを準備する。旧folderへ `UPDATE.bat` / `update.sh` を実行しない。公式UPDATEはmainへgit pullするため、この管理更新の経路に使わない。指定SHAのclean checkoutまたはAoiTalkのchecksum済みarchiveを使う
-3. 新sourceへ旧モデルconfigをコピーし、同じdata_dir/gguf_dirを指定した明示的prepareを行う。旧source_rootは残す。公式setupで新しいexe/cwd/profile pathを生成し、既存env、batch設定、prefill256/reserve2048/expert cache auto、明示 `--ple-io direct` を引き継いだことを比較する。他の手動engine引数の差も確認し、自動探索した別installの設定だけに依存しない
-4. sourceのみの確認には `venv/Scripts/python.exe scripts/verify_strata_runtime.py --source-root <new-root>`、配置後のartifactと実engine確認には同コマンドへ `--config <new-root>/strata-iq3_s.json` を追加する。Linuxの検証用Pythonは `venv/bin/python`。sourceのみの成功はengine実稼働版の証拠にしない
-5. active generationの完了を待ち、AoiTalk所有serverを通常経路で停止する。DBのsource_rootだけを新folderへ切り替え、通常経路で起動する。外部serverを終了しない。healthと正確なmodel ID、load、短文/長文のchat・streaming・tool calling・reasoning、watchdogログを確認する
-6. 同じモデル・context・performance設定でcold/load時間、短いprompt（512/1K）、通常prompt、decodeを測る。単一NVIDIAではCPU share on/offを比較し、既存batch構成がある場合だけgroups auto/1を比較する。I/Oが動く遅い処理をhangとして終了しないこと、失敗requestを自動再送しないことを確認する
+1. 現行設定とconfigを安全に控える。新revision専用rootは先にchecksum済みsourceを用意し、その後に旧configを事前コピーする（configだけを置いた未検証rootはmanagerが拒否する）。model、quant、context、port、vision、performance、env、argsの実値と既存weightsを保持する。
+2. prepare前に対象Strata自身のendpointのgeneration leaseと利用状況を通常のgetterで確認し、利用中なら終了を待つ。通常のmanager prepareで新rootに固定sourceとengine、Python依存を準備する。既存のdata_dir/gguf_dirを使い、weightsを再取得・移動しない。`run_strata_setup` の既存設定保持を利用し、生成後に実値を比較する。旧rootで `UPDATE.bat` / `update.sh` は実行しない。
+3. `<aoitalk-repository-root>\venv\Scripts\python.exe scripts/verify_strata_runtime.py --source-root <new-root> --config <new-config>` でsource、artifact、BUILDと実engineを確認する。Windows CUDA 13 / 12の公式engine asset digestはそれぞれ `34f399a0a22e4af8b434439de04dcce3734ccba7e884ef6003439ba148d667df` / `fd3d3ff7f875d1878e88c69a35746373d5cf522e7cf5d5d3f8ba8eeff09e7739`。実install時に確認する。
+4. 通常prepareの成功callbackによる設定のDB保存と必要な再起動をそのまま利用する。別途手動でDBを切り替えず、必要に応じ通常起動し、health、model IDと実推論を確認する。
 
-切戻しはactive leaseを確認して新serverを通常停止し、DBのsource_root/config設定とAoiTalkコードを同じ旧snapshotへ戻して再起動する。
-新コードは旧版engineを拒否するため、source_rootだけ戻す操作では切戻し完了にならない。
-親のmain統合前ならこのbranchを適用せず現用を継続する。統合後のコード切戻しはこの更新commitだけをrevertし、並行するMobile/記憶UI/軽量化commitをresetしない。
-旧runtimeを保持する切替では `--rollback-engine` は不要。in-placeのengine rollbackだけで異なるsource/engineを混在させない。
+切戻しは通常停止して旧runtime/configとDB設定を戻し、この更新commitだけをrevertして再起動する。新コードは旧engineを拒否するためsource_rootだけの切替では完了しない。
 
 ## 起動・停止・接続
 
@@ -201,6 +188,8 @@ native起動からready観測は約131秒、arena読込は39.97GiB/0.44GiB/s、3
 `E:\AI\models\Cold_E\llm\strata` は存在せず、上記2026-10-09のE現用は現在の状態ではない。E側の重複は削除（ごみ箱へ移動）済みと親作業で確認している。
 `<configured-model-root>\strata` には `models` / `mtp` / `packs` が残っているが、稼働中processはこれを参照していない。保存先の整理・移動は [ローカルLLMストレージ運用規約](local_llm_storage_policy.md) に従い、この文書では行わない。
 
+2026-11-01の現行配置: Qwenのdata/GGUFは `C:\path\to\models\Hot\llm\strata\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` へ同一ドライブ内で移動した。通常の選択・起動確認は別途必要。
+
 Personalの画面で起動・停止できる。AoiTalkが起動して追跡しているStrata processだけ停止する。
 応答生成中は停止を拒否し、外部processがportを使用中なら勝手に終了させない。
 既存のgeneration leaseと通常のアプリ終了処理も共用する。
@@ -236,7 +225,7 @@ Windowsでの確認範囲: 既存logでroot checkpoint(3520 token)と同一loop�
 
 ## 検証の範囲
 
-v0.1.41準備では、公式tag checkoutとchecksum済みarchiveのsource検証、Windows改行の正規化、marker/件数/容量の改変拒否、
+v0.2.9候補では、公式tag checkoutとchecksum済みarchiveのsource検証、Windows改行の正規化、marker/件数/容量の改変拒否、
 setupのdownload固定と設定保持、実engine版不一致の拒否を確認する。検証CLIはsourceのみの場合に実engine版を未観測として返す。
 
 小さなfixtureとmock HTTPでprofile、URL、Windows/Linux command、setup確認、artifact状態、health/models、Enterprise無起動、外部process保護を検証する。

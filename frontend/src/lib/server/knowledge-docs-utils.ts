@@ -863,6 +863,17 @@ async function resolveReferenceTargetIds(
   return Array.from(targetIds);
 }
 
+export function docsReferenceTokenTargetIds(
+  node: Pick<typeof knowledgeNodes.$inferSelect, "id" | "title" | "bodyText">,
+): string[] {
+  const bodyText = decryptNodeBodyText(node.bodyText ?? "");
+  const referenceText = [node.title, bodyText].filter(Boolean).join("\n");
+  const sourceNodeId = String(node.id).toLowerCase();
+  return extractDocsReferenceHints(referenceText).docsIds
+    .filter((targetId) => targetId !== sourceNodeId)
+    .sort();
+}
+
 type AoiTalkGuideNodeSpec = {
   systemKey: string;
   title: string;

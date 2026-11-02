@@ -5,6 +5,7 @@ import { Button, Dialog, IconButton, Surface, Text, TextInput } from "react-nati
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useConversationController } from "./useConversationController";
+import { useAoiDotsSessionModel } from "./use-aoidots-session-model";
 import type { ConversationRuntimeFocus } from "./useConversationRuntime";
 import { useConversationDurableTimeline } from "./useConversationTimeline";
 import type { TimelineItem } from "./models";
@@ -21,6 +22,11 @@ import { ScopeSwitcher } from "../../components/scope-switcher";
 import type { ConversationMessage } from "../../types/api";
 import { getPendingMessageRetryRoute } from "./message-actions";
 import type { ChatResponseModelSelection } from "../../types/api";
+import { aoidotsApi, aoiDotsErrorCode, aoiDotsHistoryFenceErrorMessage } from "../../lib/aoidots-api";
+import { HistoryFenceNotice } from "../aoidots/HistoryFenceNotice";
+import type { AoiDotsHistoryFenceReview } from "../aoidots/types";
+import { ConversationWorkMapSheet } from "./ConversationWorkMapSheet";
+import { useConversationWorkMap } from "./use-conversation-work-map";
 
 export type ConversationSurfaceProps = {
   sessionId: string;
@@ -34,6 +40,8 @@ export type ConversationSurfaceProps = {
   /** Kept explicit so root overlays and route wrappers cannot infer focus from mount state. */
   active?: boolean;
   embedded?: boolean;
+  /** Enables owner-reviewed history recovery only for the AoiDots root. */
+  aoiDotsRoot?: boolean;
   onClose?: () => void;
   onOpenWork?: (reference: OperationsWorkReference) => void;
   onSessionPromoted?: (sessionId: string) => void;
@@ -57,6 +65,7 @@ export function ConversationSurface({
   runtimeFocus,
   active = true,
   embedded = false,
+  aoiDotsRoot = false,
   onClose,
   onOpenWork,
   onSessionPromoted,
@@ -68,7 +77,6 @@ export function ConversationSurface({
   const router = useRouter();
   const reduceMotion = useReducedMotion();
   const flatListRef = useRef<FlatList<TimelineItem>>(null);
-  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [actionTargetId, setActionTargetId] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState<ConversationMessage | null>(null);
@@ -77,6 +85,7 @@ export function ConversationSurface({
   const [editError, setEditError] = useState<string | null>(null);
   const [pendingQueueVisible, setPendingQueueVisible] = useState(false);
   const [responseModelVisible, setResponseModelVisible] = useState(false);
+  const [aoiDotsModelVisible, setAoiDotsModelVisible] = useState(false);
   const [llmModeVisible, setLlmModeVisible] = useState(false);
   const controller = useConversationController({
     sessionId,
@@ -88,6 +97,118 @@ export function ConversationSurface({
     onSessionPromoted,
     disableLlmPreferencePersistence: embedded,
   });
+  const [historyFenceState, setHistoryFenceStateValue] = useState<"checking" | "clear" | "blocked" | "unavailable">("checking");
+  const [historyFenceReviews, setHistoryFenceReviews] = useState<AoiDotsHistoryFenceReview[]>([]);
+  const [historyFenceError, setHistoryFenceError] = useState<string | null>(null);
+  const [historyFenceApplying, setHistoryFenceApplying] = useState<string | null>(null);
+  const historyFenceGenerationRef = useRef(0);
+  const historyFenceStateRef = useRef<"checking" | "clear" | "blocked" | "unavailable">("checking");
+  const unresolvedInteractiveBusyRef = useRef(false);
+  const setHistoryFenceState = useCallback((value: "checking" | "clear" | "blocked" | "unavailable") => {
+    historyFenceStateRef.current = value;
+    setHistoryFenceStateValue(value);
+  }, []);
+
+  const refreshHistoryFence = useCallback(async (busyWasConfirmed = false): Promise<boolean> => {
+    if (busyWasConfirmed) unresolvedInteractiveBusyRef.current = true;
+    const requestGeneration = ++historyFenceGenerationRef.current;
+    setHistoryFenceState("checking");
+    setHistoryFenceError(null);
+    try {
+      const candidates = await aoidotsApi.listUncertainInteractiveWork(
+        sessionId,
+        controller.session?.agent_id,
+      );
+      const bounded = candidates.slice(0, 50);
+      const reviews = await Promise.all(bounded.map(async (candidate) => {
+        try {
+          return await aoidotsApi.previewHistoryFence(candidate, sessionId);
+        } catch (error) {
+          const code = aoiDotsErrorCode(error);
+          return {
+            workItemId: candidate.workItemId,
+            safeErrorCode: candidate.safeErrorCode,
+            status: code === "history_fence_already_releasable" ? "already_releasable" as const : "unavailable" as const,
+            stateDigest: null,
+            runStatus: null,
+            childWorkStates: [],
+            errorCode: code,
+            errorStatus: error && typeof error === "object" && "status" in error
+              ? Number((error as { status?: unknown }).status)
+              : null,
+            errorMessage: aoiDotsHistoryFenceErrorMessage(error),
+          };
+        }
+      }));
+      if (requestGeneration !== historyFenceGenerationRef.current) return false;
+      const actionable = reviews.filter(
+        (review) => review.status !== "already_fenced" && review.status !== "already_releasable",
+      );
+      setHistoryFenceReviews(actionable);
+      if (actionable.length > 0) {
+        setHistoryFenceState("blocked");
+        return false;
+      }
+      if (candidates.length > bounded.length) {
+        setHistoryFenceReviews(reviews);
+        setHistoryFenceState("blocked");
+        setHistoryFenceError("対象Workが多いため一覧を分割して確認できません。Work一覧を整理して再確認してください。");
+        return false;
+      }
+      if (candidates.length > 0) unresolvedInteractiveBusyRef.current = false;
+      if (unresolvedInteractiveBusyRef.current) {
+        setHistoryFenceState("blocked");
+        setHistoryFenceError("サーバーはこの相談の継続を拒否しましたが、安全に確認できるWorkを特定できません。再確認しても解決しない場合は運用担当へ連絡してください。");
+        return false;
+      }
+      setHistoryFenceReviews([]);
+      setHistoryFenceState("clear");
+      return true;
+    } catch (error) {
+      if (requestGeneration !== historyFenceGenerationRef.current) return false;
+      setHistoryFenceReviews([]);
+      setHistoryFenceState(unresolvedInteractiveBusyRef.current ? "blocked" : "unavailable");
+      setHistoryFenceError(aoiDotsHistoryFenceErrorMessage(
+        error,
+        "不明状態のWorkを取得できません。送信を保留し、時間をおいて再確認してください。",
+      ));
+      return false;
+    }
+  }, [controller.session?.agent_id, sessionId, setHistoryFenceState]);
+
+  const applyHistoryFence = useCallback(async (review: AoiDotsHistoryFenceReview) => {
+    if (historyFenceApplying) return;
+    setHistoryFenceApplying(review.workItemId);
+    setHistoryFenceError(null);
+    try {
+      const result = await aoidotsApi.applyHistoryFence(review, sessionId);
+      if (!new Set(["fenced", "already_fenced", "already_fenced_same_request"]).has(result.status)) {
+        throw new Error("履歴区切りの結果を確認できませんでした。最新状態を再確認してください。");
+      }
+      unresolvedInteractiveBusyRef.current = false;
+      await refreshHistoryFence();
+    } catch (error) {
+      const code = aoiDotsErrorCode(error);
+      if (["history_fence_already_applied", "history_fence_already_releasable"].includes(code ?? "")) {
+        unresolvedInteractiveBusyRef.current = false;
+      }
+      setHistoryFenceError(aoiDotsHistoryFenceErrorMessage(error));
+      if (error && typeof error === "object" && "status" in error && Number((error as { status?: unknown }).status) === 409) {
+        await refreshHistoryFence();
+      }
+    } finally {
+      setHistoryFenceApplying(null);
+    }
+  }, [historyFenceApplying, refreshHistoryFence, sessionId]);
+
+  useEffect(() => {
+    if (!aoiDotsRoot) {
+      setHistoryFenceState("clear");
+      return;
+    }
+    unresolvedInteractiveBusyRef.current = false;
+    void refreshHistoryFence();
+  }, [aoiDotsRoot, refreshHistoryFence, sessionId]);
 
   const durableTimeline = useConversationDurableTimeline({
     messages: controller.visibleMessages,
@@ -119,6 +240,20 @@ export function ConversationSurface({
         Boolean(message.metadata?.persistence_error) ||
         message.metadata?.message_state === "direct-failed"),
   );
+  const modelChangeBlocked = controller.diagnostics.runState !== "idle" || pendingCount > 0;
+  const aoiDotsModelEnabled = embedded && aoiDotsRoot && isAuthenticated &&
+    !controller.session?.is_local_only &&
+    sessionId !== "new" && !sessionId.startsWith("local-");
+  const workMapEnabled = Boolean(aoiDotsRoot && active && isAuthenticated && userId &&
+    sessionId !== "new" && !sessionId.startsWith("local-") &&
+    controller.session?.id === sessionId && controller.session.user_id && !controller.session.is_local_only);
+  const workMap = useConversationWorkMap({ sessionId, userId, isAuthenticated, enabled: workMapEnabled });
+  const aoiDotsModel = useAoiDotsSessionModel({
+    sessionId,
+    enabled: aoiDotsModelEnabled,
+    blocked: modelChangeBlocked,
+    authScopeHint: userId,
+  });
   const currentResponseModel = controller.responseTarget.kind === "server"
     ? controller.responseTarget.responseModel
     : null;
@@ -129,36 +264,37 @@ export function ConversationSurface({
     ? controller.llmModeLabels[controller.llmMode] ?? controller.llmMode
     : "標準";
 
-  const scheduleScrollToEnd = useCallback((delay = 48) => {
-    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
-    scrollTimerRef.current = setTimeout(() => {
-      scrollTimerRef.current = null;
-      flatListRef.current?.scrollToEnd({ animated: !reduceMotion });
-    }, delay);
-  }, [reduceMotion]);
-
-  useEffect(() => {
-    scheduleScrollToEnd();
-    return () => {
-      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
-    };
-  }, [durableTimeline.length, Boolean(controller.streamContent), scheduleScrollToEnd]);
-
   useEffect(() => {
     const show = Keyboard.addListener("keyboardDidShow", () => {
       setKeyboardVisible(true);
-      scheduleScrollToEnd(64);
     });
     const hide = Keyboard.addListener("keyboardDidHide", () => setKeyboardVisible(false));
     return () => {
       show.remove();
       hide.remove();
     };
-  }, [scheduleScrollToEnd]);
+  }, []);
 
   const sendMessage = useCallback(
-    (submission: ChatComposerSubmission) =>
-      controller.sendConversationCommand({
+    async (submission: ChatComposerSubmission) => {
+      if (aoiDotsModelEnabled && aoiDotsModel.isSaving()) {
+        throw new Error("AoiDotsのモデル設定を保存中です。設定確認後に送信してください。");
+      }
+      if (aoiDotsRoot) {
+        if (historyFenceStateRef.current !== "clear") {
+          throw new Error(
+            historyFenceError ??
+              "前回の実行結果を確認できないため、この相談は停止中です。入力は保持し、前回の依頼は再送していません。",
+          );
+        }
+        if (!(await refreshHistoryFence())) {
+          throw new Error(
+            "前回の実行結果を確認できないため、この相談は停止中です。入力は保持し、前回の依頼は再送していません。",
+          );
+        }
+      }
+      try {
+        await controller.sendConversationCommand({
         message: submission.content,
         submissionId: submission.submissionId,
         // AoiDots root is always projectless. This field is only a context
@@ -169,8 +305,20 @@ export function ConversationSurface({
         agentMode: "confirm",
         target: { kind: "server" },
         commandCapabilities: submission.capabilities,
-      }),
-    [contextProjectHintId, controller, controller.session?.project_id],
+        });
+      } catch (error) {
+        if (aoiDotsRoot && aoiDotsErrorCode(error) === "interactive_session_busy") {
+          unresolvedInteractiveBusyRef.current = true;
+          setHistoryFenceState("blocked");
+          await refreshHistoryFence(true);
+          throw new Error(
+            "前回の実行結果を確認できないため、この相談は停止中です。入力を保持し、前回の依頼は再送していません。",
+          );
+        }
+        throw error;
+      }
+    },
+    [aoiDotsModel.isSaving, aoiDotsModelEnabled, aoiDotsRoot, contextProjectHintId, controller, controller.session?.project_id, historyFenceError, refreshHistoryFence, setHistoryFenceState],
   );
 
   const changeProject = useCallback(
@@ -231,6 +379,20 @@ export function ConversationSurface({
     controller.changeResponseTarget({ kind: "server", ...(selection ? { responseModel: selection } : {}) });
     setResponseModelVisible(false);
   }, [controller]);
+  const openResponseModel = useCallback(() => {
+    if (aoiDotsModelEnabled) {
+      if (modelChangeBlocked || aoiDotsModel.saving) return;
+      setAoiDotsModelVisible(true);
+      void aoiDotsModel.open();
+      return;
+    }
+    setResponseModelVisible(true);
+    void controller.refreshResponseModelOptions();
+  }, [aoiDotsModel.open, aoiDotsModel.saving, aoiDotsModelEnabled, controller, modelChangeBlocked]);
+  const startDeepResearch = useCallback(async (query: string) => {
+    if (aoiDotsModelEnabled && aoiDotsModel.isSaving()) return;
+    await controller.startDeepResearch(query);
+  }, [aoiDotsModel.isSaving, aoiDotsModelEnabled, controller]);
 
   const header = embedded ? (
     <>
@@ -243,11 +405,12 @@ export function ConversationSurface({
           onPress={onClose}
           accessibilityLabel="AoiDotsを閉じる"
         />
-        <View style={styles.embeddedHeaderCopy}>
+        <View testID="aoidots-embedded-header-copy" style={styles.embeddedHeaderCopy}>
           <Text style={styles.embeddedTitle}>AoiDots</Text>
           <View style={styles.embeddedProject}>
             <ScopeSwitcher
               variant="inline"
+              compact
               projectNameOnly
               projects={projects}
               projectId={contextProjectHintId}
@@ -261,21 +424,25 @@ export function ConversationSurface({
         <Text style={styles.embeddedStatus}>
           {controller.diagnostics.runState === "idle" ? "待機中" : "実行中"}
         </Text>
+        {workMapEnabled ? <Button compact accessibilityLabel="担当マップを開く" onPress={workMap.open}>担当マップ</Button> : null}
       </Surface>
       {embeddedHeaderAccessory}
     </>
   ) : (
-    <ChatHeaderStatus
-      diagnostics={controller.diagnostics}
-      session={controller.session}
-      projects={projects}
-      currentProjectId={currentProjectId}
-      pendingCount={pendingCount}
-      onChangeProject={changeProject}
-      onChangeCharacter={controller.changeCharacter}
-      onOpenPendingQueue={() => setPendingQueueVisible(true)}
-      onBack={onClose}
-    />
+    <>
+      <ChatHeaderStatus
+        diagnostics={controller.diagnostics}
+        session={controller.session}
+        projects={projects}
+        currentProjectId={currentProjectId}
+        pendingCount={pendingCount}
+        onChangeProject={changeProject}
+        onChangeCharacter={controller.changeCharacter}
+        onOpenPendingQueue={() => setPendingQueueVisible(true)}
+        onBack={onClose}
+      />
+      {workMapEnabled ? <Button compact accessibilityLabel="担当マップを開く" onPress={workMap.open}>担当マップ</Button> : null}
+    </>
   );
 
   const loading = controller.loading && controller.messages.length === 0 && !controller.session;
@@ -292,6 +459,7 @@ export function ConversationSurface({
       >
         <ChatTimeline
           listRef={flatListRef}
+          sessionKey={sessionId}
           items={durableTimeline}
           allMessages={controller.messages}
           streamContent={controller.streamContent}
@@ -322,6 +490,16 @@ export function ConversationSurface({
           onForkMessage={forkMessage}
         />
       </ChatTimelineFrame>
+      {aoiDotsRoot ? (
+        <HistoryFenceNotice
+          state={historyFenceState}
+          reviews={historyFenceReviews}
+          error={historyFenceError}
+          applyingWorkId={historyFenceApplying}
+          onApply={(review) => void applyHistoryFence(review)}
+          onRefresh={() => void refreshHistoryFence(unresolvedInteractiveBusyRef.current)}
+        />
+      ) : null}
       <ChatComposer
         voiceContext={{
           conversationKey: sessionId,
@@ -337,26 +515,28 @@ export function ConversationSurface({
         keyboardVisible={keyboardVisible}
         sendEnabled={Boolean(active && sendEnabled)}
         directResponseActive={false}
-        currentResponseModelLabel={currentResponseModelLabel}
+        currentResponseModelLabel={aoiDotsModelEnabled ? aoiDotsModel.currentModelLabel : currentResponseModelLabel}
         currentLlmModeLabel={currentLlmModeLabel}
         effortEnabled={controller.llmModeOptions.length > 0}
         llmSelectionMessage={controller.llmSelectionMessage}
-        llmSyncLabel={null}
+        llmSyncLabel={aoiDotsModelEnabled && aoiDotsModel.saving ? "モデル設定を保存中…" : null}
         skillCommands={controller.skillCommands}
         isAuthenticated={isAuthenticated}
         pendingCount={pendingMessages.length}
         onSend={sendMessage}
-        onOpenResponseModel={() => {
-          setResponseModelVisible(true);
-          void controller.refreshResponseModelOptions();
-        }}
+        onOpenResponseModel={openResponseModel}
         onOpenLlmMode={() => setLlmModeVisible(true)}
         onOpenPendingQueue={() => setPendingQueueVisible(true)}
-        onStartDeepResearch={controller.startDeepResearch}
-        hideModelSelector={embedded}
+        onStartDeepResearch={startDeepResearch}
+        hideModelSelector={embedded && !aoiDotsModelEnabled}
         hideEffortSelector={embedded}
+        blockSends={aoiDotsModelEnabled && aoiDotsModel.saving}
+        modelSelectorDisabled={aoiDotsModelEnabled && (modelChangeBlocked || aoiDotsModel.saving)}
       />
       <ChatDialogHost>
+        <ConversationWorkMapSheet visible={workMap.visible && workMapEnabled} onDismiss={workMap.close}
+          currentScopeKey={workMap.currentScopeKey} currentConversationId={sessionId} data={workMap.data}
+          onRefresh={workMap.refresh} onOpenWork={onOpenWork ? (reference) => { workMap.close(); onOpenWork(reference); } : undefined} />
         <Dialog visible={pendingQueueVisible} onDismiss={() => setPendingQueueVisible(false)} style={styles.dialog}>
           <Dialog.Title style={styles.dialogTitle}>未送信メッセージ</Dialog.Title>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
@@ -373,6 +553,54 @@ export function ConversationSurface({
           </Dialog.ScrollArea>
           <Dialog.Actions><Button onPress={() => setPendingQueueVisible(false)}>閉じる</Button></Dialog.Actions>
         </Dialog>
+        {aoiDotsModelEnabled ? (
+          <Dialog
+            visible={aoiDotsModelVisible}
+            onDismiss={() => {
+              if (!aoiDotsModel.saving) setAoiDotsModelVisible(false);
+            }}
+            style={styles.dialog}
+          >
+            <Dialog.Title style={styles.dialogTitle}>AoiDotsの応答モデル</Dialog.Title>
+            <Dialog.Content>
+              <Text style={styles.dialogText}>現在の実効モデル: {aoiDotsModel.currentModelLabel}</Text>
+              {aoiDotsModel.error ? <Text style={styles.dialogError} accessibilityLiveRegion="polite">{aoiDotsModel.error}</Text> : null}
+            </Dialog.Content>
+            <Dialog.ScrollArea style={styles.dialogScrollArea}>
+              <ScrollView contentContainerStyle={styles.dialogScrollContent}>
+                {aoiDotsModel.catalogLoading ? <Text style={styles.dialogText}>モデル候補を取得しています…</Text> : null}
+                {aoiDotsModel.options.map((option) => {
+                  const key = `${option.provider.trim().toLowerCase()}:${option.model.trim()}`;
+                  return (
+                    <Button
+                      key={key}
+                      mode={aoiDotsModel.selectedKey === key ? "contained" : "outlined"}
+                      disabled={aoiDotsModel.saving || modelChangeBlocked || !aoiDotsModel.settingsReady}
+                      onPress={() => {
+                        void aoiDotsModel.select(option).then((saved) => {
+                          if (saved) setAoiDotsModelVisible(false);
+                        });
+                      }}
+                    >
+                      {option.providerLabel} / {option.modelLabel || option.model}
+                    </Button>
+                  );
+                })}
+                {!aoiDotsModel.catalogLoading && aoiDotsModel.options.length === 0 ? (
+                  <Text style={styles.dialogText}>
+                    {aoiDotsModel.settingsReady ? "利用可能なServerモデルがありません。" : "セッション設定を確認してからモデルを選べます。"}
+                  </Text>
+                ) : null}
+              </ScrollView>
+            </Dialog.ScrollArea>
+            <Dialog.Actions>
+              <Button disabled={aoiDotsModel.saving || modelChangeBlocked} onPress={() => void aoiDotsModel.refresh(true)}>
+                再取得
+              </Button>
+              <Button disabled={aoiDotsModel.saving} onPress={() => setAoiDotsModelVisible(false)}>閉じる</Button>
+            </Dialog.Actions>
+          </Dialog>
+        ) : null}
         <Dialog visible={responseModelVisible} onDismiss={() => setResponseModelVisible(false)} style={styles.dialog}>
           <Dialog.Title style={styles.dialogTitle}>応答モデル</Dialog.Title>
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
@@ -422,7 +650,7 @@ const styles = StyleSheet.create({
   embeddedHeader: {
     minHeight: 50,
     flexDirection: "row",
-    alignItems: "flex-start",
+    alignItems: "center",
     paddingHorizontal: 4,
     paddingVertical: 3,
     backgroundColor: "#1e1e2e",
@@ -430,10 +658,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   embeddedClose: { width: 44, height: 44, margin: 0 },
-  embeddedHeaderCopy: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "flex-start", flexWrap: "wrap", gap: 4, paddingHorizontal: 2 },
+  embeddedHeaderCopy: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 4, paddingHorizontal: 2 },
   embeddedTitle: { color: "#cdd6f4", fontSize: 15, fontWeight: "700", flexShrink: 1 },
   embeddedProject: { flex: 1, minWidth: 0, flexShrink: 1 },
-  embeddedStatus: { color: "#89b4fa", fontSize: 10, flexShrink: 1, minWidth: 0, paddingHorizontal: 4, paddingVertical: 6 },
+  embeddedStatus: { color: "#89b4fa", fontSize: 10, flexShrink: 1, minWidth: 0, paddingHorizontal: 4 },
   dialog: { backgroundColor: "#1e1e2e" },
   dialogTitle: { color: "#cdd6f4" },
   dialogText: { color: "#a6adc8", paddingVertical: 8 },

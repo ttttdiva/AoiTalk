@@ -92,6 +92,22 @@ function getSafeLoginErrorMessage(
   error: unknown,
   isReauthRequired: boolean,
 ): string {
+  // CredentialTargetError also has an HTTP status. Classify the identity
+  // boundary before the broader HTTP guard so a rejected probe is never
+  // presented as a username/password failure.
+  if (error instanceof CredentialTargetError) {
+    if (error.code === "identity_mismatch" || error.code === "target_namespace_mismatch") {
+      return "接続先のサーバー identity が保存済み接続先と異なります。既存アカウントの再認証で置き換えず、接続設定を確認してください。";
+    }
+    if (error.code === "primary_pin_missing") {
+      return "ログイン前に『接続先を確認』を実行して、サーバー identity を登録してください。";
+    }
+    if (error.code === "identity_probe_failed" && error.status === 403) {
+      return "接続先の確認がサーバーに拒否されました。許可されたサーバー URL を接続設定で確認してください。";
+    }
+    return "接続先のサーバー identity を確認できませんでした。接続設定を確認して再試行してください。";
+  }
+
   if (isApiHttpError(error)) {
     if (error.status === 401 || error.status === 403) {
       return isReauthRequired
@@ -107,15 +123,6 @@ function getSafeLoginErrorMessage(
 
   if (error instanceof Error && SAFE_AUTH_RECOVERY_MESSAGES.has(error.message)) {
     return error.message;
-  }
-
-  if (error instanceof CredentialTargetError) {
-    if (error.code === "identity_mismatch" || error.code === "target_namespace_mismatch") {
-      return "接続先のサーバー identity が保存済み接続先と異なります。既存アカウントの再認証で置き換えず、接続設定を確認してください。";
-    }
-    if (error.code === "primary_pin_missing") {
-      return "ログイン前に『接続先を確認』を実行して、サーバー identity を登録してください。";
-    }
   }
 
   return "ログインに失敗しました。入力内容と接続設定を確認して再試行してください。";

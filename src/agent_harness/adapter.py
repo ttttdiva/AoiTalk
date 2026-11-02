@@ -64,6 +64,8 @@ class PreparedCodeAgentRun:
     attempt: int
     created: bool
     prepared_at: datetime
+    workspace_owner_id: str | None = None
+    workspace_run_id: str | None = None
 
 
 class CodeAgentExecutionAdapter:
@@ -111,6 +113,7 @@ class CodeAgentExecutionAdapter:
         self.workspace_manager = workspace_manager
         self.workflow = workflow
         self.event_sink = event_sink
+        self._workspace_claims: dict[str, tuple[str, str]] = {}
         configured = required_capabilities or self.required_capabilities
         self.capabilities = frozenset(
             _bounded_identifier(value, max_length=96)
@@ -206,7 +209,17 @@ class CodeAgentExecutionAdapter:
 
         normalized = normalize_work_item(work_item)
         attempt_number = max(1, int(attempt or 1))
-        workspace, created = self.workspace_manager.create_for(normalized.identifier)
+        workspace_owner_id = _workspace_owner_id(normalized)
+        workspace_run_id = _workspace_run_id(normalized, attempt_number)
+        workspace, created = _workspace_method_call(
+            self.workspace_manager,
+            "create_for",
+            normalized.identifier,
+            owner_id=workspace_owner_id,
+            run_id=workspace_run_id,
+        )
+        claim_key = str(normalized.work_item_id or normalized.id)
+        self._workspace_claims[claim_key] = (workspace_owner_id, workspace_run_id)
         try:
             self.workspace_manager.run_before_run(workspace)
             prompt = render_prompt(
@@ -218,14 +231,30 @@ class CodeAgentExecutionAdapter:
             # A failed preparation must not strand a newly-created worktree.
             # Existing workspaces are intentionally retained for compatibility
             # and diagnostics; only this attempt's fresh workspace is removed.
-            if created:
-                try:
-                    self.workspace_manager.remove_for(normalized.identifier)
-                except Exception:
-                    logger.exception(
-                        "Code-agent workspace cleanup failed after preparation error for %s",
+            try:
+                _workspace_method_call(
+                    self.workspace_manager,
+                    "release_for",
+                    normalized.identifier,
+                    owner_id=workspace_owner_id,
+                    run_id=workspace_run_id,
+                )
+                if created:
+                    _workspace_method_call(
+                        self.workspace_manager,
+                        "remove_for",
                         normalized.identifier,
+                        owner_id=workspace_owner_id,
+                        run_id=workspace_run_id,
                     )
+                self._workspace_claims.pop(claim_key, None)
+            except Exception:
+                logger.exception(
+                    "Code-agent workspace cleanup failed after preparation error for %s",
+                    normalized.identifier,
+                )
+            finally:
+                self._workspace_claims.pop(claim_key, None)
             raise
         return PreparedCodeAgentRun(
             work_item=normalized,
@@ -234,9 +263,25 @@ class CodeAgentExecutionAdapter:
             attempt=attempt_number,
             created=created,
             prepared_at=datetime.utcnow(),
+            workspace_owner_id=workspace_owner_id,
+            workspace_run_id=workspace_run_id,
         )
 
-    async def execute(
+    async def execute(self, work_item: Any, **kwargs: Any) -> RunResult:
+        """Run one attempt; with broad network it is one non-preemptible section.
+
+        A network-isolated (``none``) run only edits its workspace and can be
+        stopped and resumed.  With ``broad`` network the CLI itself may write
+        to external services, which a shutdown must not interrupt.
+        """
+        if self.settings.execution_network != "broad":
+            return await self._execute_attempt(work_item, **kwargs)
+        from ..services.work_preemption import non_preemptible
+
+        async with non_preemptible("code_agent_network_broad"):
+            return await self._execute_attempt(work_item, **kwargs)
+
+    async def _execute_attempt(
         self,
         work_item: Any,
         *,
@@ -334,6 +379,35 @@ class CodeAgentExecutionAdapter:
                     "Code-agent after-run hook failed for %s",
                     prepared_run.work_item.identifier,
                 )
+            finally:
+                if prepared_run.workspace_owner_id and prepared_run.workspace_run_id:
+                    try:
+                        maybe_release = _workspace_method_call(
+                            self.workspace_manager,
+                            "release_for",
+                            prepared_run.work_item.identifier,
+                            owner_id=prepared_run.workspace_owner_id,
+                            run_id=prepared_run.workspace_run_id,
+                        )
+                        if inspect.isawaitable(maybe_release):
+                            await maybe_release
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Code-agent workspace claim release failed for %s",
+                            prepared_run.work_item.identifier,
+                        )
+                    claim_key = str(
+                        prepared_run.work_item.work_item_id
+                        or prepared_run.work_item.id
+                    )
+                    current_claim = self._workspace_claims.get(claim_key)
+                    if current_claim == (
+                        prepared_run.workspace_owner_id,
+                        prepared_run.workspace_run_id,
+                    ):
+                        self._workspace_claims.pop(claim_key, None)
 
     async def run(self, work_item: Any, **kwargs: Any) -> RunResult:
         """Compatibility alias matching ``AgentRunner.run``/adapter callers."""
@@ -408,7 +482,22 @@ class CodeAgentExecutionAdapter:
         """Remove a worktree after durable settlement has completed."""
 
         normalized = normalize_work_item(work_item)
-        maybe = self.workspace_manager.remove_for(normalized.identifier)
+        claim_key = str(normalized.work_item_id or normalized.id)
+        claim = self._workspace_claims.pop(claim_key, None)
+        if claim is not None:
+            _workspace_method_call(
+                self.workspace_manager,
+                "release_for",
+                normalized.identifier,
+                owner_id=claim[0],
+                run_id=claim[1],
+            )
+        maybe = _workspace_method_call(
+            self.workspace_manager,
+            "remove_for",
+            normalized.identifier,
+            owner_id=_workspace_owner_id(normalized),
+        )
         if inspect.isawaitable(maybe):
             await maybe
 
@@ -437,15 +526,9 @@ class CodeAgentExecutionAdapter:
                 if safe_value:
                     manifest[key] = safe_value
         # The authority resolver/coordinator may provide hash-only execution
-        # evidence and exact Team/Profile/Subagent pins.  Accept only the
-        # AgentRunService allowlist and never persist prompts, paths, models,
-        # or arbitrary context.
-        for key in (
-            "agent_revision_version",
-            "team_id",
-            "execution_profile_id",
-            "subagent_id",
-        ):
+        # evidence and the Agent revision version. Never persist retired
+        # topology pins, prompts, paths, models, or arbitrary context.
+        for key in ("agent_revision_version",):
             value = context.get(key, _work_item_value(normalized, key, None))
             safe_value = _safe_manifest_identifier(value)
             if safe_value:
@@ -620,9 +703,6 @@ def normalize_work_item(value: Any) -> WorkItem:
         parent_work_item_id=_bounded_identifier(get("parent_work_item_id", None), max_length=128) or None,
         causation_id=_bounded_identifier(get("causation_id", None), max_length=128) or None,
         causal_depth=max(0, min(int(get("causal_depth", 0) or 0), 64)),
-        team_id=_bounded_identifier(get("team_id", None), max_length=128) or None,
-        execution_profile_id=_bounded_identifier(get("execution_profile_id", None), max_length=128) or None,
-        subagent_id=_bounded_identifier(get("subagent_id", None), max_length=128) or None,
         authority_hash=(
             str(get("authority_hash", "")).strip().lower()
             if re.fullmatch(r"[0-9a-fA-F]{64}", str(get("authority_hash", "")).strip())
@@ -907,6 +987,44 @@ def _safe_provider_identifier(value: Any) -> str:
     ):
         return ""
     return text
+
+
+def _workspace_owner_id(item: WorkItem) -> str:
+    return str(item.work_item_id or item.id or item.identifier)
+
+
+def _workspace_run_id(item: WorkItem, attempt: int) -> str:
+    return f"agent-harness:{_workspace_owner_id(item)}:attempt-{int(attempt)}:{uuid.uuid4().hex}"
+
+
+def _workspace_method_call(
+    manager: Any,
+    method_name: str,
+    identifier: str,
+    *,
+    owner_id: str | None = None,
+    run_id: str | None = None,
+) -> Any:
+    method = getattr(manager, method_name, None)
+    if not callable(method):
+        if method_name == "release_for":
+            return None
+        raise AttributeError(f"workspace manager has no {method_name} method")
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(method).parameters
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    except (TypeError, ValueError):
+        parameters = {}
+        accepts_var_kwargs = False
+    if owner_id is not None and (accepts_var_kwargs or "owner_id" in parameters):
+        kwargs["owner_id"] = owner_id
+    if run_id is not None and (accepts_var_kwargs or "run_id" in parameters):
+        kwargs["run_id"] = run_id
+    return method(identifier, **kwargs)
 
 
 __all__ = [

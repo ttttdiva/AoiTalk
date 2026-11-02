@@ -37,7 +37,9 @@ from .muse_cli_diagnostics import (
     classify_cli_stderr,
     closed_exception_type,
     command_label,
+    sanitize_cli_failure_diagnostic,
     sanitize_cause,
+    sanitize_stderr_tail,
 )
 
 try:  # The module is useful in isolated fixture imports as well.
@@ -70,6 +72,15 @@ MUSE_ADAPTER_KEY = "remote_agent_turn"
 REMOTE_AGENT_DELEGATE = "remote_agent_delegate"
 
 MAX_MUSE_TEXT_CHARS = 24_000
+# Baseline history is read before the irreversible send boundary. Only a small
+# set of closed-vocabulary transient curl transport failures may retry here.
+_BASELINE_HISTORY_RETRY_BACKOFF_SECONDS = (0.1, 0.25)
+_RETRYABLE_HISTORY_CURL_CODES = frozenset({5, 6, 7, 28, 52, 55, 56})
+_RETRYABLE_HISTORY_ERROR_CODES = frozenset({"remote_gateway_error", "cli_process_failed", "remote_timeout"})
+# Keep provider input and recovered output limits independent: send input still
+# has to fit the pinned Muse CLI/Windows argv contract, while terminal history
+# replies can contain bounded source artifacts larger than a prompt.
+MAX_MUSE_OUTPUT_CHARS = 128_000
 MAX_WINDOWS_ARG_CHARS = 32_000
 MAX_HISTORY_EVENTS = 4_096
 MAX_ROLE_TEXT_CHARS = 16_000
@@ -105,13 +116,14 @@ class MuseError(RuntimeError):
     def __init__(self, code: str | None = None, *, timed_out: bool = False) -> None:
         self.code = _safe_code(code or self.code)
         self.timed_out = bool(timed_out)
-        # Closed-vocabulary evidence about the failing CLI process (never raw output).  It is
-        # filled in at the process boundary and only ever read through ``_cause_from_exception``.
+        # Safe process evidence: the cause remains closed-vocabulary while
+        # stderr_evidence holds only a separately redacted bounded tail.
         self.command: str | None = None
         self.returncode: int | None = None
         self.duration_ms: int | None = None
         self.diagnostics: Mapping[str, Any] | None = None
         self.cause_type: str | None = None
+        self.stderr_evidence: Mapping[str, Any] | None = None
         super().__init__(self.code)
 
 
@@ -388,6 +400,11 @@ class MuseBinding:
     unsafe_reason: str | None = None
     unsafe_cause: Mapping[str, Any] | None = None
     current_run_id: str | None = None
+    # A digest-only acknowledgement receipt makes tool-loop settlement
+    # idempotent across a crash between the binding write and the coordinator
+    # journal update. It never contains the provider nonce itself.
+    last_acknowledged_nonce_hash: str | None = None
+    last_acknowledged_run_id: str | None = None
 
     def normalized(self) -> "MuseBinding":
         owner = _bounded_identifier(self.owner_id)
@@ -404,6 +421,16 @@ class MuseBinding:
         binding_revision_id = _bounded_identifier(self.revision_id) if self.revision_id else None
         target_key = _bounded_identifier(self.remote_target_key) if self.remote_target_key else None
         run_id = _bounded_identifier(self.current_run_id) if self.current_run_id else None
+        acknowledged_nonce_hash = (
+            _safe_hash(self.last_acknowledged_nonce_hash)
+            if self.last_acknowledged_nonce_hash
+            else None
+        )
+        acknowledged_run_id = (
+            _bounded_identifier(self.last_acknowledged_run_id)
+            if self.last_acknowledged_run_id
+            else None
+        )
         if not all((owner, ref, vm, thread, auth)):
             raise MuseBindingError()
         if role_mode not in {"raw", "managed_role"}:
@@ -435,6 +462,8 @@ class MuseBinding:
             current_run_id=run_id,
             unsafe_reason=_safe_code(self.unsafe_reason) if self.unsafe_reason else None,
             unsafe_cause=sanitize_cause(self.unsafe_cause),
+            last_acknowledged_nonce_hash=acknowledged_nonce_hash,
+            last_acknowledged_run_id=acknowledged_run_id,
         )
 
 
@@ -448,6 +477,8 @@ class MuseProcessResult:
     duration_ms: int = 0
     # Closed-vocabulary reduction of stderr (see muse_cli_diagnostics); stderr itself is never kept.
     diagnostics: Mapping[str, Any] | None = None
+    # Redacted, bounded stderr evidence is populated at the subprocess boundary.
+    stderr_evidence: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -542,6 +573,7 @@ class _TurnRuntime:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[Any] | None = None
     process_started: bool = False
+    confirmed_turns: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 class MuseRemoteClient:
@@ -630,7 +662,13 @@ class MuseRemoteClient:
             wait_seconds=wait_seconds,
         )
         await self._ensure_contract(root)
-        result = await self._invoke(argv, root, timeout_seconds=max(30.0, float(wait) + 30.0), map_errors=False)
+        result = await self._invoke(
+            argv,
+            root,
+            timeout_seconds=max(30.0, float(wait) + 30.0),
+            map_errors=False,
+            stderr_prompt=text,
+        )
         if result.timed_out or result.returncode == 4:
             raise _annotate(MuseTimeoutError(), command=command_label(argv), result=result)
         if result.returncode == 2:
@@ -642,7 +680,10 @@ class MuseRemoteClient:
         # The provider may emit {"sent": true}; that is retained only as an
         # internal process fact.  It is never surfaced as an ACK/completion.
         if result.stdout.strip():
-            _parse_json_payload(result.stdout, allow_empty=False)
+            try:
+                _parse_json_payload(result.stdout, allow_empty=False)
+            except MuseError as exc:
+                raise _annotate(exc, command="send", result=result) from None
         return MuseSendReceipt(send_attempted=True, acceptance="acceptance_unconfirmed", returncode=result.returncode)
 
     def preflight_send(
@@ -684,8 +725,11 @@ class MuseRemoteClient:
         await self._ensure_contract(root)
         argv = [self.executable, "history", "--thread", thread, "--raw"]
         result = await self._invoke(argv, root, timeout_seconds)
-        payload = _parse_json_payload(result.stdout, allow_empty=False)
-        events = _extract_history_events(payload)
+        try:
+            payload = _parse_json_payload(result.stdout, allow_empty=False)
+            events = _extract_history_events(payload)
+        except MuseError as exc:
+            raise _annotate(exc, command="history", result=result) from None
         cursor = _find_string(payload, ("cursor", "next_cursor", "nextCursor"))
         return MuseHistorySnapshot(events=tuple(events[:MAX_HISTORY_EVENTS]), cursor=_bounded_identifier(cursor))
 
@@ -730,15 +774,28 @@ class MuseRemoteClient:
         timeout_seconds: float,
         *,
         map_errors: bool = True,
+        stderr_prompt: str | None = None,
     ) -> MuseProcessResult:
         _validate_allowed_argv(argv)
         _validate_argv_length(argv, self.max_argv_chars)
-        result = await self._invoke_raw(argv, root, timeout=timeout_seconds)
+        result = await self._invoke_raw(
+            argv,
+            root,
+            timeout=timeout_seconds,
+            stderr_prompt=stderr_prompt,
+        )
         if map_errors and result.returncode not in (0, None):
             raise _error_from_process(result)
         return result
 
-    async def _invoke_raw(self, argv: Sequence[str], root: Path, *, timeout: float) -> MuseProcessResult:
+    async def _invoke_raw(
+        self,
+        argv: Sequence[str],
+        root: Path,
+        *,
+        timeout: float,
+        stderr_prompt: str | None = None,
+    ) -> MuseProcessResult:
         environment = _child_environment(root)
         _prove_dedicated_home(root, environment)
         started = time.monotonic()
@@ -767,19 +824,30 @@ class MuseRemoteClient:
                 cause_type=closed_exception_type(type(exc).__name__),
             ) from None
         if isinstance(value, MuseProcessResult):
-            if value.diagnostics is None:
-                # A runner that did not classify (custom/fake) may hand back stderr text: reduce it to
-                # closed labels and drop the text.
-                value = replace(value, stderr="", diagnostics=classify_cli_stderr(value.stderr, timed_out=value.timed_out))
-            return value
+            diagnostics = value.diagnostics
+            if diagnostics is None:
+                diagnostics = classify_cli_stderr(value.stderr, timed_out=value.timed_out)
+            # Scrub before dropping the process text, even for runners that supplied
+            # their own closed-vocabulary classifier result.
+            stderr_evidence = sanitize_stderr_tail(value.stderr, prompt=stderr_prompt)
+            return replace(
+                value,
+                stderr="",
+                diagnostics=diagnostics,
+                stderr_evidence=stderr_evidence,
+            )
         if isinstance(value, Mapping):
+            timed_out = value.get("timed_out") is True
+            raw_stderr = str(value.get("stderr") or "")
             return MuseProcessResult(
                 argv=tuple(str(item) for item in argv),
                 returncode=_int_or_none(value.get("returncode")),
                 stdout=str(value.get("stdout") or ""),
                 stderr="",  # stderr is never retained in public evidence.
-                timed_out=bool(value.get("timed_out")),
+                timed_out=timed_out,
                 duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                diagnostics=classify_cli_stderr(raw_stderr, timed_out=timed_out),
+                stderr_evidence=sanitize_stderr_tail(raw_stderr, prompt=stderr_prompt),
             )
         raise MuseProcessError()
 
@@ -917,6 +985,282 @@ class MuseRemoteExecutionAdapter:
             "sandbox": "remote_uncontrolled",
         }
 
+    def begin_tool_loop(self, claim: Any) -> _TurnRuntime:
+        """Register one cancellable owner-bound loop across all its rounds."""
+
+        work_id = _bounded_identifier(_claim_value(claim, "work_item_id", ""))
+        if not work_id:
+            raise MuseBindingError(MuseErrorCode.THREAD_BINDING_MISMATCH)
+        if work_id in self._active:
+            raise MuseBindingError(MuseErrorCode.THREAD_BINDING_UNSAFE)
+        runtime = _TurnRuntime(binding_key=self._binding_key(claim))
+        runtime.task = asyncio.current_task()
+        self._active[work_id] = runtime
+        self._work_binding_keys[work_id] = runtime.binding_key
+        return runtime
+
+    def end_tool_loop(self, claim: Any, runtime: _TurnRuntime) -> None:
+        """Release the in-process cancellation handle after the loop settles."""
+
+        work_id = _bounded_identifier(_claim_value(claim, "work_item_id", ""))
+        if work_id and self._active.get(work_id) is runtime:
+            self._active.pop(work_id, None)
+
+    @staticmethod
+    def tool_loop_should_cancel(runtime: _TurnRuntime) -> bool:
+        return runtime.cancel_event.is_set()
+
+    async def execute_tool_loop_round(
+        self,
+        claim: Any,
+        *,
+        runtime: _TurnRuntime,
+        prompt: str,
+        turn_nonce: str,
+        authority: Any | None = None,
+        send_ordinal: int = 1,
+    ) -> ExecutionOutcome:
+        """Send one coordinator-owned nonce, preserving its binding on success.
+
+        The caller must durably journal ``turn_nonce`` before invoking this
+        method. An existing nonce with another value is never overwritten or
+        replayed; only the same nonce may enter the existing history-only
+        recovery path.
+        """
+
+        work_id = _bounded_identifier(_claim_value(claim, "work_item_id", ""))
+        nonce = _bounded_identifier(turn_nonce)
+        if (
+            not work_id
+            or not nonce
+            or self._active.get(work_id) is not runtime
+            or runtime.binding_key != self._binding_key(claim)
+            or not isinstance(prompt, str)
+            or not prompt
+            or type(send_ordinal) is not int
+            or not 1 <= send_ordinal <= 10_000
+        ):
+            return self._outcome(
+                "blocked",
+                MuseErrorCode.THREAD_BINDING_UNSAFE,
+                turn_status="not_sent",
+                send_attempted=False,
+                safe_to_send=False,
+                acceptance="not_attempted",
+            )
+        try:
+            binding = await self._get_binding(runtime.binding_key)
+        except MuseError as exc:
+            return self._outcome(
+                "blocked",
+                exc.code,
+                turn_status="not_sent",
+                send_attempted=False,
+                safe_to_send=False,
+                acceptance="not_attempted",
+            )
+        if binding is not None and binding.current_turn_nonce:
+            if (
+                binding.current_turn_nonce != nonce
+                or not _binding_run_matches(binding, claim)
+            ):
+                return self._outcome(
+                    "uncertain",
+                    MuseErrorCode.SEND_RESPONSE_UNCORRELATED,
+                    turn_status="uncertain",
+                    send_attempted=_attempted_for_recovery(binding),
+                    safe_to_send=False,
+                    acceptance="acceptance_unconfirmed",
+                    role_delivery=_role_receipt(binding),
+                    history_reconciled=False,
+                    reconciliation_diagnostic="tool_loop_nonce_mismatch",
+                )
+        elif binding is not None and binding.last_acknowledged_nonce_hash:
+            # A new durable round supersedes the in-memory acknowledgement
+            # receipt from the just-settled round. Local dispatch still checks
+            # the live nonce in the binding before using this map.
+            stale = [
+                item
+                for item in runtime.confirmed_turns
+                if hashlib.sha256(item.encode("utf-8")).hexdigest()
+                == binding.last_acknowledged_nonce_hash
+            ]
+            for item in stale:
+                runtime.confirmed_turns.pop(item, None)
+        elif binding is not None and binding.current_run_id:
+            return self._outcome(
+                "blocked",
+                MuseErrorCode.THREAD_BINDING_UNSAFE,
+                turn_status="blocked",
+                send_attempted=False,
+                safe_to_send=False,
+                acceptance="not_attempted",
+                role_delivery=_role_receipt(binding),
+            )
+        outcome = await self._execute_one(
+            claim,
+            runtime,
+            authority=authority,
+            prompt_override=prompt,
+            turn_nonce_override=nonce,
+            preserve_binding_on_completion=True,
+            send_ordinal=send_ordinal,
+        )
+        outcome = self._annotate_tool_loop_nonce(outcome, nonce)
+        self._remember_confirmed_turn(runtime, nonce, outcome)
+        return outcome
+
+    async def reconcile_tool_loop_round(
+        self,
+        claim: Any,
+        *,
+        runtime: _TurnRuntime,
+        turn_nonce: str,
+        authority: Any | None = None,
+    ) -> ExecutionOutcome:
+        """Read history for one exact pending loop nonce; never sends."""
+
+        nonce = _bounded_identifier(turn_nonce)
+        if not nonce or runtime.binding_key != self._binding_key(claim):
+            return self._outcome(
+                "blocked",
+                MuseErrorCode.THREAD_BINDING_MISMATCH,
+                turn_status="uncertain",
+                send_attempted=False,
+                safe_to_send=False,
+                acceptance="acceptance_unconfirmed",
+                history_reconciled=False,
+                reconciliation_diagnostic="binding_mismatch",
+            )
+        binding = await self._get_binding(runtime.binding_key)
+        if (
+            binding is None
+            or binding.current_turn_nonce != nonce
+            or not _binding_run_matches(binding, claim)
+        ):
+            return self._outcome(
+                "uncertain",
+                MuseErrorCode.SEND_RESPONSE_UNCORRELATED,
+                turn_status="uncertain",
+                send_attempted=_attempted_for_recovery(binding) if binding else None,
+                safe_to_send=False,
+                acceptance="acceptance_unconfirmed",
+                history_reconciled=False,
+                reconciliation_diagnostic="pending_nonce_unavailable",
+            )
+        outcome = await self.reconcile(
+            claim,
+            authority=authority,
+            preserve_binding=True,
+            expected_turn_nonce=nonce,
+        )
+        outcome = self._annotate_tool_loop_nonce(outcome, nonce)
+        self._remember_confirmed_turn(runtime, nonce, outcome)
+        return outcome
+
+    async def acknowledge_tool_loop_round(
+        self,
+        claim: Any,
+        *,
+        runtime: _TurnRuntime,
+        turn_nonce: str,
+        authority: Any | None = None,
+    ) -> bool:
+        """Clear one already-correlated nonce after coordinator state is durable."""
+
+        nonce = _bounded_identifier(turn_nonce)
+        run_id = _claim_run_id(claim)
+        if (
+            not nonce
+            or not run_id
+            or runtime.binding_key != self._binding_key(claim)
+        ):
+            return False
+        validation = self._validate_claim(claim, authority=authority)
+        if validation is not None:
+            return False
+        try:
+            context = await self._resolve_context(claim, authority=authority)
+            binding = await self._get_binding(runtime.binding_key)
+        except Exception:
+            return False
+        if binding is None:
+            return False
+        if (
+            binding.owner_id != context.owner_id
+            or binding.agent_id != context.agent_id
+            or binding.revision_id != context.revision_id
+            or binding.remote_target_key != context.remote_target_key
+            or str(binding.unsafe_reason or "") == MuseErrorCode.SEND_CANCELLED_LOCAL
+        ):
+            return False
+        nonce_hash = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        if binding.current_turn_nonce is None:
+            return bool(
+                binding.safe_to_send
+                and binding.state == "bound"
+                and binding.last_acknowledged_nonce_hash == nonce_hash
+                and binding.last_acknowledged_run_id == run_id
+            )
+        if (
+            runtime.confirmed_turns.get(nonce) is None
+            or
+            binding.current_turn_nonce != nonce
+            or binding.current_run_id != run_id
+            or binding.state not in {_TURN_ATTEMPTED, "unsafe"}
+        ):
+            return False
+        acknowledged = replace(
+            binding,
+            current_turn_nonce=None,
+            current_run_id=None,
+            turn_count=binding.turn_count + 1,
+            safe_to_send=True,
+            state="bound",
+            unsafe_reason=None,
+            unsafe_cause=None,
+            last_acknowledged_nonce_hash=nonce_hash,
+            last_acknowledged_run_id=run_id,
+        ).normalized()
+        try:
+            await self._persist_binding(runtime.binding_key, acknowledged)
+        except Exception:
+            self._unsafe_keys.add(runtime.binding_key)
+            return False
+        self._unsafe_keys.discard(runtime.binding_key)
+        return True
+
+    @staticmethod
+    def _annotate_tool_loop_nonce(outcome: ExecutionOutcome, nonce: str) -> ExecutionOutcome:
+        if outcome.classification != "succeeded":
+            return outcome
+        metadata = dict(outcome.metadata or {})
+        metadata["tool_loop_turn_nonce_sha256"] = hashlib.sha256(
+            nonce.encode("utf-8")
+        ).hexdigest()
+        return replace(outcome, metadata=metadata)
+
+    @staticmethod
+    def _remember_confirmed_turn(
+        runtime: _TurnRuntime,
+        nonce: str,
+        outcome: ExecutionOutcome,
+    ) -> None:
+        result = outcome.result if isinstance(outcome.result, Mapping) else {}
+        metadata = outcome.metadata if isinstance(outcome.metadata, Mapping) else {}
+        if (
+            outcome.classification == "succeeded"
+            and str(metadata.get("turn_status") or "") == "confirmed"
+            and result.get("assistant_artifact_complete") is True
+            and not result.get("assistant_text_truncated")
+            and isinstance(result.get("assistant_message_id"), str)
+            and isinstance(result.get("assistant_text"), str)
+        ):
+            runtime.confirmed_turns[nonce] = (
+                str(result["assistant_message_id"]),
+                hashlib.sha256(str(result["assistant_text"]).encode("utf-8")).hexdigest(),
+            )
+
     async def _cancel_binding_key(self, work_item_id: str, runtime: _TurnRuntime | None) -> str:
         """Resolve the binding currently owned by a work item before poisoning it."""
 
@@ -983,6 +1327,8 @@ class MuseRemoteExecutionAdapter:
         current_authority: Any | None = None,
         current_agent_authority: Any | None = None,
         run: Any | None = None,
+        preserve_binding: bool = False,
+        expected_turn_nonce: str | None = None,
     ) -> ExecutionOutcome:
         """Read-only recovery for an existing nonce; never resends.
 
@@ -996,6 +1342,11 @@ class MuseRemoteExecutionAdapter:
         try:
             validation = self._validate_claim(claim, authority=current_authority)
             if validation is not None:
+                validation.metadata = {
+                    **dict(validation.metadata or {}),
+                    "history_reconciled": False,
+                    "reconciliation_diagnostic": "binding_mismatch",
+                }
                 return validation
             role = self._role_context(_claim_metadata(claim))
             context = await self._resolve_context(claim, authority=current_authority)
@@ -1011,6 +1362,22 @@ class MuseRemoteExecutionAdapter:
                     send_attempted=attempted,
                     safe_to_send=False,
                     acceptance="acceptance_unconfirmed",
+                    history_reconciled=False,
+                    reconciliation_diagnostic="no_pending_nonce",
+                )
+            if (
+                expected_turn_nonce is not None
+                and binding.current_turn_nonce != _bounded_identifier(expected_turn_nonce)
+            ):
+                return self._outcome(
+                    "uncertain",
+                    MuseErrorCode.SEND_RESPONSE_UNCORRELATED,
+                    turn_status="uncertain",
+                    send_attempted=_attempted_for_recovery(binding),
+                    safe_to_send=False,
+                    acceptance="acceptance_unconfirmed",
+                    history_reconciled=False,
+                    reconciliation_diagnostic="tool_loop_nonce_mismatch",
                 )
             mismatch = _binding_mismatch(binding, context, role)
             if mismatch:
@@ -1022,12 +1389,15 @@ class MuseRemoteExecutionAdapter:
                     safe_to_send=False,
                     acceptance="acceptance_unconfirmed",
                     role_delivery=_role_receipt(binding),
+                    history_reconciled=False,
+                    reconciliation_diagnostic="binding_mismatch",
                 )
             return await self._reconcile_binding(
                 claim,
                 binding_key=binding_key,
                 binding=binding,
                 context=context,
+                preserve_binding=preserve_binding,
             )
         except MuseError as exc:
             attempted: bool | None = False
@@ -1060,6 +1430,8 @@ class MuseRemoteExecutionAdapter:
                 send_attempted=attempted,
                 safe_to_send=attempted is False,
                 acceptance="acceptance_unconfirmed",
+                history_reconciled=False,
+                reconciliation_diagnostic="authority_unavailable",
             )
         except Exception:
             return self._outcome(
@@ -1069,6 +1441,8 @@ class MuseRemoteExecutionAdapter:
                 send_attempted=True,
                 safe_to_send=False,
                 acceptance="acceptance_unconfirmed",
+                history_reconciled=False,
+                reconciliation_diagnostic="history_unavailable",
             )
 
     async def _reconcile_binding(
@@ -1078,6 +1452,7 @@ class MuseRemoteExecutionAdapter:
         binding_key: str,
         binding: MuseBinding,
         context: MuseCredentialResolution,
+        preserve_binding: bool = False,
     ) -> ExecutionOutcome:
         """Reconcile one persisted nonce using history only."""
 
@@ -1090,6 +1465,8 @@ class MuseRemoteExecutionAdapter:
                 send_attempted=False,
                 safe_to_send=False,
                 acceptance="acceptance_unconfirmed",
+                history_reconciled=False,
+                reconciliation_diagnostic="recovery_state_ineligible",
             )
         if _binding_blocks_recovery(binding, claim):
             return self._outcome(
@@ -1100,6 +1477,8 @@ class MuseRemoteExecutionAdapter:
                 safe_to_send=False,
                 acceptance="acceptance_unconfirmed",
                 role_delivery=_role_receipt(binding),
+                history_reconciled=False,
+                reconciliation_diagnostic="binding_mismatch",
             )
         try:
             history = await self.client.history(thread_id=binding.thread_id, state_root=context.state_root)
@@ -1115,43 +1494,61 @@ class MuseRemoteExecutionAdapter:
                 safe_to_send=not attempted,
                 acceptance="acceptance_unconfirmed",
                 role_delivery=_role_receipt(binding),
+                history_reconciled=False,
+                reconciliation_diagnostic="history_unavailable",
             )
         correlation = _correlate_history(history, MuseHistorySnapshot(events=()), binding.current_turn_nonce or "")
         if correlation.status == "confirmed":
-            updated = replace(
-                binding,
-                current_turn_nonce=None,
-                current_run_id=None,
-                turn_count=binding.turn_count + 1,
-                safe_to_send=True,
-                state="bound",
-            )
-            try:
-                await self._persist_binding(binding_key, updated)
-            except MuseError:
-                self._unsafe_keys.add(binding_key)
-                return self._outcome(
-                    "uncertain",
-                    MuseErrorCode.BINDING_PERSIST_FAILED,
-                    turn_status="uncertain",
-                    send_attempted=True,
-                    safe_to_send=False,
-                    acceptance="acceptance_unconfirmed",
-                    role_delivery=_role_receipt(binding),
+            updated = (
+                binding
+                if preserve_binding
+                else replace(
+                    binding,
+                    current_turn_nonce=None,
+                    current_run_id=None,
+                    turn_count=binding.turn_count + 1,
+                    safe_to_send=True,
+                    state="bound",
+                    last_acknowledged_nonce_hash=hashlib.sha256(
+                        str(binding.current_turn_nonce or "").encode("utf-8")
+                    ).hexdigest(),
+                    last_acknowledged_run_id=_claim_run_id(claim),
                 )
+            )
+            if not preserve_binding:
+                try:
+                    await self._persist_binding(binding_key, updated)
+                except MuseError:
+                    self._unsafe_keys.add(binding_key)
+                    return self._outcome(
+                        "uncertain",
+                        MuseErrorCode.BINDING_PERSIST_FAILED,
+                        turn_status="uncertain",
+                        send_attempted=True,
+                        safe_to_send=False,
+                        acceptance="acceptance_unconfirmed",
+                        role_delivery=_role_receipt(binding),
+                        history_reconciled=False,
+                        reconciliation_diagnostic="binding_persist_failed",
+                    )
+            # The durable nonce still wins over this local cache if the caller
+            # cannot atomically persist the recovered output and cleared
+            # binding.  Any subsequent execute therefore remains history-only.
             self._unsafe_keys.discard(binding_key)
             outcome = self._outcome(
                 "succeeded",
                 turn_status="confirmed",
                 send_attempted=True,
-                safe_to_send=True,
+                safe_to_send=not preserve_binding,
                 acceptance="acceptance_confirmed",
                 role_delivery=_role_receipt(updated),
                 assistant_text=correlation.assistant_text,
                 assistant_message_id=correlation.assistant_message_id,
+                history_reconciled=True,
+                reconciliation_diagnostic="confirmed",
             )
             work_id = _bounded_identifier(_claim_value(claim, "work_item_id", ""))
-            if work_id:
+            if work_id and not preserve_binding:
                 self._settled[work_id] = outcome
             return outcome
         return self._outcome(
@@ -1162,9 +1559,25 @@ class MuseRemoteExecutionAdapter:
             safe_to_send=False,
             acceptance="acceptance_unconfirmed",
             role_delivery=_role_receipt(binding),
+            history_reconciled=False,
+            reconciliation_diagnostic=(
+                "history_nonterminal"
+                if correlation.status == "nonterminal"
+                else "history_unconfirmed"
+            ),
         )
 
-    async def _execute_one(self, claim: Any, runtime: _TurnRuntime, *, authority: Any | None = None) -> ExecutionOutcome:
+    async def _execute_one(
+        self,
+        claim: Any,
+        runtime: _TurnRuntime,
+        *,
+        authority: Any | None = None,
+        prompt_override: str | None = None,
+        turn_nonce_override: str | None = None,
+        preserve_binding_on_completion: bool = False,
+        send_ordinal: int = 1,
+    ) -> ExecutionOutcome:
         validation = self._validate_claim(claim, authority=authority)
         if validation is not None:
             return validation
@@ -1173,9 +1586,18 @@ class MuseRemoteExecutionAdapter:
             role = self._role_context(metadata)
         except MuseError as exc:
             return self._outcome("blocked", exc.code, turn_status="not_sent", send_attempted=False, safe_to_send=True, acceptance="not_attempted")
-        prompt = _input_text(metadata)
+        prompt = prompt_override if prompt_override is not None else _input_text(metadata)
         if not prompt:
             return self._outcome("blocked", MuseErrorCode.INPUT_MISSING, turn_status="not_sent", send_attempted=False, safe_to_send=True, acceptance="not_attempted")
+        if len(prompt) > int(getattr(self.client, "max_text_chars", MAX_MUSE_TEXT_CHARS)):
+            return self._outcome(
+                "blocked",
+                MuseErrorCode.INPUT_TOO_LONG,
+                turn_status="not_sent",
+                send_attempted=False,
+                safe_to_send=True,
+                acceptance="not_attempted",
+            )
         try:
             context = await self._resolve_context(claim, authority=authority)
         except MuseError as exc:
@@ -1217,6 +1639,21 @@ class MuseRemoteExecutionAdapter:
                     acceptance="acceptance_unconfirmed",
                     role_delivery=_role_receipt(binding),
                 )
+            if (
+                turn_nonce_override is not None
+                and binding.current_turn_nonce != _bounded_identifier(turn_nonce_override)
+            ):
+                return self._outcome(
+                    "uncertain",
+                    MuseErrorCode.SEND_RESPONSE_UNCORRELATED,
+                    turn_status="uncertain",
+                    send_attempted=_attempted_for_recovery(binding),
+                    safe_to_send=False,
+                    acceptance="acceptance_unconfirmed",
+                    role_delivery=_role_receipt(binding),
+                    history_reconciled=False,
+                    reconciliation_diagnostic="tool_loop_nonce_mismatch",
+                )
             # Resolve the server-owned identity again immediately before the
             # recovery history read.  A credential, VM, node, or auth change
             # between admission and recovery must never open the old thread.
@@ -1224,7 +1661,13 @@ class MuseRemoteExecutionAdapter:
             mismatch = _binding_mismatch(binding, current_context, role)
             if mismatch:
                 return self._outcome("blocked", mismatch, turn_status="uncertain", send_attempted=_attempted_for_recovery(binding), safe_to_send=False, acceptance="acceptance_unconfirmed", role_delivery=_role_receipt(binding))
-            return await self._reconcile_binding(claim, binding_key=binding_key, binding=binding, context=current_context)
+            return await self._reconcile_binding(
+                claim,
+                binding_key=binding_key,
+                binding=binding,
+                context=current_context,
+                preserve_binding=preserve_binding_on_completion,
+            )
         if binding_key in self._unsafe_keys:
             return self._outcome("blocked", MuseErrorCode.THREAD_BINDING_UNSAFE, turn_status="blocked", send_attempted=False, safe_to_send=False, acceptance="not_attempted")
         if self.privacy_gateway is None:
@@ -1316,11 +1759,32 @@ class MuseRemoteExecutionAdapter:
             return self._outcome("uncertain", MuseErrorCode.THREAD_CREATE_UNCERTAIN, turn_status="uncertain", send_attempted=False, safe_to_send=False, acceptance="acceptance_unconfirmed", cause=cause)
 
         try:
-            baseline = await self.client.history(thread_id=binding.thread_id, state_root=context.state_root)
+            for attempt in range(len(_BASELINE_HISTORY_RETRY_BACKOFF_SECONDS) + 1):
+                try:
+                    baseline = await self.client.history(
+                        thread_id=binding.thread_id,
+                        state_root=context.state_root,
+                    )
+                    break
+                except MuseError as exc:
+                    if (
+                        attempt >= len(_BASELINE_HISTORY_RETRY_BACKOFF_SECONDS)
+                        or not _is_retryable_baseline_history_transport(exc)
+                    ):
+                        raise
+                    await asyncio.sleep(_BASELINE_HISTORY_RETRY_BACKOFF_SECONDS[attempt])
         except MuseError as exc:
-            return self._outcome("transient", MuseErrorCode.BASELINE_HISTORY_UNAVAILABLE, turn_status="not_sent", send_attempted=False, safe_to_send=True, acceptance="not_attempted")
-        except Exception:
-            return self._outcome("transient", MuseErrorCode.BASELINE_HISTORY_UNAVAILABLE, turn_status="not_sent", send_attempted=False, safe_to_send=True, acceptance="not_attempted")
+            return self._outcome(
+                "transient", MuseErrorCode.BASELINE_HISTORY_UNAVAILABLE,
+                turn_status="not_sent", send_attempted=False, safe_to_send=True,
+                acceptance="not_attempted", cause=_cause_from_exception(exc),
+            )
+        except Exception as exc:
+            return self._outcome(
+                "transient", MuseErrorCode.BASELINE_HISTORY_UNAVAILABLE,
+                turn_status="not_sent", send_attempted=False, safe_to_send=True,
+                acceptance="not_attempted", cause=_cause_from_exception(exc),
+            )
 
         # Re-resolve the server-owned credential/target immediately before the
         # irreversible provider invocation.  A check made only at admission
@@ -1336,7 +1800,16 @@ class MuseRemoteExecutionAdapter:
             return self._outcome("blocked", MuseErrorCode.CURRENT_AUTH_MISMATCH, turn_status="not_sent", send_attempted=False, safe_to_send=False, acceptance="not_attempted")
         context = current_context
 
-        nonce = str(uuid.uuid4())
+        nonce = _bounded_identifier(turn_nonce_override) if turn_nonce_override is not None else str(uuid.uuid4())
+        if not nonce:
+            return self._outcome(
+                "blocked",
+                MuseErrorCode.INPUT_MISSING,
+                turn_status="not_sent",
+                send_attempted=False,
+                safe_to_send=True,
+                acceptance="not_attempted",
+            )
         try:
             body = _compose_turn_text(prompt, nonce=nonce, role=role, first_turn=binding.turn_count == 0)
             body = await self._protect_outbound(body, nonce=nonce)
@@ -1390,10 +1863,22 @@ class MuseRemoteExecutionAdapter:
             receipt = await self.client.send(body, thread_id=binding.thread_id, state_root=context.state_root, wait_seconds=self.wait_seconds)
         except MuseError as exc:
             cause = _cause_from_exception(exc)
+            cli_failure_diagnostic = _cli_failure_diagnostic_from_exception(
+                exc, send_ordinal=send_ordinal
+            )
             self._unsafe_keys.add(binding_key)
             await self._mark_unsafe(binding_key, reason=exc.code, cause=cause)
             classification = "blocked" if isinstance(exc, MuseAuthorizationError) else "uncertain"
-            return self._outcome(classification, exc.code, turn_status="uncertain", send_attempted=True, safe_to_send=False, acceptance="acceptance_unconfirmed", cause=cause)
+            return self._outcome(
+                classification,
+                exc.code,
+                turn_status="uncertain",
+                send_attempted=True,
+                safe_to_send=False,
+                acceptance="acceptance_unconfirmed",
+                cause=cause,
+                cli_failure_diagnostic=cli_failure_diagnostic,
+            )
         except Exception as exc:
             cause = _cause_from_exception(exc)
             self._unsafe_keys.add(binding_key)
@@ -1401,6 +1886,7 @@ class MuseRemoteExecutionAdapter:
             return self._outcome("uncertain", MuseErrorCode.SEND_ACCEPTANCE_UNCONFIRMED, turn_status="uncertain", send_attempted=True, safe_to_send=False, acceptance="acceptance_unconfirmed", cause=cause)
 
         deadline = time.monotonic() + self.reconcile_timeout_seconds
+        history_cause: dict[str, Any] | None = None
         while True:
             if runtime.cancel_event.is_set():
                 self._unsafe_keys.add(binding_key)
@@ -1408,29 +1894,39 @@ class MuseRemoteExecutionAdapter:
                 return self._outcome("cancelled", MuseErrorCode.SEND_CANCELLED_LOCAL, turn_status="local_stopped", send_attempted=True, safe_to_send=False, acceptance="acceptance_unconfirmed", role_delivery=_role_receipt(binding))
             try:
                 current = await self.client.history(thread_id=binding.thread_id, state_root=context.state_root)
-            except MuseError:
+            except MuseError as exc:
+                history_cause = _cause_from_exception(exc)
+                current = None
+            except Exception as exc:
+                history_cause = _cause_from_exception(exc)
                 current = None
             if current is not None:
                 correlation = _correlate_history(current, baseline, nonce)
                 if correlation.status == "confirmed":
-                    confirmed = replace(
-                        binding,
-                        current_turn_nonce=None,
-                        current_run_id=None,
-                        turn_count=binding.turn_count + 1,
-                        safe_to_send=True,
-                        state="bound",
-                    )
-                    try:
-                        await self._persist_binding(binding_key, confirmed)
-                    except MuseError:
-                        self._unsafe_keys.add(binding_key)
-                        return self._outcome("uncertain", MuseErrorCode.BINDING_PERSIST_FAILED, turn_status="uncertain", send_attempted=True, safe_to_send=False, acceptance="acceptance_unconfirmed", role_delivery=_role_receipt(binding))
+                    confirmed = binding
+                    if not preserve_binding_on_completion:
+                        confirmed = replace(
+                            binding,
+                            current_turn_nonce=None,
+                            current_run_id=None,
+                            turn_count=binding.turn_count + 1,
+                            safe_to_send=True,
+                            state="bound",
+                            last_acknowledged_nonce_hash=hashlib.sha256(
+                                nonce.encode("utf-8")
+                            ).hexdigest(),
+                            last_acknowledged_run_id=_claim_run_id(claim),
+                        )
+                        try:
+                            await self._persist_binding(binding_key, confirmed)
+                        except MuseError:
+                            self._unsafe_keys.add(binding_key)
+                            return self._outcome("uncertain", MuseErrorCode.BINDING_PERSIST_FAILED, turn_status="uncertain", send_attempted=True, safe_to_send=False, acceptance="acceptance_unconfirmed", role_delivery=_role_receipt(binding))
                     return self._outcome(
                         "succeeded",
                         turn_status="confirmed",
                         send_attempted=receipt.send_attempted,
-                        safe_to_send=True,
+                        safe_to_send=not preserve_binding_on_completion,
                         acceptance="acceptance_confirmed",
                         role_delivery=_role_receipt(confirmed),
                         assistant_text=correlation.assistant_text,
@@ -1444,7 +1940,12 @@ class MuseRemoteExecutionAdapter:
                 pass
         self._unsafe_keys.add(binding_key)
         await self._mark_unsafe(binding_key, reason=MuseErrorCode.SEND_ACCEPTANCE_UNCONFIRMED)
-        return self._outcome("uncertain", MuseErrorCode.SEND_RESPONSE_UNCORRELATED, turn_status="uncertain", send_attempted=True, safe_to_send=False, acceptance="acceptance_unconfirmed", role_delivery=_role_receipt(binding))
+        return self._outcome(
+            "uncertain", MuseErrorCode.SEND_RESPONSE_UNCORRELATED,
+            turn_status="uncertain", send_attempted=True, safe_to_send=False,
+            acceptance="acceptance_unconfirmed", role_delivery=_role_receipt(binding),
+            cause=history_cause,
+        )
 
     def _preflight_send(self, body: str, *, thread_id: str, state_root: Path, wait_seconds: float) -> None:
         callback = getattr(self.client, "preflight_send", None)
@@ -1781,6 +2282,9 @@ class MuseRemoteExecutionAdapter:
         assistant_text: str | None = None,
         assistant_message_id: str | None = None,
         cause: Mapping[str, Any] | None = None,
+        cli_failure_diagnostic: Mapping[str, Any] | None = None,
+        history_reconciled: bool | None = None,
+        reconciliation_diagnostic: str | None = None,
     ) -> ExecutionOutcome:
         delivery = dict(role_delivery or _raw_role_receipt())
         # ``send_attempted`` is tri-state: True / False are backed by durable evidence; ``None`` means
@@ -1800,15 +2304,20 @@ class MuseRemoteExecutionAdapter:
         truncated = (
             classification == "succeeded"
             and isinstance(assistant_text, str)
-            and len(assistant_text) > MAX_MUSE_TEXT_CHARS
+            and len(assistant_text) > MAX_MUSE_OUTPUT_CHARS
         )
         original_length = len(assistant_text) if truncated and isinstance(assistant_text, str) else None
         safe_cause = sanitize_cause(cause)
         if safe_cause:
             safe_result["cause"] = safe_cause
+        safe_cli_failure = sanitize_cli_failure_diagnostic(cli_failure_diagnostic)
+        if safe_cli_failure:
+            safe_result["cli_failure_diagnostic"] = safe_cli_failure
         if classification == "succeeded":
-            if isinstance(assistant_text, str) and assistant_text:
-                safe_result["assistant_text"] = assistant_text[:MAX_MUSE_TEXT_CHARS]
+            if isinstance(assistant_text, str):
+                safe_result["assistant_artifact_complete"] = not truncated
+                if assistant_text:
+                    safe_result["assistant_text"] = assistant_text[:MAX_MUSE_OUTPUT_CHARS]
             if truncated:
                 safe_result["assistant_text_truncated"] = True
                 safe_result["assistant_text_original_length"] = original_length
@@ -1829,9 +2338,20 @@ class MuseRemoteExecutionAdapter:
         }
         if safe_cause:
             metadata["cause"] = safe_cause
+        if safe_cli_failure:
+            metadata["cli_failure_diagnostic"] = safe_cli_failure
         if truncated:
             metadata["assistant_text_truncated"] = True
             metadata["assistant_text_original_length"] = original_length
+            metadata["assistant_artifact_complete"] = False
+        elif classification == "succeeded" and isinstance(assistant_text, str):
+            metadata["assistant_artifact_complete"] = True
+        if history_reconciled is not None:
+            metadata["history_reconciled"] = bool(history_reconciled)
+        if reconciliation_diagnostic:
+            metadata["reconciliation_diagnostic"] = _safe_code(
+                reconciliation_diagnostic
+            )
         return ExecutionOutcome(
             classification=classification,
             success=classification == "succeeded",
@@ -2022,6 +2542,8 @@ def _annotate(
             exc.returncode = int(result.returncode)
         if exc.diagnostics is None and result.diagnostics is not None:
             exc.diagnostics = dict(result.diagnostics)
+        if exc.stderr_evidence is None and result.stderr_evidence is not None:
+            exc.stderr_evidence = dict(result.stderr_evidence)
         if result.timed_out:
             exc.timed_out = True
     if cause_type and exc.cause_type is None:
@@ -2052,6 +2574,44 @@ def _cause_from_exception(exc: BaseException) -> dict[str, Any]:
             timed_out=exc.timed_out, diagnostics=exc.diagnostics, cause_type=exc.cause_type,
         )
     return build_cause(cause_code="unhandled_exception", cause_type=type(exc).__name__)
+
+
+def _is_retryable_baseline_history_transport(exc: MuseError) -> bool:
+    """Retry only known transient curl transport failures from read-only history."""
+
+    if isinstance(exc, MuseAuthorizationError) or exc.code not in _RETRYABLE_HISTORY_ERROR_CODES:
+        return False
+    diagnostics = exc.diagnostics
+    if not isinstance(diagnostics, Mapping):
+        return False
+    if diagnostics.get("stderr_class") != "python_exception":
+        return False
+    if diagnostics.get("http_status") is not None or diagnostics.get("gateway_status") is not None:
+        return False
+    curl_code = diagnostics.get("curl_code")
+    return type(curl_code) is int and curl_code in _RETRYABLE_HISTORY_CURL_CODES
+
+
+def _cli_failure_diagnostic_from_exception(
+    exc: BaseException,
+    *,
+    send_ordinal: int,
+) -> dict[str, Any] | None:
+    """Keep bounded, redacted process evidence only for an abnormal CLI exit."""
+
+    if not isinstance(exc, MuseError):
+        return None
+    if not (exc.timed_out or (exc.returncode is not None and exc.returncode != 0)):
+        return None
+    evidence = dict(exc.stderr_evidence or {})
+    evidence.update(
+        {
+            "returncode": exc.returncode,
+            "send_ordinal": send_ordinal,
+            "cause": _cause_from_exception(exc),
+        }
+    )
+    return sanitize_cli_failure_diagnostic(evidence)
 
 
 def _parse_json_payload(text: str, *, allow_empty: bool) -> Any:
@@ -2138,6 +2698,7 @@ def _correlate_history(current: MuseHistorySnapshot, baseline: MuseHistorySnapsh
     competing = False
     ambiguous_assistant = False
     nonterminal_assistant = False
+    assistant_event_count = 0
     assistant_candidates: list[tuple[int, str, str | None]] = []
     for index in range(user_index + 1, len(events)):
         event = events[index]
@@ -2146,16 +2707,23 @@ def _correlate_history(current: MuseHistorySnapshot, baseline: MuseHistorySnapsh
             break
         if not _event_is_assistant(event):
             continue
-        # v0.3.2 marks proactive/background assistant events by making them
-        # self-referential.  Ignore those events, while treating every other
-        # non-empty reply_to value as an ambiguous competing response.
+        assistant_event_count += 1
+        # Self-referential replies are proactive/background messages. A
+        # non-empty reference to this turn's nonce-bearing user is also valid
+        # provider history; references to any other event remain ambiguous.
         if _event_is_proactive(event):
+            ambiguous_assistant = True
             continue
-        if _event_reply_to(event):
+        if _event_reply_to(event) and not _assistant_targets_user(
+            event,
+            user_id=user_id,
+            nonce=nonce,
+        ):
             ambiguous_assistant = True
             continue
         text = _event_text(event)
         if not text:
+            ambiguous_assistant = True
             continue
         if not _assistant_is_terminal(event):
             status = _assistant_status(event)
@@ -2168,11 +2736,15 @@ def _correlate_history(current: MuseHistorySnapshot, baseline: MuseHistorySnapsh
         assistant_candidates.append((index, text, _event_id(event)))
     if competing:
         return _Correlation("uncertain")
+    if assistant_event_count != 1:
+        return _Correlation("uncertain")
     if ambiguous_assistant or len(assistant_candidates) != 1:
         if nonterminal_assistant and not assistant_candidates and not ambiguous_assistant:
             return _Correlation("nonterminal")
         if not assistant_candidates and not ambiguous_assistant and not nonterminal_assistant:
-            return _Correlation("nonterminal")
+            # No assistant event is evidence only that the history did not
+            # confirm a reply. It does not establish why the reply is absent.
+            return _Correlation("uncertain")
         return _Correlation("uncertain")
     _assistant_index, assistant_text, assistant_message_id = assistant_candidates[0]
     return _Correlation(
@@ -2700,6 +3272,7 @@ __all__ = [
     "MuseSessionStart",
     "MuseTimeoutError",
     "MuseTurnStatus",
+    "MAX_MUSE_OUTPUT_CHARS",
     "MuseExecutionAdapter",
     "MUSE_ADAPTER_KEY",
     "MUSE_CLI_VERSION",

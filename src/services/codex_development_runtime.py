@@ -45,6 +45,15 @@ POLICY_RECEIPT_TTL_SECONDS = 300
 _HEX64 = "0123456789abcdef"
 _DEPLOYMENT_POLICY_SEAL = object()
 
+_NATIVE_CODE_WORKER_STAGE_INSTRUCTION = (
+    "You are the already-assigned code_worker for this execution stage. "
+    "Implement the assigned workspace changes and run relevant verification using the declared tools. "
+    "Report the actual changes and verification results to the host. "
+    "The host owns source ZIP export, independent QA, and final publication and return; "
+    "do not perform or delegate those host stages. References to those stages in the goal are task context, "
+    "not instructions to take ownership of them."
+)
+
 _NATIVE_CODE_WORKER_CONSTRAINTS = (
     "Delegation authority: the parent/Operations agent explicitly assigned this task to you as the code_worker implementation owner for the assigned customer workspace and files. Complete the implementation yourself with the declared workspace tools; a read-only diagnosis alone does not satisfy this task.",
     "The human-adopted global AGENTS.md remains authoritative and must not be edited, removed, or ignored. Its existing delegation rules explicitly permit this assigned code_worker to implement the requested workspace changes; the parent-editing rule governs orchestration outside this assigned implementation scope.",
@@ -109,6 +118,18 @@ def _native_telemetry_provenance(value: Any, *, redactor=None) -> dict[str, str]
 
 def _native_telemetry_payload(kind: str, value: Any, *, redactor=None) -> dict[str, Any]:
     raw = value if isinstance(value, Mapping) else {}
+    if kind == "native_request_contract":
+        from .local_agent_tasks import _COMMAND_TOOLS, _MUTATION_TOOLS, _READ_TOOLS
+
+        allowed_names = set(_READ_TOOLS + _MUTATION_TOOLS + _COMMAND_TOOLS)
+        names = raw.get("declared_tools")
+        families = raw.get("owner_families")
+        names = sorted({name for name in names if isinstance(name, str) and name in allowed_names}) if isinstance(names, list) else []
+        families = sorted({family for family in families if isinstance(family, str) and family in {"workspace_read", "workspace_write", "command_execute"}}) if isinstance(families, list) else []
+        count = raw.get("declared_tool_count")
+        count = max(0, min(count, 256)) if isinstance(count, int) and not isinstance(count, bool) else 0
+        return {"stage": "code_worker", "version": 1, "evidence": "declared_in_request",
+                "declared_tools": names, "declared_tool_count": count, "owner_families": families}
     allowed: dict[str, tuple[str, ...]] = {
         "command_start": ("command", "cwd", "background", "timeout_sec", "tool_call_id"),
         "command_end": ("command", "exit_code", "success", "timed_out", "duration_sec", "tool_call_id", "job_id", "stdout", "stderr"),
@@ -986,6 +1007,7 @@ class CodexDevelopmentRuntime:
         cancel_event: Any | None = None,
         isolated_backend_ready: bool = False,
         telemetry_provenance: Mapping[str, Any] | None = None,
+        agent_instruction: str = "",
     ) -> dict[str, Any]:
         """Run a canonical mutate worker and return the existing task result."""
 
@@ -1058,6 +1080,8 @@ class CodexDevelopmentRuntime:
             )
         result = runner.run_inline(
             spec,
+            agent_system_prompt=_NATIVE_CODE_WORKER_STAGE_INSTRUCTION,
+            agent_instruction=agent_instruction,
             task_id=str(task_id),
             user_id=owner,
             project_id=project_id,

@@ -831,8 +831,8 @@ class AgentHarnessSettings:
 
         return cls(
             # Agent Harness is an independent background automation feature.
-            # Its lifecycle must not depend on Agent Team delegation or any
-            # Team/Subagent route, including routes persisted by older config
+            # Its lifecycle must not depend on retired Agent topology routes,
+            # including values persisted by older config
             # versions.
             enabled=_as_bool(raw.get("enabled"), False),
             auto_start=_as_bool(raw.get("auto_start"), False),

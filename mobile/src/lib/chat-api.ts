@@ -269,7 +269,10 @@ export const chatApi = {
     if (options.refresh) query.set("refresh", "true");
     if (options.provider?.trim()) query.set("provider", options.provider.trim());
     const suffix = query.toString() ? `?${query.toString()}` : "";
-    return fetchApi<LlmModelCatalogResponse>(`/api/llm/models${suffix}`);
+    const path = `/api/llm/models${suffix}`;
+    return options.refresh
+      ? fetchApi<LlmModelCatalogResponse>(path, {}, 60_000)
+      : fetchApi<LlmModelCatalogResponse>(path);
   },
 
   async listSkillSlashCommands(projectId?: string | null): Promise<SkillSlashCommand[]> {
@@ -503,7 +506,10 @@ export const chatApi = {
     sessionId: string,
     since?: string | null,
   ): Promise<ConversationMessagesResponse> {
-    const query = since ? `?since=${encodeURIComponent(since)}` : "";
+    const queryParams = new URLSearchParams();
+    queryParams.set("include_sync_fingerprint", "1");
+    if (since) queryParams.set("since", since);
+    const query = `?${queryParams.toString()}`;
     conversationPerformanceDiagnostics.increment(
       "http",
       "conversation-messages.requests",

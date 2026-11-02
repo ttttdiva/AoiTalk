@@ -26,7 +26,6 @@ import {
 } from "@/lib/operations-work-projection";
 import { AppSelect } from "@/components/ui/app-select";
 import { useWorkProjection } from "./use-work-projection";
-import { MediaPortfolioSummary } from "./media/media-portfolio-summary";
 import "./operations-overview.css";
 
 type Props = { query: string; onNavigate: (href: string) => void };
@@ -167,7 +166,6 @@ function OverviewView({
         </button>
       </header>
       <div className="ol-body">
-        <div className="ol-media"><MediaPortfolioSummary compact /></div>
         <div className="ol-observation" role="status">
           <span>
             {paging

@@ -80,10 +80,17 @@ class LifecycleBackend:
             if isinstance(value, (str, Path)) and ("path" in key or key in {"executable", "model_dir", "source_root", "gguf_dir"}):
                 candidates.add(str(value))
         if runtime == "strata":
-            from src.services.strata_runtime import _strata_config_path_values
+            from src.services.strata_runtime import (
+                _is_deepseek_profile,
+                _strata_config_path_values,
+            )
             config_path = Path(settings["config_path"])
             payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
-            for _role, _container, _key, value in _strata_config_path_values(payload, use_gguf_root=bool(settings.get("gguf_dir"))):
+            for _role, _container, _key, value in _strata_config_path_values(
+                payload,
+                use_gguf_root=bool(settings.get("gguf_dir")),
+                deepseek=_is_deepseek_profile(settings.get("runtime_profile")),
+            ):
                 path = Path(value)
                 candidates.add(str(path if path.is_absolute() else Path(payload.get("cwd") or cwd) / path))
         for value in sorted(candidates):

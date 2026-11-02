@@ -14,7 +14,7 @@ FROM scratch AS npm-cache
 # `npm ci` behaviour is unchanged.
 FROM scratch AS offline-inputs
 
-FROM node@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS enterprise-node-base
+FROM node@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS enterprise-node-base
 
 FROM enterprise-node-base AS frontend-builder
 
@@ -146,7 +146,9 @@ RUN --mount=type=bind,from=offline-inputs,target=/tmp/enterprise-offline,ro \
         rm -f /tmp/nodesource_setup.sh && \
         /usr/local/sbin/ensure-https-apt-sources && \
         DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs; \
-    fi && rm -f /tmp/nodesource_setup.sh && rm -rf /var/lib/apt/lists/*
+    fi && \
+    node -e 'const [major, minor, patch] = process.versions.node.split(".").map(Number); if (major !== 22 || minor < 23 || (minor === 23 && patch < 4)) { console.error("Node.js " + process.versions.node + " is below patched v22.23.4"); process.exit(1); }' && \
+    rm -f /tmp/nodesource_setup.sh && rm -rf /var/lib/apt/lists/*
 
 # 日本語ロケール設定
 RUN sed -i '/ja_JP.UTF-8/s/^# //g' /etc/locale.gen && \

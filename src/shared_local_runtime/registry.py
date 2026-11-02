@@ -12,16 +12,22 @@ from urllib.parse import urlsplit
 import uuid
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2] / "cache" / "shared_local_runtime"
+from src.runtime_release_contract import persistent_path
+
+ROOT = persistent_path(
+    "cache/shared_local_runtime", Path(__file__).resolve().parents[2]
+)
 LLAMA_KEYS = frozenset("executable model_path model_root model_dir model_alias host port context_size gpu_layers extra_args auto_start readiness_timeout reasoning_effort mtp_enabled".split())
 PROFILE_KEYS = frozenset("model_path model_alias context_size extra_args gpu_layers reasoning_effort mtp_enabled auto_start readiness_timeout".split())
 FREETOKEN_KEYS = frozenset("host port auto_start readiness_timeout readiness_timeout_seconds extra_args".split())
-STRATA_KEYS = frozenset("source_root data_dir gguf_dir host port context_size vision auto_start readiness_timeout prefill vram_reserve_mib expert_cache".split())
+STRATA_KEYS = frozenset("source_root data_dir gguf_dir deepseek_source_root deepseek_model_dir host port context_size vision auto_start readiness_timeout prefill vram_reserve_mib expert_cache".split())
 
 
 _PROFILE_OPTION_ALIASES = {
     "--parallel": frozenset({"--parallel", "-np"}),
     "-np": frozenset({"--parallel", "-np"}),
+    "--temp": frozenset({"--temp", "--temperature"}),
+    "--temperature": frozenset({"--temp", "--temperature"}),
     "--reasoning": frozenset({"--reasoning", "-rea"}),
     "-rea": frozenset({"--reasoning", "-rea"}),
     "--log-verbosity": frozenset({"--log-verbosity", "--verbosity", "-lv"}),
@@ -211,6 +217,15 @@ def snapshot(config, model, overrides=None):
         if name == "llama_cpp" and overrides:
             raw.update(overrides)
         filtered = {key: raw[key] for key in keys if key in raw}
+        if name == "strata":
+            # These paths belong only to DeepSeek V4.1. Do not put them into
+            # a Qwen snapshot, where they would change its IPC identity despite
+            # having no effect on Qwen's launch plan.
+            from src.llm.openai_compatible_local_profiles import STRATA_DEEPSEEK_MODEL_ID
+
+            if str(model or "").strip().casefold() != STRATA_DEEPSEEK_MODEL_ID.casefold():
+                filtered.pop("deepseek_source_root", None)
+                filtered.pop("deepseek_model_dir", None)
         if name == "llama_cpp" and isinstance(raw.get("profile_runtime"), dict):
             filtered["profile_runtime"] = {
                 key: {field: value[field] for field in PROFILE_KEYS if field in value}
@@ -246,7 +261,8 @@ LLAMA_CPP_HOST LLAMA_CPP_MODEL_ALIAS LLAMA_CPP_MODEL_PATH LLAMA_CPP_MODEL_ROOT
 LLAMA_CPP_PORT LLAMA_CPP_READINESS_TIMEOUT LLAMA_CPP_EXECUTABLE LLAMA_SERVER_EXE
 MUSE_GLIMMER_MODEL_PATH AOITALK_LLAMA_CPP_MODEL_ROOT AOITALK_LOCAL_LLM_RUNTIME_ROOT
 FREETOKEN_AUTO_START FREETOKEN_EXTRA_ARGS FREETOKEN_HOST FREETOKEN_PORT FREETOKEN_READINESS_TIMEOUT
-STRATA_AUTO_START STRATA_DATA_DIR STRATA_SOURCE_ROOT OPENAI_COMPATIBLE_LOCAL_BASE_URL
+STRATA_AUTO_START STRATA_DATA_DIR STRATA_SOURCE_ROOT STRATA_DEEPSEEK_SOURCE_ROOT
+STRATA_DEEPSEEK_MODEL_DIR OPENAI_COMPATIBLE_LOCAL_BASE_URL
 AOITALK_ENTERPRISE_BACKEND AOITALK_BACKEND AOITALK_ACTIVE_DEPLOYMENT_BACKEND
 AOITALK_LLM_BACKEND AOITALK_DEPLOYMENT_BACKEND AOITALK_RUNTIME_BACKEND AOITALK_LLM_MODE
 """.split())

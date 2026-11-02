@@ -95,8 +95,6 @@ type CommandAgent = {
   currentWork: string;
   currentWorkId: string;
   latestRun: string;
-  team: string;
-  profile: string;
   personas: string[];
   character: string;
   capabilities: string[];
@@ -436,8 +434,6 @@ function normaliseAgents(payload: unknown): CommandAgent[] {
       currentWork: label(valueAt(work, ["title", "name", "id", "work_item_id"])),
       currentWorkId: safeId(valueAt(work, ["id", "work_item_id"])),
       latestRun: label(valueAt(latest, ["id", "run_id", "status"])),
-      team: label(valueAt(root, ["team_name", "agent_team_id", "team_id", "team"])),
-      profile: label(valueAt(root, ["execution_profile_name", "execution_profile_id", "execution_profile", "profile_id"])),
       personas: safeList(valueAt(root, ["personas", "persona_assignments", "persona_names"])),
       character: label(valueAt(root, ["character_name", "character_id"])),
       capabilities: safeList(valueAt(root, ["capabilities", "effective_capabilities", "capability_ceiling"])),
@@ -1461,7 +1457,8 @@ function OverviewView({
       <div inert={Boolean(selectedWork)} className="relative flex min-h-0 flex-1 flex-col" data-testid="operations-overview-background">
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-border/70 bg-card px-3 py-2">
           <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs" data-testid="operations-attention-strip">
-            <span className="text-[10px] text-muted-foreground">取得済み</span>
+            <span className="text-[10px] text-muted-foreground">取得時点</span>
+            <Link href="/operations?tab=agents" className="text-primary hover:underline">Agent Teamの設定へ</Link>
             <span className={cn("inline-flex items-center gap-1.5 font-medium", attentionNodes.size ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>
               <AlertTriangle className="size-3.5" aria-hidden="true" />
               要確認 {attentionNodes.size}件
@@ -1511,9 +1508,9 @@ function OverviewView({
           />
         </section>
         <RecordPagination snapshot={snapshot} matchingWork={visibleWork.length} loading={paginationLoading} error={paginationError} onLoadMore={onLoadMore} />
-        <details className="absolute bottom-10 left-3 z-10 max-h-[70%] max-w-[calc(100%-1.5rem)] overflow-auto rounded-lg border border-border bg-card">
-          <summary className="cursor-pointer px-3 py-2 text-xs font-medium">取得済みの稼働状況・関連する記録</summary>
-          <div className="space-y-4 border-t border-border p-4">
+        <details className="shrink-0 border-t border-border bg-card" data-testid="operations-supporting-records">
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium">稼働状況・関連記録</summary>
+          <div className="max-h-[35vh] space-y-4 overflow-auto border-t border-border p-4">
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
               <Metric label="Active Agents" value={summary.activeAgents} tone="good" />
               <Metric label="実行中のWork" value={summary.working} tone="good" />
@@ -1571,7 +1568,7 @@ function OverviewView({
 }
 
 function AgentsView({ agents }: { agents: CommandAgent[] }) {
-  return <div className="space-y-3" data-testid="operations-command-center-agents"><Card size="sm"><CardHeader className="border-b border-border/70"><CardTitle className="flex items-center gap-1.5 text-sm"><Bot className="size-4 text-primary" /> <span className="inline-flex items-center gap-1">Agents<HelpPopover label="Agents">Agent identity、lifecycle、authority ceilingと実行履歴のsafe projection。</HelpPopover></span></CardTitle></CardHeader><CardContent className="space-y-3 pt-3">{agents.length ? agents.map((agent) => <article key={agent.id || agent.name} className="rounded-lg border border-border/70 bg-background/40 p-3"><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="truncate text-sm font-semibold">{agent.name}</h3><p className="mt-0.5 text-xs text-muted-foreground">{agent.jobTitle} · primary Space {agent.space}</p></div><span className={cn("text-xs font-medium", statusClass(agent.state))}>{agent.state}</span></div><div className="mt-3 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-4"><span>Project grants: {agent.projectGrants.join(", ") || "—"}</span><span>Current work: {agent.currentWork}</span><span>Latest AgentRun: {agent.latestRun}</span><span>Execution Team: {agent.team}</span><span>Execution Profile: {agent.profile}</span><span>Persona: {agent.personas.join(", ") || "—"}</span><span>Character link: {agent.character}</span><span>Capabilities: {agent.capabilities.join(", ") || "—"}</span><span>Budget: {agent.budget}</span><span>Concurrency: {agent.concurrency}</span></div>{agent.blockers.length || agent.failures.length ? <div className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-xs"><span className="font-medium">Blockers / failures: </span>{[...agent.blockers, ...agent.failures].join(" · ")}</div> : null}{agent.runHistory.length ? <details className="mt-2 text-xs"><summary className="cursor-pointer text-muted-foreground">Run history ({agent.runHistory.length})</summary><ul className="mt-1 space-y-1 pl-4 text-muted-foreground">{agent.runHistory.map((run) => <li key={run.id}>{run.id} · {run.state} · {run.createdAt}</li>)}</ul></details> : null}</article>) : <EmptyState>Agentのprojectionはありません。</EmptyState>}</CardContent></Card></div>;
+  return <div className="space-y-3" data-testid="operations-command-center-agents"><Card size="sm"><CardHeader className="border-b border-border/70"><CardTitle className="flex items-center gap-1.5 text-sm"><Bot className="size-4 text-primary" /> <span className="inline-flex items-center gap-1">Agents<HelpPopover label="Agents">Agent identity、lifecycle、authority ceilingと実行履歴のsafe projection。</HelpPopover></span></CardTitle></CardHeader><CardContent className="space-y-3 pt-3">{agents.length ? agents.map((agent) => <article key={agent.id || agent.name} className="rounded-lg border border-border/70 bg-background/40 p-3"><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="truncate text-sm font-semibold">{agent.name}</h3><p className="mt-0.5 text-xs text-muted-foreground">{agent.jobTitle} · primary Space {agent.space}</p></div><span className={cn("text-xs font-medium", statusClass(agent.state))}>{agent.state}</span></div><div className="mt-3 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-4"><span>Project grants: {agent.projectGrants.join(", ") || "—"}</span><span>Current work: {agent.currentWork}</span><span>Latest AgentRun: {agent.latestRun}</span><span>Persona: {agent.personas.join(", ") || "—"}</span><span>Character link: {agent.character}</span><span>Capabilities: {agent.capabilities.join(", ") || "—"}</span><span>Budget: {agent.budget}</span><span>Concurrency: {agent.concurrency}</span></div>{agent.blockers.length || agent.failures.length ? <div className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-xs"><span className="font-medium">Blockers / failures: </span>{[...agent.blockers, ...agent.failures].join(" · ")}</div> : null}{agent.runHistory.length ? <details className="mt-2 text-xs"><summary className="cursor-pointer text-muted-foreground">Run history ({agent.runHistory.length})</summary><ul className="mt-1 space-y-1 pl-4 text-muted-foreground">{agent.runHistory.map((run) => <li key={run.id}>{run.id} · {run.state} · {run.createdAt}</li>)}</ul></details> : null}</article>) : <EmptyState>Agentのprojectionはありません。</EmptyState>}</CardContent></Card></div>;
 }
 
 function WorkView({ work, scopeQuery }: { work: CommandWork[]; scopeQuery: string }) {

@@ -120,16 +120,7 @@ async function installComposerFixtures(page: Page) {
   await page.route("**/api/python-proxy/llm/session-settings", async (route) => {
     await route.fulfill({
       json: {
-        settings: {
-          agent_team_selection: {
-            mode: "auto",
-            team_id: "",
-            loaded_team_ids: [],
-          },
-          main_route: { provider: "mock", model: "mock-model" },
-          special_routing: {},
-          execution_profile_id: "",
-        },
+        settings: { main_route: { provider: "mock", model: "mock-model" } },
         effective_main: { provider: "mock", model: "mock-model" },
       },
     });

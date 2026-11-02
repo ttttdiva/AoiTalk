@@ -44,19 +44,15 @@ import {
   type OperationsSection,
 } from "@/components/operations/operations-workspace-navigation";
 import { PersonaWorkspace } from "@/components/operations/media/persona-workspace";
-import { MediaPortfolioSummary } from "@/components/operations/media/media-portfolio-summary";
 import { MediaPersonaPanel } from "@/components/operations/media/persona-panel";
 import { MediaResearchPanel } from "@/components/operations/media/research-panel";
 import { MediaBootstrapImportPanel } from "@/components/operations/media/media-bootstrap-import";
-import { MediaAutomationPanel } from "@/components/operations/media/automation-panel";
-import { MediaGenerationPanel } from "@/components/operations/media/generation-panel";
-import { MediaContentVariantPanel } from "@/components/operations/media/content-variant-panel";
 import { MediaCalendarPanel } from "@/components/operations/media/calendar-panel";
-import { MediaResultsPanel } from "@/components/operations/media/results-panel";
 import { ActionPackagePanel } from "@/components/operations/action-package-panel";
 import { ActionReceiptPanel } from "@/components/operations/action-receipt-panel";
 import { OperationsOverview } from "@/components/operations/operations-overview";
 import { OperationsCommandCenter } from "@/components/operations/operations-command-center";
+import { OperationsMapAuthoring } from "@/components/operations/operations-map-authoring";
 import { EmployeeWorkspace } from "@/components/operations/agents/employee-workspace";
 import { OperationsLocalTaskPanel } from "@/components/operations/local-task-panel";
 import {
@@ -66,6 +62,7 @@ import {
   developmentStatusLabel,
   feasibilityLabel,
   isDevelopmentKind,
+  operationsArtifactContentUrl,
 } from "@/components/operations/crowdworks-development-panels";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -74,6 +71,8 @@ import { AppSelect } from "@/components/ui/app-select";
 import { Textarea } from "@/components/ui/textarea";
 import { HelpPopover } from "@/components/ui/help-popover";
 import { cn } from "@/lib/utils";
+import { withoutTestFixtures } from "@/lib/operations-test-data";
+import { TestDataToggle } from "@/components/operations/test-data-toggle";
 
 type ConnectionForm = {
   provider_key: string;
@@ -124,6 +123,8 @@ function newIdempotencyKey(): string {
   return `operations-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+type IdempotentRun = <T>(run: (idempotencyKey: string) => Promise<T>) => Promise<T>;
+
 function asOptionalNumber(value: string): number | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -136,6 +137,21 @@ function splitLines(value: string): string[] {
     .split(/[,\n]/u)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function ClarificationQuestions({ opportunity }: { opportunity: EngagementOpportunity }) {
+  const questions = Array.isArray(opportunity.clarification_questions)
+    ? opportunity.clarification_questions.filter((question): question is string => typeof question === "string" && question.trim().length > 0)
+    : [];
+  if (!questions.length) return null;
+  return (
+    <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.04] px-3 py-2" data-testid={"clarification-questions-" + opportunity.id}>
+      <p className="text-xs font-semibold">応募文で確認したい点</p>
+      <ul className="mt-1 list-disc space-y-1 pl-4 text-xs leading-5 text-muted-foreground">
+        {questions.map((question, index) => <li key={index} className="whitespace-pre-wrap break-words">{question}</li>)}
+      </ul>
+    </div>
+  );
 }
 
 function readableError(error: unknown): string {
@@ -482,17 +498,20 @@ function ConnectionPanel({
   connections,
   loading,
   error,
-  idempotencyKey,
+  idempotent,
   onReload,
   onSaved,
 }: {
   connections: OperationsConnection[];
   loading: boolean;
   error: unknown;
-  idempotencyKey: string;
+  idempotent: IdempotentRun;
   onReload: () => void;
   onSaved: (connection: OperationsConnection) => void;
 }) {
+  const [includeTest, setIncludeTest] = useState(false);
+  const listedConnections = withoutTestFixtures(connections, (connection) => [connection.display_name], includeTest);
+  const hiddenTestCount = includeTest ? 0 : connections.length - listedConnections.length;
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingVersion, setEditingVersion] = useState<number>(1);
   const [saving, setSaving] = useState(false);
@@ -568,18 +587,18 @@ function ConnectionPanel({
       const displayName = form.display_name.trim();
       const remoteAccountRef = form.remote_account_ref.trim() || null;
       const result = editingId
-        ? await operationsApi.updateConnection(editingId, {
+        ? await idempotent((key) => operationsApi.updateConnection(editingId, {
           provider_key: providerKey,
           display_name: displayName,
           remote_account_ref: remoteAccountRef,
           expected_version: editingVersion,
-        } satisfies UpdateConnectionInput, idempotencyKey)
-        : await operationsApi.createConnection({
+        } satisfies UpdateConnectionInput, key))
+        : await idempotent((key) => operationsApi.createConnection({
           provider_key: providerKey,
           display_name: displayName,
           remote_account_ref: remoteAccountRef,
           project_id: form.project_id.trim() || null,
-        } satisfies CreateConnectionInput, idempotencyKey);
+        } satisfies CreateConnectionInput, key));
       onSaved(result);
       setEditingId(null);
       beginEdit();
@@ -616,10 +635,11 @@ function ConnectionPanel({
           </CardHeader>
           <CardContent className="space-y-2 pt-1">
             <ErrorNotice error={error} />
+            <div className="pt-2"><TestDataToggle hiddenCount={hiddenTestCount} checked={includeTest} onChange={setIncludeTest} /></div>
             {loading && !connections.length ? (
               <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 読み込み中…</div>
-            ) : connections.length ? (
-              connections.map((connection) => (
+            ) : listedConnections.length ? (
+              listedConnections.map((connection) => (
                 <div key={connection.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/40 px-3 py-2.5">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
@@ -708,14 +728,14 @@ function ConnectionPanel({
 function OpportunityDetailPanel({
   detail,
   connections,
-  idempotencyKey,
+  idempotent,
   onRefresh,
   onActionCreated,
   onDetailChanged,
 }: {
   detail: OpportunityDetail;
   connections: OperationsConnection[];
-  idempotencyKey: string;
+  idempotent: IdempotentRun;
   onRefresh: () => void;
   onActionCreated: (action: OperationsAction) => void;
   onDetailChanged: (detail: OpportunityDetail) => void;
@@ -813,16 +833,14 @@ function OpportunityDetailPanel({
     }
   };
 
-  useEffect(() => {
-    if (!actionConnectionId && connections[0]?.id) setActionConnectionId(connections[0].id);
-  }, [actionConnectionId, connections]);
+  if (!actionConnectionId && connections[0]?.id) setActionConnectionId(connections[0].id);
 
   const createEvaluation = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSaving("evaluation");
     setError(null);
     try {
-      const evaluation = await operationsApi.createEvaluation(detail.id, {
+      const evaluation = await idempotent((key) => operationsApi.createEvaluation(detail.id, {
         fit: evaluationForm.fit.trim() || null,
         estimated_effort_hours: asOptionalNumber(evaluationForm.estimated_effort_hours),
         estimated_cost: asOptionalNumber(evaluationForm.estimated_cost),
@@ -831,7 +849,7 @@ function OpportunityDetailPanel({
         risks: splitLines(evaluationForm.risks),
         missing_requirements: splitLines(evaluationForm.missing_requirements),
         evidence_refs: splitLines(evaluationForm.evidence_refs),
-      }, idempotencyKey);
+      }, key));
       onDetailChanged({ ...detail, evaluations: [...detail.evaluations, evaluation] });
       setEvaluationForm((current) => ({ ...current, summary: "", risks: "", missing_requirements: "", evidence_refs: "" }));
       toast.success("Evaluation versionを作成しました");
@@ -851,13 +869,13 @@ function OpportunityDetailPanel({
     setSaving("draft");
     setError(null);
     try {
-      const draft = await operationsApi.createDraft(detail.id, {
+      const draft = await idempotent((key) => operationsApi.createDraft(detail.id, {
         message: draftForm.message.trim(),
         offered_price: asOptionalNumber(draftForm.offered_price),
         currency: draftForm.currency.trim() || null,
         delivery_estimate: draftForm.delivery_estimate.trim() || null,
         artifact_version_ids: splitLines(draftForm.artifact_version_ids),
-      }, idempotencyKey);
+      }, key));
       onDetailChanged({ ...detail, drafts: [...detail.drafts, draft] });
       setDraftForm((current) => ({ ...current, message: "", offered_price: "", delivery_estimate: "", artifact_version_ids: "" }));
       toast.success("Application Draft versionを作成しました");
@@ -876,7 +894,7 @@ function OpportunityDetailPanel({
     setSaving("action");
     setError(null);
     try {
-      const action = await operationsApi.createAction({ connection_id: actionConnectionId, application_draft_id: draft.id, idempotency_key: idempotencyKey }, idempotencyKey);
+      const action = await idempotent((key) => operationsApi.createAction({ connection_id: actionConnectionId, application_draft_id: draft.id, idempotency_key: key }, key));
       onActionCreated(action);
       toast.success("Actionを作成しました。承認前にcanonical payloadを確認してください");
     } catch (createError) {
@@ -895,7 +913,7 @@ function OpportunityDetailPanel({
     setSaving("artifact");
     setError(null);
     try {
-      const artifact = await operationsApi.uploadArtifact({ file: artifactFile, opportunity_id: detail.id, label: artifactFile.name }, idempotencyKey);
+      const artifact = await idempotent((key) => operationsApi.uploadArtifact({ file: artifactFile, opportunity_id: detail.id, label: artifactFile.name }, key));
       setUploadedArtifacts((current) => [artifact, ...current.filter((item) => item.id !== artifact.id)]);
       setDraftForm((current) => {
         const ids = splitLines(current.artifact_version_ids);
@@ -980,6 +998,11 @@ function OpportunityDetailPanel({
               <div className="rounded-md border p-2"><span className="font-semibold">不足条件: </span>{latestEvaluation ? latestEvaluation.missing_requirements?.join("、") || "特記事項なし" : "未評価"}</div>
             </div>
 
+            <div className="rounded-md border bg-background/60 p-2 text-xs" data-testid="crowdworks-application-qa-status">
+              <span className="font-semibold">応募案AIレビュー: </span>
+              {detail.application_qa_status === "passed" ? "PASS" : detail.application_qa_status || "未確認"}
+            </div>
+
             <div className="rounded-md border bg-background/60 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs font-semibold">{decisionAction ? "承認対象の応募内容" : "応募案"}</p>
@@ -991,17 +1014,21 @@ function OpportunityDetailPanel({
               <p className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap text-xs leading-5 text-muted-foreground">{applicationMessage || "応募文はまだ作成されていません。"}</p>
             </div>
 
+            {decisionAction?.status === "proposed" ? <ClarificationQuestions opportunity={detail} /> : null}
+
             {decisionAction?.status === "proposed" ? (
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-primary/30 bg-background/80 p-3">
                 <div className="max-w-3xl">
-                  <p className="text-sm font-semibold">あなたの判断: 応募する / 見送る</p>
+                  <p className="text-sm font-semibold">{detail.approval_available !== true ? "応募承認は保留中" : "あなたの判断: 応募する / 見送る"}</p>
                   <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
-                    「応募して進める」でこの応募を人間承認します。承認後は CrowdWorks実応募 → 契約監視 → 受注後AI作業 → READY_FOR_REVIEW まで進みます。最終納品は自動ではありません。
+                    {detail.approval_available !== true
+                      ? detail.approval_block_reason || "期限・brief要件・応募案QAを確認できるまで承認できません。"
+                      : "「応募して進める」でこの応募を人間承認します。承認後は CrowdWorks実応募 → 契約監視 → 受注後AI作業 → READY_FOR_REVIEW まで進みます。最終納品は自動ではありません。"}
                   </p>
                 </div>
                 <div className="flex gap-2">
                   <Button type="button" size="sm" variant="outline" disabled={decisionSaving} onClick={() => void decideCrowdWorks("reject")}><XCircle className="size-3.5" /> 今回は見送る</Button>
-                  <Button type="button" size="sm" disabled={decisionSaving} onClick={() => void decideCrowdWorks("approve")}><CheckCircle2 className="size-3.5" /> 応募して進める</Button>
+                  <Button type="button" size="sm" disabled={decisionSaving || detail.approval_available !== true} onClick={() => void decideCrowdWorks("approve")}><CheckCircle2 className="size-3.5" /> 応募して進める</Button>
                 </div>
               </div>
             ) : decisionAction ? (
@@ -1013,6 +1040,43 @@ function OpportunityDetailPanel({
               <p className="text-xs text-muted-foreground">採算条件を満たす候補は、応募案ができ次第ここで最終判断できます。</p>
             )}
             <ErrorNotice error={error} />
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {!isDevelopmentKind(detail.worker_kind) && (detail.review_artifact_version_ids?.length ?? 0) > 0 ? (
+        <Card size="sm" className="border-primary/30 bg-primary/[0.03]" data-testid="opportunity-artifact-review">
+          <CardHeader className="border-b border-border/70">
+            <CardTitle className="flex items-center gap-1.5 text-sm">
+              成果物レビュー
+              <HelpPopover label="成果物レビュー">受注後に作成した成果物とAIレビュー状態を確認できます。AIレビューは人間による最終確認の代わりにはなりません。</HelpPopover>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 pt-3">
+            <ul className="space-y-1.5 text-sm">
+              {detail.review_artifact_version_ids?.map((artifactId, index) => (
+                <li key={artifactId}>
+                  <a
+                    href={operationsArtifactContentUrl(artifactId)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary underline-offset-4 hover:underline"
+                  >
+                    成果物 {index + 1} を開く
+                  </a>
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              {detail.ai_review_status === "completed"
+                ? "AIレビュー済み・人間の最終確認前"
+                : detail.ai_review_status === "unavailable"
+                  ? "AIレビュー未取得・人間確認で要件充足を確認"
+                  : "AIレビュー状態は未記録"}
+            </p>
+            <p className="rounded-md border border-amber-500/40 bg-amber-500/[0.06] px-3 py-2 text-xs font-medium text-amber-900 dark:text-amber-200">
+              最終納品は自動ではありません。成果物の内容と要件への適合を確認してから、手動で納品してください。
+            </p>
           </CardContent>
         </Card>
       ) : null}
@@ -1113,12 +1177,12 @@ function OpportunityDetailPanel({
 
 function OpportunitiesPanel({
   connections,
-  idempotencyKey,
+  idempotent,
   onActionCreated,
   initialOpportunityId,
 }: {
   connections: OperationsConnection[];
-  idempotencyKey: string;
+  idempotent: IdempotentRun;
   onActionCreated: (action: OperationsAction) => void;
   initialOpportunityId?: string | null;
 }) {
@@ -1134,7 +1198,6 @@ function OpportunitiesPanel({
   const [saving, setSaving] = useState(false);
   const [cardDecisionSaving, setCardDecisionSaving] = useState<string | null>(null);
   const requestedOpportunityIdRef = useRef(requestedOpportunityId);
-  const opportunitiesRef = useRef(opportunities);
   const targetDetailRef = useRef<OpportunityDetail | null>(null);
   const opportunitiesRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
@@ -1144,20 +1207,20 @@ function OpportunitiesPanel({
   const [connectionId, setConnectionId] = useState("");
   const selectedConnection = connections.find((connection) => connection.id === connectionId) ?? null;
 
-  useEffect(() => {
-    opportunitiesRef.current = opportunities;
-  }, [opportunities]);
-
   // A deep link is an explicit target, even when the bounded list projection
   // does not include it. Reset stale detail state before resolving a new URL
   // so a previous card cannot flash while the target is loading.
+  const [resolvedOpportunityId, setResolvedOpportunityId] = useState(requestedOpportunityId);
+  if (resolvedOpportunityId !== requestedOpportunityId) {
+    setResolvedOpportunityId(requestedOpportunityId);
+    setDetail(null);
+    setDetailError(null);
+    setSelectedId(requestedOpportunityId ?? opportunities[0]?.id ?? null);
+  }
   useEffect(() => {
     requestedOpportunityIdRef.current = requestedOpportunityId;
     targetDetailRef.current = null;
     ++detailRequestRef.current;
-    setDetail(null);
-    setDetailError(null);
-    setSelectedId(requestedOpportunityId ?? opportunitiesRef.current[0]?.id ?? null);
   }, [requestedOpportunityId]);
 
   const boardOpportunities = useMemo(() => {
@@ -1168,7 +1231,8 @@ function OpportunitiesPanel({
       const development = String(item.development?.status || "");
       if (stage === "READY_FOR_REVIEW") return 0;
       if (["uncertain", "verification_failed", "blocked"].includes(development)) return 1;
-      if (stage === "APPLICATION_PROPOSED" && (item.external_action_status || "proposed") === "proposed") return 2;
+      if (stage === "APPLICATION_PROPOSED" && (item.external_action_status || "proposed") === "proposed"
+        && item.approval_available === true) return 2;
       if (["CONTRACT_ACCEPTED", "APPLICATION_SUBMITTED"].includes(stage) || development === "running") return 3;
       return 4;
     };
@@ -1185,7 +1249,8 @@ function OpportunitiesPanel({
   );
   const decisionReadyCount = useMemo(
     () => boardOpportunities.filter((item) => String(item.workflow_stage || "").toUpperCase() === "APPLICATION_PROPOSED"
-      && (item.external_action_status || (item.external_action_id ? "proposed" : "")) === "proposed").length,
+      && (item.external_action_status || (item.external_action_id ? "proposed" : "")) === "proposed"
+      && item.approval_available === true).length,
     [boardOpportunities],
   );
 
@@ -1278,7 +1343,7 @@ function OpportunitiesPanel({
     setSaving(true);
     setFormError(null);
     try {
-      const opportunity = await operationsApi.createOpportunity({ connection_id: selectedConnection?.id ?? null, project_id: selectedConnection?.project_id ?? null, source_url: sourceUrl.trim(), source_text: sourceText, title: title.trim() || "Imported opportunity" }, idempotencyKey);
+      const opportunity = await idempotent((key) => operationsApi.createOpportunity({ connection_id: selectedConnection?.id ?? null, project_id: selectedConnection?.project_id ?? null, source_url: sourceUrl.trim(), source_text: sourceText, title: title.trim() || "Imported opportunity" }, key));
       setOpportunities((current) => [opportunity, ...current]);
       setSelectedId(opportunity.id);
       setSourceUrl("");
@@ -1367,12 +1432,23 @@ function OpportunitiesPanel({
                 {boardOpportunities.map((opportunity) => {
                   const stage = String(opportunity.workflow_stage || "").toUpperCase();
                   const actionStatus = String(opportunity.external_action_status || (opportunity.external_action_id ? "proposed" : "")).toLowerCase();
-                  const ready = stage === "APPLICATION_PROPOSED" && actionStatus === "proposed";
+                  const ready = stage === "APPLICATION_PROPOSED" && actionStatus === "proposed"
+                    && opportunity.approval_available === true;
                   const accepted = ["approved", "attempting", "running", "succeeded"].includes(actionStatus)
                     || ["APPLICATION_SUBMITTED", "CONTRACT_ACCEPTED", "READY_FOR_REVIEW"].includes(stage);
                   const rejected = actionStatus === "rejected";
                   const screeningStatus = String(opportunity.screening_status || "").toLowerCase();
-                  const screeningReason = String(opportunity.screening_reason || "");
+                  const approvalBlocked = stage === "APPLICATION_PROPOSED" && actionStatus === "proposed" && !ready;
+                  const specificBlock = [
+                    "deadline_expired", "deadline_unverified", "requirements_incomplete",
+                    "application_qa_unverified", "application_qa_failed", "application_qa_unavailable",
+                  ].includes(screeningStatus);
+                  const screeningReason = String(
+                    opportunity.approval_block_reason
+                    || (approvalBlocked && !specificBlock
+                      ? "期限・brief要件・応募案AIレビューを確認できないため、承認を停止しています"
+                      : opportunity.screening_reason || ""),
+                  );
                   const summaryLines = [...(opportunity.card_summary_lines ?? [])].filter(Boolean).slice(0, 3);
                   const fallbackSummaryLines = [
                     "仕事内容: " + (opportunity.title || "案件内容を確認中"),
@@ -1392,6 +1468,20 @@ function OpportunitiesPanel({
                       ? "進行中"
                       : rejected
                         ? "見送り"
+                      : screeningStatus === "deadline_expired"
+                        ? "期限切れ"
+                        : screeningStatus === "deadline_unverified"
+                          ? "期限要確認"
+                          : screeningStatus === "requirements_incomplete"
+                            ? "要件不足・追加確認"
+                            : screeningStatus === "application_qa_unverified"
+                              ? "応募案QA未確認"
+                              : screeningStatus === "application_qa_failed"
+                                ? "応募案QA不合格"
+                                : screeningStatus === "application_qa_unavailable"
+                                  ? "応募案QA未完了"
+                                  : stage === "APPLICATION_PROPOSED" && actionStatus === "proposed"
+                                    ? "応募条件の確認待ち"
                         : ["below_profit_threshold", "below_profit_per_hour"].includes(screeningStatus)
                           ? "採算条件未達"
                           : screeningStatus === "qualified_waiting_rank"
@@ -1469,6 +1559,8 @@ function OpportunitiesPanel({
                         {screeningReason && !accepted && !rejected ? <p className="mt-0.5 line-clamp-1 text-[10px] text-muted-foreground" title={screeningReason}>{screeningReason}</p> : null}
                       </div>
 
+                      {ready ? <div className="mt-3"><ClarificationQuestions opportunity={opportunity} /></div> : null}
+
                       <div className="mt-3 flex items-center justify-end gap-2 border-t border-border/70 pt-3">
                         {ready ? (
                           <>
@@ -1520,7 +1612,7 @@ function OpportunitiesPanel({
         <CardContent className="relative pt-4">
           {detail && detail.id === selectedId ? (
             <>
-              <OpportunityDetailPanel key={detail.id} detail={detail} connections={connections} idempotencyKey={idempotencyKey} onRefresh={() => selectedId && void loadDetail(selectedId)} onActionCreated={onActionCreated} onDetailChanged={(next) => {
+              <OpportunityDetailPanel key={detail.id} detail={detail} connections={connections} idempotent={idempotent} onRefresh={() => selectedId && void loadDetail(selectedId)} onActionCreated={onActionCreated} onDetailChanged={(next) => {
                 setDetail(next);
                 if (requestedOpportunityIdRef.current === next.id) targetDetailRef.current = next;
                 setOpportunities((current) => current.map((item) => item.id === next.id ? { ...item, external_action_status: next.external_action_status } : item));
@@ -1576,13 +1668,13 @@ function OpportunitiesPanel({
 
 function ActionDetailPanel({
   action,
-  idempotencyKey,
+  idempotent,
   readOnly,
   onChanged,
   onReload,
 }: {
   action: OperationsAction;
-  idempotencyKey: string;
+  idempotent: IdempotentRun;
   readOnly: boolean;
   onChanged: (action: OperationsAction) => void;
   onReload: () => void;
@@ -1598,9 +1690,11 @@ function ActionDetailPanel({
   const [reconcileEvidenceArtifactIds, setReconcileEvidenceArtifactIds] = useState("");
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
+  const [attemptsSeen, setAttemptsSeen] = useState(action.attempts);
+  if (attemptsSeen !== action.attempts) {
+    setAttemptsSeen(action.attempts);
     setAttempt(action.attempts?.[0] ?? null);
-  }, [action.attempts]);
+  }
 
   const expectedVersion = action.version ?? action.action_version ?? 1;
   const actionStatus = action.status?.toLowerCase() ?? "";
@@ -1626,7 +1720,7 @@ function ActionDetailPanel({
     setSaving("decision");
     setError(null);
     try {
-      const result = operation === "approve" ? await operationsApi.approveAction(action.id, { expected_version: expectedVersion, reason: decisionReason.trim() || null }, idempotencyKey) : await operationsApi.rejectAction(action.id, { expected_version: expectedVersion, reason: decisionReason.trim() || null }, idempotencyKey);
+      const result = operation === "approve" ? await idempotent((key) => operationsApi.approveAction(action.id, { expected_version: expectedVersion, reason: decisionReason.trim() || null }, key)) : await idempotent((key) => operationsApi.rejectAction(action.id, { expected_version: expectedVersion, reason: decisionReason.trim() || null }, key));
       onChanged(result);
       toast.success(operation === "approve" ? "Actionを承認しました" : "Actionを却下しました");
     } catch (decisionError) {
@@ -1646,7 +1740,7 @@ function ActionDetailPanel({
     setSaving("revise");
     setError(null);
     try {
-      const result = await operationsApi.reviseAction(action.id, { application_draft_id: revisionDraftId.trim(), expected_version: expectedVersion }, idempotencyKey);
+      const result = await idempotent((key) => operationsApi.reviseAction(action.id, { application_draft_id: revisionDraftId.trim(), expected_version: expectedVersion }, key));
       onChanged(result);
       toast.warning("Actionを改訂しました。以前のApprovalは無効化されています");
       setRevisionDraftId("");
@@ -1662,7 +1756,7 @@ function ActionDetailPanel({
     setSaving("attempt");
     setError(null);
     try {
-      const result = await operationsApi.startAttempt(action.id, { expected_version: expectedVersion }, idempotencyKey);
+      const result = await idempotent((key) => operationsApi.startAttempt(action.id, { expected_version: expectedVersion }, key));
       setAttempt(result);
       onChanged({ ...action, attempts: [result, ...(action.attempts ?? [])], status: "attempting", version: expectedVersion + 1 });
       toast.success("Manual attemptを開始しました");
@@ -1684,7 +1778,7 @@ function ActionDetailPanel({
     setSaving("complete");
     setError(null);
     try {
-      const result = await operationsApi.completeAttempt(action.id, attempt.id, { expected_version: expectedVersion, outcome: completeForm.outcome, result_summary: completeForm.result_summary.trim() || null, remote_resource_id: completeForm.remote_resource_id.trim() || null, remote_url: completeForm.remote_url.trim() || null, remote_status: completeForm.remote_status.trim() || null, evidence_note: completeForm.evidence_note.trim() || null, confirmation_level: completeForm.confirmation_level.trim() || null, evidence_artifact_ids: splitLines(completeForm.evidence_artifact_ids) }, idempotencyKey);
+      const result = await idempotent((key) => operationsApi.completeAttempt(action.id, attempt.id, { expected_version: expectedVersion, outcome: completeForm.outcome, result_summary: completeForm.result_summary.trim() || null, remote_resource_id: completeForm.remote_resource_id.trim() || null, remote_url: completeForm.remote_url.trim() || null, remote_status: completeForm.remote_status.trim() || null, evidence_note: completeForm.evidence_note.trim() || null, confirmation_level: completeForm.confirmation_level.trim() || null, evidence_artifact_ids: splitLines(completeForm.evidence_artifact_ids) }, key));
       onChanged(result);
       setAttempt(result.attempts?.[0] ?? attempt);
       onReload();
@@ -1706,7 +1800,7 @@ function ActionDetailPanel({
     setSaving("reconcile");
     setError(null);
     try {
-      const result = await operationsApi.reconcileAction(action.id, { expected_version: expectedVersion, outcome: reconcileResolution, evidence_note: reconcileEvidence.trim(), evidence_artifact_ids: splitLines(reconcileEvidenceArtifactIds) }, idempotencyKey);
+      const result = await idempotent((key) => operationsApi.reconcileAction(action.id, { expected_version: expectedVersion, outcome: reconcileResolution, evidence_note: reconcileEvidence.trim(), evidence_artifact_ids: splitLines(reconcileEvidenceArtifactIds) }, key));
       onChanged(result);
       setReconcileEvidence("");
       setReconcileEvidenceArtifactIds("");
@@ -1749,7 +1843,7 @@ function ActionDetailPanel({
   );
 }
 
-function ActionDetailLoader({ actionId, idempotencyKey, readOnly, onChanged }: { actionId: string; idempotencyKey: string; readOnly: boolean; onChanged: (action: OperationsAction) => void }) {
+function ActionDetailLoader({ actionId, idempotent, readOnly, onChanged }: { actionId: string; idempotent: IdempotentRun; readOnly: boolean; onChanged: (action: OperationsAction) => void }) {
   const [reloadToken, setReloadToken] = useState(0);
   const [result, setResult] = useState<{ reloadToken: number; action: OperationsAction | null; error: unknown } | null>(null);
   const currentResult = result?.reloadToken === reloadToken ? result : null;
@@ -1773,7 +1867,7 @@ function ActionDetailLoader({ actionId, idempotencyKey, readOnly, onChanged }: {
   if (!currentResult.action) {
     return <div className="space-y-3"><p className="break-all text-sm">Action {actionId}を読み込めませんでした。</p><ErrorNotice error={currentResult.error} /><Button type="button" size="sm" variant="outline" onClick={() => setReloadToken((value) => value + 1)}>再試行</Button></div>;
   }
-  return <ActionDetailPanel action={currentResult.action} idempotencyKey={idempotencyKey} readOnly={readOnly} onChanged={(next) => {
+  return <ActionDetailPanel action={currentResult.action} idempotent={idempotent} readOnly={readOnly} onChanged={(next) => {
     setResult((current) => current?.reloadToken === reloadToken
       ? { reloadToken, action: next, error: null }
       : current);
@@ -1781,7 +1875,7 @@ function ActionDetailLoader({ actionId, idempotencyKey, readOnly, onChanged }: {
   }} onReload={() => setReloadToken((value) => value + 1)} />;
 }
 
-function ActionsPanel({ initialActionId, reloadToken, idempotencyKey, readOnly }: { initialActionId: string | null; reloadToken: number; idempotencyKey: string; readOnly: boolean }) {
+function ActionsPanel({ initialActionId, reloadToken, idempotent, readOnly }: { initialActionId: string | null; reloadToken: number; idempotent: IdempotentRun; readOnly: boolean }) {
   const [actions, setActions] = useState<OperationsAction[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(initialActionId);
   const [loading, setLoading] = useState(true);
@@ -1811,7 +1905,7 @@ function ActionsPanel({ initialActionId, reloadToken, idempotencyKey, readOnly }
   return (
     <div className="space-y-4" data-testid="operations-actions-panel">
       <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="inline-flex items-center gap-1 text-lg font-semibold tracking-tight">Approvals / Actions<HelpPopover label="Approvals / Actions">{readOnly ? "Canonical payloadとActionの履歴を閲覧します。" : "Canonical payloadを確認し、承認・改訂・手動実行・不確実結果の照合を行います。"}</HelpPopover></h2></div><Button type="button" variant="outline" size="sm" onClick={() => void loadActions()} disabled={loading}><RefreshCw className={cn("size-3.5", loading && "animate-spin")} /> Timeline / actionsを更新</Button></div>
-      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(15rem,22rem)_minmax(0,1fr)]"><Card size="sm" className="min-w-0"><CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Action一覧<span className="text-xs font-normal text-muted-foreground">{actions.length}件</span><HelpPopover label="Action一覧">明示的なidempotency keyで更新</HelpPopover></CardTitle></CardHeader><CardContent className="space-y-1.5 pt-1">{loading && !actions.length ? <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 読み込み中…</div> : actions.length ? actions.map((action) => <button key={action.id} type="button" className={cn("group relative w-full rounded-md border-l-2 px-3 py-2.5 text-left transition-colors", selectedId === action.id ? "border-primary bg-primary/5" : "border-transparent hover:border-border hover:bg-muted/40")} aria-current={selectedId === action.id ? "page" : undefined} onClick={() => setSelectedId(action.id)}><div className="flex items-center justify-between gap-2"><span className="truncate font-mono text-xs">{action.id}</span><StatusPill status={action.status} /></div><p className="mt-1 text-[10px] text-muted-foreground">v{action.version ?? action.action_version ?? "—"} · draft {action.application_draft_id || "—"}</p></button>) : <EmptyState>Actionはまだありません。OpportunitiesのDraftから作成できます。</EmptyState>}<ErrorNotice error={error} /></CardContent></Card><Card size="sm" className="min-w-0"><CardContent className="pt-4">{selectedId ? <ActionDetailLoader key={selectedId} actionId={selectedId} idempotencyKey={idempotencyKey} readOnly={readOnly} onChanged={applyActionChange} /> : <EmptyState>左のActionを選択してください。</EmptyState>}</CardContent></Card></div>
+      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(15rem,22rem)_minmax(0,1fr)]"><Card size="sm" className="min-w-0"><CardHeader className="border-b border-border/70"><CardTitle className="inline-flex items-center gap-1 text-sm">Action一覧<span className="text-xs font-normal text-muted-foreground">{actions.length}件</span><HelpPopover label="Action一覧">明示的なidempotency keyで更新</HelpPopover></CardTitle></CardHeader><CardContent className="space-y-1.5 pt-1">{loading && !actions.length ? <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 読み込み中…</div> : actions.length ? actions.map((action) => <button key={action.id} type="button" className={cn("group relative w-full rounded-md border-l-2 px-3 py-2.5 text-left transition-colors", selectedId === action.id ? "border-primary bg-primary/5" : "border-transparent hover:border-border hover:bg-muted/40")} aria-current={selectedId === action.id ? "page" : undefined} onClick={() => setSelectedId(action.id)}><div className="flex items-center justify-between gap-2"><span className="truncate font-mono text-xs">{action.id}</span><StatusPill status={action.status} /></div><p className="mt-1 text-[10px] text-muted-foreground">v{action.version ?? action.action_version ?? "—"} · draft {action.application_draft_id || "—"}</p></button>) : <EmptyState>Actionはまだありません。OpportunitiesのDraftから作成できます。</EmptyState>}<ErrorNotice error={error} /></CardContent></Card><Card size="sm" className="min-w-0"><CardContent className="pt-4">{selectedId ? <ActionDetailLoader key={selectedId} actionId={selectedId} idempotent={idempotent} readOnly={readOnly} onChanged={applyActionChange} /> : <EmptyState>左のActionを選択してください。</EmptyState>}</CardContent></Card></div>
     </div>
   );
 }
@@ -1837,15 +1931,22 @@ export function OperationsWorkspace() {
 
   const [section, setSection] = useState<OperationsSection>(routedSection);
   const fillsPanel = section === "overview" || section === "agents";
+  const sectionDefinition = OPERATIONS_ALL_SECTIONS.find((item) => item.id === section);
 
-  const [idempotencyKey, setIdempotencyKey] =
-    useState(newIdempotencyKey);
+  // Retrying a failed request reuses its key; a successful one rotates it.
+  const idempotencyKey = useRef(newIdempotencyKey());
+  const idempotent = useCallback<IdempotentRun>(async (run) => {
+    const result = await run(idempotencyKey.current);
+    idempotencyKey.current = newIdempotencyKey();
+    return result;
+  }, []);
   const [connections, setConnections] =
     useState<OperationsConnection[]>([]);
   const [connectionsLoading, setConnectionsLoading] =
     useState(true);
   const [connectionsError, setConnectionsError] =
     useState<unknown>(null);
+  const opportunityConnections = useMemo(() => withoutTestFixtures(connections, (connection) => [connection.display_name]), [connections]);
   const [actionFocus, setActionFocus] = useState({
     requestedActionId,
     focusedActionId: requestedActionId,
@@ -1857,9 +1958,11 @@ export function OperationsWorkspace() {
   const [actionsReloadToken, setActionsReloadToken] =
     useState(0);
 
-  useEffect(() => {
+  const [routedSeen, setRoutedSeen] = useState(routedSection);
+  if (routedSeen !== routedSection) {
+    setRoutedSeen(routedSection);
     setSection(routedSection);
-  }, [routedSection]);
+  }
 
   const loadConnections = useCallback(async () => {
     setConnectionsLoading(true);
@@ -1877,7 +1980,8 @@ export function OperationsWorkspace() {
   }, []);
 
   useEffect(() => {
-    void loadConnections();
+    const task = window.setTimeout(() => { void loadConnections(); }, 0);
+    return () => window.clearTimeout(task);
   }, [loadConnections]);
 
   const selectSection = useCallback(
@@ -1919,7 +2023,6 @@ export function OperationsWorkspace() {
   ) => {
     setActionFocus({ requestedActionId, focusedActionId: action.id || null });
     setActionsReloadToken((value) => value + 1);
-    setIdempotencyKey(newIdempotencyKey());
     selectSection("actions", action.id);
   };
 
@@ -1929,145 +2032,11 @@ export function OperationsWorkspace() {
       data-testid="operations-workspace"
     >
       <main className={cn("min-h-0 min-w-0 flex-1", fillsPanel ? "flex overflow-hidden" : "overflow-y-auto")}>
-        <div className={fillsPanel ? `flex min-h-0 min-w-0 w-full flex-1 flex-col ${section === "agents" ? "p-4 sm:p-6" : ""}` : "w-full space-y-5 p-4 pb-12 sm:p-6"}>
-          {section === "studio" || section === "overview" || section === "agents" || section === "work" || section === "activity" ? null : section === "personas" ? (
+        <div className={fillsPanel ? `flex min-h-0 min-w-0 w-full flex-1 flex-col ${section === "agents" ? "p-4 sm:p-6" : ""}` : "mx-auto w-full max-w-6xl space-y-5 p-4 pb-12 sm:p-6"}>
+          {section === "studio" || section === "personas" || section === "overview" || section === "agents" || section === "work" || section === "activity" ? null : (
             <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-                Personas
-              </h1>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                発信人格（Persona / Brand）・対象読者・文体・利用プラットフォームを管理します。
-              </p>
-            </header>
-          ) : section === "research" ? (
-            <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-                Research
-              </h1>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                ResearchRoutine → Run snapshot → Evidence付きFinding → Editorial traceを管理します。
-              </p>
-            </header>
-          ) : section === "automation" ? (
-            <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-                Automation
-              </h1>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                AoiTalkがTheme・Research・Concept・承認・Generation Studio実行をdurableにオーケストレーションします。
-              </p>
-            </header>
-          ) : section === "generation" ? (
-            <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-                Creative / Generation
-              </h1>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                PersonaとCreative Recipeのexact revisionを固定し、画像生成のRunとOutput provenanceを確認します。
-              </p>
-            </header>
-          ) : section === "pipeline" ? (
-            <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations / Pipeline
-              </p>
-              <h1 className="mt-1 inline-flex items-center gap-1 text-2xl font-semibold tracking-tight">
-                Content Pipeline
-                <HelpPopover label="Content Pipeline">
-                  ContentItemからPlatform別のtyped variantを作り、immutable revision・QA・Rights・Readinessを確認します。
-                </HelpPopover>
-              </h1>
-            </header>
-          ) : section === "calendar" ? (
-            <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations / Calendar
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight">カレンダー</h1>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                調査・編集・生成・公開・レビューの予定と、人手で次に行うことを確認します。
-              </p>
-            </header>
-          ) : section === "results" ? (
-            <header>
-              <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                Media Operations / Results
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold tracking-tight">結果</h1>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                Metrics・Experiment・Revenue・学習提案を、保存済みEvidenceに紐づけて確認します。
-              </p>
-            </header>
-          ) : (
-            <header className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
-                  Operations workspace
-                </p>
-                <h1 className="mt-1 inline-flex items-center gap-1 text-2xl font-semibold tracking-tight">
-                  Engagement Operations
-                  <HelpPopover label="Engagement Operations">
-                    Connections → Opportunities → Approval / Actionを一つの監査可能な流れで扱います。
-                  </HelpPopover>
-                </h1>
-              </div>
-
-              <div className="flex min-w-[18rem] flex-col items-stretch gap-1.5 sm:items-end">
-                <label
-                  htmlFor="operations-idempotency-key"
-                  className="text-[11px] font-medium text-muted-foreground"
-                >
-                  Idempotency key（明示）
-                </label>
-
-                <div className="flex w-full max-w-md gap-1.5">
-                  <Input
-                    id="operations-idempotency-key"
-                    value={idempotencyKey}
-                    onChange={(event) =>
-                      setIdempotencyKey(
-                        event.target.value,
-                      )
-                    }
-                    aria-describedby="operations-idempotency-help"
-                    className="font-mono text-xs"
-                  />
-
-                  <Button
-                    type="button"
-                    size="icon-sm"
-                    variant="outline"
-                    title="新しいidempotency keyを生成"
-                    aria-label="新しいidempotency keyを生成"
-                    onClick={() =>
-                      setIdempotencyKey(
-                        newIdempotencyKey(),
-                      )
-                    }
-                  >
-                    <RefreshCw className="size-3.5" />
-                  </Button>
-                </div>
-
-                <p
-                  id="operations-idempotency-help"
-                  className="text-[10px] text-muted-foreground"
-                >
-                  同じキーで再送すると重複作成を避けられます。
-                </p>
-              </div>
+              <h1 className="text-xl font-semibold tracking-tight">{sectionDefinition?.label}</h1>
+              <p className="mt-0.5 text-sm text-muted-foreground">{sectionDefinition?.description}</p>
             </header>
           )}
 
@@ -2075,14 +2044,10 @@ export function OperationsWorkspace() {
             id={`operations-panel-${section}`}
             role="region"
             className={fillsPanel ? "flex min-h-0 flex-1 flex-col" : undefined}
-            aria-label={
-              OPERATIONS_ALL_SECTIONS.find(
-                (item) => item.id === section,
-              )?.label
-            }
+            aria-label={sectionDefinition?.label}
           >
             {section === "studio" ? <PersonaWorkspace /> : null}
-            {section === "agents" ? <EmployeeWorkspace /> : null}
+            {section === "agents" ? <>{searchParams?.get("return_to") === "team_map" ? <Link className="shrink-0 px-4 py-2 text-sm text-primary hover:underline" href="/operations?tab=overview&overview_view=map&map_mode=design">← Team設計に戻る</Link> : null}<EmployeeWorkspace /></> : null}
             {section === "overview" || section === "work" || section === "activity" ? (
               <>
                 {section === "overview" && !mapOverview ? (
@@ -2090,8 +2055,7 @@ export function OperationsWorkspace() {
                 ) : (
                   <>
                     {section === "overview" ? <Link className="shrink-0 border-b border-border px-4 py-2 text-sm text-primary hover:underline" href={`/operations?${(() => { const query = new URLSearchParams(searchParams?.toString()); for (const key of ["overview_view", "graph_node", "graph_work", "execution_focus", "execution_node", "work_view"]) query.delete(key); query.set("tab", "overview"); return query.toString(); })()}`}>Operationsの状況へ戻る</Link> : null}
-                    {section === "overview" ? <div className="shrink-0 px-3 py-2"><MediaPortfolioSummary compact /></div> : null}
-                    <OperationsCommandCenter view={section} />
+                    {section === "overview" ? <OperationsMapAuthoring><OperationsCommandCenter view={section} /></OperationsMapAuthoring> : <OperationsCommandCenter view={section} />}
                   </>
                 )}
                 {section === "work" ? <OperationsLocalTaskPanel /> : null}
@@ -2099,31 +2063,15 @@ export function OperationsWorkspace() {
             ) : null}
 
             {section === "personas" ? (
-              <MediaPersonaPanel initialPersonaId={searchParams?.get("persona") ?? undefined} />
+              <MediaPersonaPanel key={searchParams?.get("persona") ?? ""} personaId={searchParams?.get("persona") ?? ""} />
             ) : null}
 
             {section === "research" ? (
-              <div className="space-y-4"><MediaBootstrapImportPanel /><MediaResearchPanel /></div>
-            ) : null}
-
-            {section === "automation" ? (
-              <MediaAutomationPanel />
-            ) : null}
-
-            {section === "generation" ? (
-              <MediaGenerationPanel />
-            ) : null}
-
-            {section === "pipeline" ? (
-              <MediaContentVariantPanel initialContentItemId={searchParams?.get("content_item_id") ?? undefined} initialOutputRef={searchParams?.get("output_ref") ?? undefined} />
+              <div className="space-y-4"><MediaResearchPanel /><details className="rounded-xl border bg-card p-4 text-sm"><summary className="cursor-pointer font-semibold">初期登録（plan JSON の取り込み）</summary><div className="mt-3"><MediaBootstrapImportPanel /></div></details></div>
             ) : null}
 
             {section === "calendar" ? (
               <MediaCalendarPanel />
-            ) : null}
-
-            {section === "results" ? (
-              <MediaResultsPanel />
             ) : null}
 
             {section === "connections" ? (
@@ -2131,7 +2079,7 @@ export function OperationsWorkspace() {
                 connections={connections}
                 loading={connectionsLoading}
                 error={connectionsError}
-                idempotencyKey={idempotencyKey}
+                idempotent={idempotent}
                 onReload={() =>
                   void loadConnections()
                 }
@@ -2160,8 +2108,8 @@ export function OperationsWorkspace() {
 
             {section === "opportunities" ? (
               <OpportunitiesPanel
-                connections={connections}
-                idempotencyKey={idempotencyKey}
+                connections={opportunityConnections}
+                idempotent={idempotent}
                 initialOpportunityId={searchParams?.get("opportunity_id") ?? undefined}
                 onActionCreated={
                   handleActionCreated
@@ -2175,7 +2123,7 @@ export function OperationsWorkspace() {
                 initialActionId={actionFocus.focusedActionId}
                 readOnly={actionsReadOnly}
                 reloadToken={actionsReloadToken}
-                idempotencyKey={idempotencyKey}
+                idempotent={idempotent}
               />
             ) : null}
           </div>

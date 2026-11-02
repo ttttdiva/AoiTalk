@@ -216,6 +216,33 @@ describe(
       expect(Array.from(form.keys())).not.toContain("package");
     });
 
+    it("updates an existing YouTube channel slot with optimistic version and idempotency", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(response({ id: "account-id" }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await mediaOperationsSetupApi.updateYouTubeChannelSlot(
+        "account-id",
+        {
+          expected_version: 4,
+          channel_id: "UC" + "a".repeat(22),
+          activate: false,
+        } as never,
+        "youtube-channel-key",
+      );
+
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        "/api/python-proxy/operations/media/platform-accounts/account-id/youtube-channel",
+      );
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(String(init.body))).toEqual({
+        expected_version: 4,
+        channel_id: "UC" + "a".repeat(22),
+        activate: false,
+      });
+      expect(new Headers(init.headers).get("idempotency-key")).toBe("youtube-channel-key");
+    });
+
     it("does not retain provider error bodies or secret-looking details", async () => {
       const fetchMock = vi.fn().mockResolvedValue(
         new Response(

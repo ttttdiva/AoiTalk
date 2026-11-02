@@ -18,6 +18,7 @@ import {
   FAB,
   IconButton,
   List,
+  Menu,
   Portal,
   Snackbar,
   Text,
@@ -70,6 +71,11 @@ export default function ChatListScreen() {
   const reduceMotionRef = useRef(reduceMotion);
   reduceMotionRef.current = reduceMotion;
   const [sessions, setSessions] = useState<ConversationSession[]>([]);
+  const [loadedScope, setLoadedScope] = useState<string | null>(null);
+  const [errorScope, setErrorScope] = useState<string | null>(null);
+  const scope = JSON.stringify([isAuthenticated, user?.user_id ?? null, selectedProjectId]);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
   const [refreshing, setRefreshing] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
@@ -131,15 +137,15 @@ export default function ChatListScreen() {
     void AsyncStorage.setItem(CHAT_HISTORY_FILTER_KEY, value).catch(() => undefined);
   }, []);
   const filteredSessions = useMemo(
-    () => filterChatSessions(sessions, historyFilter),
-    [historyFilter, sessions],
+    () => filterChatSessions(loadedScope === scope ? sessions : [], historyFilter),
+    [historyFilter, sessions, loadedScope, scope],
   );
   const filteredSearchResults = useMemo(
     () => filterChatSearchResults(searchResults, historyFilter),
     [historyFilter, searchResults],
   );
   const listData: Array<ConversationSession | ConversationSearchResult> =
-    showingSearch ? filteredSearchResults : filteredSessions;
+    loadedScope !== scope ? [] : showingSearch ? filteredSearchResults : filteredSessions;
   const visibleSessionIds = useMemo(() => getVisibleSessionIds(listData), [listData]);
   const selectedCount = visibleSessionIds.filter((id) => selectedSessionIds.has(id)).length;
   const allSelected = visibleSessionIds.length > 0 && selectedCount === visibleSessionIds.length;
@@ -156,7 +162,9 @@ export default function ChatListScreen() {
   useEffect(() => {
     clearSelection();
     setSessions([]);
-  }, [selectedProjectId, clearSelection]);
+    setLoadedScope(null);
+    setErrorScope(null);
+  }, [scope, clearSelection]);
 
   useEffect(() => {
     if (deleting) return;
@@ -179,6 +187,15 @@ export default function ChatListScreen() {
     return () => subscription.remove();
   }, [selectionMode, deleteTargets.length, clearSelection]);
 
+  useEffect(() => {
+    if (!actionTarget) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      setActionTarget(null);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [actionTarget]);
+
   const loadSessions = useCallback(
     async (options?: { forceRefresh?: boolean; localOnly?: boolean }) => {
       if (!focusedRef.current) return;
@@ -191,12 +208,19 @@ export default function ChatListScreen() {
       syncTaskRef.current = null;
 
       const applyList = (list: ConversationSession[]) => {
-        if (requestId !== loadRequestRef.current) return;
+        if (requestId !== loadRequestRef.current || scopeRef.current !== scope) return;
+        setErrorScope(null);
+        setLoadedScope(scope);
         setSessions((previous) => {
           if (areConversationListsEqual(previous, list)) return previous;
           animateNextListChange(reduceMotionRef.current);
           return list;
         });
+      };
+      const applyError = () => {
+        if (requestId === loadRequestRef.current && scopeRef.current === scope) {
+          setErrorScope(scope);
+        }
       };
 
       if (options?.forceRefresh) {
@@ -207,7 +231,7 @@ export default function ChatListScreen() {
           );
           applyList(list);
         } catch {
-          // Keep the current list visible if an explicit refresh fails.
+          applyError();
         }
         if (requestId !== loadRequestRef.current) return;
         // Chat一覧の明示更新をDocs等の全体sync完了待ちにしない。
@@ -217,7 +241,7 @@ export default function ChatListScreen() {
           try {
             applyList(await conversationsRepo.listSessionsLocal(selectedProjectId));
           } catch {
-            // 全体同期後の再読込失敗でも、直接取得した一覧を維持する。
+            applyError();
           }
         });
         return;
@@ -228,7 +252,7 @@ export default function ChatListScreen() {
         localSessions = await conversationsRepo.listSessionsLocal(selectedProjectId);
         applyList(localSessions);
       } catch {
-        // A sync can still repair a failed/stale local read.
+        applyError();
       }
       if (requestId !== loadRequestRef.current) return;
 
@@ -251,11 +275,11 @@ export default function ChatListScreen() {
         try {
           applyList(await conversationsRepo.listSessionsLocal(selectedProjectId));
         } catch {
-          // 同期後の再読込失敗でも、先に表示したローカル一覧を維持する。
+          applyError();
         }
       });
     },
-    [selectedProjectId, isAuthenticated, user?.user_id],
+    [selectedProjectId, scope],
   );
   const loadSessionsRef = useRef(loadSessions);
   loadSessionsRef.current = loadSessions;
@@ -677,6 +701,76 @@ export default function ChatListScreen() {
       : "タップして会話を開きます。長押しで複数選択できます",
   });
 
+  const renderSessionActions = (item: ConversationSession) => {
+    const localOnly = item.user_id === "" || item.is_local_only === true;
+    const menuVisible = actionTarget?.id === item.id;
+    const anchor = (
+      <IconButton
+        icon="dots-vertical"
+        iconColor="#a6adc8"
+        size={22}
+        accessibilityLabel={`${item.title || "無題の会話"}の操作`}
+        onPress={(event) => {
+          event?.stopPropagation();
+          setActionTarget(item);
+        }}
+      />
+    );
+
+    if (!menuVisible) return anchor;
+
+    return (
+      <Menu
+        testID={`session-actions-menu-${item.id}`}
+        visible
+        onDismiss={() => {
+          setActionTarget((current) => current?.id === item.id ? null : current);
+        }}
+        anchor={anchor}
+        contentStyle={styles.actionMenuContent}
+      >
+        <Menu.Item
+          title="タイトルを編集"
+          leadingIcon="pencil-outline"
+          onPress={openRename}
+        />
+        <Menu.Item
+          title={item.is_pinned ? "ピン留めを解除" : "ピン留め"}
+          leadingIcon={item.is_pinned ? "pin-off-outline" : "pin-outline"}
+          disabled={localOnly}
+          onPress={() => void handleTogglePin()}
+        />
+        {localOnly ? (
+          <Text style={styles.actionMenuHint}>サーバー同期後に利用できます</Text>
+        ) : null}
+        <Menu.Item
+          title="セッションIDをコピー"
+          leadingIcon="content-copy"
+          onPress={() => void handleCopySessionId()}
+        />
+        {localOnly ? (
+          <Menu.Item
+            title="サーバーへ同期"
+            leadingIcon="cloud-upload-outline"
+            onPress={() => {
+              setSyncTarget(item);
+              setActionTarget(null);
+            }}
+          />
+        ) : null}
+        <Menu.Item
+          title="削除"
+          titleStyle={styles.dangerText}
+          leadingIcon="delete-outline"
+          onPress={() => {
+            setDeleteTargets([item.id]);
+            setActionTarget(null);
+          }}
+        />
+      </Menu>
+    );
+  };
+
   const renderSearchItem = ({ item }: { item: ConversationSearchResult }) => (
     <List.Item
       {...sessionInteraction(item.session_id)}
@@ -749,18 +843,7 @@ export default function ChatListScreen() {
             }
           />
         )}
-      right={selectionMode ? undefined : () => (
-        <IconButton
-          icon="dots-vertical"
-          iconColor="#a6adc8"
-          size={22}
-          accessibilityLabel={`${item.title || "無題の会話"}の操作`}
-          onPress={(event) => {
-            event?.stopPropagation();
-            setActionTarget(item);
-          }}
-        />
-      )}
+      right={selectionMode ? undefined : () => renderSessionActions(item)}
       style={[styles.listItem, selectionMode && selectedSessionIds.has(item.id) && styles.selectedItem]}
     />
   );
@@ -856,6 +939,7 @@ export default function ChatListScreen() {
       ) : null}
 
       <FlatList<ConversationSession | ConversationSearchResult>
+        testID="chat-list"
         data={listData}
         extraData={{ selectionMode, selectedSessionIds, deleting }}
         keyExtractor={(item) => item.id}
@@ -872,7 +956,17 @@ export default function ChatListScreen() {
             tintColor="#7c3aed"
           />
         )}
-        ListEmptyComponent={
+        ListEmptyComponent={loadedScope !== scope && errorScope === scope ? (
+          <View style={styles.empty}>
+            <Text style={styles.emptyText}>会話一覧を読み込めませんでした。</Text>
+            <Button onPress={() => { setErrorScope(null); void loadSessions(); }}>再試行</Button>
+          </View>
+        ) : loadedScope !== scope ? (
+          <View style={styles.empty}>
+            <ActivityIndicator color="#7c3aed" />
+            <Text style={styles.emptyText}>読み込み中…</Text>
+          </View>
+        ) : (
           <View style={styles.empty}>
             <Text style={styles.emptyText}>
               {searching
@@ -889,7 +983,7 @@ export default function ChatListScreen() {
                 : "Create a session to start chatting."}
             </Text>
           </View>
-        }
+        )}
         contentContainerStyle={
           listData.length === 0 ? styles.emptyContainer : undefined
         }
@@ -979,67 +1073,6 @@ export default function ChatListScreen() {
               作成
             </Button>
           </Dialog.Actions>
-        </Dialog>
-
-        <Dialog
-          visible={!!actionTarget}
-          onDismiss={() => setActionTarget(null)}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>セッション操作</Dialog.Title>
-          <Dialog.Content style={styles.actionDialogContent}>
-            <List.Item
-              title="タイトルを編集"
-              left={(props) => <List.Icon {...props} icon="pencil-outline" />}
-              onPress={openRename}
-            />
-            <List.Item
-              title={actionTarget?.is_pinned ? "ピン留めを解除" : "ピン留め"}
-              description={
-                (actionTarget?.user_id === "" || actionTarget?.is_local_only === true)
-                  ? "サーバー同期後に利用できます"
-                  : undefined
-              }
-              left={(props) => (
-                <List.Icon
-                  {...props}
-                  icon={
-                    actionTarget?.is_pinned
-                      ? "pin-off-outline"
-                      : "pin-outline"
-                  }
-                />
-              )}
-              disabled={(actionTarget?.user_id === "" || actionTarget?.is_local_only === true)}
-              onPress={() => void handleTogglePin()}
-            />
-            <List.Item
-              title="セッションIDをコピー"
-              left={(props) => <List.Icon {...props} icon="content-copy" />}
-              onPress={() => void handleCopySessionId()}
-            />
-            {(actionTarget?.user_id === "" || actionTarget?.is_local_only === true) ? (
-              <List.Item
-                title="サーバーへ同期"
-                left={(props) => <List.Icon {...props} icon="cloud-upload-outline" />}
-                onPress={() => {
-                  setSyncTarget(actionTarget);
-                  setActionTarget(null);
-                }}
-              />
-            ) : null}
-            <List.Item
-              title="削除"
-              titleStyle={styles.dangerText}
-              left={(props) => (
-                <List.Icon {...props} icon="delete-outline" color="#f38ba8" />
-              )}
-              onPress={() => {
-                setDeleteTargets(actionTarget ? [actionTarget.id] : []);
-                setActionTarget(null);
-              }}
-            />
-          </Dialog.Content>
         </Dialog>
 
         <Dialog
@@ -1240,7 +1273,8 @@ const styles = StyleSheet.create({
   dialogText: { color: "#a6adc8" },
   syncIndicator: { marginTop: 12, alignSelf: "flex-start" },
   syncErrorText: { color: "#f38ba8", fontSize: 13, marginTop: 10 },
-  actionDialogContent: { paddingHorizontal: 0 },
+  actionMenuContent: { backgroundColor: "#1e1e2e" },
+  actionMenuHint: { color: "#a6adc8", fontSize: 12, paddingHorizontal: 52, paddingBottom: 8 },
   dangerText: { color: "#f38ba8" },
   renameError: { color: "#f38ba8", fontSize: 12, marginTop: 8 },
   groupDialogContent: { paddingVertical: 8, gap: 8 },

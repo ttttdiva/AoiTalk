@@ -25,6 +25,7 @@ from ....memory.models import (
     TimeEntry,
     User,
 )
+from ....memory.models.tasks import task_audit_iso
 from ....services.task_management._shared import TaskManagementError
 from ...uuid_http import parse_uuid_or_400
 from ._shared import _parse_browse_scope
@@ -239,8 +240,8 @@ async def get_task_section(
                 "created_by": str(task.created_by) if task.created_by else None,
                 "completed_at": _iso(task.completed_at),
                 "archived_at": _iso(task.archived_at),
-                "created_at": _iso(task.created_at),
-                "updated_at": _iso(task.updated_at),
+                "created_at": task_audit_iso(task.created_at),
+                "updated_at": task_audit_iso(task.updated_at),
                 "deletion_batch_id": (
                     str(task.deletion_batch_id) if task.deletion_batch_id else None
                 ),

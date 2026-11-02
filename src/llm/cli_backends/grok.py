@@ -39,6 +39,13 @@ _LIMIT_MARKERS = (
     "weekly limit",
     "limit reached",
 )
+_HTTP_ERROR_MARKERS = (
+    "http 5",
+    "http 4",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+)
 _FINAL_TYPES = {
     "final",
     "final_message",
@@ -46,9 +53,22 @@ _FINAL_TYPES = {
     "response",
     "assistant_message",
     "assistant_response",
+    "agent_message_end",
+    "assistant_message_end",
+    "agent_message_completed",
+    "assistant_message_completed",
     "assistant",
     "completion",
 }
+_COMPLETION_TYPES = {
+    "turn_completed",
+    "session_completed",
+    "run_completed",
+    "message_stop",
+    "done",
+    "end",
+}
+_CANCEL_TYPES = {"cancelled", "canceled", "turn_cancelled", "turn_canceled"}
 
 
 def _text_value(value: Any) -> str:
@@ -90,11 +110,13 @@ class GrokCLIBackend(CLIBackendBase):
         # text delta を溜め、ツール呼び出し境界でまとまった assistant_text にする。
         self._text_delta_buffer: list[str] = []
         self._stream_round = 0
+        self._stream_terminal_seen = False
         super().__init__()
 
     def _reset_stream_state(self) -> None:
         self._text_delta_buffer = []
         self._stream_round = 0
+        self._stream_terminal_seen = False
 
     def get_session_capabilities(self) -> CLISessionCapabilities:
         if self.__class__._native_sessions_available is None:
@@ -214,23 +236,50 @@ class GrokCLIBackend(CLIBackendBase):
         return ["--cwd", str(cwd.resolve())]
 
     def parse_output(self, raw_output: str) -> str:
-        final_messages: list[str] = []
-        deltas: list[str] = []
-        for event in self._events(raw_output):
+        events = list(self._events(raw_output))
+        terminal_messages: list[tuple[int, str]] = []
+        completions: list[int] = []
+        deltas: list[tuple[int, str]] = []
+        for index, event in enumerate(events):
             payload = _event_payload(event)
             event_type = self._event_type(event, payload)
             text = self._event_text(event, payload)
-            if not text:
+            if self._is_terminal_assistant_event(event, payload, event_type):
+                terminal_messages.append((index, text.strip()))
                 continue
-            if self._is_delta(event, payload, event_type):
-                deltas.append(text)
-            elif self._is_final(event_type, payload):
-                final_messages.append(text.strip())
+            if self._is_completion_event(event, payload, event_type):
+                completions.append(index)
+            if (
+                text
+                and self._is_assistant_event(event, payload, event_type)
+                and self._is_delta(event, payload, event_type)
+            ):
+                deltas.append((index, text))
 
-        if final_messages:
-            return final_messages[-1]
+        if terminal_messages:
+            terminal_index, terminal_text = terminal_messages[-1]
+            if terminal_text:
+                return terminal_text
+            # Some CLIs terminate the assistant item separately from its final
+            # text chunks. Use only the chunks belonging to that item.
+            previous_terminal = terminal_messages[-2][0] if len(terminal_messages) > 1 else -1
+            return "".join(
+                text for index, text in deltas if previous_terminal < index < terminal_index
+            ).strip()
+        if completions:
+            completion_index = completions[-1]
+            previous_completion = completions[-2] if len(completions) > 1 else -1
+            return "".join(
+                text
+                for index, text in deltas
+                if previous_completion < index < completion_index
+            ).strip()
         if deltas:
-            return "".join(deltas).strip()
+            return "".join(text for _, text in deltas).strip()
+        if events:
+            # Structured tool/status events must never leak their JSON payload
+            # as the assistant response.
+            return ""
         return super().parse_output(raw_output)
 
     def handle_stream_output_line(
@@ -245,6 +294,17 @@ class GrokCLIBackend(CLIBackendBase):
         payload = _event_payload(event)
         event_type = self._event_type(event, payload)
         normalized = event_type.lower().replace("-", "_")
+        failure_kind, _ = self._event_failure(event, payload, normalized)
+        if failure_kind == "stream_cancelled":
+            self._text_delta_buffer = []
+            event_callback(
+                "status_update",
+                {
+                    "status": "grok_cli_cancelled",
+                    "message": "Grok Build CLI turn was cancelled",
+                },
+            )
+            return
         operation_id = str(
             payload.get("id")
             or payload.get("call_id")
@@ -253,6 +313,11 @@ class GrokCLIBackend(CLIBackendBase):
             or event.get("call_id")
             or ""
         ).strip()
+        if self._is_terminal_assistant_event(event, payload, normalized):
+            self._text_delta_buffer = []
+            self._stream_terminal_seen = True
+            return
+
         if normalized in {"error", "failed", "failure"}:
             message = self._event_text(event, payload) or "Grok Build CLI error"
             event_callback(
@@ -310,16 +375,26 @@ class GrokCLIBackend(CLIBackendBase):
             return
 
         if normalized in {"turn_started", "session_started", "run_started", "message_start"}:
+            self._text_delta_buffer = []
+            self._stream_terminal_seen = False
             event_callback(
                 "status_update",
                 {"status": f"grok_{normalized}", "message": f"Grok Build CLI {normalized}"},
             )
             return
 
-        if normalized in {"turn_completed", "session_completed", "run_completed", "message_stop", "done"}:
+        if normalized in {
+            "turn_completed",
+            "session_completed",
+            "run_completed",
+            "message_stop",
+            "done",
+            "end",
+        }:
             # 完了時点で残っている delta は最終回答そのもの（parse_output が返す）ため、
             # assistant_text として重複配信せず破棄する。
             self._text_delta_buffer = []
+            self._stream_terminal_seen = True
             event_callback(
                 "status_update",
                 {"status": f"grok_{normalized}", "message": f"Grok Build CLI {normalized}"},
@@ -328,6 +403,8 @@ class GrokCLIBackend(CLIBackendBase):
 
         text = self._event_text(event, payload)
         if text and self._is_delta(event, payload, normalized):
+            if self._stream_terminal_seen:
+                return
             self._text_delta_buffer.append(text)
             # 既存の逐次表示は互換のためそのまま残す。
             event_callback(
@@ -350,38 +427,68 @@ class GrokCLIBackend(CLIBackendBase):
             return "Grok Build CLI が未認証です。`grok login` を実行するか、XAI_API_KEYを設定してください。"
         if any(marker in lower for marker in _LIMIT_MARKERS):
             return "Grok Build CLI の利用上限またはレート制限に達しました。時間を置くか別のモデルへ切り替えてください。"
+        if any(marker in lower for marker in _HTTP_ERROR_MARKERS):
+            return f"Grok Build CLI returned an HTTP error: {message[:2000]}"
         if message:
             return f"Grok Build CLI の実行に失敗しました: {message[:2000]}"
         return None
 
     def validate_success_output(self, raw_output: str, stderr: str) -> Optional[str]:
-        """Treat structured streaming error/result-failed events as failures."""
+        """Reject successful process exits without a complete assistant reply."""
 
-        if self.get_invocation_options() is None:
-            return None
-        events = list(self._events(str(raw_output or "")))
+        raw_output = str(raw_output or "")
+        events = list(self._events(raw_output))
         for event in events:
             payload = _event_payload(event)
             event_type = self._event_type(event, payload).lower()
-            status_value = event.get("status") or payload.get("status")
-            result_payload = payload.get("result")
-            if isinstance(result_payload, dict):
-                status_value = status_value or result_payload.get("status")
-            status = str(status_value or "").lower()
-            if event_type in {"error", "failed", "failure", "turn_failed", "result_failed"} or status in {
-                "error",
-                "failed",
-                "failure",
-                "canceled",
-                "cancelled",
-            }:
+            failure_kind, detail = self._event_failure(event, payload, event_type)
+            if failure_kind:
                 self._set_cli_diagnostic(
                     status="failed",
                     state="failed",
-                    error_code="grok_stream_error",
+                    error_code=f"grok_{failure_kind}",
                 )
-                detail = self._event_text(event, payload) or "Grok Build CLI reported a failed result"
+                if failure_kind == "stream_cancelled":
+                    return "Grok Build CLI turn was cancelled."
+                classified = self.parse_error_output(raw_output, stderr, 0)
+                if classified and (
+                    "未認証" in classified
+                    or "利用上限" in classified
+                    or "HTTP error" in classified
+                ):
+                    return classified
                 return f"Grok Build CLI reported a failed result: {detail[:1000]}"
+
+        if not raw_output.strip():
+            self._set_cli_diagnostic(
+                status="failed", state="failed", error_code="grok_empty_response"
+            )
+            return "Grok Build CLI returned no assistant response."
+
+        if not events:
+            lower_output = raw_output.lower()
+            if any(
+                marker in lower_output
+                for marker in (*_AUTH_MARKERS, *_LIMIT_MARKERS, *_HTTP_ERROR_MARKERS)
+            ):
+                self._set_cli_diagnostic(
+                    status="failed", state="failed", error_code="grok_provider_error"
+                )
+                return self.parse_error_output(raw_output, stderr, 0)
+
+        malformed_lines = self._malformed_json_lines(raw_output)
+        if malformed_lines:
+            self._set_cli_diagnostic(
+                status="failed", state="failed", error_code="grok_truncated_stream"
+            )
+            return "Grok Build CLI returned truncated or invalid streaming JSON."
+
+        terminal_answer = self._terminal_assistant_output(events)
+        if not terminal_answer:
+            self._set_cli_diagnostic(
+                status="failed", state="failed", error_code="grok_terminal_response_missing"
+            )
+            return "Grok Build CLI stream ended without a terminal assistant response."
         return None
 
     @classmethod
@@ -398,6 +505,14 @@ class GrokCLIBackend(CLIBackendBase):
             event = cls._parse_event(line)
             if event is not None:
                 yield event
+
+    @classmethod
+    def _malformed_json_lines(cls, raw_output: str) -> list[str]:
+        return [
+            line
+            for line in raw_output.splitlines()
+            if line.strip() and cls._parse_event(line) is None
+        ]
 
     @staticmethod
     def _event_type(event: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -454,6 +569,181 @@ class GrokCLIBackend(CLIBackendBase):
         if event_type == "item_completed" and str(payload.get("role") or "").lower() == "assistant":
             return True
         return event_type.endswith("_final")
+
+    @classmethod
+    def _is_terminal_assistant_event(
+        cls,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+        event_type: str,
+    ) -> bool:
+        if not cls._is_assistant_event(event, payload, event_type):
+            return False
+        if cls._is_final(event_type, payload):
+            return True
+        item = payload.get("item")
+        if event_type == "item_completed" and isinstance(item, dict):
+            if str(item.get("role") or "").lower() == "assistant":
+                return True
+        return any(
+            bool(source.get(key))
+            for source in (event, payload)
+            for key in ("is_final", "final", "terminal")
+        )
+
+    @classmethod
+    def _is_assistant_event(
+        cls,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+        event_type: str,
+    ) -> bool:
+        normalized = event_type.lower().replace("-", "_")
+        if (
+            normalized.startswith("tool_")
+            or normalized in {
+                "tool",
+                "tool_start",
+                "tool_started",
+                "tool_use",
+                "tool_call",
+                "tool_end",
+                "tool_completed",
+                "tool_result",
+                "command",
+                "command_execution",
+                "command_execution_completed",
+                "shell",
+            }
+        ):
+            return False
+        sources = [event, payload]
+        for source in (event, payload):
+            for key in ("item", "content_block", "message", "result"):
+                nested = source.get(key)
+                if isinstance(nested, dict):
+                    sources.append(nested)
+        for source in sources:
+            nested_type = str(source.get("type") or source.get("kind") or "").lower()
+            if nested_type.startswith("tool_") or nested_type in {
+                "tool",
+                "tool_call",
+                "tool_result",
+                "command_execution",
+                "shell",
+            }:
+                return False
+            role = source.get("role") or source.get("speaker") or source.get("author")
+            if role and str(role).strip().lower() not in {"assistant", "agent"}:
+                return False
+        if payload.get("tool"):
+            return False
+        return True
+
+    @classmethod
+    def _is_completion_event(
+        cls,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+        event_type: str,
+    ) -> bool:
+        return event_type in _COMPLETION_TYPES and cls._is_assistant_event(
+            event, payload, event_type
+        )
+
+    @classmethod
+    def _terminal_assistant_output(cls, events: list[dict[str, Any]]) -> str:
+        terminal_messages: list[tuple[int, str]] = []
+        completions: list[int] = []
+        deltas: list[tuple[int, str]] = []
+        for index, event in enumerate(events):
+            payload = _event_payload(event)
+            event_type = cls._event_type(event, payload)
+            text = cls._event_text(event, payload)
+            if cls._is_terminal_assistant_event(event, payload, event_type):
+                terminal_messages.append((index, text.strip()))
+                continue
+            if cls._is_completion_event(event, payload, event_type):
+                completions.append(index)
+            if (
+                text
+                and cls._is_assistant_event(event, payload, event_type)
+                and cls._is_delta(event, payload, event_type)
+            ):
+                deltas.append((index, text))
+
+        if terminal_messages:
+            terminal_index, terminal_text = terminal_messages[-1]
+            if terminal_text:
+                return terminal_text
+            previous_terminal = terminal_messages[-2][0] if len(terminal_messages) > 1 else -1
+            return "".join(
+                text for index, text in deltas if previous_terminal < index < terminal_index
+            ).strip()
+        if completions:
+            completion_index = completions[-1]
+            previous_completion = completions[-2] if len(completions) > 1 else -1
+            return "".join(
+                text
+                for index, text in deltas
+                if previous_completion < index < completion_index
+            ).strip()
+        return ""
+
+    @classmethod
+    def _event_failure(
+        cls,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+        event_type: str,
+    ) -> tuple[Optional[str], str]:
+        status_values: list[Any] = []
+        for source in (event, payload):
+            status_values.extend(
+                source.get(key)
+                for key in ("status", "status_code", "http_status", "httpStatus")
+                if source.get(key) is not None
+            )
+        result_payload = payload.get("result")
+        if isinstance(result_payload, dict):
+            status_values.extend(
+                result_payload.get(key)
+                for key in ("status", "status_code", "http_status", "httpStatus")
+                if result_payload.get(key) is not None
+            )
+        statuses = {str(value).strip().lower() for value in status_values}
+        detail = cls._event_text(event, payload).strip()
+        error_sources = [event, payload]
+        if isinstance(result_payload, dict):
+            error_sources.append(result_payload)
+        error_detail = " ".join(
+            str(source.get(key) or "")
+            for source in error_sources
+            for key in ("error", "message")
+        ).lower()
+        normalized = event_type.lower().replace("-", "_")
+        if normalized in _CANCEL_TYPES or statuses.intersection({"cancelled", "canceled"}):
+            return "stream_cancelled", detail or "Provider cancelled the turn"
+        if any(value.isdigit() and int(value) >= 400 for value in statuses):
+            return "http_error", detail or f"HTTP status {', '.join(sorted(statuses))}"
+        is_failure = normalized in {
+            "error",
+            "failed",
+            "failure",
+            "turn_failed",
+            "result_failed",
+        } or statuses.intersection({"error", "failed", "failure"})
+        error_present = any(source.get("error") for source in error_sources)
+        if is_failure or error_present:
+            if any(marker in error_detail for marker in _AUTH_MARKERS):
+                return "authentication_error", detail or "Grok Build CLI is not authenticated"
+            if any(marker in error_detail for marker in _LIMIT_MARKERS):
+                return "usage_limit", detail or "Grok Build CLI usage limit reached"
+            if any(marker in error_detail for marker in _HTTP_ERROR_MARKERS):
+                return "http_error", detail or "Provider returned an HTTP error"
+            if is_failure:
+                return "stream_error", detail or "Grok Build CLI reported a failed result"
+        return None, ""
 
     @staticmethod
     def _tool_context(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:

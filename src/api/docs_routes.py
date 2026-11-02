@@ -597,7 +597,14 @@ def create_docs_router(
             root が食い違わないよう ``DocsGraphService`` へ必ず透過する。
     """
     router = APIRouter(prefix="/api/docs", tags=["docs"])
-    clip_storage = ClipIngestStorage(workspace_root)
+    # Router construction is a read/configuration step.  A deployment may
+    # configure a workspace root that is not present until the first explicit
+    # upload; defer that writer mkdir to ClipIngestStorage.stage_uploads().
+    clip_storage = ClipIngestStorage(
+        workspace_root,
+        create_root=False,
+        allow_missing_root=True,
+    )
 
     def _docs_service(session) -> DocsGraphService:
         """Docs 操作用 service を実効 root 付きで生成する。
@@ -728,7 +735,15 @@ def create_docs_router(
         actor_id: UUID,
         root_id: UUID,
         project_id: UUID | None,
-    ) -> tuple[KnowledgeNode, set[UUID], UUID | None]:
+    ) -> tuple[
+        KnowledgeNode,
+        set[UUID] | None,
+        UUID | None,
+        tuple[UUID, ...],
+        bool,
+        tuple[UUID, ...],
+        tuple[UUID, ...],
+    ]:
         """Resolve a caller root only inside the canonical Docs scope lanes."""
 
         from ..services.docs_scope import DocsScopeMode, resolve_docs_scope
@@ -742,22 +757,50 @@ def create_docs_router(
                 if project_id is not None
                 else DocsScopeMode.PERSONAL_ONLY
             ),
+            target_node_id=root_id,
         )
         verified_project_id = scope.project_id if project_id is not None else None
         if project_id is not None and (
             verified_project_id != project_id or not scope.project_ids
         ):
             raise HTTPException(status_code=404, detail="Docs root not found")
-        allowed_ids = set(scope.canonical_node_ids) | set(scope.related_node_ids)
+        scope_anchor_ids = tuple(getattr(scope, "anchor_node_ids", ()) or ())
+        point_scope = bool(scope_anchor_ids)
+        point_allowed_ids = getattr(scope, "point_allowed_node_ids", None)
+        point_canonical_seed_ids = tuple(
+            getattr(scope, "point_canonical_seed_ids", ()) or ()
+        )
+        point_related_seed_ids = tuple(
+            getattr(scope, "point_related_seed_ids", ()) or ()
+        )
+        allowed_ids = (
+            set(point_allowed_ids)
+            if point_scope and point_allowed_ids is not None
+            else None
+            if point_scope
+            else set(scope.canonical_node_ids) | set(scope.related_node_ids)
+        )
         root = await session.get(KnowledgeNode, root_id)
         if (
             root is None
-            or root_id not in allowed_ids
+            or (
+                root_id not in set(scope.related_node_ids) | set(scope.canonical_node_ids)
+                if point_scope
+                else root_id not in allowed_ids
+            )
             or root.docs_library_id not in set(scope.allowed_library_ids)
             or getattr(root, "archived_at", None) is not None
         ):
             raise HTTPException(status_code=404, detail="Docs root not found")
-        return root, allowed_ids, verified_project_id
+        return (
+            root,
+            allowed_ids,
+            verified_project_id,
+            scope_anchor_ids,
+            point_scope and bool(getattr(scope, "personal_projection_only", False)),
+            point_canonical_seed_ids,
+            point_related_seed_ids,
+        )
 
     def _protocol_error(status_code: int, code: str, message: str) -> HTTPException:
         return HTTPException(
@@ -2608,7 +2651,7 @@ def create_docs_router(
         user_id = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
-            root, allowed_ids, verified_project_id = await _resolve_protocol_root_scope(
+            root, allowed_ids, verified_project_id, _scope_anchors, personal_scope, canonical_seeds, related_seeds = await _resolve_protocol_root_scope(
                 session,
                 actor_id=user_id,
                 root_id=payload.root_id,
@@ -2627,6 +2670,10 @@ def create_docs_router(
                 depth=payload.depth,
                 page_chars=payload.page_chars,
                 wire_view=True,
+                personal_scope=personal_scope,
+                scope_anchor_ids=_scope_anchors,
+                scope_canonical_seed_ids=canonical_seeds,
+                scope_related_seed_ids=related_seeds,
             )
         except HTTPException:
             raise
@@ -2654,7 +2701,7 @@ def create_docs_router(
 
         session = await get_db_manager().get_session()
         try:
-            root, allowed_ids, verified_project_id = await _resolve_protocol_root_scope(
+            root, allowed_ids, verified_project_id, scope_anchors, personal_scope, canonical_seeds, related_seeds = await _resolve_protocol_root_scope(
                 session,
                 actor_id=user_id,
                 root_id=payload.root_id,
@@ -2684,6 +2731,10 @@ def create_docs_router(
                 depth=payload.depth,
                 page_chars=payload.page_chars,
                 mutation_binding=mutation_binding,
+                scope_anchor_ids=scope_anchors,
+                personal_scope=personal_scope,
+                scope_canonical_seed_ids=canonical_seeds,
+                scope_related_seed_ids=related_seeds,
             )
             await session.commit()
             return result
@@ -2716,7 +2767,7 @@ def create_docs_router(
 
         session = await get_db_manager().get_session()
         try:
-            root, _allowed_ids, verified_project_id = await _resolve_protocol_root_scope(
+            root, _allowed_ids, verified_project_id, _scope_anchors, _personal_scope, _canonical_seeds, _related_seeds = await _resolve_protocol_root_scope(
                 session,
                 actor_id=user_id,
                 root_id=payload.root_id,

@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   and,
   eq,
@@ -76,6 +76,7 @@ export type ExchangeClientHandoffInput = {
   client: AuthHandoffClient;
   body: ClientAuthExchangeBody;
   now?: HandoffTime;
+  consumerApp?: "73" | "86";
 };
 
 export type AuthHandoffIdentityAssertion = {
@@ -84,6 +85,9 @@ export type AuthHandoffIdentityAssertion = {
   aud: string;
   iat: number;
   exp: number;
+  ticket?: string;
+  renewalProof?: string;
+  sourceExpiresAt?: number;
 };
 
 export type AuthHandoffRateLimitEndpoint = "requests" | "exchange" | "authorize";
@@ -369,6 +373,50 @@ export async function exchangeClientHandoff(
     const exp = Math.min(sourceExpiresAt, iat + CLIENT_AUTH_HANDOFF_ASSERTION_TTL_SECONDS);
     if (exp <= iat) return null;
 
+    // A domain-separated key prevents this ticket from being accepted as a
+    // normal Next.js session even though both processes share NEXTAUTH_SECRET.
+    let ticket: string | undefined;
+    let renewalProof: string | undefined;
+    if (input.consumerApp) {
+      if (current.consumerApp !== input.consumerApp) return null;
+      const secret = process.env.NEXTAUTH_SECRET?.trim();
+      if (!secret) throw new Error("Consumer ticket signing unavailable");
+      const key = createHmac("sha256", secret).update("aoitalk:remote-consumer:v1").digest();
+      const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+      const payload = Buffer.from(JSON.stringify({
+        iss: issuer,
+        sub: String(row.sourceUserId),
+        aud: "41",
+        purpose: "remote-consumer",
+        consumer_app: input.consumerApp,
+        client_id: current.clientId,
+        registration_hash: authHandoffRegistrationHash(current),
+        session_version: row.sourceSessionVersion,
+        iat,
+        exp,
+        jti: randomOpaque(),
+      })).toString("base64url");
+      const content = `${header}.${payload}`;
+      ticket = `${content}.${createHmac("sha256", key).update(content).digest("base64url")}`;
+
+      const renewalKey = createHmac("sha256", secret).update("aoitalk:remote-consumer-renewal:v1").digest();
+      const renewalPayload = Buffer.from(JSON.stringify({
+        iss: issuer,
+        sub: String(row.sourceUserId),
+        aud: "41",
+        purpose: "remote-consumer-renewal",
+        consumer_app: input.consumerApp,
+        client_id: current.clientId,
+        registration_hash: authHandoffRegistrationHash(current),
+        session_version: row.sourceSessionVersion,
+        iat,
+        exp: sourceExpiresAt,
+        jti: randomOpaque(),
+      })).toString("base64url");
+      const renewalContent = `${header}.${renewalPayload}`;
+      renewalProof = `${renewalContent}.${createHmac("sha256", renewalKey).update(renewalContent).digest("base64url")}`;
+    }
+
     const [updated] = await tx
       .update(authHandoffClientTransactions)
       .set({ consumedAt: sql`current_timestamp` })
@@ -387,8 +435,146 @@ export async function exchangeClientHandoff(
       aud: current.audience,
       iat,
       exp,
+      ...(ticket ? { ticket } : {}),
+      ...(renewalProof && sourceExpiresAt ? { renewalProof, sourceExpiresAt } : {}),
     };
   });
+}
+
+export type RenewConsumerTicketInput = {
+  client: AuthHandoffClient;
+  consumerApp: "73" | "86";
+  renewalProof: string;
+  now?: HandoffTime;
+};
+
+export type RenewConsumerTicketResult = {
+  ticket: string;
+  exp: number;
+};
+
+export async function renewConsumerTicket(
+  input: RenewConsumerTicketInput,
+): Promise<RenewConsumerTicketResult | null> {
+  const issuer = getAuthHandoffIssuer();
+  if (!issuer || isLegacyAuthHandoffClient(input.client)) return null;
+  if (!input.client.consumerApp || input.client.consumerApp !== input.consumerApp) return null;
+
+  const current = getAuthHandoffClient(input.client.clientId, undefined, { external: true });
+  if (
+    !current ||
+    current.consumerApp !== input.consumerApp ||
+    !equalAuthHandoffDigest(
+      authHandoffRegistrationHash(current),
+      authHandoffRegistrationHash(input.client),
+    )
+  ) {
+    return null;
+  }
+
+  const secret = process.env.NEXTAUTH_SECRET?.trim();
+  if (!secret) throw new Error("Consumer ticket signing unavailable");
+
+  if (typeof input.renewalProof !== "string" || input.renewalProof.length > 4096) return null;
+  const parts = input.renewalProof.split(".");
+  if (parts.length !== 3) return null;
+  const [headerB64, payloadB64, signature] = parts;
+
+  const renewalKey = createHmac("sha256", secret).update("aoitalk:remote-consumer-renewal:v1").digest();
+  const content = `${headerB64}.${payloadB64}`;
+  const expectedSig = createHmac("sha256", renewalKey).update(content).digest("base64url");
+  if (signature.length !== expectedSig.length) return null;
+  if (!timingSafeEqual(Buffer.from(signature, "ascii"), Buffer.from(expectedSig, "ascii"))) {
+    return null;
+  }
+
+  let header: unknown;
+  try {
+    header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (
+    !header ||
+    typeof header !== "object" ||
+    (header as Record<string, unknown>).alg !== "HS256" ||
+    (header as Record<string, unknown>).typ !== "JWT"
+  ) {
+    return null;
+  }
+
+  let claims: Record<string, unknown>;
+  try {
+    claims = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!claims || typeof claims !== "object") return null;
+
+  if (
+    claims.iss !== issuer ||
+    claims.aud !== "41" ||
+    claims.purpose !== "remote-consumer-renewal" ||
+    claims.consumer_app !== input.consumerApp ||
+    claims.client_id !== current.clientId ||
+    typeof claims.registration_hash !== "string" ||
+    !equalAuthHandoffDigest(claims.registration_hash, authHandoffRegistrationHash(current)) ||
+    typeof claims.sub !== "string" ||
+    !SOURCE_USER_ID_RE.test(claims.sub) ||
+    typeof claims.session_version !== "number" ||
+    !Number.isSafeInteger(claims.session_version) ||
+    claims.session_version < 1 ||
+    typeof claims.iat !== "number" ||
+    !Number.isSafeInteger(claims.iat) ||
+    typeof claims.exp !== "number" ||
+    !Number.isSafeInteger(claims.exp) ||
+    typeof claims.jti !== "string" ||
+    !OPAQUE_RE.test(claims.jti)
+  ) {
+    return null;
+  }
+
+  const now = nowDate(input.now);
+  const effectiveNowSeconds = unixSeconds(now);
+
+  if (claims.exp <= effectiveNowSeconds) return null;
+  if (claims.iat > effectiveNowSeconds) return null;
+
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, claims.sub))
+    .limit(1);
+
+  if (!user || !user.isActive || user.isPasswordResetRequired) return null;
+  if (Number(user.sessionVersion ?? 1) !== claims.session_version) return null;
+
+  const newExp = Math.min(claims.exp, effectiveNowSeconds + CLIENT_AUTH_HANDOFF_ASSERTION_TTL_SECONDS);
+  if (newExp <= effectiveNowSeconds) return null;
+
+  const accessKey = createHmac("sha256", secret).update("aoitalk:remote-consumer:v1").digest();
+  const accessHeader = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const accessPayload = Buffer.from(JSON.stringify({
+    iss: issuer,
+    sub: String(user.id),
+    aud: "41",
+    purpose: "remote-consumer",
+    consumer_app: input.consumerApp,
+    client_id: current.clientId,
+    registration_hash: authHandoffRegistrationHash(current),
+    session_version: claims.session_version,
+    iat: effectiveNowSeconds,
+    exp: newExp,
+    jti: randomOpaque(),
+  })).toString("base64url");
+
+  const accessContent = `${accessHeader}.${accessPayload}`;
+  const ticket = `${accessContent}.${createHmac("sha256", accessKey).update(accessContent).digest("base64url")}`;
+
+  return {
+    ticket,
+    exp: newExp,
+  };
 }
 
 function endpointLimit(

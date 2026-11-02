@@ -143,6 +143,47 @@ _ARGUMENT_REJECTION_DIGEST_KEYS = (
     "max_chars_digest",
 )
 _ARGUMENT_REJECTION_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+AUTHORITY_DENIAL_CODES = frozenset(
+    {
+        "authority_revalidation_failed",
+        "authority_scope_denied",
+        "capability_grant_invalid",
+        "capability_not_in_ceiling",
+        "capability_revalidation_failed",
+        "capability_unresolved",
+        "execution_identity_missing",
+        "human_anchor_mismatch",
+        "memory_scope_denied",
+        "pack_not_allowed",
+        "pack_unknown",
+        "project_scope_denied",
+        "resource_scope_denied",
+        "run_missing",
+        "run_scope_invalid",
+        "run_scope_mismatch",
+        "run_scope_missing",
+        "subagent_scope_denied",
+        "tool_owner_unknown",
+        "work_lease_invalid",
+    }
+)
+AUTHORITY_DECISION_LAYERS = frozenset(
+    {
+        "capability_resolver",
+        "execution_identity",
+        "human_anchor",
+        "memory_scope",
+        "project_scope",
+        "resource_scope",
+        "root_scope",
+        "run_scope",
+        "subagent_scope",
+        "tool_pack",
+        "work_lease",
+        "worker_scope",
+    }
+)
+_AUTHORITY_IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
 
 def safe_argument_rejection(value: Any) -> Dict[str, str]:
@@ -165,6 +206,42 @@ def safe_argument_rejection(value: Any) -> Dict[str, str]:
         if isinstance(digest, str) and _ARGUMENT_REJECTION_DIGEST_RE.fullmatch(digest):
             safe[key] = digest
     return safe
+
+
+def safe_authority_denial(value: Any) -> Dict[str, Any]:
+    """Project framework authority evidence to a fixed, non-sensitive shape."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    code = value.get("code")
+    tool = value.get("tool")
+    layer = value.get("layer")
+    capabilities = value.get("capability_families")
+    if (
+        not isinstance(code, str)
+        or code not in AUTHORITY_DENIAL_CODES
+        or not isinstance(tool, str)
+        or not _AUTHORITY_IDENTIFIER_RE.fullmatch(tool)
+        or not isinstance(layer, str)
+        or layer not in AUTHORITY_DECISION_LAYERS
+        or not isinstance(capabilities, (list, tuple, set, frozenset))
+    ):
+        return {}
+    safe_capabilities = sorted(
+        {
+            item
+            for item in capabilities
+            if isinstance(item, str) and _AUTHORITY_IDENTIFIER_RE.fullmatch(item)
+        }
+    )[:8]
+    if len(safe_capabilities) != len(capabilities):
+        return {}
+    return {
+        "code": code,
+        "tool": tool,
+        "capability_families": safe_capabilities,
+        "layer": layer,
+    }
 
 
 class ToolArgumentValidationError(ValueError):

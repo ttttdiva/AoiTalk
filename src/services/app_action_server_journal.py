@@ -13,10 +13,12 @@ import json
 import hashlib
 import os
 import sqlite3
+import shutil
+import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from uuid import UUID
 
 
@@ -24,6 +26,225 @@ MAX_RESULT_BYTES = 64 * 1024
 MAX_LOG_BYTES = 64 * 1024
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "unknown"})
 ACTIVE_STATES = frozenset({"accepted", "starting", "running", "stopping"})
+_CLEANUP_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
+_RUN_TRANSIENT_DIRS = ("runtime", "input-staging", "inputs")
+_RUN_OUTPUT_DIR = "outputs"
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    """Return whether *path* is a link/reparse entry without following it."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A path that cannot be inspected is unsafe to remove.
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _entry_exists(path: Path) -> bool:
+    """Existence check that also sees dangling links/reparse entries."""
+
+    return path.exists() or _is_link_or_reparse(path)
+
+
+def _has_reparse_component(path: Path) -> bool:
+    """Inspect existing path components without resolving through them."""
+
+    lexical = _lexical_path(path)
+    cursor = Path(lexical.anchor)
+    for part in lexical.parts[1:]:
+        cursor /= part
+        if _is_link_or_reparse(cursor):
+            return True
+        if not cursor.exists():
+            return False
+    return False
+
+
+def _lexical_path(value: str | os.PathLike[str]) -> Path:
+    """Normalize a path lexically without resolving links."""
+
+    return Path(os.path.abspath(os.fspath(value)))
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        first_text = os.path.normcase(os.path.abspath(os.fspath(first)))
+        second_text = os.path.normcase(os.path.abspath(os.fspath(second)))
+        common = os.path.commonpath((first_text, second_text))
+        return common in {first_text, second_text}
+    except (OSError, ValueError):
+        return False
+
+
+def _is_lexically_under(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _tree_is_owned_directory(path: Path) -> bool:
+    """Check a removable tree without following links or reparse entries."""
+
+    if _is_link_or_reparse(path) or not path.is_dir():
+        return False
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            return False
+        for entry in entries:
+            child = Path(entry.path)
+            if _is_link_or_reparse(child):
+                return False
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(child)
+            except OSError:
+                return False
+    return True
+
+
+def _remove_owned_directory(path: Path) -> bool:
+    """Remove one previously inspected directory, failing closed on races."""
+
+    if not _entry_exists(path):
+        return True
+    if not _tree_is_owned_directory(path):
+        return False
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        return False
+    return not path.exists()
+
+
+def owned_directory_identity(path: str | os.PathLike[str]) -> tuple[int, int] | None:
+    """Return the creation-time directory identity used by bounded cleanup."""
+
+    target = Path(path)
+    if _is_link_or_reparse(target) or not target.is_dir():
+        return None
+    try:
+        info = target.stat()
+    except OSError:
+        return None
+    return int(getattr(info, "st_dev", 0)), int(getattr(info, "st_ino", 0))
+
+
+def cleanup_owned_directory(
+    path: str | os.PathLike[str],
+    identity: tuple[int, int] | None,
+) -> bool:
+    """Remove a directory only when its identity matches this attempt."""
+
+    target = Path(path)
+    if identity is None or _is_link_or_reparse(target) or not target.is_dir():
+        return False
+    try:
+        info = target.stat()
+        current = int(getattr(info, "st_dev", 0)), int(getattr(info, "st_ino", 0))
+    except OSError:
+        return False
+    if current != tuple(identity):
+        return False
+    return _remove_owned_directory(target)
+
+
+def _run_namespace_for(journal_path: Path, run_id: str | UUID) -> tuple[Path, Path] | None:
+    """Return the exact journal namespace/run root pair for a UUID."""
+
+    try:
+        run_text = str(UUID(str(run_id)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    namespace = _lexical_path(journal_path).parent
+    run_root = namespace / f"run_{run_text}"
+    if namespace.name != "_app_action_runs":
+        return None
+    return namespace, run_root
+
+
+def _cleanup_known_run_directories(
+    run_root: Path,
+    *,
+    include_outputs: bool = False,
+    remove_dirs: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Remove only exact per-run transient directories that pass inspection."""
+
+    result: dict[str, Any] = {"removed": [], "preserved": [], "reasons": []}
+    if not _entry_exists(run_root):
+        return result
+    if _is_link_or_reparse(run_root) or not run_root.is_dir():
+        result["preserved"].append(str(run_root))
+        result["reasons"].append("run_root_link_or_not_directory")
+        return result
+    names: Iterable[str] = tuple(_RUN_TRANSIENT_DIRS if remove_dirs is None else remove_dirs)
+    if include_outputs:
+        names = (*names, _RUN_OUTPUT_DIR)
+    names = tuple(name for name in names if name in {*_RUN_TRANSIENT_DIRS, _RUN_OUTPUT_DIR})
+    for name in names:
+        path = run_root / name
+        if not _entry_exists(path):
+            continue
+        if _remove_owned_directory(path):
+            result["removed"].append(str(path))
+        else:
+            result["preserved"].append(str(path))
+            result["reasons"].append(f"{name}_ambiguous_or_remove_failed")
+    if _entry_exists(run_root) and not _is_link_or_reparse(run_root):
+        try:
+            with os.scandir(run_root) as entries:
+                empty = next(entries, None) is None
+        except OSError:
+            empty = False
+        if empty:
+            try:
+                run_root.rmdir()
+            except OSError:
+                result["preserved"].append(str(run_root))
+                result["reasons"].append("run_root_remove_failed")
+            else:
+                result["removed"].append(str(run_root))
+    return result
+
+
+def cleanup_unjournaled_run(
+    journal_path: str | os.PathLike[str],
+    run_id: str | UUID,
+    *,
+    include_outputs: bool = False,
+    remove_dirs: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Clean exact staging/runtime directories for a failed pre-journal run.
+
+    This helper intentionally has no recursive namespace cleanup authority.  It
+    only removes the three directories that this transport creates below the
+    UUID-derived run root, and refuses a link/reparse collision.
+    """
+
+    pair = _run_namespace_for(Path(journal_path), run_id)
+    if pair is None:
+        return {"removed": [], "preserved": [], "reasons": ["run_namespace_invalid"]}
+    namespace, run_root = pair
+    if _is_link_or_reparse(namespace):
+        return {"removed": [], "preserved": [str(namespace)], "reasons": ["namespace_link_or_reparse"]}
+    return _cleanup_known_run_directories(
+        run_root,
+        include_outputs=include_outputs,
+        remove_dirs=remove_dirs,
+    )
 
 
 class ServerActionJournalError(RuntimeError):
@@ -99,7 +320,7 @@ class ServerActionJournal:
 
     def __init__(self, path: str | os.PathLike[str], *, journal_epoch: str | None = None):
         raw_path = Path(path)
-        if raw_path.exists() and raw_path.is_symlink():
+        if _has_reparse_component(raw_path):
             raise ServerActionJournalError("server_action_journal_link_invalid")
         self.path = raw_path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -523,6 +744,147 @@ class ServerActionJournal:
             self._connection.commit()
         return self.get(run_id)
 
+    def cleanup_run_artifacts(
+        self,
+        run_id: str | UUID,
+        *,
+        owner_user_id: str | UUID | None = None,
+        include_outputs: bool = False,
+        allow_unjournaled_failed_reservation: bool = False,
+    ) -> dict[str, Any]:
+        """Remove owned per-run transient directories after a terminal outcome.
+
+        The SQLite row remains durable.  ``runtime``, input staging and the
+        materialized input copy are removed only when the row is terminal,
+        the runtime still matches its journal hash, all journal paths remain
+        inside the exact UUID run root, and no other run references that root.
+        ``unknown`` and active rows are deliberately left untouched.  Output
+        bytes are retained unless a caller has already captured them into the
+        durable App Action file store.
+        """
+
+        try:
+            run_text = _uuid_text(run_id, "run_id")
+        except ServerActionJournalError:
+            return {"removed": [], "preserved": [], "reasons": ["run_id_invalid"]}
+        row = self.get(run_text)
+        if row is None:
+            with self._lock:
+                reservation = self._connection.execute(
+                    "SELECT status FROM server_action_reservations WHERE run_id = ?",
+                    (run_text,),
+                ).fetchone()
+            if (
+                allow_unjournaled_failed_reservation
+                and reservation is not None
+                and str(reservation[0]) == "failed"
+            ):
+                return cleanup_unjournaled_run(self.path, run_text, include_outputs=include_outputs)
+            return {"removed": [], "preserved": [], "reasons": ["run_not_terminal"]}
+
+        status = str(row.get("status") or "unknown")
+        if status not in _CLEANUP_TERMINAL_STATES:
+            return {"removed": [], "preserved": [], "reasons": ["active_or_unknown"]}
+        if owner_user_id is not None and str(row.get("owner_user_id") or "") != str(owner_user_id):
+            return {"removed": [], "preserved": [], "reasons": ["owner_mismatch"]}
+        pair = _run_namespace_for(self.path, run_text)
+        if pair is None:
+            return {"removed": [], "preserved": [], "reasons": ["run_namespace_invalid"]}
+        namespace, run_root = pair
+        if _is_link_or_reparse(namespace) or _is_link_or_reparse(run_root):
+            return {"removed": [], "preserved": [str(run_root)], "reasons": ["run_root_link_or_reparse"]}
+        runtime_root = _lexical_path(str(row.get("runtime_root") or ""))
+        expected_runtime = run_root / "runtime"
+        if runtime_root != expected_runtime:
+            return {"removed": [], "preserved": [str(run_root)], "reasons": ["runtime_reference_mismatch"]}
+        expected_paths = {
+            "runtime_root": expected_runtime,
+            "input_path": run_root / "input.json",
+            "output_path": run_root / "result.json",
+            "output_manifest_path": run_root / "output-manifest.json",
+            "log_path": run_root / "run.log",
+        }
+        for field, expected in expected_paths.items():
+            raw = row.get(field)
+            if not isinstance(raw, str) or _lexical_path(raw) != expected:
+                return {
+                    "removed": [],
+                    "preserved": [str(run_root)],
+                    "reasons": [f"{field}_reference_mismatch"],
+                }
+        if self._row_output_reference_is_ambiguous(row, run_root):
+            return {"removed": [], "preserved": [str(run_root)], "reasons": ["output_reference_mismatch"]}
+        if self._other_run_references_root(run_text, run_root):
+            return {"removed": [], "preserved": [str(run_root)], "reasons": ["referenced_by_other_run"]}
+        if _entry_exists(runtime_root):
+            if _is_link_or_reparse(runtime_root) or not runtime_root.is_dir():
+                return {"removed": [], "preserved": [str(runtime_root)], "reasons": ["runtime_link_or_not_directory"]}
+            try:
+                if runtime_tree_sha256(runtime_root) != str(row.get("runtime_tree_sha256") or ""):
+                    return {"removed": [], "preserved": [str(runtime_root)], "reasons": ["runtime_hash_changed"]}
+            except (OSError, ServerActionJournalError):
+                return {"removed": [], "preserved": [str(runtime_root)], "reasons": ["runtime_unavailable"]}
+        return _cleanup_known_run_directories(run_root, include_outputs=include_outputs)
+
+    @staticmethod
+    def _row_output_reference_is_ambiguous(row: Mapping[str, Any], run_root: Path) -> bool:
+        output_files = row.get("output_files")
+        if not isinstance(output_files, list):
+            return False
+        for item in output_files:
+            if not isinstance(item, Mapping):
+                continue
+            for key in ("path", "source_path", "remote_ref"):
+                value = item.get(key)
+                if not isinstance(value, str) or not value:
+                    continue
+                candidate = _lexical_path(value) if os.path.isabs(value) else run_root / value
+                if not _paths_overlap(candidate, run_root) or not _is_lexically_under(run_root, candidate):
+                    return True
+                if any(
+                    _is_lexically_under(run_root / name, candidate)
+                    for name in _RUN_TRANSIENT_DIRS
+                ):
+                    return True
+        return False
+
+    def _other_run_references_root(self, run_id: str, run_root: Path) -> bool:
+        """Return true when another journal row points into this run root."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT run_id,runtime_root,input_path,output_path,output_manifest_path,log_path,output_files_json "
+                "FROM server_action_runs WHERE run_id <> ?",
+                (run_id,),
+            ).fetchall()
+        for other in rows:
+            try:
+                other_root = _lexical_path(str(other[1])).parent
+            except (OSError, TypeError, ValueError):
+                return True
+            for value in (other[index] for index in range(1, 6)):
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    candidate = _lexical_path(value)
+                except (OSError, TypeError, ValueError):
+                    return True
+                if _paths_overlap(candidate, run_root):
+                    return True
+            output_files = _parse_json(other[6], fallback=[])
+            if isinstance(output_files, list):
+                for item in output_files:
+                    if not isinstance(item, Mapping):
+                        continue
+                    for key in ("path", "source_path"):
+                        value = item.get(key)
+                        if not isinstance(value, str) or not value:
+                            continue
+                        candidate = _lexical_path(value) if os.path.isabs(value) else other_root / value
+                        if _paths_overlap(candidate, run_root):
+                            return True
+        return False
+
     def logs(self, run_id: str | UUID, *, cursor: int = 0, limit_bytes: int = MAX_LOG_BYTES) -> dict[str, Any]:
         row = self.get(run_id)
         if row is None:
@@ -594,5 +956,8 @@ __all__ = [
     "ServerActionJournal",
     "ServerActionJournalError",
     "TERMINAL_STATES",
+    "cleanup_owned_directory",
+    "cleanup_unjournaled_run",
+    "owned_directory_identity",
     "runtime_tree_sha256",
 ]

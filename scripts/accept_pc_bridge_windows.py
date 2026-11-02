@@ -546,6 +546,9 @@ def cleanup_owned(client, server, work, runtimes, identities, *, inspector=None)
 
 
 def main(argv=None):
+    print(json.dumps({"status": "blocked", "error": "direct_edge_cdp_forbidden"}))
+    return 1
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="explicitly permit this one Windows acceptance session")
     parser.add_argument("--bundle-dir", type=Path, required=True, help="existing packaged resources/agent-browser directory")
@@ -577,7 +580,7 @@ def main(argv=None):
         print("他のタブは操作しません。新しい許可・セキュリティ画面が出たら承認せず Ctrl+C で停止してください。")
         if input("専用フォームが表示されたら RUN と入力（それ以外は中止）: ").strip() != "RUN":
             raise AcceptanceFailure("operator_cancelled_before_connection")
-        from pc_bridge.browser_backend import load_helper_bundle
+        from pc_bridge.agent_browser_bundle import load_helper_bundle
         bundle = load_helper_bundle(
             args.bundle_dir.resolve(), require_pinned=True
         )  # Hash check only, no execution.

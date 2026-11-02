@@ -69,6 +69,7 @@ export const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 export const KIMI_DEFAULT_BASE_URL = "https://api.moonshot.ai/v1";
 export const DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com";
 export const DEEPINFRA_DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai";
+export const DEEPINFRA_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
 export const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 export const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 
@@ -133,10 +134,11 @@ export const CLOUD_PROVIDER_DEFINITIONS: Record<
     baseUrlRequired: false,
     advanced: false,
     models: [
+      { id: DEEPINFRA_DEFAULT_MODEL },
       { id: "deepseek-ai/DeepSeek-V4-Flash" },
       { id: "deepseek-ai/DeepSeek-V4-Pro" },
     ],
-    defaultModel: "deepseek-ai/DeepSeek-V4-Flash",
+    defaultModel: DEEPINFRA_DEFAULT_MODEL,
     hint: "自分のDeepInfra API tokenが必要です。Chat URLは /v1/openai、モデル一覧は公式 /v1/models から取得します。",
   },
   kimi: {

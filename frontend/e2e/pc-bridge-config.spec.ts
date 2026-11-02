@@ -8,9 +8,16 @@ const syntheticDevice = { id: "fixture-pc", name: "Fixture PC", online: false, e
 test.beforeEach(async ({ page }) => {
   await addAuthCookie(page);
   await mockAuthenticatedApis(page);
+  let remoteEnabled = false;
+  await page.route("**/api/python-proxy/settings", async (route) => {
+    if (route.request().method() === "PATCH") {
+      remoteEnabled = route.request().postDataJSON().value === true;
+    }
+    await route.fulfill({ json: { settings: { pc_bridge: { remote_enabled: remoteEnabled } }, schema: {} } });
+  });
 });
 
-test("Bridge設定保存はHTTPのBackend URLと通常browserを使い、操作先を変更しない", async ({ page }, testInfo) => {
+test("既定オフからBridgeを有効にし、設定保存はHTTPのBackend URLと通常browserを使う", async ({ page }, testInfo) => {
   const methods: string[] = [];
   await page.route("**/api/python-proxy/pc-bridge/**", async (route) => {
     const method = route.request().method();
@@ -20,6 +27,11 @@ test("Bridge設定保存はHTTPのBackend URLと通常browserを使い、操作�
       : { selected_device_id: syntheticDevice.id, devices: [syntheticDevice] } } });
   });
   await page.goto(`${basePath}/settings`);
+  const toggle = page.getByRole("switch", { name: "他の PC の制御" });
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByRole("link", { name: "AoiTalk-PC-Bridge.exe を取得" })).not.toBeVisible();
+  await toggle.check();
+  await expect(toggle).toBeChecked();
   await page.locator('[data-settings-target="pc-bridge"] button[aria-expanded]').click();
   await page.getByLabel("追加するPCの名前").fill("New Fixture PC");
   await page.getByRole("button", { name: "PCを登録", exact: true }).click();
@@ -50,6 +62,7 @@ test("PC一覧の取得失敗から更新で復帰し、保存済みの選択先
       : { json: { success: true, result: { selected_device_id: syntheticDevice.id, devices: [syntheticDevice] } } });
   });
   await page.goto(`${basePath}/settings`);
+  await page.getByRole("switch", { name: "他の PC の制御" }).check();
   await page.locator('[data-settings-target="pc-bridge"] button[aria-expanded]').click();
   await expect(page.getByText("PC一覧を取得できませんでした。", { exact: true })).toBeVisible();
   failed = false;

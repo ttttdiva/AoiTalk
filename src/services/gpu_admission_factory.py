@@ -16,6 +16,7 @@ run next to what, so it is not an end-user setting):
 * ``AOITALK_GPU_TRIAL_STATE_PATH`` - absolute path of the durable trial state (default ``data/gpu_admission/``)
 * ``AOITALK_GPU_TRIAL_GPU_INDICES`` - comma separated devices to watch (default: all, smallest free wins)
 * ``AOITALK_GPU_TRIAL_NVIDIA_SMI`` - path of ``nvidia-smi`` (default: found on PATH)
+* ``AOITALK_GPU_TRIAL_MAX_LEASE_SECONDS`` - optional trial lease maximum (default 180; hard maximum 900)
 """
 
 from __future__ import annotations
@@ -28,10 +29,12 @@ from typing import Callable, Mapping
 
 from ..shared_local_runtime import registry
 from ..shared_local_runtime.backend import is_managed
+from src.runtime_release_contract import persistent_path
 from .gpu_admission import Conflict
 from .gpu_admission_driver import GpuAdmissionDriver
 from .gpu_trial_adapter import CooperativeGpuBackend, FileTrialStateStore, RuntimeEmbeddingPort
 from .gpu_trial_launcher import GpuTrialLauncher
+from .gpu_trial_lease_policy import DEFAULT_MAX_LEASE_SECONDS, resolve_trial_max_lease_seconds
 from .gpu_trial_ports import ManagedBrokerPort, NvidiaSmiCapacityPort, PsutilProcessPort
 
 log = logging.getLogger(__name__)
@@ -43,7 +46,11 @@ ENV_STATE = "AOITALK_GPU_TRIAL_STATE_PATH"
 ENV_INDICES = "AOITALK_GPU_TRIAL_GPU_INDICES"
 ENV_SMI = "AOITALK_GPU_TRIAL_NVIDIA_SMI"
 NOT_CONFIGURED = "not_configured"
-DEFAULT_STATE_PATH = Path(__file__).resolve().parents[2] / "data" / "gpu_admission" / "trial-state.json"
+
+DEFAULT_STATE_PATH = persistent_path(
+    "data/gpu_admission/trial-state.json",
+    Path(__file__).resolve().parents[2],
+)
 MEBIBYTE = 1024 * 1024
 
 
@@ -59,6 +66,7 @@ class GpuTrialRuntime:
     client_factory: Callable
     snapshot_factory: Callable[[], str | None]
     api_key: Callable[[], str]
+    max_lease_ttl_seconds: float = DEFAULT_MAX_LEASE_SECONDS
 
     def launcher(self, driver: GpuAdmissionDriver) -> GpuTrialLauncher:
         return GpuTrialLauncher(driver, self.broker, profile=self.profile, client_factory=self.client_factory,
@@ -107,6 +115,11 @@ def build_gpu_trial_runtime(config, environ: Mapping[str, str] | None = None, *,
     if not profile:
         return None, NOT_CONFIGURED
     try:
+        try:
+            max_lease_ttl_seconds = resolve_trial_max_lease_seconds(
+                environ, trial_enabled=True)
+        except ValueError as exc:
+            raise GpuTrialConfigError(str(exc)) from None
         grant = _positive_mebibytes(environ, ENV_GRANT)
         reopen = _positive_mebibytes(environ, ENV_REOPEN)
         state_path = _state_path(environ)
@@ -140,4 +153,7 @@ def build_gpu_trial_runtime(config, environ: Mapping[str, str] | None = None, *,
         embedding=RuntimeEmbeddingPort(), store=FileTrialStateStore(state_path),
         grant_free_bytes=grant, reopen_free_bytes=reopen)
     recorded[0] = backend.recorded_bindings
-    return GpuTrialRuntime(backend, broker, profile, client_factory, snapshot, api_key), None
+    return GpuTrialRuntime(
+        backend, broker, profile, client_factory, snapshot, api_key,
+        max_lease_ttl_seconds=max_lease_ttl_seconds,
+    ), None

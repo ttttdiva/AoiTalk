@@ -5,6 +5,7 @@ Gemini LLM engine implementation with Function Calling support
 import os
 import asyncio
 import copy
+import weakref
 import inspect
 import threading
 import concurrent.futures
@@ -16,6 +17,8 @@ import mimetypes
 from collections.abc import Mapping, Sequence
 from typing import Optional, List, Dict, Any, Union, Generator
 import google.generativeai as genai
+from google.generativeai import client as genai_client
+from google.generativeai.types import file_types
 from google.api_core.exceptions import DeadlineExceeded
 from google.generativeai.types import (
     HarmCategory,
@@ -63,6 +66,12 @@ from .generation_policy import (
     set_current_generation_policy,
 )
 from .generation_cancellation import GenerationInterrupted, PlanningInteractionTerminated
+from .agent_run_budget import (
+    AgentRunBudgetStop,
+    budget_failure_generation_failure,
+    get_agent_run_budget,
+    is_http_429_error,
+)
 from .agentic_completion import (
     render_messages_for_review,
     run_agentic_completion_loop_sync,
@@ -312,6 +321,33 @@ def _gemini_generation_config_without_thoughts(config_kwargs: Dict[str, Any]) ->
         return genai.types.GenerationConfig(**fallback_kwargs)
 
 
+class _GeminiAsyncClientByLoop:
+    """Create SDK async transports on the event loop that will use them."""
+
+    def __init__(self, clients):
+        self._clients = clients
+        self._by_loop = weakref.WeakKeyDictionary()
+        self._lock = threading.Lock()
+
+    def _client(self):
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            client = self._by_loop.get(loop)
+            if client is None:
+                client = self._clients.make_client("generative_async")
+                self._by_loop[loop] = client
+            return client
+
+    async def generate_content(self, *args, **kwargs):
+        return await self._client().generate_content(*args, **kwargs)
+
+    async def stream_generate_content(self, *args, **kwargs):
+        return await self._client().stream_generate_content(*args, **kwargs)
+
+    async def count_tokens(self, *args, **kwargs):
+        return await self._client().count_tokens(*args, **kwargs)
+
+
 class GeminiLLMClient:
     """Gemini LLM client for character-based responses"""
 
@@ -366,6 +402,7 @@ class GeminiLLMClient:
         self.model_name = model
         self.session_user_id = "default_user"
         self.session_metadata: Dict[str, Any] = {}
+        self._last_usage_metrics: Dict[str, Any] = {}
         self._privacy_session_context: Dict[str, Any] = {}
         self._privacy_project_metadata: Dict[str, Any] = {}
         self.current_session_id: Optional[str] = (
@@ -405,7 +442,6 @@ class GeminiLLMClient:
         self._cleanup_done = False
         self._memory_loop: Optional[asyncio.AbstractEventLoop] = None
         self._memory_thread: Optional[threading.Thread] = None
-        self._memory_warmup_future = None
         if self._memory_enabled:
             memory_config = MemoryConfig()
             if config:
@@ -426,15 +462,11 @@ class GeminiLLMClient:
             )
             self._memory_thread.start()
 
-            memory_settings = config.get("memory", {}) if config else {}
-            if memory_settings.get("enable_search", True):
-                # Pre-warm cross-session memory only when semantic memory search is enabled.
-                self._memory_warmup_future = asyncio.run_coroutine_threadsafe(
-                    self._warmup_cross_session_memory(), self._memory_loop
-                )
 
-        # Configure Gemini
-        genai.configure(api_key=api_key)
+        # SDK 0.8.x models otherwise lazily use a process-global client.
+        self._gemini_sdk_clients = genai_client._ClientManager()
+        self._gemini_sdk_clients.configure(api_key=api_key)
+        self._gemini_async_client = _GeminiAsyncClientByLoop(self._gemini_sdk_clients)
 
         # Initialize system prompt based on character
         if self._lightweight_ephemeral_client:
@@ -477,7 +509,7 @@ class GeminiLLMClient:
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
         }
 
-        self.model = genai.GenerativeModel(
+        self.model = self._new_gemini_model(
             model_name=model, safety_settings=self._safety_settings, tools=self.tools
         )
 
@@ -506,6 +538,30 @@ class GeminiLLMClient:
             model,
             len(self._tool_registry),
         )
+
+    def _gemini_clients(self):
+        clients = getattr(self, "_gemini_sdk_clients", None)
+        if clients is None:
+            config = getattr(self, "config", None)
+            api_key = config.get("gemini_api_key") if config is not None else None
+            if not api_key:
+                raise RuntimeError("Gemini client has no instance credential")
+            clients = genai_client._ClientManager()
+            clients.configure(api_key=api_key)
+            self._gemini_async_client = _GeminiAsyncClientByLoop(clients)
+            self._gemini_sdk_clients = clients
+        elif getattr(self, "_gemini_async_client", None) is None:
+            self._gemini_async_client = _GeminiAsyncClientByLoop(clients)
+        return clients
+
+    def _new_gemini_model(self, *args: Any, **kwargs: Any):
+        clients = self._gemini_clients()
+        model = genai.GenerativeModel(*args, **kwargs)
+        # google-generativeai 0.8.6 has no public model client injection API.
+        # Both hooks must be set before the SDK's lazy global lookup occurs.
+        model._client = clients.get_default_client("generative")
+        model._async_client = self._gemini_async_client
+        return model
 
     def _gemini_request_timeout_seconds(self) -> int:
         configured = (
@@ -591,8 +647,11 @@ class GeminiLLMClient:
             provider="gemini",
             model=str(getattr(self, "model_name", "") or ""),
         )
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        request_started = False
 
         def send_message(outbound: dict[str, Any]) -> Any:
+            nonlocal request_started
             if not isinstance(outbound, dict) or "message" not in outbound:
                 raise PrivacyError("Gemini outbound message is missing")
             outbound_kwargs = dict(outbound)
@@ -614,24 +673,42 @@ class GeminiLLMClient:
                     # latest message is still passed through the gateway;
                     # retaining the existing state is the safest fallback.
                     pass
+            if run_budget is not None and not run_budget.begin_provider_request():
+                failure = run_budget.failure
+                if failure is not None:
+                    raise AgentRunBudgetStop(failure)
+            request_started = True
             return chat.send_message(outbound_message, **outbound_kwargs)
 
-        return gateway.execute_sync(
-            request_payload,
-            provider="gemini",
-            descriptor=descriptor,
-            sender=send_message,
-            base_url=base_url,
-            source_kind="model_request",
-            model=str(getattr(self, "model_name", "") or ""),
-        )
+        try:
+            response = gateway.execute_sync(
+                request_payload,
+                provider="gemini",
+                descriptor=descriptor,
+                sender=send_message,
+                base_url=base_url,
+                source_kind="model_request",
+                model=str(getattr(self, "model_name", "") or ""),
+            )
+        except AgentRunBudgetStop:
+            raise
+        except Exception as error:
+            if request_started and run_budget is not None:
+                if is_http_429_error(error):
+                    run_budget.record_provider_response({"total_tokens": 0})
+                else:
+                    run_budget.mark_token_usage_unavailable()
+            raise
+        if request_started and run_budget is not None:
+            run_budget.record_provider_response(self._gemini_usage_payload(response))
+        return response
 
     def set_tool_registry(self, registry: ToolRegistry) -> None:
         """専門委譲用に許可済みtoolだけでGemini宣言を再構築する。"""
 
         self._tool_registry = registry
         self.tools = self._setup_tools()
-        self.model = genai.GenerativeModel(
+        self.model = self._new_gemini_model(
             model_name=self.model_name,
             safety_settings=self._safety_settings,
             tools=self.tools,
@@ -728,6 +805,9 @@ class GeminiLLMClient:
 
     def get_generation_metadata(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
+        usage_metrics = dict(getattr(self, "_last_usage_metrics", None) or {})
+        if usage_metrics:
+            metadata["cache_usage"] = usage_metrics
         context_snapshots = list(getattr(self, "_last_context_snapshots", None) or [])
         if context_snapshots:
             bounded_snapshot = sanitized_snapshot_series(context_snapshots)
@@ -908,19 +988,24 @@ class GeminiLLMClient:
 
         input_tokens = _count("prompt_token_count")
         output_tokens = _count("candidates_token_count")
-        if input_tokens is None and output_tokens is None:
+        total_tokens = _count("total_token_count")
+        if input_tokens is None and output_tokens is None and total_tokens is None:
             return None
         cached_tokens = _count("cached_content_token_count") or 0
         reasoning_tokens = _count("thoughts_token_count") or 0
         payload: Dict[str, Any] = {
-            "input_tokens": input_tokens or 0,
-            "output_tokens": output_tokens or 0,
             "cached_tokens": cached_tokens,
             "cache_read_tokens": cached_tokens,
             "reasoning_tokens": reasoning_tokens,
             "cache_provider": "gemini",
             "metrics_source": "gemini.usage_metadata",
         }
+        if input_tokens is not None:
+            payload["input_tokens"] = input_tokens
+        if output_tokens is not None:
+            payload["output_tokens"] = output_tokens
+        if total_tokens is not None:
+            payload["total_tokens"] = total_tokens
         resolved_model = getattr(response, "model_version", None)
         if resolved_model is None and isinstance(response, dict):
             resolved_model = response.get("model_version")
@@ -949,6 +1034,27 @@ class GeminiLLMClient:
         del recorded[:-8]
         return False
 
+    def _accumulate_gemini_usage(self, payload: Mapping[str, Any]) -> None:
+        """Keep all provider rounds from the current target invocation for Free Team settlement."""
+        metrics = dict(getattr(self, "_last_usage_metrics", None) or {})
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+        ):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                metrics[key] = int(metrics.get(key, 0) or 0) + max(0, value)
+        metrics["requests"] = int(metrics.get("requests", 0) or 0) + 1
+        for key in ("cache_provider", "metrics_source"):
+            value = payload.get(key)
+            if value is not None:
+                metrics[key] = value
+        self._last_usage_metrics = metrics
+
     def _record_gemini_usage(
         self,
         response: Any,
@@ -958,16 +1064,29 @@ class GeminiLLMClient:
         is_streaming: bool = False,
     ) -> None:
         """Gemini レスポンスの usage を永続化する（失敗しても本処理は落とさない）。"""
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # Help is a one-turn Guide projection; do not create ordinary
-            # token-usage records from a direct provider invocation.
-            return
         try:
             payload = self._gemini_usage_payload(response)
             if not payload:
                 return
             if self._mark_usage_recorded(response):
                 return
+            self._accumulate_gemini_usage(payload)
+            if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+                # Help must not create ordinary TokenUsage rows, but Free Team
+                # still needs measured provider usage to settle count meters.
+                return
+            config = getattr(self, "config", None)
+            scope = config.get("gemini.billing_scope_id") if config else None
+            cleaned_scope = scope.strip() if isinstance(scope, str) else ""
+            if (
+                not getattr(get_turn_context(), "billing_scope_id", None)
+                and cleaned_scope
+                and len(cleaned_scope) <= 100
+                and cleaned_scope.casefold() not in {"default", "unknown", "none"}
+            ):
+                # Local ledger attribution only; this does not verify Google credit.
+                # Invalid forms stay unattributed instead of being stored as a scope.
+                payload["billing_scope_id"] = cleaned_scope
             persist_usage_sync(
                 self,
                 provider="gemini",
@@ -978,6 +1097,22 @@ class GeminiLLMClient:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[GeminiLLMClient] usage記録に失敗しました: {exc}")
+
+    def _record_gemini_tool_intake(
+        self,
+        *,
+        remaining_in_batch: int = 0,
+    ) -> Any | None:
+        """Count one Gemini function call before validation or tool execution."""
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        if run_budget is None or run_budget.record_tool_call():
+            return None
+        run_budget.count_unexecuted_tool_calls(remaining_in_batch)
+        failure = budget_failure_generation_failure(run_budget.failure)
+        if failure is not None:
+            self._last_generation_failure = failure
+        return failure
 
     def _reconcile_context_usage(self, response: Any) -> None:
         try:
@@ -1089,7 +1224,7 @@ class GeminiLLMClient:
             )
         ):
             return self.model
-        return genai.GenerativeModel(
+        return self._new_gemini_model(
             model_name=target_model,
             safety_settings=(
                 self.model._safety_settings
@@ -1182,8 +1317,14 @@ class GeminiLLMClient:
                 provider="gemini",
                 model="gemini-2.5-flash",
             )
+            run_budget = get_agent_run_budget(
+                self,
+                config=getattr(self, "config", None),
+            )
+            request_started = False
 
             def send_audio_request(outbound: dict[str, Any]) -> Any:
+                nonlocal request_started
                 # Build the upload and transcription request only from the
                 # final payload supplied by the gateway.  BytesIO avoids
                 # reintroducing a local filesystem path after protected
@@ -1196,23 +1337,55 @@ class GeminiLLMClient:
                     upload_source: Any = io.BytesIO(bytes(outbound_media))
                 else:
                     upload_source = outbound_media
-                audio_file = genai.upload_file(
-                    path=upload_source,
-                    mime_type=media_type,
+                if run_budget is not None and not run_budget.begin_provider_request():
+                    failure = run_budget.failure
+                    if failure is not None:
+                        raise AgentRunBudgetStop(failure)
+                request_started = True
+                file_client = self._gemini_clients().get_default_client("file")
+                audio_file = file_types.File(
+                    file_client.create_file(
+                        path=upload_source, mime_type=media_type, name=None,
+                        display_name=None, resumable=True,
+                    )
                 )
-                transcription_model = genai.GenerativeModel("gemini-2.5-flash")
-                return transcription_model.generate_content(
-                    [outbound_prompt, audio_file]
-                )
+                try:
+                    transcription_model = self._new_gemini_model("gemini-2.5-flash")
+                    return transcription_model.generate_content(
+                        [outbound_prompt, audio_file]
+                    )
+                finally:
+                    try:
+                        file_client.delete_file(name=audio_file.name)
+                    except Exception as exc:
+                        # SDK errors can contain URLs or credentials; log only the type.
+                        logger.warning(
+                            "Failed to delete Gemini transcription file (error type: %s)",
+                            type(exc).__name__,
+                        )
 
-            response = self._privacy_gateway.execute_sync(
-                {"prompt": prompt, "media": media_bytes},
-                provider="gemini",
-                descriptor=descriptor,
-                sender=send_audio_request,
-                source_kind="audio_transcription",
-                model="gemini-2.5-flash",
-            )
+            try:
+                response = self._privacy_gateway.execute_sync(
+                    {"prompt": prompt, "media": media_bytes},
+                    provider="gemini",
+                    descriptor=descriptor,
+                    sender=send_audio_request,
+                    source_kind="audio_transcription",
+                    model="gemini-2.5-flash",
+                )
+            except AgentRunBudgetStop:
+                raise
+            except Exception as error:
+                if request_started and run_budget is not None:
+                    if is_http_429_error(error):
+                        run_budget.record_provider_response({"total_tokens": 0})
+                    else:
+                        run_budget.mark_token_usage_unavailable()
+                raise
+            if request_started and run_budget is not None:
+                run_budget.record_provider_response(
+                    self._gemini_usage_payload(response)
+                )
             # Audio transcription is a direct Gemini API request outside the
             # normal chat loop.  Record it independently when usage metadata
             # is returned; ``_record_gemini_usage`` safely no-ops otherwise.
@@ -1912,6 +2085,17 @@ class GeminiLLMClient:
                     # thought part はレビュー本文へ混ぜない。
                     text_parts.append(part.text)
 
+            run_budget = get_agent_run_budget(
+                self,
+                config=getattr(self, "config", None),
+            )
+            if run_budget is not None and run_budget.failure is not None:
+                if function_calls:
+                    run_budget.count_unexecuted_tool_calls(len(function_calls))
+                failure = budget_failure_generation_failure(run_budget.failure)
+                self._last_generation_failure = failure
+                return failure.user_message if failure else ""
+
             if text_parts:
                 return guard_tool_execution_claims("".join(text_parts), tool_calls)
 
@@ -1919,18 +2103,34 @@ class GeminiLLMClient:
                 return ""
 
             function_response_parts = []
-            for func_call in function_calls:
+            for function_call_index, func_call in enumerate(function_calls):
+                budget_failure = self._record_gemini_tool_intake(
+                    remaining_in_batch=(
+                        len(function_calls) - function_call_index - 1
+                    )
+                )
+                if budget_failure is not None:
+                    return budget_failure.user_message
                 function_name = func_call.name
                 arguments = _plain_json_object(
                     getattr(func_call, "args", None) or {},
                     path=f"review.{function_name}",
                 )
-                result = self._execute_tool(function_name, arguments)
+                review_tool_result = self._execute_tool_result(
+                    function_name,
+                    arguments,
+                )
+                result = str(review_tool_result.model_output)
+                if run_budget is not None:
+                    run_budget.record_tool_outcome(
+                        function_name, bool(review_tool_result.success)
+                    )
                 tool_calls.append(
                     OpenAIToolCallRecord(
                         tool=function_name,
                         arguments=arguments,
                         result=result,
+                        success=bool(review_tool_result.success),
                     )
                 )
                 function_response_parts.append(
@@ -2012,10 +2212,12 @@ class GeminiLLMClient:
         Returns:
             Generated response
         """
+        self._last_usage_metrics = {}
         turn_event_emitter = make_sync_stream_emitter(stream_callback)
         # Capture session_id locally to prevent race conditions with concurrent requests
         session_id = self.current_session_id
         self.current_assistant_message_id = None
+        self._last_generation_failure = None
         edit_message_id = self.current_edit_message_id
         external_persistence = bool(
             getattr(self, "external_persistence_enabled", False)
@@ -2631,6 +2833,8 @@ class GeminiLLMClient:
                             privacy_payload=image_data if tool_call_count == 0 else None,
                         )
                     except Exception as send_error:
+                        if isinstance(send_error, AgentRunBudgetStop):
+                            raise
                         if approved_directive is not None:
                             # A pending approved action has no safe provider
                             # fallback.  Transport failure must terminalize the
@@ -2816,6 +3020,34 @@ class GeminiLLMClient:
                         )
                         raise AssertionError("unreachable")
 
+                run_budget = get_agent_run_budget(
+                    self,
+                    config=getattr(self, "config", None),
+                )
+                if run_budget is not None and run_budget.failure is not None:
+                    if function_calls:
+                        run_budget.count_unexecuted_tool_calls(
+                            len(function_calls)
+                        )
+                    failure = budget_failure_generation_failure(run_budget.failure)
+                    self._last_generation_failure = failure
+                    return failure.user_message if failure else ""
+
+                budget_calls_precounted = False
+                if (
+                    (approved_directive is not None or completed_final_round)
+                    and function_calls
+                ):
+                    budget_calls_precounted = True
+                    for function_call_index, _func_call in enumerate(function_calls):
+                        budget_failure = self._record_gemini_tool_intake(
+                            remaining_in_batch=(
+                                len(function_calls) - function_call_index - 1
+                            )
+                        )
+                        if budget_failure is not None:
+                            return budget_failure.user_message
+
                 # A completed plan has no remaining approved action.  Even if
                 # Gemini violates the explicit NONE/tool-less request and
                 # returns a stale or malicious function call, terminalize the
@@ -2896,6 +3128,14 @@ class GeminiLLMClient:
                     duplicate_detected = False
 
                     for function_call_index, func_call in enumerate(function_calls):
+                        if not budget_calls_precounted:
+                            budget_failure = self._record_gemini_tool_intake(
+                                remaining_in_batch=(
+                                    len(function_calls) - function_call_index - 1
+                                )
+                            )
+                            if budget_failure is not None:
+                                return budget_failure.user_message
                         if approved_directive is not None:
                             try:
                                 function_name = str(
@@ -2955,6 +3195,11 @@ class GeminiLLMClient:
                                 )
                                 raise AssertionError("unreachable")
                             result_text = str(unified_result.model_output)
+                            if run_budget is not None:
+                                run_budget.record_tool_outcome(
+                                    function_name,
+                                    bool(unified_result.success),
+                                )
                             try:
                                 protected_result = self._privacy_gateway.protect_sync(
                                     result_text,
@@ -3083,7 +3328,12 @@ class GeminiLLMClient:
                             operation_id=operation_id,
                         )
                         try:
-                            result = self._execute_tool(function_name, arguments)
+                            unified_result = self._execute_tool_result(
+                                function_name,
+                                arguments,
+                                call_id=operation_id,
+                            )
+                            result = str(unified_result.model_output)
                         except Exception as tool_error:
                             emit_tool_end(
                                 turn_event_emitter,
@@ -3094,11 +3344,21 @@ class GeminiLLMClient:
                                 operation_id=operation_id,
                             )
                             raise
+                        if run_budget is not None:
+                            run_budget.record_tool_outcome(
+                                function_name,
+                                bool(unified_result.success),
+                            )
                         emit_tool_end(
                             turn_event_emitter,
                             tool=function_name,
                             arguments=arguments,
                             output=str(result),
+                            error=(
+                                unified_result.error
+                                if not unified_result.success
+                                else ""
+                            ),
                             operation_id=operation_id,
                         )
                         protected_result = self._privacy_gateway.protect_sync(
@@ -3144,6 +3404,10 @@ class GeminiLLMClient:
                             )
                             in {"executing", "PlanningRunPhase.EXECUTING"}
                         ):
+                            if run_budget is not None:
+                                run_budget.count_unexecuted_tool_calls(
+                                    len(function_calls) - function_call_index - 1
+                                )
                             for skipped in function_calls[function_call_index + 1 :]:
                                 skipped_name = str(
                                     getattr(skipped, "name", "") or ""
@@ -3432,6 +3696,19 @@ class GeminiLLMClient:
                 return fallback_generator()
             return fallback
 
+        except AgentRunBudgetStop as exc:
+            failure = budget_failure_generation_failure(exc.failure)
+            self._last_generation_failure = failure
+            if stream:
+                failure_message = (
+                    failure.user_message if failure else exc.failure.code
+                )
+
+                def budget_failure_generator():
+                    yield failure_message
+
+                return budget_failure_generator()
+            return failure.user_message if failure else exc.failure.code
         except PlanningInteractionTerminated:
             # Keep planning control-flow visible to the terminal response
             # handler instead of converting it into a normal fallback answer.
@@ -3536,29 +3813,6 @@ class GeminiLLMClient:
         """Run the persistent memory event loop in a background thread"""
         asyncio.set_event_loop(self._memory_loop)
         self._memory_loop.run_forever()
-
-    async def _warmup_cross_session_memory(self):
-        """Pre-initialize cross-session memory (embedding model + Qdrant) at startup"""
-        try:
-            from ..memory.cross_session_memory import get_cross_session_memory
-
-            csm = get_cross_session_memory()
-            initialized = await csm.initialize()
-            if initialized:
-                logger.info(
-                    "Gemini cross-session memory pre-initialized",
-                    extra=FILE_ONLY_LOG_EXTRA,
-                )
-            else:
-                logger.warning(
-                    "Gemini cross-session semantic memory unavailable; continuing without it",
-                )
-        except Exception:
-            logger.warning(
-                "Gemini cross-session semantic memory degraded; continuing without it",
-                exc_info=True,
-                extra=FILE_ONLY_LOG_EXTRA,
-            )
 
     def _safe_memory_operation(
         self, operation_func, *args, timeout=30, fire_and_forget=False
@@ -3758,6 +4012,7 @@ class GeminiLLMClient:
     ) -> str:
         """Generate ephemeral text while preserving a reused Help client."""
 
+        self._last_usage_metrics = {}
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
@@ -3799,7 +4054,7 @@ class GeminiLLMClient:
         }
         if system_prompt:
             model_kwargs["system_instruction"] = system_prompt
-        model = genai.GenerativeModel(**model_kwargs)
+        model = self._new_gemini_model(**model_kwargs)
         generation_config, _ = _gemini_generation_config(
             {
                 "temperature": 0.2,
@@ -3814,8 +4069,11 @@ class GeminiLLMClient:
             provider="gemini",
             model=str(self.model_name or ""),
         )
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        request_started = False
 
         def send_plain_text_request(outbound: dict[str, Any]) -> Any:
+            nonlocal request_started
             if not isinstance(outbound, dict) or "prompt" not in outbound:
                 raise PrivacyError("Gemini plain-text prompt is missing")
             outbound_prompt = outbound.get("prompt")
@@ -3823,6 +4081,11 @@ class GeminiLLMClient:
                 raise PrivacyError("Gemini plain-text prompt is empty")
             if "generation_config" not in outbound:
                 raise PrivacyError("Gemini generation config is missing")
+            if run_budget is not None and not run_budget.begin_provider_request():
+                failure = run_budget.failure
+                if failure is not None:
+                    raise AgentRunBudgetStop(failure)
+            request_started = True
             from .generation_budget import record_bounded_model_request
             budget = record_bounded_model_request(outbound)
             return model.generate_content(
@@ -3831,17 +4094,29 @@ class GeminiLLMClient:
                 **({"request_options": {"retry": None}} if budget else {}),
             )
 
-        response = self._privacy_gateway.execute_sync(
-            {
-                "prompt": prompt or "",
-                "generation_config": generation_config,
-            },
-            provider="gemini",
-            descriptor=descriptor,
-            sender=send_plain_text_request,
-            source_kind=request_type,
-            model=str(self.model_name or ""),
-        )
+        try:
+            response = self._privacy_gateway.execute_sync(
+                {
+                    "prompt": prompt or "",
+                    "generation_config": generation_config,
+                },
+                provider="gemini",
+                descriptor=descriptor,
+                sender=send_plain_text_request,
+                source_kind=request_type,
+                model=str(self.model_name or ""),
+            )
+        except AgentRunBudgetStop:
+            raise
+        except Exception as error:
+            if request_started and run_budget is not None:
+                if is_http_429_error(error):
+                    run_budget.record_provider_response({"total_tokens": 0})
+                else:
+                    run_budget.mark_token_usage_unavailable()
+            raise
+        if request_started and run_budget is not None:
+            run_budget.record_provider_response(self._gemini_usage_payload(response))
         self._record_gemini_usage(
             response,
             model_name=self.model_name,
@@ -4151,20 +4426,6 @@ class GeminiLLMClient:
             and memory_thread.is_alive()
             and not memory_loop.is_closed()
         ):
-            warmup_future = self._memory_warmup_future
-            if warmup_future is not None:
-                if not warmup_future.done():
-                    warmup_future.cancel()
-                try:
-                    # Await both a cancelled and an already-completed future
-                    # so its result/exception is always retrieved.
-                    cleanup_cancelled = (
-                        await _await_threadsafe(warmup_future, timeout=5.0)
-                        or cleanup_cancelled
-                    )
-                except Exception as e:
-                    print(f"[GeminiLLMClient] Memory warmup cleanup error: {e}")
-
             if self.memory_manager:
                 try:
                     cleanup_future = asyncio.run_coroutine_threadsafe(
@@ -4189,7 +4450,6 @@ class GeminiLLMClient:
                 and not memory_loop.is_closed()
             ):
                 memory_loop.close()
-            self._memory_warmup_future = None
         elif self.memory_manager:
             # Startup may fail before the persistent loop is running.  There
             # are no loop-owned background tasks in that case, so close on the

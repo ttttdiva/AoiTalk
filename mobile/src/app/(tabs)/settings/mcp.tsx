@@ -5,6 +5,7 @@ import { goBackOrReplace } from "../../../lib/navigation";
 import { Button, List, Surface, Switch, Text } from "react-native-paper";
 import { ScreenHeader } from "../../../components/screen-header";
 import { ScreenShell } from "../../../components/screen-primitives";
+import { PersonalDeadlineChatDraftSetting } from "../../../components/personal-deadline-chat-draft-setting";
 import { useAuth } from "../../../contexts/AuthContext";
 import { settingsApi } from "../../../lib/settings-api";
 import type { AppSettings } from "../../../types/api";
@@ -27,7 +28,7 @@ function getSettingsErrorMessage(
 
 export default function SettingsMcpScreen() {
   const router = useRouter();
-  const { isAuthenticated } = useAuth();
+  const { user, isAuthenticated, isAnonymous } = useAuth();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
 
@@ -217,6 +218,9 @@ export default function SettingsMcpScreen() {
               )}
             </View>
           </Surface>
+        ) : null}
+        {isAuthenticated && !isAnonymous ? (
+          <PersonalDeadlineChatDraftSetting isAdmin={user?.role === "admin"} />
         ) : null}
     </ScreenShell>
   );

@@ -343,6 +343,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/agent-dialogues/{dialogue_id}/deliveries/{delivery_id}/recover-native-outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Recover Native Outcome */
+        post: operations["recover_native_outcome_api_agent_dialogues__dialogue_id__deliveries__delivery_id__recover_native_outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-dialogues/{dialogue_id}/deliveries/{delivery_id}/terminalize-stale-control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Terminalize Stale Control Delivery */
+        post: operations["terminalize_stale_control_delivery_api_agent_dialogues__dialogue_id__deliveries__delivery_id__terminalize_stale_control_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agent-dialogues/{dialogue_id}/inputs/{input_id}/answer": {
         parameters: {
             query?: never;
@@ -662,27 +696,121 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/agent-team/config": {
+    "/api/agent-team-graphs": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /**
-         * Get Agent Team Config
-         * @description Return the canonical Agent Team schema-v3 envelope.
-         *
-         *     Teams own Subagent membership and Team-scoped Execution Profiles.
-         *     Subagents are role/capability definitions only.  Compatibility
-         *     roster/templates/model-groups and user-facing LLM Profiles are omitted.
-         */
-        get: operations["get_agent_team_config_api_agent_team_config_get"];
-        /**
-         * Update Agent Team Config
-         * @description Validate and atomically persist the canonical Agent Team v3 graph.
-         */
-        put: operations["update_agent_team_config_api_agent_team_config_put"];
+        /** List Graphs */
+        get: operations["list_graphs_api_agent_team_graphs_get"];
+        put?: never;
+        /** Create */
+        post: operations["create_api_agent_team_graphs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-team-graphs/default/configuration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Default */
+        get: operations["get_default_api_agent_team_graphs_default_configuration_get"];
+        /** Put Default */
+        put: operations["put_default_api_agent_team_graphs_default_configuration_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-team-graphs/{graph_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Graph */
+        get: operations["get_graph_api_agent_team_graphs__graph_id__get"];
+        /** Update */
+        put: operations["update_api_agent_team_graphs__graph_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-team-graphs/{graph_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Archive */
+        post: operations["archive_api_agent_team_graphs__graph_id__archive_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-team-graphs/{graph_id}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore */
+        post: operations["restore_api_agent_team_graphs__graph_id__restore_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-team-graphs/{graph_id}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Revisions */
+        get: operations["revisions_api_agent_team_graphs__graph_id__revisions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent-tools/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Agent Tools Catalog */
+        get: operations["get_agent_tools_catalog_api_agent_tools_catalog_get"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -928,23 +1056,6 @@ export interface paths {
         };
         /** Get Agent Authority */
         get: operations["get_agent_authority_api_agents__agent_id__effective_authority_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/agents/{agent_id}/execution-profiles": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Agent Runtime Execution Profiles */
-        get: operations["get_agent_runtime_execution_profiles_api_agents__agent_id__execution_profiles_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3472,6 +3583,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/conversations/{session_id}/delegation-map": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Conversation Delegation Map
+         * @description Read the bounded delegation lineage for one visible conversation.
+         */
+        get: operations["get_conversation_delegation_map_api_conversations__session_id__delegation_map_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations/{session_id}/dispatch": {
         parameters: {
             query?: never;
@@ -5390,6 +5521,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/free-team/openai-provider-circuit/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset Openai Provider Circuit Route */
+        post: operations["reset_openai_provider_circuit_route_api_free_team_openai_provider_circuit_reset_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/free-team/openrouter/quota": {
         parameters: {
             query?: never;
@@ -5456,6 +5604,26 @@ export interface paths {
         head?: never;
         /** Update Quota */
         patch: operations["update_quota_api_free_team_quota_pools__quota_id__patch"];
+        trace?: never;
+    };
+    "/api/free-team/reservations/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile Reservation
+         * @description Settle one uncertain OpenAI reservation from its linked TokenUsage row.
+         */
+        post: operations["reconcile_reservation_api_free_team_reservations_reconcile_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/free-team/settings": {
@@ -6441,41 +6609,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/llm/execution-profiles": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Execution Profiles */
-        get: operations["get_execution_profiles_api_llm_execution_profiles_get"];
-        /** Put Execution Profiles */
-        put: operations["put_execution_profiles_api_llm_execution_profiles_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/llm/execution-profiles/{profile_id}/activate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Activate Execution Profile Route */
-        post: operations["activate_execution_profile_route_api_llm_execution_profiles__profile_id__activate_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/llm/llama-cpp/model-root": {
         parameters: {
             query?: never;
@@ -7355,6 +7488,24 @@ export interface paths {
          * @description Execute a configured mobile command
          */
         post: operations["run_mobile_command_api_mobile_commands_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/model-roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Model Roles */
+        get: operations["get_model_roles_api_model_roles_get"];
+        /** Put Model Roles */
+        put: operations["put_model_roles_api_model_roles_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -8610,6 +8761,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/operations/media/content-items/{content_item_id}/stock-adoption": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Change Content Item Stock */
+        post: operations["media_change_content_item_stock_adoption"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/operations/media/content-items/{content_item_id}/variants": {
         parameters: {
             query?: never;
@@ -9581,6 +9749,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/operations/media/platform-accounts/{account_id}/account-ref": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update Platform Account Ref */
+        post: operations["media_update_platform_account_ref"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/operations/media/platform-accounts/{account_id}/bridge-connection": {
         parameters: {
             query?: never;
@@ -9780,6 +9965,23 @@ export interface paths {
         put?: never;
         /** Append Platform Account Revision */
         post: operations["media_append_platform_account_revision"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/operations/media/platform-accounts/{account_id}/youtube-channel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update Youtube Channel Slot */
+        post: operations["media_update_youtube_channel_slot"];
         delete?: never;
         options?: never;
         head?: never;
@@ -10220,6 +10422,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/operations/media/stock": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Stock Items */
+        get: operations["media_list_content_item_stock"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/operations/opportunities": {
         parameters: {
             query?: never;
@@ -10255,6 +10474,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/operations/opportunities/{opportunity_id}/adopt-delegation-artifact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Adopt Delegation Artifact */
+        post: operations["adopt_delegation_artifact_api_operations_opportunities__opportunity_id__adopt_delegation_artifact_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/operations/opportunities/{opportunity_id}/development-requirements": {
         parameters: {
             query?: never;
@@ -10266,6 +10502,23 @@ export interface paths {
         put?: never;
         /** Resolve Development Requirements */
         post: operations["resolve_development_requirements_api_operations_opportunities__opportunity_id__development_requirements_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/operations/opportunities/{opportunity_id}/development-retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry Development */
+        post: operations["retry_development_api_operations_opportunities__opportunity_id__development_retry_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -10479,6 +10732,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/personal-agents/owner-agent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Owner Agents */
+        get: operations["list_owner_agents_api_personal_agents_owner_agent_get"];
+        put?: never;
+        /** Create Owner Agent */
+        post: operations["create_owner_agent_api_personal_agents_owner_agent_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-agents/owner-agent/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Owner Agent Sessions */
+        get: operations["list_owner_agent_sessions_api_personal_agents_owner_agent_sessions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/personal-agents/owner-agent/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Owner Agent */
+        patch: operations["update_owner_agent_api_personal_agents_owner_agent__agent_id__patch"];
+        trace?: never;
+    };
     "/api/personal-agents/profiles": {
         parameters: {
             query?: never;
@@ -10642,7 +10947,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** List Unproposed Evidence */
+        get: operations["list_unproposed_evidence_api_personal_drafts_evidence_get"];
         put?: never;
         /** Record Evidence */
         post: operations["record_evidence_api_personal_drafts_evidence_post"];
@@ -12026,6 +12332,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/remote-llm-consumers/turns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Turn */
+        post: operations["turn_api_remote_llm_consumers_turns_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/remote-llm-consumers/turns/{consumer_app}/{provider}/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Turn */
+        get: operations["get_turn_api_remote_llm_consumers_turns__consumer_app___provider___operation_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/remote-servers": {
         parameters: {
             query?: never;
@@ -12797,6 +13137,41 @@ export interface paths {
          * @description Update a configuration setting
          */
         patch: operations["update_setting_api_settings_patch"];
+        trace?: never;
+    };
+    "/api/settings/remote-targets/muse/allowed-agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Register Muse Allowed Agent */
+        post: operations["register_muse_allowed_agent_api_settings_remote_targets_muse_allowed_agents_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/remote-targets/muse/canonical-agent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Muse Canonical Agent */
+        get: operations["get_muse_canonical_agent_api_settings_remote_targets_muse_canonical_agent_get"];
+        /** Put Muse Canonical Agent */
+        put: operations["put_muse_canonical_agent_api_settings_remote_targets_muse_canonical_agent_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/skill-recordings": {
@@ -13792,6 +14167,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/task-attachments/{attachment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Lookup Task Attachment */
+        get: operations["lookup_task_attachment_api_task_attachments__attachment_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/task-occurrences": {
         parameters: {
             query?: never;
@@ -14177,144 +14569,6 @@ export interface paths {
          *     body or query string it acts as an exact optimistic-concurrency guard.
          */
         post: operations["restore_task_api_tasks__task_id__restore_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/calls": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Calls */
-        get: operations["calls_api_telephony_calls_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/calls/{call_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Call */
-        get: operations["call_api_telephony_calls__call_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/catalog": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Catalog */
-        get: operations["catalog_api_telephony_catalog_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/routes": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Routes */
-        get: operations["routes_api_telephony_routes_get"];
-        put?: never;
-        /** Create */
-        post: operations["create_api_telephony_routes_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/routes/{route_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get */
-        get: operations["get_api_telephony_routes__route_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        /** Patch */
-        patch: operations["patch_api_telephony_routes__route_id__patch"];
-        trace?: never;
-    };
-    "/api/telephony/routes/{route_id}/readiness": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Readiness */
-        get: operations["readiness_api_telephony_routes__route_id__readiness_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/routes/{route_id}/state": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** State */
-        post: operations["state_api_telephony_routes__route_id__state_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/telephony/webhooks/openai/{connection_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Webhook */
-        post: operations["webhook_api_telephony_webhooks_openai__connection_id__post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -14769,6 +15023,46 @@ export interface paths {
         get: operations["get_pricing_status_api_usage_pricing_status_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/usage/provider-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Provider Key Attribution
+         * @description Owner-only, body-free provider key attribution and health projection.
+         */
+        get: operations["get_provider_key_attribution_api_usage_provider_keys_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/usage/provider-keys/attestation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Attest Provider Key
+         * @description Attach an owner-provided, non-secret Tracking ID digest to a seen key.
+         */
+        post: operations["attest_provider_key_api_usage_provider_keys_attestation_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -15924,6 +16218,13 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** AgentDelegatePolicy */
+        AgentDelegatePolicy: {
+            /** Agents */
+            agents: string[] | "any_owned";
+            /** Workers */
+            workers: string[];
+        };
         /** AgentDialogueBudgetDTO */
         AgentDialogueBudgetDTO: {
             /** Attempt Count */
@@ -16054,6 +16355,7 @@ export interface components {
             /** Artifacts */
             artifacts?: components["schemas"]["ArtifactSafeRef"][];
             budget?: components["schemas"]["AgentDialogueBudgetDTO"] | null;
+            caller_run_budget?: components["schemas"]["CallerRunBudgetDTO"] | null;
             /**
              * Control Revision
              * @default 0
@@ -16095,6 +16397,187 @@ export interface components {
             /** Worker Agent Name */
             worker_agent_name?: string | null;
         };
+        /** AgentEffectiveModelRoute */
+        AgentEffectiveModelRoute: {
+            /** Route */
+            route: components["schemas"]["AgentLlmRoute"] | components["schemas"]["AgentPoolRoute"];
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "agent" | "global" | "inherit_chat" | "legacy";
+        };
+        /**
+         * AgentIdentityListItem
+         * @description Safe Agent identity row used by the Operations catalog.
+         */
+        AgentIdentityListItem: {
+            /** Character Id */
+            character_id?: string | null;
+            /** Create Hash */
+            create_hash: string;
+            /** Created At */
+            created_at?: string | null;
+            /** Created By */
+            created_by?: string | null;
+            /** Created By User Id */
+            created_by_user_id?: string | null;
+            /** Display Name */
+            display_name: string;
+            /** Id */
+            id: string;
+            /**
+             * Is Default Chat Agent
+             * @default false
+             */
+            is_default_chat_agent: boolean;
+            /** Slug */
+            slug?: string | null;
+            /** State */
+            state: string;
+            /** Thumbnail Artifact Id */
+            thumbnail_artifact_id?: string | null;
+            /** Updated At */
+            updated_at?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * AgentIdentityListResponse
+         * @description Canonical ``GET /api/agents`` envelope.
+         */
+        AgentIdentityListResponse: {
+            /** Agents */
+            agents: components["schemas"]["AgentIdentityListItem"][];
+            /**
+             * Success
+             * @default true
+             */
+            success: boolean;
+            /** Total */
+            total: number;
+        };
+        /** AgentLlmRoute */
+        AgentLlmRoute: {
+            /** Effort */
+            effort?: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "llm";
+            /** Model */
+            model: string;
+            /** Provider */
+            provider: string;
+        };
+        /** AgentModelOverride */
+        AgentModelOverride: {
+            /** Allow Paid Fallback */
+            allow_paid_fallback?: boolean | null;
+            /** Fallback On */
+            fallback_on?: ("model_unavailable" | "provider_unavailable" | "rate_limited" | "connect_timeout")[] | null;
+            /** Routes */
+            routes: (components["schemas"]["AgentLlmRoute"] | components["schemas"]["AgentPoolRoute"])[];
+        };
+        /** AgentPoolRoute */
+        AgentPoolRoute: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "pool";
+            /** Pool Id */
+            pool_id: string;
+        };
+        /** AgentRevisionEnvelope */
+        AgentRevisionEnvelope: {
+            revision: components["schemas"]["AgentRevisionProjection"];
+            /** Success */
+            success: boolean;
+        };
+        /**
+         * AgentRevisionLegacy
+         * @description Historical Team/Profile pins retained only for old revision display.
+         */
+        AgentRevisionLegacy: {
+            /** Agent Team Id */
+            agent_team_id?: string | null;
+            /** Allowed Subagent Ids */
+            allowed_subagent_ids?: string[] | null;
+            /** Execution Profile Id */
+            execution_profile_id?: string | null;
+        };
+        /** AgentRevisionListEnvelope */
+        AgentRevisionListEnvelope: {
+            /** Revisions */
+            revisions: components["schemas"]["AgentRevisionProjection"][];
+            /** Success */
+            success: boolean;
+            /** Total */
+            total: number;
+        };
+        /** AgentRevisionProjection */
+        AgentRevisionProjection: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Budget Policy */
+            budget_policy: {
+                [key: string]: unknown;
+            };
+            /** Capability Ceiling */
+            capability_ceiling: string[];
+            /** Concurrency Policy */
+            concurrency_policy: {
+                [key: string]: unknown;
+            };
+            /** Content Hash */
+            content_hash: string;
+            /** Created At */
+            created_at: string | null;
+            /** Created By */
+            created_by: string | null;
+            /** Created By User Id */
+            created_by_user_id: string | null;
+            delegate_policy: components["schemas"]["AgentDelegatePolicy"] | null;
+            /** Display Name */
+            display_name: string;
+            /** Effective Model Routes */
+            effective_model_routes: {
+                [key: string]: components["schemas"]["AgentEffectiveModelRoute"];
+            };
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            legacy?: components["schemas"]["AgentRevisionLegacy"] | null;
+            /** Mission */
+            mission: string;
+            /** Model Overrides */
+            model_overrides: {
+                [key: string]: components["schemas"]["AgentModelOverride"];
+            } | null;
+            /** Operational Instructions */
+            operational_instructions: string;
+            /** Responsibility Summary */
+            responsibility_summary: string;
+            /** Route Warnings */
+            route_warnings?: {
+                [key: string]: string;
+            }[] | null;
+            /** Tool Ids */
+            tool_ids: string[] | null;
+            /** Version */
+            version: number;
+            /** Wake Policy */
+            wake_policy: {
+                [key: string]: unknown;
+            };
+        };
         /**
          * AgentRunActivityDTO
          * @description Bounded Agent activity row; prompts/events/transcripts are excluded.
@@ -16116,6 +16599,10 @@ export interface components {
             } | null;
             /** Id */
             id: string;
+            /** Legacy */
+            legacy?: {
+                [key: string]: unknown;
+            } | null;
             /** Project Id */
             project_id?: string | null;
             /** Resource Refs */
@@ -16152,89 +16639,6 @@ export interface components {
              */
             success: boolean;
         };
-        /** AgentRuntimeExecutionProfile */
-        AgentRuntimeExecutionProfile: {
-            /** Acting Subagent Id */
-            acting_subagent_id: string;
-            /**
-             * Availability Category
-             * @enum {string}
-             */
-            availability_category: "available" | "context_required" | "policy_denied" | "provider_unavailable" | "ingress_unavailable";
-            /** Availability Reason */
-            availability_reason?: string | null;
-            /**
-             * Available
-             * @description Whether this explicit ingress is eligible for the supplied caller context; live provider delivery is separate
-             */
-            available: boolean;
-            /** Effort */
-            effort?: string | null;
-            /**
-             * Ingress
-             * @enum {string}
-             */
-            ingress: "api" | "cli_session" | "remote_agent";
-            /** Is Default */
-            is_default: boolean;
-            /** Model */
-            model?: string | null;
-            /** Name */
-            name: string;
-            /** Profile Id */
-            profile_id: string;
-            /** Provider */
-            provider: string;
-            /**
-             * Provider Readiness
-             * @enum {string}
-             */
-            provider_readiness: "unknown" | "ready" | "unavailable" | "not_applicable";
-            /** Provider Readiness Reason */
-            provider_readiness_reason?: string | null;
-        };
-        /** AgentRuntimeProfileCatalogResponse */
-        AgentRuntimeProfileCatalogResponse: {
-            /**
-             * Acting Role
-             * @constant
-             */
-            acting_role: "operator";
-            /**
-             * Agent Id
-             * Format: uuid
-             */
-            agent_id: string;
-            /**
-             * Agent Revision Id
-             * Format: uuid
-             */
-            agent_revision_id: string;
-            /** Agent Team Id */
-            agent_team_id: string;
-            /** Binding Id */
-            binding_id?: string | null;
-            /**
-             * Context Source
-             * @enum {string}
-             */
-            context_source: "agent_revision" | "session_binding";
-            /** Default Execution Profile Id */
-            default_execution_profile_id: string;
-            /** Diagnostics */
-            diagnostics: components["schemas"]["AgentRuntimeProfileDiagnostic"][];
-            /** Profiles */
-            profiles: components["schemas"]["AgentRuntimeExecutionProfile"][];
-            /** Session Id */
-            session_id?: string | null;
-        };
-        /** AgentRuntimeProfileDiagnostic */
-        AgentRuntimeProfileDiagnostic: {
-            /** Profile Id */
-            profile_id: string;
-            /** Reason */
-            reason: string;
-        };
         /** AgentStateRequest */
         AgentStateRequest: {
             /** Expected State */
@@ -16244,6 +16648,16 @@ export interface components {
              * @enum {string}
              */
             state: "draft" | "active" | "paused" | "retired";
+        };
+        /** AgentTaskAdmissionErrorDetail */
+        AgentTaskAdmissionErrorDetail: {
+            /**
+             * Code
+             * @constant
+             */
+            code: "admin_restart_pending";
+            /** Message */
+            message: string;
         };
         /** AgentTaskCancelResponse */
         AgentTaskCancelResponse: {
@@ -16286,13 +16700,9 @@ export interface components {
             edit_targets?: string[] | null;
             /** Effort */
             effort?: string | null;
-            /**
-             * Execution Profile Id
-             * @description Optional runtime ExecutionProfile for this task. Omitted/null keeps the pinned AgentRevision default. An explicit id must be a formal system Profile or an enabled Profile of the Agent's own Team; it never changes the Agent role and never falls back. provider/model/effort remain assertions against the selected route.
-             */
-            execution_profile_id?: string | null;
             /** Goal */
             goal: string;
+            image_review?: components["schemas"]["AgentTaskImageReviewInput"] | null;
             /** Mode */
             mode?: string | null;
             /** Model */
@@ -16335,7 +16745,7 @@ export interface components {
             /** Detail */
             detail: string | {
                 [key: string]: unknown;
-            }[];
+            }[] | components["schemas"]["AgentTaskAdmissionErrorDetail"];
             /** Error */
             error?: string | null;
             /**
@@ -16459,6 +16869,167 @@ export interface components {
              */
             response: string;
         };
+        /** AgentTaskFreeTeamActualUsage */
+        AgentTaskFreeTeamActualUsage: {
+            /** Input Tokens */
+            input_tokens?: number | null;
+            /** Output Tokens */
+            output_tokens?: number | null;
+            /** Quota Actual */
+            quota_actual?: {
+                [key: string]: number;
+            } | null;
+            /** Requests */
+            requests?: number | null;
+            /** Total Tokens */
+            total_tokens?: number | null;
+        };
+        /**
+         * AgentTaskFreeTeamProjection
+         * @description Latest lease fields plus a bounded sum across all reservations for this task.
+         */
+        AgentTaskFreeTeamProjection: {
+            /** Billing Mode */
+            billing_mode?: string | null;
+            /** Candidate */
+            candidate?: string | null;
+            /** Model */
+            model?: string | null;
+            /**
+             * Non Free Reservation Detected
+             * @default false
+             */
+            non_free_reservation_detected: boolean;
+            /** Provider */
+            provider?: string | null;
+            /** Quota Pool Ids */
+            quota_pool_ids?: string[];
+            /** Reservation Id */
+            reservation_id?: string | null;
+            reservations_total: components["schemas"]["AgentTaskFreeTeamReservationsTotal"];
+            settlement?: components["schemas"]["AgentTaskFreeTeamSettlement"] | null;
+            wait?: components["schemas"]["AgentTaskFreeTeamWait"] | null;
+        };
+        /** AgentTaskFreeTeamReservationsTotal */
+        AgentTaskFreeTeamReservationsTotal: {
+            actual_usage: components["schemas"]["AgentTaskFreeTeamUsageTotals"];
+            by_status: components["schemas"]["AgentTaskFreeTeamStatusCounts"];
+            /**
+             * Count
+             * @default 0
+             */
+            count: number;
+            /**
+             * Truncated
+             * @default false
+             */
+            truncated: boolean;
+            /** Uncertain Estimated Hold */
+            uncertain_estimated_hold?: {
+                [key: string]: number;
+            };
+        };
+        /** AgentTaskFreeTeamSettlement */
+        AgentTaskFreeTeamSettlement: {
+            actual_usage: components["schemas"]["AgentTaskFreeTeamActualUsage"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "committed" | "uncertain" | "released";
+        };
+        /** AgentTaskFreeTeamStatusCounts */
+        AgentTaskFreeTeamStatusCounts: {
+            /**
+             * Committed
+             * @default 0
+             */
+            committed: number;
+            /**
+             * Released
+             * @default 0
+             */
+            released: number;
+            /**
+             * Reserved
+             * @default 0
+             */
+            reserved: number;
+            /**
+             * Uncertain
+             * @default 0
+             */
+            uncertain: number;
+        };
+        /** AgentTaskFreeTeamUsageTotals */
+        AgentTaskFreeTeamUsageTotals: {
+            /**
+             * Input Tokens
+             * @default 0
+             */
+            input_tokens: number;
+            /**
+             * Output Tokens
+             * @default 0
+             */
+            output_tokens: number;
+            /** Quota Actual */
+            quota_actual?: {
+                [key: string]: number;
+            };
+            /**
+             * Requests
+             * @default 0
+             */
+            requests: number;
+            /**
+             * Total Tokens
+             * @default 0
+             */
+            total_tokens: number;
+        };
+        /** AgentTaskFreeTeamWait */
+        AgentTaskFreeTeamWait: {
+            /** Deferred Reason */
+            deferred_reason?: string | null;
+            /** Quota Ids */
+            quota_ids?: string[];
+            /** Quota Reset At */
+            quota_reset_at?: string | null;
+            /** Quota Reset Kind */
+            quota_reset_kind?: ("daily" | "minute" | "cooldown") | null;
+        };
+        /** AgentTaskImageReviewInput */
+        AgentTaskImageReviewInput: {
+            /**
+             * Expected Agent Revision Id
+             * Format: uuid
+             */
+            expected_agent_revision_id: string;
+            /**
+             * Persona Id
+             * Format: uuid
+             */
+            persona_id: string;
+            pin: components["schemas"]["AgentTaskMediaInputPin"];
+            /**
+             * Project Id
+             * Format: uuid
+             */
+            project_id: string;
+        };
+        /** AgentTaskImageReviewResult */
+        AgentTaskImageReviewResult: {
+            /** Image Review */
+            image_review: {
+                [key: string]: unknown;
+            };
+            /**
+             * Response
+             * @description Secret-redacted final assistant answer; no internal execution trace
+             */
+            response: string;
+        };
         /** AgentTaskInterruptedOperation */
         AgentTaskInterruptedOperation: {
             /**
@@ -16516,6 +17087,49 @@ export interface components {
             /** Next Cursor */
             next_cursor?: string | null;
         };
+        /** AgentTaskMediaInputPin */
+        AgentTaskMediaInputPin: {
+            /**
+             * Agent Run Id
+             * Format: uuid
+             */
+            agent_run_id: string;
+            /**
+             * Asset Revision Id
+             * Format: uuid
+             */
+            asset_revision_id: string;
+            /** Bytes Sha256 */
+            bytes_sha256: string;
+            /** Generation Run Hash */
+            generation_run_hash: string;
+            /**
+             * Generation Run Id
+             * Format: uuid
+             */
+            generation_run_id: string;
+            /**
+             * Output Id
+             * Format: uuid
+             */
+            output_id: string;
+            /** Output Provenance Hash */
+            output_provenance_hash: string;
+            /** Plan Hash */
+            plan_hash: string;
+            /**
+             * Plan Id
+             * Format: uuid
+             */
+            plan_id: string;
+            /** Revision Hash */
+            revision_hash: string;
+            /**
+             * Work Id
+             * Format: uuid
+             */
+            work_id: string;
+        };
         /** AgentTaskProjection */
         AgentTaskProjection: {
             /**
@@ -16533,12 +17147,15 @@ export interface components {
             /** Cancellation Requested */
             cancellation_requested: boolean;
             failure?: components["schemas"]["AgentTaskFailure"] | null;
+            /** @description Latest complimentary lease and settlement, bounded wait data, and aggregate reservations_total for tasks whose bound AgentRevision operator route resolves to a Free Team pool */
+            free_team?: components["schemas"]["AgentTaskFreeTeamProjection"] | null;
             /**
              * Reconciliation Required
              * @description Operations whose outcome a restart left unknown; inspect the workspace, then resume with their operation ids
              */
             reconciliation_required?: components["schemas"]["AgentTaskInterruptedOperation"][] | null;
-            result?: components["schemas"]["AgentTaskFinalResult"] | null;
+            /** Result */
+            result?: components["schemas"]["AgentTaskImageReviewResult"] | components["schemas"]["AgentTaskFinalResult"] | null;
             /**
              * Status
              * @enum {string}
@@ -16639,6 +17256,24 @@ export interface components {
             /** Artifact Id */
             artifact_id: string | null;
         };
+        /** AgentToolCatalogItem */
+        AgentToolCatalogItem: {
+            /** Description */
+            description: string;
+            /** Group */
+            group: string;
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+            /** Requires Capabilities */
+            requires_capabilities: string[];
+        };
+        /** AgentToolCatalogResponse */
+        AgentToolCatalogResponse: {
+            /** Tools */
+            tools: components["schemas"]["AgentToolCatalogItem"][];
+        };
         /** AnnotationStatusPayload */
         AnnotationStatusPayload: {
             /** Status */
@@ -16680,6 +17315,7 @@ export interface components {
             /** Artifacts */
             artifacts?: components["schemas"]["ArtifactSafeRef"][];
             budget?: components["schemas"]["AgentDialogueBudgetDTO"] | null;
+            caller_run_budget?: components["schemas"]["CallerRunBudgetDTO"] | null;
             /**
              * Control Revision
              * @default 0
@@ -18081,8 +18717,6 @@ export interface components {
             allowed_capabilities?: ("command_execute" | "workspace_read" | "workspace_write")[] | null;
             /** Effort */
             effort?: string | null;
-            /** Execution Profile Id */
-            execution_profile_id?: string | null;
             /** Idempotency Key */
             idempotency_key: string;
             /** Model */
@@ -18181,6 +18815,11 @@ export interface components {
             idempotency_key: string;
             /** Message */
             message: string;
+            /**
+             * Muse Tool Loop Opt In
+             * @default false
+             */
+            muse_tool_loop_opt_in: boolean;
         };
         /**
          * CLIDevelopmentSessionOutputChunk
@@ -18448,6 +19087,32 @@ export interface components {
             id: string;
             /** Type */
             type: string;
+        };
+        /**
+         * CallerRunBudgetDTO
+         * @description Safe usage and settlement projection for a caller Run reservation.
+         */
+        CallerRunBudgetDTO: {
+            /** Actual Cost Micros */
+            actual_cost_micros?: number | null;
+            /** Actual Tokens */
+            actual_tokens?: number | null;
+            /** Charged Cost Micros */
+            charged_cost_micros?: number | null;
+            /** Charged Tokens */
+            charged_tokens?: number | null;
+            /** Overrun Cost Micros */
+            overrun_cost_micros?: number | null;
+            /** Overrun Tokens */
+            overrun_tokens?: number | null;
+            /** Reserved Cost Micros */
+            reserved_cost_micros?: number | null;
+            /** Reserved Tokens */
+            reserved_tokens?: number | null;
+            /** State */
+            state?: string | null;
+            /** Usage State */
+            usage_state?: string | null;
         };
         /** CandidateEditRequest */
         CandidateEditRequest: {
@@ -19447,6 +20112,75 @@ export interface components {
             /** Url */
             url?: string | null;
         };
+        /** CompiledEdge */
+        CompiledEdge: {
+            /** Key */
+            key: string;
+            /** Kind */
+            kind: string;
+            /** Output Key */
+            output_key: string | null;
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+        };
+        /** CompiledGroup */
+        CompiledGroup: {
+            /** Allowed Pairs */
+            allowed_pairs: [
+                string,
+                string
+            ][];
+            /** Edges */
+            edges: components["schemas"]["CompiledEdge"][];
+            /** Execution Kind */
+            execution_kind?: "software_code" | null;
+            /**
+             * External Handoffs
+             * @default []
+             */
+            external_handoffs: components["schemas"]["CompiledEdge"][];
+            /** Graph Hash */
+            graph_hash: string;
+            /**
+             * Graph Id
+             * Format: uuid
+             */
+            graph_id: string;
+            /**
+             * Graph Revision Id
+             * Format: uuid
+             */
+            graph_revision_id: string;
+            /** Group Key */
+            group_key: string;
+            leader: components["schemas"]["CompiledNode"];
+            /** Purpose */
+            purpose: string;
+            root: components["schemas"]["CompiledNode"];
+            /** Roster */
+            roster: components["schemas"]["CompiledNode"][];
+        };
+        /** CompiledNode */
+        CompiledNode: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Explicit Revision */
+            explicit_revision: boolean;
+            /** Key */
+            key: string;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
+            /** Role */
+            role: string;
+        };
         /**
          * ConnectionCollectionUpdateRequest
          * @description Compatibility body for clients that PATCH the collection endpoint.
@@ -19528,6 +20262,32 @@ export interface components {
             provider_key?: string | null;
             /** Remote Account Ref */
             remote_account_ref?: string | null;
+        };
+        /** ConsumerTurnRequest */
+        ConsumerTurnRequest: {
+            /**
+             * Consumer App
+             * @enum {string}
+             */
+            consumer_app: "73" | "86";
+            /** Operation Id */
+            operation_id: string;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "muse" | "grok_bot";
+            /** System */
+            system: string;
+            /** User */
+            user: string;
+        };
+        /** ConsumerTurnResponse */
+        ConsumerTurnResponse: {
+            /** State */
+            state: string;
+            /** Text */
+            text?: string | null;
         };
         /** ContentItemCreateRequest */
         ContentItemCreateRequest: {
@@ -19633,6 +20393,59 @@ export interface components {
             title: string;
             /** Version */
             version: number;
+        };
+        /** ContentItemStockDecisionResponse */
+        ContentItemStockDecisionResponse: {
+            /** Actor Id */
+            actor_id?: string | null;
+            /**
+             * Actor Type
+             * @enum {string}
+             */
+            actor_type: "human" | "admin";
+            /** Content Item Hash */
+            content_item_hash: string;
+            /** Content Item Id */
+            content_item_id: string;
+            /** Content Item Version */
+            content_item_version: number;
+            /** Created At */
+            created_at: string;
+            /** Decision Hash */
+            decision_hash: string;
+            /** Event Hash */
+            event_hash: string;
+            /**
+             * Event Type
+             * @enum {string}
+             */
+            event_type: "adopt" | "withdraw";
+            /**
+             * From Status
+             * @enum {string}
+             */
+            from_status: "draft" | "ready";
+            /** Id */
+            id: string;
+            /** Owner User Id */
+            owner_user_id: string;
+            /** Prev Event Hash */
+            prev_event_hash?: string | null;
+            /** Project Id */
+            project_id?: string | null;
+            /** Request Hash */
+            request_hash: string;
+            /** Sequence */
+            sequence: number;
+            /** Snapshot */
+            snapshot: {
+                [key: string]: unknown;
+            };
+            /**
+             * To Status
+             * @enum {string}
+             */
+            to_status: "draft" | "ready";
         };
         /** ContentItemSummaryResponse */
         ContentItemSummaryResponse: {
@@ -20009,20 +20822,29 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * ConversationAgentBindingLegacyProjection
+         * @description Historical Team/Profile pins for a conversation binding.
+         */
+        ConversationAgentBindingLegacyProjection: {
+            /** Agent Team Id */
+            agent_team_id?: string | null;
+            /** Allowed Subagent Ids */
+            allowed_subagent_ids?: string[] | null;
+            /** Execution Profile Id */
+            execution_profile_id?: string | null;
+        };
         /** ConversationAgentBindingProjection */
         ConversationAgentBindingProjection: {
             /** Agent Id */
             agent_id: string;
             /** Agent Revision Id */
             agent_revision_id: string;
-            /** Agent Team Id */
-            agent_team_id: string;
             /** Created At */
             created_at?: string | null;
-            /** Execution Profile Id */
-            execution_profile_id: string;
             /** Id */
             id: string;
+            legacy?: components["schemas"]["ConversationAgentBindingLegacyProjection"] | null;
             /** Revision Version */
             revision_version: number;
             /** Session Id */
@@ -20108,8 +20930,6 @@ export interface components {
             context_project_hint_id?: string | null;
             /** Edit Message Id */
             edit_message_id?: string | null;
-            /** Execution Profile Id */
-            execution_profile_id?: string | null;
             /** Expected Agent Id */
             expected_agent_id?: string | null;
             /** Generation Profile */
@@ -20881,43 +21701,38 @@ export interface components {
         };
         /** CreateRevisionRequest */
         CreateRevisionRequest: {
-            /** Agent Team Id */
-            agent_team_id: string;
-            /** Allowed Subagent Ids */
-            allowed_subagent_ids?: string[];
             /** Budget Policy */
             budget_policy?: {
                 [key: string]: unknown;
             } | null;
             /** Capability Ceiling */
-            capability_ceiling?: string[];
+            capability_ceiling?: string[] | null;
             /** Concurrency Policy */
             concurrency_policy?: {
                 [key: string]: unknown;
             } | null;
             /** Content Hash */
             content_hash?: string | null;
+            /** Delegate Policy */
+            delegate_policy?: {
+                [key: string]: unknown;
+            } | null;
             /** Display Name */
-            display_name: string;
-            /** Execution Profile Id */
-            execution_profile_id: string;
+            display_name?: string | null;
             /** Idempotency Key */
             idempotency_key?: string | null;
-            /**
-             * Mission
-             * @default
-             */
-            mission: string;
-            /**
-             * Operational Instructions
-             * @default
-             */
-            operational_instructions: string;
-            /**
-             * Responsibility Summary
-             * @default
-             */
-            responsibility_summary: string;
+            /** Mission */
+            mission?: string | null;
+            /** Model Overrides */
+            model_overrides?: {
+                [key: string]: unknown;
+            } | null;
+            /** Operational Instructions */
+            operational_instructions?: string | null;
+            /** Responsibility Summary */
+            responsibility_summary?: string | null;
+            /** Tool Ids */
+            tool_ids?: string[] | null;
             /** Version */
             version?: number | null;
             /** Wake Policy */
@@ -20948,6 +21763,11 @@ export interface components {
             app_id?: string | null;
             /** App Target Id */
             app_target_id?: string | null;
+            /**
+             * Background Worker
+             * @default false
+             */
+            background_worker: boolean;
             /** Character Name */
             character_name: string;
             initial_message?: components["schemas"]["InitialUserMessageRequest"] | null;
@@ -21524,6 +22344,61 @@ export interface components {
             /** Supersedes Entry Id */
             supersedes_entry_id?: string | null;
         };
+        /** DefaultGraphRef */
+        DefaultGraphRef: {
+            /** Content Hash */
+            content_hash: string;
+            /**
+             * Graph Id
+             * Format: uuid
+             */
+            graph_id: string;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
+        };
+        /** DefaultGraphUpdate */
+        DefaultGraphUpdate: {
+            expected: components["schemas"]["DefaultGraphRef"] | null;
+            /**
+             * Graph Id
+             * Format: uuid
+             */
+            graph_id: string;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
+        };
+        /** DelegationArtifactAdoptionRequest */
+        DelegationArtifactAdoptionRequest: {
+            /** Expected Review Hash */
+            expected_review_hash?: string | null;
+            /** Expected Work Hash */
+            expected_work_hash?: string | null;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /**
+             * Order Id
+             * Format: uuid
+             */
+            order_id: string;
+            /**
+             * Review Artifact Id
+             * Format: uuid
+             */
+            review_artifact_id: string;
+            /** Source Snapshot Hash */
+            source_snapshot_hash: string;
+            /**
+             * Work Artifact Id
+             * Format: uuid
+             */
+            work_artifact_id: string;
+        };
         /** DelegationArtifactContent */
         DelegationArtifactContent: {
             /** Accepted */
@@ -21620,26 +22495,25 @@ export interface components {
             instruction: string;
             /** Linked Work Item Id */
             linked_work_item_id?: string | null;
+            /** Media Input Pins */
+            media_input_pins?: components["schemas"]["MediaInputPinDTO"][] | null;
+            operations_source_ref?: components["schemas"]["OperationsSourceRefDTO"] | null;
             /** Parent Delegation Id */
             parent_delegation_id?: string | null;
             /** Persona Id */
             persona_id?: string | null;
-            planning?: components["schemas"]["DelegationPlanningPolicy"] | null;
+            /** Planning */
+            planning?: components["schemas"]["DelegationPlanningPolicy"] | components["schemas"]["GraphPlanningInput"] | null;
             /**
              * Project Id
              * Format: uuid
              */
             project_id: string;
-            /**
-             * Reviewer Agent Id
-             * Format: uuid
-             */
-            reviewer_agent_id: string;
-            /**
-             * Reviewer Revision Id
-             * Format: uuid
-             */
-            reviewer_revision_id: string;
+            /** Reviewer Agent Id */
+            reviewer_agent_id?: string | null;
+            /** Reviewer Revision Id */
+            reviewer_revision_id?: string | null;
+            team_graph_ref?: components["schemas"]["TeamGraphRef"] | null;
             /** Title */
             title: string;
             /**
@@ -21647,16 +22521,10 @@ export interface components {
              * @enum {string}
              */
             work_role: "researcher" | "writer" | "data_worker" | "general_worker" | "code_worker";
-            /**
-             * Worker Agent Id
-             * Format: uuid
-             */
-            worker_agent_id: string;
-            /**
-             * Worker Revision Id
-             * Format: uuid
-             */
-            worker_revision_id: string;
+            /** Worker Agent Id */
+            worker_agent_id?: string | null;
+            /** Worker Revision Id */
+            worker_revision_id?: string | null;
         };
         /** DelegationDTO */
         DelegationDTO: {
@@ -21682,6 +22550,9 @@ export interface components {
             id: string;
             /** Linked Work Item Id */
             linked_work_item_id: string | null;
+            /** Media Input Pins */
+            media_input_pins?: components["schemas"]["MediaInputPinDTO"][];
+            operations_source_ref?: components["schemas"]["OperationsSourceRefDTO"] | null;
             /** Parent Delegation Id */
             parent_delegation_id: string | null;
             /** Persona Id */
@@ -21726,10 +22597,73 @@ export interface components {
              */
             success: boolean;
         };
+        /** DelegationMapEdge */
+        DelegationMapEdge: {
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "delegation" | "work";
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
+        };
+        /** DelegationMapGraph */
+        DelegationMapGraph: {
+            /** Edges */
+            edges: components["schemas"]["DelegationMapEdge"][];
+            /** Nodes */
+            nodes: components["schemas"]["DelegationMapNode"][];
+        };
+        /** DelegationMapNode */
+        DelegationMapNode: {
+            /** Agent Id */
+            agent_id: string | null;
+            /** Agent Name */
+            agent_name: string | null;
+            /** Agent Revision Id */
+            agent_revision_id: string | null;
+            /** Dialogue Id */
+            dialogue_id: string | null;
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "conversation" | "dialogue" | "work";
+            /** Status */
+            status: string;
+            /** Task Id */
+            task_id: string | null;
+            /** Title */
+            title: string;
+            /** Work Id */
+            work_id: string | null;
+        };
+        /** DelegationMapResponse */
+        DelegationMapResponse: {
+            graph: components["schemas"]["DelegationMapGraph"];
+            /** Has More */
+            has_more: boolean;
+            /** Observed At */
+            observed_at: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: "conversation-delegation-map-v1";
+            /** Session Id */
+            session_id: string;
+        };
         /** DelegationPlanningPolicy */
         DelegationPlanningPolicy: {
             /** Brand Keys */
             brand_keys?: string[];
+            graph_constraints?: components["schemas"]["CompiledGroup"] | null;
             /** Input Artifacts */
             input_artifacts?: {
                 [key: string]: string;
@@ -21802,6 +22736,23 @@ export interface components {
             note?: string | null;
             /** Resolved */
             resolved: boolean;
+        };
+        /** DevelopmentRetryRequest */
+        DevelopmentRetryRequest: {
+            /**
+             * Expected Run Id
+             * Format: uuid
+             */
+            expected_run_id: string;
+            /**
+             * Expected Work Item Id
+             * Format: uuid
+             */
+            expected_work_item_id: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Note */
+            note?: string | null;
         };
         /** DialogueControlRequest */
         DialogueControlRequest: {
@@ -22352,6 +23303,22 @@ export interface components {
         DuplicateRequest: {
             /** Name */
             name?: string | null;
+        };
+        /** Edge */
+        Edge: {
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "supervises" | "assigns" | "reviews" | "handoff";
+            /** Output Key */
+            output_key?: string | null;
+            /** Source */
+            source: string;
+            /** Target */
+            target: string;
         };
         /**
          * EditMessageRequest
@@ -23605,6 +24572,104 @@ export interface components {
             /** Title */
             title?: string | null;
         };
+        /** FreeTeamActualUsageInput */
+        FreeTeamActualUsageInput: {
+            /** Input Tokens */
+            input_tokens?: number | null;
+            /** Output Tokens */
+            output_tokens?: number | null;
+            /** Reasoning Tokens */
+            reasoning_tokens?: number | null;
+            /** Total Tokens */
+            total_tokens: number;
+        };
+        /** FreeTeamReconciliationQuotaBalance */
+        FreeTeamReconciliationQuotaBalance: {
+            /** Actual Consumed */
+            actual_consumed: string;
+            /** Consumed After */
+            consumed_after: string;
+            /** Consumed Before */
+            consumed_before: string;
+            /** Hold Released */
+            hold_released: string;
+            /** Reserved After */
+            reserved_after: string;
+            /** Reserved Before */
+            reserved_before: string;
+        };
+        /** FreeTeamReconciliationUsageResult */
+        FreeTeamReconciliationUsageResult: {
+            /** Input Tokens */
+            input_tokens: number;
+            /** Output Tokens */
+            output_tokens: number;
+            /** Reasoning Tokens */
+            reasoning_tokens: number;
+            /** Total Tokens */
+            total_tokens: number;
+        };
+        /** FreeTeamReservationReconciliationRequest */
+        FreeTeamReservationReconciliationRequest: {
+            actual_usage: components["schemas"]["FreeTeamActualUsageInput"];
+            /** Evidence Ref */
+            evidence_ref: string;
+            /** Reservation Id */
+            reservation_id: string;
+        };
+        /** FreeTeamReservationReconciliationResponse */
+        FreeTeamReservationReconciliationResponse: {
+            actual_usage: components["schemas"]["FreeTeamReconciliationUsageResult"];
+            /** Evidence Ref */
+            evidence_ref: string;
+            /** Idempotency Key */
+            idempotency_key: string;
+            /** Idempotent Replay */
+            idempotent_replay: boolean;
+            /** Quota Pools */
+            quota_pools: {
+                [key: string]: components["schemas"]["FreeTeamReconciliationQuotaBalance"];
+            };
+            /** Reservation Id */
+            reservation_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "committed";
+        };
+        /** FreeTeamUsageResponse */
+        FreeTeamUsageResponse: {
+            /** Next Probe At */
+            next_probe_at?: string | null;
+            /** Openai Usage Actual */
+            openai_usage_actual?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Probe Interval Minutes
+             * @default 15
+             */
+            probe_interval_minutes: number;
+            /** Provider Block Persistence */
+            provider_block_persistence: string | null;
+            /** Provider Block Reason Code */
+            provider_block_reason_code: string | null;
+            /** Provider Blocked */
+            provider_blocked: boolean;
+            /** Provider Blocked Until */
+            provider_blocked_until: string | null;
+            /** Provider Half Open */
+            provider_half_open: boolean;
+            /** Quota Pools */
+            quota_pools: {
+                [key: string]: unknown;
+            }[];
+            /** Verification */
+            verification: {
+                [key: string]: unknown;
+            };
+        };
         /** GeminiTTSCatalogResponse */
         GeminiTTSCatalogResponse: {
             /** Api Key Configured */
@@ -23787,6 +24852,7 @@ export interface components {
             plan_hash: string;
             /** Project Id */
             project_id: string | null;
+            receipt_recovery?: components["schemas"]["ReceiptRecoveryResponse"] | null;
             request_spec: components["schemas"]["GenerationRequestSpecResponse"];
             /** Requested Outputs */
             requested_outputs: number;
@@ -24083,6 +25149,188 @@ export interface components {
             default_action?: ("open_template" | "create_event") | null;
             /** Default Event Reminder Minutes */
             default_event_reminder_minutes?: number | null;
+        };
+        /** GraphCreateRequest */
+        GraphCreateRequest: {
+            definition: components["schemas"]["GraphDefinition"];
+            /** Idempotency Key */
+            idempotency_key?: string | null;
+            /** Project Id */
+            project_id?: string | null;
+            /** Title */
+            title: string;
+        };
+        /** GraphDefinition */
+        GraphDefinition: {
+            /** Edges */
+            edges?: components["schemas"]["Edge"][];
+            /** Groups */
+            groups?: components["schemas"]["Group"][];
+            /** Nodes */
+            nodes?: components["schemas"]["Node"][];
+            /** Root Key */
+            root_key?: string | null;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /** GraphListResponse */
+        GraphListResponse: {
+            /** Graphs */
+            graphs: components["schemas"]["GraphProjection"][];
+            /**
+             * Success
+             * @default true
+             */
+            success: boolean;
+            /** Total */
+            total: number;
+        };
+        /** GraphPlanningInput */
+        GraphPlanningInput: {
+            /** Brand Keys */
+            brand_keys?: string[];
+            /** Graph Constraints */
+            graph_constraints?: null;
+            /** Input Artifacts */
+            input_artifacts?: {
+                [key: string]: string;
+            };
+            /**
+             * Max Attempts Per Phase
+             * @default 2
+             */
+            max_attempts_per_phase: number;
+            /**
+             * Max Children
+             * @default 2
+             */
+            max_children: number;
+            /**
+             * Max Depth
+             * @default 3
+             */
+            max_depth: number;
+            /**
+             * Max Output Tokens Per Call
+             * @default 2048
+             */
+            max_output_tokens_per_call: number;
+            /**
+             * Max Rework Rounds
+             * @default 1
+             */
+            max_rework_rounds: number;
+            /**
+             * Max Total Children
+             * @default 16
+             */
+            max_total_children: number;
+            /**
+             * Max Total Output Tokens
+             * @default 65536
+             */
+            max_total_output_tokens: number;
+            /** Roster */
+            roster?: components["schemas"]["PlanningRosterEntry"][] | null;
+        };
+        /** GraphProjection */
+        GraphProjection: {
+            /** Archived At */
+            archived_at?: string | null;
+            /** Content Hash */
+            content_hash: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Created By
+             * Format: uuid
+             */
+            created_by: string;
+            /**
+             * Current Revision Id
+             * Format: uuid
+             */
+            current_revision_id: string;
+            definition: components["schemas"]["GraphDefinition"];
+            /** Diagnostics */
+            diagnostics: string[];
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Project Id */
+            project_id: string | null;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
+            /** Title */
+            title: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** GraphResponse */
+        GraphResponse: {
+            graph: components["schemas"]["GraphProjection"];
+            /**
+             * Success
+             * @default true
+             */
+            success: boolean;
+        };
+        /** GraphRevisionsResponse */
+        GraphRevisionsResponse: {
+            /** Revisions */
+            revisions: components["schemas"]["GraphProjection"][];
+            /**
+             * Success
+             * @default true
+             */
+            success: boolean;
+            /** Total */
+            total: number;
+        };
+        /** GraphUpdateRequest */
+        GraphUpdateRequest: {
+            definition: components["schemas"]["GraphDefinition"];
+            /** Expected Revision */
+            expected_revision: number;
+            /** Project Id */
+            project_id?: string | null;
+            /** Title */
+            title: string;
+        };
+        /** Group */
+        Group: {
+            /** Execution Kind */
+            execution_kind?: ("media_image" | "media_video" | "software_code") | null;
+            /** Key */
+            key: string;
+            /** Leader Key */
+            leader_key?: string | null;
+            /** Node Keys */
+            node_keys?: string[];
+            /**
+             * Purpose
+             * @default
+             */
+            purpose: string;
+            /** Title */
+            title: string;
         };
         /**
          * GroupRespondRequest
@@ -26085,6 +27333,49 @@ export interface components {
             /** Warnings */
             warnings?: ("index_retry_pending" | "inventory_scan_failed")[];
         };
+        /** MediaInputPinDTO */
+        MediaInputPinDTO: {
+            /**
+             * Agent Run Id
+             * Format: uuid
+             */
+            agent_run_id: string;
+            /**
+             * Asset Revision Id
+             * Format: uuid
+             */
+            asset_revision_id: string;
+            /** Bytes Sha256 */
+            bytes_sha256: string;
+            /** Generation Run Hash */
+            generation_run_hash: string;
+            /**
+             * Generation Run Id
+             * Format: uuid
+             */
+            generation_run_id: string;
+            /**
+             * Output Id
+             * Format: uuid
+             */
+            output_id: string;
+            /** Output Provenance Hash */
+            output_provenance_hash: string;
+            /** Plan Hash */
+            plan_hash: string;
+            /**
+             * Plan Id
+             * Format: uuid
+             */
+            plan_id: string;
+            /** Revision Hash */
+            revision_hash: string;
+            /**
+             * Work Id
+             * Format: uuid
+             */
+            work_id: string;
+        };
         /** MediaOAuthCallbackResponse */
         MediaOAuthCallbackResponse: {
             credential?: components["schemas"]["MediaCredentialResponse"] | null;
@@ -27165,12 +28456,132 @@ export interface components {
             /** Text */
             text: string;
         };
+        /** ModelRolesChatSchema */
+        ModelRolesChatSchema: {
+            /** Allow Paid Fallback */
+            allow_paid_fallback: boolean;
+            /** Fallbacks */
+            fallbacks: (components["schemas"]["ModelRolesLLMRouteSchema"] | components["schemas"]["ModelRolesPoolRouteSchema"])[];
+        };
+        /** ModelRolesErrorResponse */
+        ModelRolesErrorResponse: {
+            /** Detail */
+            detail: string;
+        };
+        /** ModelRolesImageGenerationSchema */
+        ModelRolesImageGenerationSchema: {
+            primary: components["schemas"]["ModelRolesLLMRouteSchema"] | null;
+        };
+        /** ModelRolesLLMRouteSchema */
+        ModelRolesLLMRouteSchema: {
+            /** Effort */
+            effort: string | null;
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "llm";
+            /** Model */
+            model: string;
+            /** Provider */
+            provider: string;
+        };
+        /** ModelRolesPoolRouteSchema */
+        ModelRolesPoolRouteSchema: {
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "pool";
+            /** Pool Id */
+            pool_id: string;
+        };
+        /** ModelRolesRolesSchema */
+        ModelRolesRolesSchema: {
+            chat: components["schemas"]["ModelRolesChatSchema"];
+            image_generation: components["schemas"]["ModelRolesImageGenerationSchema"];
+        };
+        /** ModelRolesViewSchema */
+        ModelRolesViewSchema: {
+            /** Billing Classes */
+            billing_classes: {
+                [key: string]: "free" | "subscription" | "paid" | "local";
+            };
+            roles: components["schemas"]["ModelRolesRolesSchema"];
+            /** Version */
+            version: number;
+        };
         /** MoveRequest */
         MoveRequest: {
             /** Destination */
             destination: string;
             /** Source */
             source: string;
+        };
+        /** MuseAllowedAgentPayload */
+        MuseAllowedAgentPayload: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+        };
+        /** MuseCanonicalPair */
+        MuseCanonicalPair: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
+        };
+        /** MuseCanonicalUpdate */
+        MuseCanonicalUpdate: {
+            expected: components["schemas"]["MuseCanonicalPair"] | null;
+            pair: components["schemas"]["MuseCanonicalPair"];
+        };
+        /** NativeOutcomeRecoveryRequest */
+        NativeOutcomeRecoveryRequest: {
+            /** Expected Control Revision */
+            expected_control_revision: number;
+            /**
+             * Idempotency Key
+             * @description Validated request token; recovery identity is fixed per original delivery, regardless of this value.
+             */
+            idempotency_key: string;
+        };
+        /** Node */
+        Node: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Key */
+            key: string;
+            /** Revision Id */
+            revision_id?: string | null;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "coordinator" | "worker" | "reviewer";
+            /** Title */
+            title?: string | null;
+            /**
+             * X
+             * @default 0
+             */
+            x: number;
+            /**
+             * Y
+             * @default 0
+             */
+            y: number;
         };
         /** NodeCreateBody */
         NodeCreateBody: {
@@ -27329,9 +28740,9 @@ export interface components {
             billing_scope_id: string;
             /**
              * Credential Reference
-             * @enum {string}
+             * @constant
              */
-            credential_reference: "openai_api_key" | "free-team:openai-complimentary";
+            credential_reference: "openai_api_key";
             /** Eligible */
             eligible: boolean;
             /** Enrolled */
@@ -27370,6 +28781,26 @@ export interface components {
         OpenAIConfirmationRevokeRequest: {
             /** Expected Record Id */
             expected_record_id: string;
+        };
+        /** OpenAIProviderCircuitStatus */
+        OpenAIProviderCircuitStatus: {
+            /** Next Probe At */
+            next_probe_at?: string | null;
+            /**
+             * Probe Interval Minutes
+             * @default 15
+             */
+            probe_interval_minutes: number;
+            /** Provider Block Persistence */
+            provider_block_persistence: string | null;
+            /** Provider Block Reason Code */
+            provider_block_reason_code: string | null;
+            /** Provider Blocked */
+            provider_blocked: boolean;
+            /** Provider Blocked Until */
+            provider_blocked_until: string | null;
+            /** Provider Half Open */
+            provider_half_open: boolean;
         };
         /** OpenRouterLocalQuota */
         OpenRouterLocalQuota: {
@@ -27534,8 +28965,6 @@ export interface components {
         };
         /** OperationsExecutionRun */
         OperationsExecutionRun: {
-            /** Acting Subagent Id */
-            acting_subagent_id?: string | null;
             /** Elapsed Seconds */
             elapsed_seconds?: number | null;
             /** Ended At */
@@ -27546,6 +28975,7 @@ export interface components {
             id: string;
             /** Last Event At */
             last_event_at?: string | null;
+            legacy?: components["schemas"]["OperationsExecutionRunLegacy"] | null;
             /** Parent Run Id */
             parent_run_id?: string | null;
             /** Phase */
@@ -27562,6 +28992,18 @@ export interface components {
             work_item_attempt?: number | null;
             /** Work Item Id */
             work_item_id?: string | null;
+        };
+        /**
+         * OperationsExecutionRunLegacy
+         * @description Historical AgentRun pins; never a current route selector.
+         */
+        OperationsExecutionRunLegacy: {
+            /** Acting Subagent Id */
+            acting_subagent_id?: string | null;
+            /** Route Snapshot */
+            route_snapshot?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** OperationsExecutionSummary */
         OperationsExecutionSummary: {
@@ -27662,6 +29104,16 @@ export interface components {
             /** Updated At */
             updated_at?: string | null;
         };
+        /** OperationsSourceRefDTO */
+        OperationsSourceRefDTO: {
+            /**
+             * Opportunity Id
+             * Format: uuid
+             */
+            opportunity_id: string;
+            /** Source Snapshot Hash */
+            source_snapshot_hash: string;
+        };
         /** OperationsWorkExecutionResponse */
         OperationsWorkExecutionResponse: {
             /** Events */
@@ -27714,6 +29166,8 @@ export interface components {
             actions?: {
                 [key: string]: unknown;
             }[];
+            /** Ai Review Status */
+            ai_review_status?: string | null;
             /** Connection Id */
             connection_id?: string | null;
             /** Created At */
@@ -27757,6 +29211,8 @@ export interface components {
         };
         /** OpportunityResponse */
         OpportunityResponse: {
+            /** Ai Review Status */
+            ai_review_status?: string | null;
             /** Connection Id */
             connection_id?: string | null;
             /** Created At */
@@ -28507,6 +29963,83 @@ export interface components {
             /** Result */
             result: unknown;
         };
+        /** PersonalAgentOwnerAgentOut */
+        PersonalAgentOwnerAgentOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Agent Revision Id
+             * Format: uuid
+             */
+            agent_revision_id: string;
+            /** Display Name */
+            display_name: string;
+            /** Legacy */
+            legacy?: {
+                [key: string]: string;
+            } | null;
+            /**
+             * Profile Id
+             * @enum {string}
+             */
+            profile_id: "personal-firearms-admin" | "personal-ammunition-bookkeeper" | "personal-finance-reviewer" | "personal-career-planner";
+            /** Revision Version */
+            revision_version: number;
+            /**
+             * State
+             * @constant
+             */
+            state: "active";
+        };
+        /** PersonalAgentOwnerAgentSaveRequest */
+        PersonalAgentOwnerAgentSaveRequest: {
+            /** Display Name */
+            display_name: string;
+            /**
+             * Idempotency Key
+             * Format: uuid
+             */
+            idempotency_key: string;
+            /**
+             * Profile Id
+             * @enum {string}
+             */
+            profile_id: "personal-firearms-admin" | "personal-ammunition-bookkeeper" | "personal-finance-reviewer" | "personal-career-planner";
+        };
+        /** PersonalAgentOwnerAgentsOut */
+        PersonalAgentOwnerAgentsOut: {
+            /** Items */
+            items: components["schemas"]["PersonalAgentOwnerAgentOut"][];
+        };
+        /** PersonalAgentOwnerSessionOut */
+        PersonalAgentOwnerSessionOut: {
+            /** Agent Binding Updated At */
+            agent_binding_updated_at?: string | null;
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Character Name */
+            character_name: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Title */
+            title: string;
+            /** User Id */
+            user_id: string;
+        };
+        /** PersonalAgentOwnerSessionsOut */
+        PersonalAgentOwnerSessionsOut: {
+            /** Items */
+            items: components["schemas"]["PersonalAgentOwnerSessionOut"][];
+        };
         /** PersonalAgentProfileOut */
         PersonalAgentProfileOut: {
             /**
@@ -28583,6 +30116,22 @@ export interface components {
              * Format: uuid
              */
             idempotency_key: string;
+        };
+        /** PersonalDraftEvidenceItem */
+        PersonalDraftEvidenceItem: {
+            /**
+             * Evidence Ref
+             * Format: uuid
+             */
+            evidence_ref: string;
+            proposal: components["schemas"]["DraftProposal"];
+            /** Source Text */
+            source_text: string;
+        };
+        /** PersonalDraftEvidencePage */
+        PersonalDraftEvidencePage: {
+            /** Items */
+            items: components["schemas"]["PersonalDraftEvidenceItem"][];
         };
         /** PersonalDraftPage */
         PersonalDraftPage: {
@@ -28786,6 +30335,8 @@ export interface components {
         };
         /** PlannedAssignment */
         PlannedAssignment: {
+            /** Depends On */
+            depends_on?: string[];
             /** Input Keys */
             input_keys?: string[];
             /** Instruction */
@@ -28802,6 +30353,10 @@ export interface components {
              * @default 512
              */
             max_output_tokens: number;
+            /** Result Inputs */
+            result_inputs?: {
+                [key: string]: string;
+            };
             /** Reviewer Key */
             reviewer_key: string;
             /**
@@ -28815,7 +30370,7 @@ export interface components {
              * Work Role
              * @enum {string}
              */
-            work_role: "researcher" | "writer" | "data_worker" | "general_worker";
+            work_role: "researcher" | "writer" | "data_worker" | "general_worker" | "code_worker";
             /** Worker Key */
             worker_key: string;
         };
@@ -28832,7 +30387,7 @@ export interface components {
              */
             agent_revision_id: string;
             /** Allowed Work Roles */
-            allowed_work_roles?: ("researcher" | "writer" | "data_worker" | "general_worker")[];
+            allowed_work_roles?: ("researcher" | "writer" | "data_worker" | "general_worker" | "code_worker")[];
             /**
              * Can Delegate
              * @default false
@@ -28926,6 +30481,13 @@ export interface components {
              * @enum {string}
              */
             status: "active" | "paused";
+        };
+        /** PlatformAccountRefUpdateRequest */
+        PlatformAccountRefUpdateRequest: {
+            /** Account Ref */
+            account_ref: string;
+            /** Expected Version */
+            expected_version: number;
         };
         /** PlatformAccountRevisionCreateRequest */
         PlatformAccountRevisionCreateRequest: {
@@ -29739,6 +31301,68 @@ export interface components {
             /** Replacement Content */
             replacement_content: string;
         };
+        /** ProviderKeyAttestationRequest */
+        ProviderKeyAttestationRequest: {
+            /** Local Digest */
+            local_digest: string;
+            /** Provider Key Id Digest */
+            provider_key_id_digest: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "active" | "disabled" | "unknown";
+        };
+        /** ProviderKeyAttributionEntry */
+        ProviderKeyAttributionEntry: {
+            /** Health */
+            health: components["schemas"]["ProviderKeyHealth"][];
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "legacy" | "project" | "unknown";
+            /** Local Digest */
+            local_digest: string;
+            /** Masked Alias */
+            masked_alias: string;
+            /** Provider Key Id Digest */
+            provider_key_id_digest: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "active" | "disabled" | "unknown";
+            /** State Source */
+            state_source: string;
+        };
+        /** ProviderKeyAttributionResponse */
+        ProviderKeyAttributionResponse: {
+            /** Keys */
+            keys: components["schemas"]["ProviderKeyAttributionEntry"][];
+        };
+        /** ProviderKeyHealth */
+        ProviderKeyHealth: {
+            /**
+             * Attribution
+             * @enum {string}
+             */
+            attribution: "confirmed" | "unknown" | "conflict";
+            /** Consumer Id */
+            consumer_id: string;
+            /** Failure Count */
+            failure_count: number;
+            /** Last Failure At */
+            last_failure_at: string | null;
+            /** Last Failure Class */
+            last_failure_class: string | null;
+            /** Last Success At */
+            last_success_at: string | null;
+            /** Legacy Still In Use */
+            legacy_still_in_use: boolean;
+            /** Success Count */
+            success_count: number;
+        };
         /** ProviderRecoveryRequest */
         ProviderRecoveryRequest: {
             /** Expected Version */
@@ -30006,6 +31630,10 @@ export interface components {
             span_end: number;
             /** Span Start */
             span_start: number;
+        };
+        /** ReceiptRecoveryResponse */
+        ReceiptRecoveryResponse: {
+            video_plan: components["schemas"]["VideoPlanRecoveryResponse"];
         };
         /** ReceiptSourceOut */
         ReceiptSourceOut: {
@@ -31682,6 +33310,54 @@ export interface components {
             /** Space Id */
             space_id: string;
         };
+        /** StaleControlDeliveryTerminalizationRequest */
+        StaleControlDeliveryTerminalizationRequest: {
+            /**
+             * Dialogue Id
+             * Format: uuid
+             * @description CAS identity; must equal the dialogue_id path parameter
+             */
+            dialogue_id: string;
+            /**
+             * Expected Control Revision
+             * @description CAS value of the current Dialogue control_revision; the Delivery revision must be older
+             */
+            expected_control_revision: number;
+            /**
+             * Expected State
+             * @description The observed state of this exact Delivery
+             * @constant
+             */
+            expected_state: "pending";
+            /**
+             * Idempotency Key
+             * @description Owner-scoped key for one terminalization request
+             */
+            idempotency_key: string;
+        };
+        /** StaleControlDeliveryTerminalizationResponse */
+        StaleControlDeliveryTerminalizationResponse: {
+            /** Delivery Id */
+            delivery_id: string;
+            /** Dialogue Control Revision */
+            dialogue_control_revision: number;
+            /** Dialogue Id */
+            dialogue_id: string;
+            /** Expected Control Revision */
+            expected_control_revision: number;
+            /** Idempotent */
+            idempotent: boolean;
+            /** Previous State */
+            previous_state: string;
+            /** State */
+            state: string;
+            /** Success */
+            success: boolean;
+            /** Transport Work Item Id */
+            transport_work_item_id: string;
+            /** Transport Work State */
+            transport_work_state: string;
+        };
         /** StartDeepResearchPayload */
         StartDeepResearchPayload: {
             /** Client Request Id */
@@ -31725,6 +33401,104 @@ export interface components {
              * @enum {string}
              */
             strategy: "off" | "imozuru";
+        };
+        /** StockAdoptionRequest */
+        StockAdoptionRequest: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "adopt" | "withdraw";
+            /** Expected Content Item Hash */
+            expected_content_item_hash: string;
+            /** Expected Version */
+            expected_version: number;
+        };
+        /** StockFindingEvidenceResponse */
+        StockFindingEvidenceResponse: {
+            /** Snapshot Hash */
+            snapshot_hash?: string | null;
+            /** Snapshot Id */
+            snapshot_id?: string | null;
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "url" | "metric_snapshot";
+            /** Url */
+            url?: string | null;
+        };
+        /** StockFindingResponse */
+        StockFindingResponse: {
+            /** Evidence */
+            evidence?: components["schemas"]["StockFindingEvidenceResponse"][];
+            /** Id */
+            id: string;
+            /** Kind */
+            kind: string;
+            /** Statement */
+            statement: string;
+        };
+        /** StockItemResponse */
+        StockItemResponse: {
+            /** Blockers */
+            blockers?: string[];
+            /** Brand Name */
+            brand_name: string;
+            /** Brief */
+            brief: string;
+            /** Content Hash */
+            content_hash: string;
+            /** Findings */
+            findings?: components["schemas"]["StockFindingResponse"][];
+            /** Id */
+            id: string;
+            latest_decision?: components["schemas"]["ContentItemStockDecisionResponse"] | null;
+            /** Owner User Id */
+            owner_user_id: string;
+            /** Project Id */
+            project_id?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "draft" | "ready" | "in_progress" | "published" | "archived";
+            /**
+             * Stock Status
+             * @enum {string}
+             */
+            stock_status: "adopted" | "awaiting_adoption" | "needs_review";
+            /** Title */
+            title: string;
+            /** Variants */
+            variants?: components["schemas"]["StockVariantResponse"][];
+            /** Version */
+            version: number;
+        };
+        /** StockSelectedOutputResponse */
+        StockSelectedOutputResponse: {
+            /** Generation Output Id */
+            generation_output_id: string;
+            /** Sha256 */
+            sha256: string;
+        };
+        /** StockVariantResponse */
+        StockVariantResponse: {
+            /** Blockers */
+            blockers?: string[];
+            /** Id */
+            id: string;
+            platform: components["schemas"]["MediaPlatform"];
+            /** Qa Result */
+            qa_result?: string | null;
+            /** Revision Hash */
+            revision_hash?: string | null;
+            /** Revision Id */
+            revision_id?: string | null;
+            /** Rights Result */
+            rights_result?: string | null;
+            /** Selected Outputs */
+            selected_outputs?: components["schemas"]["StockSelectedOutputResponse"][];
         };
         /** StoredArtifactPersonaResourceProvenance */
         StoredArtifactPersonaResourceProvenance: {
@@ -31865,6 +33639,19 @@ export interface components {
             assignment_role: "owner" | "executor" | "reviewer" | "observer";
             /** Task Id */
             task_id: string;
+        };
+        /** TaskAttachmentLookupResponse */
+        TaskAttachmentLookupResponse: {
+            /** Attachment Id */
+            attachment_id: string;
+            /** Display Name */
+            display_name: string;
+            /** Project Id */
+            project_id: string;
+            /** Task Id */
+            task_id: string;
+            /** Url */
+            url: string;
         };
         /** TaskCommentPayload */
         TaskCommentPayload: {
@@ -32028,92 +33815,20 @@ export interface components {
             /** Target Url */
             target_url?: string | null;
         };
-        /** TelephonyRouteCreate */
-        TelephonyRouteCreate: {
+        /** TeamGraphRef */
+        TeamGraphRef: {
             /**
-             * Agent Id
+             * Graph Id
              * Format: uuid
              */
-            agent_id: string;
+            graph_id: string;
+            /** Group Key */
+            group_key: string;
             /**
-             * Agent Revision Id
+             * Revision Id
              * Format: uuid
              */
-            agent_revision_id: string;
-            /** Business Hours Json */
-            business_hours_json?: {
-                [key: string]: unknown;
-            };
-            /**
-             * Connection Id
-             * Format: uuid
-             */
-            connection_id: string;
-            /** Display Name */
-            display_name: string;
-            /**
-             * Fallback Mode
-             * @default reject
-             * @constant
-             */
-            fallback_mode: "reject";
-            /**
-             * Greeting Override
-             * @default
-             */
-            greeting_override: string;
-            /** Idempotency Key */
-            idempotency_key: string;
-            /** Provider Route Ref */
-            provider_route_ref: string;
-            /**
-             * Timezone
-             * @default Asia/Tokyo
-             */
-            timezone: string;
-            /** Transfer Policy Json */
-            transfer_policy_json?: {
-                [key: string]: unknown;
-            };
-        };
-        /** TelephonyRoutePatch */
-        TelephonyRoutePatch: {
-            /** Agent Id */
-            agent_id?: string | null;
-            /** Agent Revision Id */
-            agent_revision_id?: string | null;
-            /** Business Hours Json */
-            business_hours_json?: {
-                [key: string]: unknown;
-            } | null;
-            /** Connection Id */
-            connection_id?: string | null;
-            /** Display Name */
-            display_name?: string | null;
-            /** Expected Version */
-            expected_version: number;
-            /** Fallback Mode */
-            fallback_mode?: "reject" | null;
-            /** Greeting Override */
-            greeting_override?: string | null;
-            /** Provider Route Ref */
-            provider_route_ref?: string | null;
-            /** Timezone */
-            timezone?: string | null;
-            /** Transfer Policy Json */
-            transfer_policy_json?: {
-                [key: string]: unknown;
-            } | null;
-        };
-        /** TelephonyRouteState */
-        TelephonyRouteState: {
-            /** Expected Version */
-            expected_version: number;
-            /**
-             * State
-             * @enum {string}
-             */
-            state: "draft" | "active" | "paused" | "retired";
+            revision_id: string;
         };
         /** TikTokContentPayload */
         TikTokContentPayload: {
@@ -32762,6 +34477,22 @@ export interface components {
             /** User Input */
             user_input: string;
         };
+        /** VideoPlanRecoveryResponse */
+        VideoPlanRecoveryResponse: {
+            /** Plan Checksum */
+            plan_checksum?: string | null;
+            /** Plan Status */
+            plan_status?: ("draft" | "previewed" | "validated" | "applied" | "queued" | "failed") | null;
+            /** Reason Code */
+            reason_code?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "found" | "not_found_or_scope_mismatch" | "unavailable" | "failed" | "uncertain";
+            /** Video Plan Id */
+            video_plan_id?: string | null;
+        };
         /**
          * VoiceAssetOrderRequest
          * @description 登録済み asset id の新しい順序。
@@ -33065,10 +34796,13 @@ export interface components {
              */
             kind: "task" | "opportunity" | "content_item";
         };
-        /** WorkRunRead */
-        WorkRunRead: {
+        /** WorkRunLegacy */
+        WorkRunLegacy: {
             /** Acting Subagent Id */
             acting_subagent_id?: string | null;
+        };
+        /** WorkRunRead */
+        WorkRunRead: {
             /** Agent Display Name */
             agent_display_name?: string | null;
             /** Agent Id */
@@ -33087,6 +34821,7 @@ export interface components {
             last_recorded_phase?: string | null;
             /** Last Recorded Phase At */
             last_recorded_phase_at?: string | null;
+            legacy?: components["schemas"]["WorkRunLegacy"] | null;
             /** Parent Run Id */
             parent_run_id: string | null;
             /** Started At */
@@ -33151,6 +34886,18 @@ export interface components {
             /** Text */
             text: string;
         };
+        /** YouTubeChannelSlotUpdateRequest */
+        YouTubeChannelSlotUpdateRequest: {
+            /**
+             * Activate
+             * @default false
+             */
+            activate: boolean;
+            /** Channel Id */
+            channel_id: string;
+            /** Expected Version */
+            expected_version: number;
+        };
         /** YouTubeContentPayload */
         YouTubeContentPayload: {
             /** Audience */
@@ -33208,6 +34955,20 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Restart was rejected because Chat is active or a restart is pending */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Restart was rejected because busy state could not be verified */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -33928,6 +35689,101 @@ export interface operations {
                     };
                 };
             };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recover_native_outcome_api_agent_dialogues__dialogue_id__deliveries__delivery_id__recover_native_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dialogue_id: string;
+                delivery_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeOutcomeRecoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Native outcome cannot be safely recovered */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    terminalize_stale_control_delivery_api_agent_dialogues__dialogue_id__deliveries__delivery_id__terminalize_stale_control_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dialogue_id: string;
+                delivery_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StaleControlDeliveryTerminalizationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StaleControlDeliveryTerminalizationResponse"];
+                };
+            };
+            /** @description Delivery is not proven safe to terminalize */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -33966,6 +35822,13 @@ export interface operations {
                     };
                 };
             };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -34001,6 +35864,13 @@ export interface operations {
                     };
                 };
             };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -34035,6 +35905,13 @@ export interface operations {
                         [key: string]: unknown;
                     };
                 };
+            };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -34276,7 +36153,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AgentRevisionEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -34678,7 +36555,73 @@ export interface operations {
             };
         };
     };
-    get_agent_team_config_api_agent_team_config_get: {
+    list_graphs_api_agent_team_graphs_get: {
+        parameters: {
+            query?: {
+                include_archived?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_api_agent_team_graphs_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "Idempotency-Key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_default_api_agent_team_graphs_default_configuration_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -34698,7 +36641,201 @@ export interface operations {
             };
         };
     };
-    update_agent_team_config_api_agent_team_config_put: {
+    put_default_api_agent_team_graphs_default_configuration_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DefaultGraphUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_graph_api_agent_team_graphs__graph_id__get: {
+        parameters: {
+            query?: {
+                revision_id?: string | null;
+            };
+            header?: never;
+            path: {
+                graph_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_api_agent_team_graphs__graph_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    archive_api_agent_team_graphs__graph_id__archive_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    restore_api_agent_team_graphs__graph_id__restore_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revisions_api_agent_team_graphs__graph_id__revisions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphRevisionsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_agent_tools_catalog_api_agent_tools_catalog_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -34713,7 +36850,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AgentToolCatalogResponse"];
                 };
             };
         };
@@ -34771,6 +36908,13 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            /** @description Admin restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     tick_api_agent_work_tick_post: {
@@ -34790,6 +36934,13 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Admin restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -34910,6 +37061,13 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            /** @description Admin restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -34939,7 +37097,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AgentIdentityListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -35176,42 +37334,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_agent_runtime_execution_profiles_api_agents__agent_id__execution_profiles_get: {
-        parameters: {
-            query?: {
-                agent_revision_id?: string | null;
-                session_id?: string | null;
-                project_id?: string | null;
-                working_directory?: string | null;
-            };
-            header?: never;
-            path: {
-                agent_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentRuntimeProfileCatalogResponse"];
                 };
             };
             /** @description Validation Error */
@@ -35620,7 +37742,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AgentRevisionListEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -35657,7 +37779,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AgentRevisionEnvelope"];
                 };
             };
             /** @description Validation Error */
@@ -40565,6 +42687,37 @@ export interface operations {
             };
         };
     };
+    get_conversation_delegation_map_api_conversations__session_id__delegation_map_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DelegationMapResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     dispatch_conversation_message_api_conversations__session_id__dispatch_post: {
         parameters: {
             query?: never;
@@ -40588,6 +42741,13 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -40787,6 +42947,13 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -40924,6 +43091,13 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description Conversation restart admission is closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -44140,6 +46314,26 @@ export interface operations {
             };
         };
     };
+    reset_openai_provider_circuit_route_api_free_team_openai_provider_circuit_reset_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OpenAIProviderCircuitStatus"];
+                };
+            };
+        };
+    };
     get_openrouter_quota_api_free_team_openrouter_quota_get: {
         parameters: {
             query?: never;
@@ -44231,6 +46425,39 @@ export interface operations {
             };
         };
     };
+    reconcile_reservation_api_free_team_reservations_reconcile_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FreeTeamReservationReconciliationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FreeTeamReservationReconciliationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_settings_api_free_team_settings_get: {
         parameters: {
             query?: never;
@@ -44286,7 +46513,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["FreeTeamUsageResponse"];
                 };
             };
         };
@@ -46266,77 +48493,6 @@ export interface operations {
             };
         };
     };
-    get_execution_profiles_api_llm_execution_profiles_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    put_execution_profiles_api_llm_execution_profiles_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    activate_execution_profile_route_api_llm_execution_profiles__profile_id__activate_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                profile_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     get_llama_cpp_model_root_api_llm_llama_cpp_model_root_get: {
         parameters: {
             query?: never;
@@ -47962,6 +50118,112 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_model_roles_api_model_roles_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesViewSchema"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesErrorResponse"];
+                };
+            };
+        };
+    };
+    put_model_roles_api_model_roles_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    expected_version: number;
+                    roles: components["schemas"]["ModelRolesRolesSchema"];
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesViewSchema"];
+                };
+            };
+            /** @description Invalid JSON payload or model role settings */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesErrorResponse"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesErrorResponse"];
+                };
+            };
+            /** @description Administrator privileges required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesErrorResponse"];
+                };
+            };
+            /** @description The expected model_roles version is stale */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "detail": "model_roles_version_conflict"
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ModelRolesErrorResponse"];
+                };
+            };
+            /** @description The model_roles setting could not be persisted */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelRolesErrorResponse"];
                 };
             };
         };
@@ -50715,6 +52977,43 @@ export interface operations {
             };
         };
     };
+    media_change_content_item_stock_adoption: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                content_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StockAdoptionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContentItemStockDecisionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     media_create_content_item_variant: {
         parameters: {
             query?: never;
@@ -53271,6 +55570,43 @@ export interface operations {
             };
         };
     };
+    media_update_platform_account_ref: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlatformAccountRefUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformAccountDetailResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     media_operations_save_bridge_connection: {
         parameters: {
             query?: never;
@@ -53728,6 +56064,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlatformAccountRevisionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    media_update_youtube_channel_slot: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["YouTubeChannelSlotUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformAccountDetailResponse"];
                 };
             };
             /** @description Validation Error */
@@ -54837,6 +57210,38 @@ export interface operations {
             };
         };
     };
+    media_list_content_item_stock: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StockItemResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_opportunities_api_operations_opportunities_get: {
         parameters: {
             query?: {
@@ -54938,6 +57343,41 @@ export interface operations {
             };
         };
     };
+    adopt_delegation_artifact_api_operations_opportunities__opportunity_id__adopt_delegation_artifact_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                opportunity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DelegationArtifactAdoptionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArtifactResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     resolve_development_requirements_api_operations_opportunities__opportunity_id__development_requirements_post: {
         parameters: {
             query?: never;
@@ -54950,6 +57390,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["DevelopmentRequirementsResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OpportunityResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_development_api_operations_opportunities__opportunity_id__development_retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                opportunity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DevelopmentRetryRequest"];
             };
         };
         responses: {
@@ -55437,6 +57912,125 @@ export interface operations {
             };
         };
     };
+    list_owner_agents_api_personal_agents_owner_agent_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAgentOwnerAgentsOut"];
+                };
+            };
+        };
+    };
+    create_owner_agent_api_personal_agents_owner_agent_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalAgentOwnerAgentSaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAgentOwnerAgentOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_owner_agent_sessions_api_personal_agents_owner_agent_sessions_get: {
+        parameters: {
+            query: {
+                profile_id: "personal-firearms-admin" | "personal-ammunition-bookkeeper" | "personal-finance-reviewer" | "personal-career-planner";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAgentOwnerSessionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_owner_agent_api_personal_agents_owner_agent__agent_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalAgentOwnerAgentSaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalAgentOwnerAgentOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_profiles_api_personal_agents_profiles_get: {
         parameters: {
             query?: never;
@@ -55802,6 +58396,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PersonalDraftProposalResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_unproposed_evidence_api_personal_drafts_evidence_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalDraftEvidencePage"];
                 };
             };
             /** @description Validation Error */
@@ -58815,6 +61440,74 @@ export interface operations {
             };
         };
     };
+    turn_api_remote_llm_consumers_turns_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConsumerTurnRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsumerTurnResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_turn_api_remote_llm_consumers_turns__consumer_app___provider___operation_id__get: {
+        parameters: {
+            query?: {
+                after?: string | null;
+            };
+            header?: never;
+            path: {
+                consumer_app: "73" | "86";
+                provider: "muse" | "grok_bot";
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsumerTurnResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_remote_servers_api_remote_servers_get: {
         parameters: {
             query?: never;
@@ -60348,6 +63041,92 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["SettingsPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_muse_allowed_agent_api_settings_remote_targets_muse_allowed_agents_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MuseAllowedAgentPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_muse_canonical_agent_api_settings_remote_targets_muse_canonical_agent_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    put_muse_canonical_agent_api_settings_remote_targets_muse_canonical_agent_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MuseCanonicalUpdate"];
             };
         };
         responses: {
@@ -62757,6 +65536,37 @@ export interface operations {
             };
         };
     };
+    lookup_task_attachment_api_task_attachments__attachment_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                attachment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskAttachmentLookupResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_occurrences_api_task_occurrences_get: {
         parameters: {
             query?: never;
@@ -63916,315 +66726,6 @@ export interface operations {
             };
         };
     };
-    calls_api_telephony_calls_get: {
-        parameters: {
-            query?: {
-                route_id?: string | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    call_api_telephony_calls__call_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                call_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    catalog_api_telephony_catalog_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    routes_api_telephony_routes_get: {
-        parameters: {
-            query?: {
-                agent_id?: string | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    create_api_telephony_routes_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TelephonyRouteCreate"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_api_telephony_routes__route_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                route_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    patch_api_telephony_routes__route_id__patch: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                route_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TelephonyRoutePatch"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    readiness_api_telephony_routes__route_id__readiness_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                route_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    state_api_telephony_routes__route_id__state_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                route_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TelephonyRouteState"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    webhook_api_telephony_webhooks_openai__connection_id__post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                connection_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_time_entries_api_time_entries_get: {
         parameters: {
             query?: never;
@@ -65028,6 +67529,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_provider_key_attribution_api_usage_provider_keys_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderKeyAttributionResponse"];
+                };
+            };
+        };
+    };
+    attest_provider_key_api_usage_provider_keys_attestation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderKeyAttestationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderKeyAttributionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

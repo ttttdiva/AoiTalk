@@ -648,22 +648,42 @@ class ConversationMixin:
             service = AgentDialogueTransport(
                 getattr(self, "_db_manager", None),
                 dispatch_bridge=bridge,
+                config=getattr(self, "config", None),
             )
         self._agent_dialogue_transport_service_instance = service
         return service
 
+    def _log_dialogue_transport_recovery_failure(self, stage: str, error_class: str) -> None:
+        # One bounded diagnostic per fixed stage; never log exception text or SQL.
+        reported = getattr(self, "_dialogue_transport_failure_stages", None)
+        if reported is None:
+            reported = self._dialogue_transport_failure_stages = set()
+        if stage in reported:
+            return
+        reported.add(stage)
+        safe_class = "".join(c for c in error_class[:80] if c.isascii() and (c.isalnum() or c == "_"))
+        logger.warning("AgentDialogue transport recovery failed stage=%s class=%s", stage, safe_class or "Unknown")
+
     async def _recover_agent_dialogue_transports_once(self, *, limit: int = 16) -> int:
         """Handoff due AgentDialogue Work through the existing recovery tick."""
 
+        stage = "service"
         try:
             service = self._agent_dialogue_transport_service()
+            stage = "contract"
             coordinator = getattr(service, "coordinator", None)
             claim_transport = getattr(coordinator, "claim_transport", None)
             handoff = getattr(service, "handoff", None)
             if not callable(claim_transport) or not callable(handoff):
+                self._log_dialogue_transport_recovery_failure(stage, "MissingCallable")
                 return 0
+            stage = "claim"
             claims = await claim_transport(limit=max(1, min(int(limit), 64)))
+            if not getattr(self, "_dialogue_transport_first_poll_logged", False):
+                logger.info("AgentDialogue transport first claim poll completed count=%d", len(claims))
+                self._dialogue_transport_first_poll_logged = True
         except Exception as exc:
+            self._log_dialogue_transport_recovery_failure(stage, type(exc).__name__)
             # Rolling deployments can start before the dialogue migration is
             # present. Preserve normal ConversationDispatch recovery and let a
             # later tick retry the typed lane.
@@ -673,7 +693,6 @@ class ConversationMixin:
                 return 0
             if _is_transient_conversation_dispatch_error(exc):
                 raise
-            logger.debug("AgentDialogue transport recovery is unavailable", exc_info=True)
             return 0
         recovered = 0
         for claim in claims:
@@ -726,6 +745,36 @@ class ConversationMixin:
                 if _is_transient_conversation_dispatch_error(exc):
                     raise
                 logger.debug("AgentDialogue terminal receipt recovery unavailable", exc_info=True)
+        work_coordinator = getattr(self, "_agent_work_coordinator", None)
+        task_service = getattr(work_coordinator, "_agent_task_service", None)
+        if task_service is not None:
+            try:
+                from ...services.agent_team_media_completion import reconcile_team_media_completion
+
+                recovered += int(await reconcile_team_media_completion(service, task_service, limit=limit))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Team media completion recovery unavailable", exc_info=True)
+        reconcile_stale_controls = getattr(
+            service,
+            "reconcile_stale_control_deliveries",
+            None,
+        )
+        if callable(reconcile_stale_controls):
+            try:
+                recovered += int(
+                    await reconcile_stale_controls(limit=max(1, min(int(limit), 64)))
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if _is_transient_conversation_dispatch_error(exc):
+                    raise
+                logger.debug(
+                    "AgentDialogue stale control terminalization recovery unavailable",
+                    exc_info=True,
+                )
         return recovered
 
     async def _record_agent_dialogue_terminal_callback(self, data: Mapping[str, Any]) -> None:
@@ -1009,6 +1058,13 @@ class ConversationMixin:
             if agent_run_id:
                 active_run_ids.discard(agent_run_id)
             raise
+        session_id = data.get("session_id")
+        if session_id is not None:
+            try:
+                setattr(task, "_conversation_session_id", str(session_id).strip())
+            except Exception:
+                # Drain classification fails safe when a task cannot be tagged.
+                pass
         self._conversation_dispatch_tasks.add(task)
         lifecycle = data.get("_dispatch_delivery_lifecycle")
         if isinstance(lifecycle, dict):
@@ -1561,6 +1617,25 @@ class ConversationMixin:
     def _conversation_control_key(self, session_id: Optional[str]) -> str:
         session_key = str(session_id or "").strip()
         return session_key or "__default__"
+
+    def _remember_background_worker_session(
+        self, session_id: Any, context: Any
+    ) -> bool:
+        """Cache only a persisted, explicit worker marker for drain inspection."""
+        session_key = str(session_id or "").strip()
+        if not session_key:
+            return False
+        sessions = getattr(self, "_background_worker_session_ids", None)
+        if not isinstance(sessions, set):
+            sessions = set()
+            self._background_worker_session_ids = sessions
+        if isinstance(context, dict) and context.get("background_worker") is True:
+            sessions.add(session_key)
+            return True
+        # Explicit non-worker or malformed context revokes any stale cache
+        # entry. Unclassified tasks continue to hold the drain.
+        sessions.discard(session_key)
+        return False
 
     def _generation_status_key(self, session_id: Optional[str]) -> str:
         return self._conversation_control_key(session_id)
@@ -2858,6 +2933,10 @@ class ConversationMixin:
                 if handle is None:
                     continue
                 task = asyncio.create_task(finalize_after_late_drain(run_id, handle))
+                try:
+                    setattr(task, "_conversation_session_id", str(session_id or "").strip())
+                except Exception:
+                    pass
                 late_finalize_tasks.add(task)
                 task.add_done_callback(late_finalize_tasks.discard)
         agent_run_id = requested_run_id or (

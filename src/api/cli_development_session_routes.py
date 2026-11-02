@@ -13,17 +13,23 @@ configuration, while mutating/read endpoints fail closed with ``409``.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
 import os
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from ..services.cli_development_sessions import cli_development_policy
+
+
+logger = logging.getLogger(__name__)
 
 
 CLIProvider = Literal[
@@ -107,9 +113,6 @@ class CLIDevelopmentSessionCreateRequest(BaseModel):
     permission_mode: PermissionMode | None = None
     # Omitted keeps the legacy full ceiling; an explicit list may only narrow it.
     allowed_capabilities: list[CLICapability] | None = Field(default=None, min_length=1, max_length=3)
-    # Omitted/null keeps the AgentRevision default runtime; an explicit id
-    # selects a server-validated ExecutionProfile (never a role change).
-    execution_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
     # Omitted remains the historical raw provider invocation.  The managed UI
     # must opt into Agent role delivery explicitly.
     role_context_mode: RoleContextMode | None = None
@@ -143,6 +146,9 @@ class CLIDevelopmentSessionMessageRequest(BaseModel):
 
     message: str = Field(..., min_length=1, max_length=100_000)
     idempotency_key: str = Field(..., min_length=1, max_length=128)
+    # Explicit owner opt-in to the bounded, separately-authorized Muse local
+    # tool loop. This flag carries no tool/path/argv authority by itself.
+    muse_tool_loop_opt_in: StrictBool = False
 
 
 class CLIDevelopmentSessionCollectRequest(BaseModel):
@@ -151,6 +157,31 @@ class CLIDevelopmentSessionCollectRequest(BaseModel):
     cursors: dict[str, str] = Field(default_factory=dict, max_length=200)
     session_ids: list[str] | None = Field(default=None, max_length=200)
     limit_per_session: int = Field(default=100, ge=1, le=500)
+
+
+class MuseScopeApprovalRequest(BaseModel):
+    """Explicit administrative approval; identity/root/command are server-owned.
+
+    ``readonly`` is opt-in and defaults to the historical writable approval
+    contract.  Readonly approvals intentionally omit pytest configuration.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    files: dict[str, Literal["read", "read_edit"]] = Field(min_length=1, max_length=16)
+    readonly: StrictBool = False
+    pytest_target: str | None = Field(default=None, min_length=1, max_length=260)
+
+    @model_validator(mode="after")
+    def validate_scope_mode(self) -> "MuseScopeApprovalRequest":
+        if self.readonly:
+            if self.pytest_target is not None:
+                raise ValueError("readonly approvals do not accept pytest_target")
+            if any(mode != "read" for mode in self.files.values()):
+                raise ValueError("readonly approvals require read-only files")
+        elif self.pytest_target is None:
+            raise ValueError("writable approvals require pytest_target")
+        return self
 
 
 class _CLIResponse(BaseModel):
@@ -495,6 +526,116 @@ async def _invoke(service: Any, operation: str, **kwargs: Any) -> Any:
     return await _maybe(method(**kwargs))
 
 
+def _exception_type_name(exc: BaseException) -> str:
+    return f"{type(exc).__module__}.{type(exc).__name__}"[:160]
+
+
+async def _begin_remote_reconnect_receipt(
+    service: Any,
+    session_id: str,
+    owner_id: str,
+) -> str | None:
+    """Persist the started receipt before the 202 ack; never blocks the ack."""
+
+    method = getattr(service, "begin_remote_reconnect_receipt", None)
+    if not callable(method):
+        return None
+    try:
+        receipt = await _maybe(method(session_id, owner_id=owner_id))
+    except Exception as exc:
+        logger.error(
+            "CLI remote reconnect receipt start failed; exception_type=%s",
+            _exception_type_name(exc),
+        )
+        return None
+    attempt_id = receipt.get("attempt_id") if isinstance(receipt, Mapping) else None
+    return str(attempt_id) if attempt_id else None
+
+
+async def _complete_remote_reconnect_receipt(
+    service: Any,
+    session_id: str,
+    owner_id: str,
+    attempt_id: str | None,
+    outcome: str,
+    *,
+    result: Any = None,
+    error: BaseException | None = None,
+) -> None:
+    method = getattr(service, "complete_remote_reconnect_receipt", None)
+    if not attempt_id or not callable(method):
+        return
+    try:
+        await _maybe(
+            method(
+                session_id,
+                owner_id=owner_id,
+                attempt_id=attempt_id,
+                outcome=outcome,
+                result=result,
+                error=error,
+            )
+        )
+    except Exception as exc:
+        # The receipt stays ``started``; a persistence failure is never
+        # reported as a successful reconnect.
+        logger.error(
+            "CLI remote reconnect receipt completion failed; outcome=%s exception_type=%s",
+            outcome,
+            _exception_type_name(exc),
+        )
+
+
+async def _run_remote_reconnect_background(
+    service: Any,
+    session_id: str,
+    owner_id: str,
+    attempt_id: str | None = None,
+) -> None:
+    """Run slow provider-history reconciliation after the HTTP ack is sent.
+
+    The service result is recorded in the bounded reconnect receipt instead
+    of being discarded; the receipt is observation only.
+    """
+
+    try:
+        result = await _invoke(
+            service,
+            "reconnect",
+            session_id=session_id,
+            owner_id=owner_id,
+        )
+    except asyncio.CancelledError as exc:
+        await _complete_remote_reconnect_receipt(
+            service, session_id, owner_id, attempt_id, "cancelled", error=exc
+        )
+        raise
+    except Exception as exc:
+        frames = traceback.extract_tb(exc.__traceback__)
+        frame_summary = ",".join(
+            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            for frame in frames[-8:]
+        )
+        cause = exc.__cause__
+        logger.error(
+            "CLI remote reconnect background failed; exception_type=%s cause_type=%s frames=%s",
+            _exception_type_name(exc),
+            (
+                f"{type(cause).__module__}.{type(cause).__name__}"[:160]
+                if cause is not None
+                else "none"
+            ),
+            frame_summary[:1200],
+        )
+        await _complete_remote_reconnect_receipt(
+            service, session_id, owner_id, attempt_id, "failed", error=exc
+        )
+        return
+    await _complete_remote_reconnect_receipt(
+        service, session_id, owner_id, attempt_id, "completed", result=result
+    )
+
+
 def _as_mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
@@ -543,6 +684,7 @@ _COLLECT_HEADER_FIELDS = (
     "native_state",
     "run_id",
     "work_item_id",
+    "remote_reconnect",
 )
 
 
@@ -823,6 +965,101 @@ def create_cli_development_session_router(
         except Exception as exc:
             return _error_response(exc)
 
+    async def _muse_scope_mutation(
+        session_id: str, request: Request, *,
+        approval: MuseScopeApprovalRequest | None = None, scope_id: str | None = None,
+    ) -> Any:
+        from ..services.cli_development_sessions import (
+            _assert_route, _binding_value,
+        )
+        from ..services.cli_session_work_adapter import muse_authorized_scope_identity
+        from ..services.muse_authorized_scope import MuseAuthorizedScopeError
+        from ..services.muse_authorized_scope_store import (
+            MuseAuthorizedScopeStore, MuseAuthorizedScopeStoreError,
+        )
+
+        owner = await _owner(request)
+        candidate = _require_service()
+        try:
+            sid = str(UUID(session_id))
+            if scope_id is not None:
+                scope_id = str(UUID(scope_id))
+        except ValueError:
+            raise MuseAuthorizedScopeStoreError("muse_scope_identifier_invalid", 422) from None
+        db = await candidate._session()
+        try:
+            row = await candidate._locked_owned_session_row(db, sid, owner["owner_id"])
+            context = candidate._context(row)
+            binding = await candidate._binding_for_row(db, row)
+            binding_id = str(_binding_value(binding, "binding_id") or "")
+            binding_hash = str(_binding_value(binding, "snapshot_hash") or "")
+            agent_id = str(_binding_value(binding, "agent_id") or "")
+            revision_id = str(_binding_value(binding, "agent_revision_id") or "")
+            if (
+                context.get("provider") != "muse-remote"
+                or context.get("admission_state") != "ready"
+                or str(_binding_value(binding, "session_id") or "") != sid
+                or str(row.agent_id or "") != agent_id
+                or context.get("agent_id") != agent_id
+                or context.get("agent_revision_id") != revision_id
+                or not binding_id or context.get("binding_id") != binding_id
+                or not binding_hash or context.get("binding_snapshot_hash") != binding_hash
+            ):
+                raise MuseAuthorizedScopeStoreError("muse_scope_binding_invalid")
+            candidate._assert_remote_admission(owner_id=owner["owner_id"], agent_id=agent_id)
+            route = _assert_route(binding, provider="muse-remote", model=None, effort=None)
+            if context.get("route") != route:
+                raise MuseAuthorizedScopeStoreError("muse_scope_binding_invalid")
+            identity = muse_authorized_scope_identity(
+                owner_id=owner["owner_id"], agent_id=agent_id, revision_id=revision_id,
+                binding_snapshot_hash=binding_hash,
+            )
+            if identity is None:
+                raise MuseAuthorizedScopeStoreError("muse_scope_binding_invalid")
+            store = MuseAuthorizedScopeStore()
+            if approval is not None:
+                result = await store.approve(
+                    db, identity=identity, session_id=sid, binding_id=binding_id,
+                    files=approval.files, pytest_target=approval.pytest_target,
+                    readonly=approval.readonly,
+                )
+            else:
+                result = await store.revoke(db, identity=identity, scope_id=scope_id)
+            await db.commit()
+            return {"success": True, **result}
+        except MuseAuthorizedScopeError:
+            await db.rollback()
+            raise MuseAuthorizedScopeStoreError("muse_scope_approval_invalid", 422) from None
+        except BaseException:
+            await db.rollback()
+            raise
+        finally:
+            await candidate._close(db)
+
+    @router.post("/{session_id}/muse-authorized-scopes", include_in_schema=False)
+    async def approve_muse_scope(
+        session_id: str, body: MuseScopeApprovalRequest, request: Request,
+    ) -> Any:
+        try:
+            return await _muse_scope_mutation(session_id, request, approval=body)
+        except Exception as exc:
+            if isinstance(exc, HTTPException) or getattr(exc, "code", None) is not None:
+                return _error_response(exc)
+            return _error_response(CLIDevelopmentSessionRouteError(
+                "muse_scope_store_unavailable", "Muse scope approval is unavailable", 503,
+            ))
+
+    @router.post("/{session_id}/muse-authorized-scopes/{scope_id}/revoke", include_in_schema=False)
+    async def revoke_muse_scope(session_id: str, scope_id: str, request: Request) -> Any:
+        try:
+            return await _muse_scope_mutation(session_id, request, scope_id=scope_id)
+        except Exception as exc:
+            if isinstance(exc, HTTPException) or getattr(exc, "code", None) is not None:
+                return _error_response(exc)
+            return _error_response(CLIDevelopmentSessionRouteError(
+                "muse_scope_store_unavailable", "Muse scope approval is unavailable", 503,
+            ))
+
     @router.post("/{session_id}/messages", status_code=202, response_model=CLIDevelopmentSessionResponse)
     async def send_cli_development_session_message(
         session_id: str,
@@ -839,6 +1076,7 @@ def create_cli_development_session_router(
                 request={
                     "content": body.message,
                     "send_key": body.idempotency_key,
+                    "muse_tool_loop_opt_in": body.muse_tool_loop_opt_in,
                 },
             )
             return JSONResponse(status_code=202, content={"success": True, "accepted": True, **_session_projection(result)})
@@ -899,8 +1137,46 @@ def create_cli_development_session_router(
             return _error_response(exc)
 
     @router.post("/{session_id}/reconnect", status_code=202, response_model=CLIDevelopmentSessionActionResponse)
-    async def reconnect_cli_development_session(session_id: str, request: Request) -> JSONResponse:
+    async def reconnect_cli_development_session(
+        session_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> JSONResponse:
         try:
+            current = _session_projection(
+                await _call("get", request, session_id=session_id)
+            )
+            if str(current.get("provider") or "").strip().casefold() == "muse-remote":
+                owner = await _owner(request)
+                service = _require_service()
+                canonical_session_id = str(current.get("session_id") or session_id)
+                # Durable "started" receipt before the ack; the background
+                # task settles the same attempt with its terminal outcome.
+                attempt_id = await _begin_remote_reconnect_receipt(
+                    service,
+                    canonical_session_id,
+                    owner["owner_id"],
+                )
+                background_tasks.add_task(
+                    _run_remote_reconnect_background,
+                    service,
+                    canonical_session_id,
+                    owner["owner_id"],
+                    attempt_id,
+                )
+                # The connector has a short request deadline, while Muse
+                # contract validation and history reads can take much longer.
+                # Acknowledging here lets the client safely check status while
+                # the same-run, history-only reconciliation finishes.
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "success": True,
+                        "accepted": True,
+                        "session_id": canonical_session_id,
+                    },
+                    background=background_tasks,
+                )
             result = await _call("reconnect", request, session_id=session_id)
             return JSONResponse(status_code=202, content={"success": True, "accepted": True, **_as_mapping(result)})
         except (HTTPException, CLIDevelopmentSessionRouteError) as exc:

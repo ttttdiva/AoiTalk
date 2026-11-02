@@ -24,7 +24,15 @@ import {
   createLocalUserMessage,
 } from "@/lib/chat-local-messages";
 import { getMessageClientId } from "@/lib/chat-state";
-import { normalizeRuntimeProfileId } from "@/lib/agent-runtime-selection";
+import {
+  DOTS_DIALOGUE_CLIENT_MESSAGE_PREFIX,
+  DOTS_DIALOGUE_PROVIDER_ID,
+  DOTS_DIALOGUE_ROUTE_MODEL_ID,
+  awaitDotsDialogueRouteReady,
+  isDotsDialogueRoutePending,
+  isDotsDialogueRouteSelected,
+  rememberDotsDialogueRoute,
+} from "@/lib/dots-dialogue-chat-route";
 import {
   createChatSendOutboxRecord,
   deleteChatSendOutboxRecord,
@@ -58,11 +66,13 @@ import {
   useDeepResearchMessage,
 } from "@/hooks/use-deep-research-message";
 import { useGroupChatCreate } from "@/hooks/use-group-chat-create";
+import { useDotsDialogueHistorySync } from "@/hooks/use-dots-dialogue-chat";
 import { resolveMessageProjectId } from "@/lib/project-message-routing";
 import {
   applyPendingNewChatLlmSettingsToSession,
   getPendingNewChatLlmSettingsSnapshot,
   hydratePendingNewChatLlmSettings,
+  type PendingNewChatLlmSettingsSnapshot,
 } from "@/lib/new-chat-llm-settings-store";
 import { PendingLlmHandoffError } from "@/lib/chat-session-route-handoff";
 import {
@@ -71,12 +81,16 @@ import {
 } from "@/lib/new-chat-send-route";
 import { awaitSessionLlmSettingsReady } from "@/lib/session-llm-settings-save-queue";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
+import { useUserSettings } from "@/contexts/user-settings-context";
 import { toast } from "sonner";
 import {
   DEFAULT_GENERATION_PROFILE,
+  GENERATION_PROFILE_STORAGE_KEY,
+  getSettingsGenerationProfile,
   normalizeGenerationProfile,
   type GenerationProfile,
 } from "@/lib/generation-profile";
+import { safeLocalStorage } from "@/lib/safe-storage";
 
 const DISPATCH_FAILURE_MESSAGE =
   "応答生成を開始できませんでした。送信内容が保存されたかは確認できません。接続を確認し、会話を再読み込みしてからもう一度実行してください。";
@@ -84,24 +98,197 @@ const DISPATCH_FAILURE_MESSAGE =
 const LLM_HANDOFF_FAILURE_MESSAGE =
   "選択した Provider / Model 設定を会話へ適用できなかったため、応答生成を開始しませんでした。Chat settings を確認してからもう一度送信してください。";
 
+type DotsDialogueErrorStage = "availability" | "request";
+
+function safeDotsDiagnosticToken(
+  value: unknown,
+  fallback: string,
+  maxLength: number,
+): string {
+  if (typeof value !== "string") return fallback;
+  const token = value
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]/g, "_")
+    .slice(0, maxLength);
+  return token || fallback;
+}
+
+function dotsDialogueDiagnosticId(error: ChatApiError): string | null {
+  const errorRecord = error as unknown as Record<string, unknown>;
+  const envelope =
+    errorRecord.error &&
+    typeof errorRecord.error === "object" &&
+    !Array.isArray(errorRecord.error)
+      ? (errorRecord.error as Record<string, unknown>)
+      : null;
+  for (const candidate of [
+    errorRecord.requestId,
+    errorRecord.request_id,
+    errorRecord.correlationId,
+    errorRecord.correlation_id,
+    envelope?.request_id,
+    envelope?.correlation_id,
+  ]) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    const token = safeDotsDiagnosticToken(candidate, "", 64);
+    if (token) return token;
+  }
+  return null;
+}
+
+function dotsDialogueHttpDiagnostic(error: ChatApiError): string | null {
+  const status = error.status;
+  const parts: string[] = [];
+  if (
+    typeof status === "number" &&
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status < 600
+  ) {
+    parts.push(`HTTP ${status}`);
+  }
+  const code = safeDotsDiagnosticToken(error.code, "chat_api_error", 64);
+  parts.push(`code=${code}`);
+  const requestId = dotsDialogueDiagnosticId(error);
+  if (requestId) parts.push(`request/correlation ID=${requestId}`);
+  return parts.join(", ");
+}
+
+function dotsDialogueStageDiagnostic(
+  error: ChatApiError,
+  stage: DotsDialogueErrorStage,
+  bindingGeneration?: number | null,
+): string {
+  const label = stage === "availability" ? "availability GET" : "request POST";
+  const diagnostic = dotsDialogueHttpDiagnostic(error);
+  const generation =
+    stage === "request" &&
+    typeof bindingGeneration === "number" &&
+    Number.isFinite(bindingGeneration) &&
+    bindingGeneration > 0
+      ? `binding generation=${bindingGeneration} (availability GET snapshot)`
+      : null;
+  return [label, diagnostic, generation].filter(Boolean).join(", ");
+}
+
+function dotsDialogueUnknownErrorMessage(
+  error: unknown,
+  stage: DotsDialogueErrorStage,
+  bindingGeneration?: number | null,
+): string {
+  if (!(error instanceof ChatApiError)) {
+    return stage === "availability"
+      ? "GPT dotsのavailability GETを確認できませんでした。依頼POSTは送信していません。"
+      : "GPT dotsのrequest POST結果を確認できません。再試行時は同じ送信IDを使用します。";
+  }
+  const diagnostic = dotsDialogueStageDiagnostic(error, stage, bindingGeneration);
+  const status = error.status;
+  const is4xx =
+    typeof status === "number" &&
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status < 500;
+  if (stage === "availability") {
+    if (is4xx) {
+      return `GPT dotsのavailability GETが${diagnostic}で拒否されました。依頼POSTは送信していません。`;
+    }
+    return `GPT dotsのavailability GETを確認できませんでした（${diagnostic}）。依頼POSTは送信していません。`;
+  }
+  if (is4xx) {
+    return `GPT dotsのrequest POSTが${diagnostic}で拒否されました。`;
+  }
+  return `GPT dotsのrequest POST結果を確認できません（${diagnostic}）。再試行時は同じ送信IDを使用します。`;
+}
+
+function appendDotsDialogueDiagnostic(
+  message: string,
+  error: ChatApiError,
+  stage?: DotsDialogueErrorStage,
+  bindingGeneration?: number | null,
+): string {
+  if (!stage) return message;
+  const postNotice =
+    stage === "availability" && !message.includes("送信していません")
+      ? "。依頼POSTは送信していません"
+      : "";
+  return `${message}（${dotsDialogueStageDiagnostic(
+    error,
+    stage,
+    bindingGeneration,
+  )}${postNotice}）`;
+}
+
+function dotsDialogueErrorMessage(
+  error: unknown,
+  stage?: DotsDialogueErrorStage,
+  bindingGeneration?: number | null,
+): string {
+  if (error instanceof ChatApiError) {
+    let knownMessage: string | null = null;
+    switch (error.code) {
+      case "active_subscription_required":
+      case "subscription_unavailable":
+        knownMessage =
+          "GPT dotsのホスト購読が有効ではありません。接続状態を確認してください。";
+        break;
+      case "binding_unavailable":
+      case "conversation_unavailable":
+        knownMessage = "GPT dotsの承認済みChatを確認できません。送信していません。";
+        break;
+      case "dots_dialogue_not_selected":
+        knownMessage =
+          "このChatではGPT dotsが選択されていないため、依頼は送信していません。GPT dotsを選択してから再試行してください。";
+        break;
+      case "idempotency_conflict":
+        knownMessage =
+          "この送信IDには別の内容が登録済みです。同じ内容を確認してください。";
+        break;
+      case "invalid_message":
+        knownMessage = "GPT dotsへ送るメッセージを確認してください。";
+        break;
+      default:
+        return stage
+          ? dotsDialogueUnknownErrorMessage(error, stage, bindingGeneration)
+          : error.status != null && error.status >= 400 && error.status < 500
+            ? "GPT dotsへ送信できませんでした。接続状態を確認してください。"
+            : "送信結果を確認できません。再試行時は同じ送信IDを使用します。";
+    }
+    if (knownMessage === null) {
+      return "送信結果を確認できません。再試行時は同じ送信IDを使用します。";
+    }
+    return appendDotsDialogueDiagnostic(knownMessage, error, stage, bindingGeneration);
+  }
+  if (stage) return dotsDialogueUnknownErrorMessage(error, stage, bindingGeneration);
+  return "送信結果を確認できません。再試行時は同じ送信IDを使用します。";
+}
+
+function dotsAvailabilityErrorMessage(state: string): string {
+  switch (state) {
+    case "subscription_missing":
+    case "subscription_expired":
+    case "subscription_revoked":
+      return "GPT dotsのホスト購読が有効ではありません。依頼は送信していません。";
+    case "conversation_unavailable":
+    case "binding_unavailable":
+    case "connection_unavailable":
+      return "GPT dotsの承認済みChatを確認できません。依頼は送信していません。";
+    default:
+      return "GPT dots接続を確認できません。依頼は送信していません。";
+  }
+}
+
+const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 /**
  * Surface the server's sanitized 4xx envelope when an explicit runtime was
  * rejected. The caller keeps the original outbox record: no other profile and
  * no legacy fallback is ever dispatched on the user's behalf.
  */
-function notifyRuntimeRejection(err: unknown, executionProfileId: string | null | undefined) {
+function notifyRuntimeRejection(err: unknown) {
   if (!(err instanceof ChatApiError)) return;
   if (err.status == null || err.status < 400 || err.status >= 500) return;
-  const requiresCliSession =
-    err.code === "cli_route_not_supported" && err.requiredIngress === "cli_session";
-  if (!executionProfileId && !requiresCliSession) return;
-  if (requiresCliSession) {
-    toast.error(`${err.message}（必要な入口: CLIセッション）`);
-    return;
-  }
-  toast.error(err.message || "選択した実行環境で開始できませんでした");
+  toast.error(err.message || "送信を開始できませんでした");
 }
-
 type ChatTimelineAction = Parameters<typeof chatTimelineReducer>[1];
 
 type SendFlight = {
@@ -127,7 +314,6 @@ export type PendingMessage = {
   commandCapabilities?: ChatCommandCapability[];
   toolsRequired?: boolean;
   /** Runtime chosen when this request was first submitted. */
-  executionProfileId?: string | null;
   /** WebSocket 再接続後の最終 dispatch 結果を composer へ通知する。 */
   settle?: (result: ChatComposerSendResult) => void;
   signal?: AbortSignal;
@@ -153,10 +339,10 @@ function createSendFingerprint(input: {
   generationProfile?: string;
   commandCapabilities?: ChatCommandCapability[];
   toolsRequired?: boolean;
+  generationProfileChangedByUser?: boolean;
   appContext?: ChatAppContextSelection | null;
   effectiveProjectId?: string;
   includeProjectContext: boolean;
-  executionProfileId?: string | null;
 }): string {
   return JSON.stringify({
     content: input.content,
@@ -168,23 +354,56 @@ function createSendFingerprint(input: {
     })) ?? [],
     mentions: input.mentions ?? [],
     generationProfile: input.generationProfile ?? null,
+    generationProfileChangedByUser: input.generationProfileChangedByUser ?? false,
     commandCapabilities: input.commandCapabilities ?? [],
     toolsRequired: input.toolsRequired ?? null,
     appContext: input.appContext ?? null,
     effectiveProjectId: input.effectiveProjectId ?? null,
     includeProjectContext: input.includeProjectContext,
-    executionProfileId: input.executionProfileId ?? null,
   });
 }
 
 const UUID_MESSAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function createClientSessionId(clientMessageId: string): string {
-  if (UUID_MESSAGE_ID.test(clientMessageId)) return clientMessageId;
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
+  const isDotsMessage = clientMessageId.startsWith(
+    DOTS_DIALOGUE_CLIENT_MESSAGE_PREFIX,
+  );
+  if (!isDotsMessage) {
+    if (UUID_MESSAGE_ID.test(clientMessageId)) return clientMessageId;
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      return crypto.randomUUID();
+    }
+    return (
+      "00000000-0000-4000-8000-" +
+      Math.random().toString(16).slice(2, 14).padEnd(12, "0")
+    );
   }
-  return "00000000-0000-4000-8000-" + Math.random().toString(16).slice(2, 14).padEnd(12, "0");
+  const dotsMessageId = clientMessageId.slice(
+    DOTS_DIALOGUE_CLIENT_MESSAGE_PREFIX.length,
+  );
+  if (UUID_MESSAGE_ID.test(dotsMessageId)) return dotsMessageId;
+
+  // The client-session key is sent before the first server response.  It must
+  // still be identical when create succeeds but its response is lost and an
+  // outbox retry replays the same DOTS request.  Keep the fallback synchronous
+  // and deterministic so no second random key can create another Chat.
+  const seeds = [
+    0x811c9dc5,
+    0x9e3779b9,
+    0x85ebca6b,
+    0xc2b2ae35,
+  ];
+  const hashes = seeds.map((seed) => {
+    let hash = seed;
+    for (let index = 0; index < dotsMessageId.length; index += 1) {
+      hash ^= dotsMessageId.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  });
+  const hex = hashes.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20)}`;
 }
 
 /**
@@ -362,6 +581,16 @@ export function useChatMessaging({
   onSessionAgentConsumed,
 }: UseChatMessagingArgs) {
   const draftUserId = useCurrentUserId();
+  const { settings: userSettings } = useUserSettings();
+  const [storedGenerationProfile] = useState<GenerationProfile | null>(() =>
+    normalizeGenerationProfile(
+      safeLocalStorage.getItem(GENERATION_PROFILE_STORAGE_KEY),
+    ),
+  );
+  const inheritedGenerationProfile =
+    getSettingsGenerationProfile(userSettings) ??
+    storedGenerationProfile ??
+    DEFAULT_GENERATION_PROFILE;
   const normalizedNewSessionAgentId = newSessionAgentId?.trim() || null;
   const draftUserIdRef = useRef(draftUserId);
   draftUserIdRef.current = draftUserId;
@@ -396,6 +625,12 @@ export function useChatMessaging({
     refreshPersistedMessages,
     waitForPersistedAssistantResponse,
     bumpSessionForAssistant,
+    loadOlderMessages,
+    hasMoreMessages,
+    isLoadingOlderMessages,
+    messageHistoryGeneration,
+    messageHistoryEpoch,
+    messageHistoryIndex,
   } = useChatPersistence({
     router,
     activeSessionId,
@@ -413,6 +648,18 @@ export function useChatMessaging({
     setSteeringInstructions,
     setIsLoadingMessages,
     setSessionLoadError,
+  });
+  const watchDotsDialogueRequest = useDotsDialogueHistorySync({
+    sessionId: activeSessionId,
+    messages,
+    onPersistedHistory: (sessionId, persistedMessages) => {
+      dispatchChatTimeline({
+        type: "hydrate_persisted",
+        sessionId,
+        messages: persistedMessages,
+      });
+      bumpSession(sessionId);
+    },
   });
   const branchSwitchInFlightRef = useRef<string | null>(null);
 
@@ -459,7 +706,8 @@ export function useChatMessaging({
       includeProjectContext?: boolean,
       appContext?: ChatAppContextSelection | null,
       toolsRequired?: boolean,
-      executionProfileId?: string | null,
+      generationProfileChangedByUser?: boolean,
+      dotsDialogue?: boolean,
     ) => {
       const userId = draftUserIdRef.current;
       if (!userId) return;
@@ -472,11 +720,12 @@ export function useChatMessaging({
         mentions,
         commandCapabilities,
         generationProfile,
+        generationProfileChangedByUser,
+        dotsDialogue,
         projectId,
         includeProjectContext,
         appContext,
         toolsRequired,
-        executionProfileId,
       });
       outboxRecordsRef.current.set(clientMessageId, record);
       // Persist without delaying the optimistic append or route lookup.
@@ -729,7 +978,6 @@ export function useChatMessaging({
       appContext?: ChatAppContextSelection | null,
       mentions?: MentionItem[],
       includeProjectContextOverride?: boolean,
-      executionProfileId?: string | null,
     ) => {
       const helpSubmission = commandCapabilities?.includes("aoitalk_help") === true;
       const result = await chatApi.dispatchMessage(sessionId, {
@@ -751,7 +999,6 @@ export function useChatMessaging({
         skip_user_persistence: persistence?.skipUserPersistence,
         persisted_user_message_id: persistence?.persistedUserMessageId,
         mentions,
-        ...(executionProfileId?.trim() ? { execution_profile_id: executionProfileId.trim() } : {}),
         ...(currentSession?.agent_id || normalizedNewSessionAgentId
           ? { expected_agent_id: currentSession?.agent_id ?? normalizedNewSessionAgentId }
           : {}),
@@ -819,7 +1066,7 @@ export function useChatMessaging({
           pending.sessionId, pending.clientMessageId, pending.commandCapabilities,
           pending.toolsRequired,
           pending.appContext ? { appId: pending.appContext.appId, targetId: pending.appContext.targetId } : null,
-          pending.signal, pending.executionProfileId,
+          pending.signal,
         );
         if (!accepted || pending.signal?.aborted || pendingMessageRef.current !== pending) return;
         pendingMessageRef.current = null;
@@ -915,6 +1162,53 @@ export function useChatMessaging({
       const sendUserId = draftUserIdRef.current ?? null;
       const sendSessionId = activeSessionIdRef.current;
       const sendAgentId = normalizedNewSessionAgentId;
+      if (sendSessionId) {
+        const routeReadiness = await awaitDotsDialogueRouteReady(
+          sendUserId,
+          sendSessionId,
+        );
+        if (routeReadiness !== "ready") {
+          toast.error(
+            "ChatのProvider設定を確認できないため、送信していません。Chat settingsを再読み込みしてから再試行してください。",
+          );
+          return "retained" as ChatComposerSendResult;
+        }
+        if (
+          activeSessionIdRef.current !== sendSessionId ||
+          draftUserIdRef.current !== sendUserId
+        ) {
+          toast.error("送信先Chatが切り替わったため、送信していません。");
+          return "retained" as ChatComposerSendResult;
+        }
+      }
+      const submittedPendingSnapshot: PendingNewChatLlmSettingsSnapshot | null =
+        sendSessionId
+          ? null
+          : (() => {
+              hydratePendingNewChatLlmSettings(sendUserId);
+              return getPendingNewChatLlmSettingsSnapshot(sendUserId);
+            })();
+      const pendingNewChatRoute = submittedPendingSnapshot?.settings.main_route;
+      const pendingNewChatDotsRoute = Boolean(
+        !sendSessionId &&
+          pendingNewChatRoute?.provider?.trim().toLowerCase() ===
+            DOTS_DIALOGUE_PROVIDER_ID &&
+          pendingNewChatRoute?.model?.trim().toLowerCase() ===
+            DOTS_DIALOGUE_ROUTE_MODEL_ID,
+      );
+      const dotsRouteSelected = isDotsDialogueRouteSelected(
+        sendUserId,
+        sendSessionId,
+        currentSession?.context,
+      ) || pendingNewChatDotsRoute;
+      const dotsRoutePending = isDotsDialogueRoutePending(
+        sendUserId,
+        sendSessionId,
+      );
+      if (dotsRoutePending) {
+        toast.error("GPT dotsのProvider設定を反映中です。完了してから送信してください。");
+        return "retained" as ChatComposerSendResult;
+      }
       const fingerprint = createSendFingerprint({
         content,
         files,
@@ -923,16 +1217,11 @@ export function useChatMessaging({
         commandCapabilities,
         toolsRequired,
         appContext,
+        generationProfileChangedByUser:
+          options?.generationProfileChangedByUser === true,
         effectiveProjectId,
         includeProjectContext,
-        executionProfileId: normalizeRuntimeProfileId(options?.executionProfileId),
       });
-      const submittedPendingSnapshot = sendSessionId
-        ? null
-        : (() => {
-            hydratePendingNewChatLlmSettings(sendUserId);
-            return getPendingNewChatLlmSettingsSnapshot(sendUserId);
-          })();
       const currentFlight = sendInFlightRef.current;
       const sameScope =
         currentFlight?.draftView === sendDraftView &&
@@ -959,19 +1248,59 @@ export function useChatMessaging({
         fingerprint,
       };
       try {
-      const clientMessageId =
+      const requestedClientMessageId =
         options?.clientMessageId?.trim() || createClientMessageId();
+      const requestedOutboxRecord = outboxRecordsRef.current.get(requestedClientMessageId);
+      const requestedIdIsDots = requestedClientMessageId.startsWith(
+        DOTS_DIALOGUE_CLIENT_MESSAGE_PREFIX,
+      );
+      const currentDotsSelection = sendSessionId
+        ? dotsRouteSelected
+        : pendingNewChatDotsRoute;
+      if (requestedIdIsDots && !currentDotsSelection) {
+        toast.error(
+          "このGPT dots送信は現在のProvider選択と一致しません。GPT dotsを選択してから再試行してください。",
+        );
+        return "retained" as ChatComposerSendResult;
+      }
+      if (dotsRouteSelected && requestedOutboxRecord && !requestedIdIsDots) {
+        toast.error(
+          "この保留メッセージは別の送信経路で作成されています。元のProviderに戻してから再試行してください。",
+        );
+        return "retained" as ChatComposerSendResult;
+      }
+      const dotsDialogueSubmission =
+        requestedIdIsDots || (dotsRouteSelected && !requestedOutboxRecord);
+      const clientMessageId =
+        dotsDialogueSubmission && !requestedIdIsDots
+          ? `${DOTS_DIALOGUE_CLIENT_MESSAGE_PREFIX}${requestedClientMessageId}`
+          : requestedClientMessageId;
       // A composer restore after an IndexedDB/File recovery path retains only
       // the stable client id and asks the user to reselect File bytes. Recover
       // the original immutable send options from the outbox before rebuilding
       // its record, so a current composer mode/project cannot change the
       // meaning of a retry.
-      const restoredOutboxRecord = outboxRecordsRef.current.get(clientMessageId);
+      const restoredOutboxRecord =
+        outboxRecordsRef.current.get(clientMessageId) ?? requestedOutboxRecord;
+      const restoredDotsOutboxProof = Boolean(
+        restoredOutboxRecord?.userId === sendUserId &&
+          (restoredOutboxRecord.dotsDialogue === true
+            ? !sendSessionId || restoredOutboxRecord.sessionId === sendSessionId
+            : restoredOutboxRecord.dotsDialogue === undefined &&
+              sendSessionId !== null &&
+              restoredOutboxRecord.sessionId === sendSessionId &&
+              dotsRouteSelected),
+      );
+      if (requestedIdIsDots && !restoredDotsOutboxProof) {
+        toast.error(
+          "このGPT dots送信記録を現在の所有者・Chatで確認できないため、Providerを再選択して再試行してください。",
+        );
+        return "retained" as ChatComposerSendResult;
+      }
       // The runtime is frozen at the first submit: a retry replays the stored
       // value and never reads the composer's current selection.
-      const executionProfileId = restoredOutboxRecord
-        ? normalizeRuntimeProfileId(restoredOutboxRecord.executionProfileId)
-        : normalizeRuntimeProfileId(options?.executionProfileId);
+      let generationProfileChangedByUser =
+        options?.generationProfileChangedByUser === true;
       if (restoredOutboxRecord) {
         content = restoredOutboxRecord.content;
         files = files?.length ? files : restoredOutboxRecord.files;
@@ -980,6 +1309,8 @@ export function useChatMessaging({
         commandCapabilities = restoredOutboxRecord.commandCapabilities;
         toolsRequired = restoredOutboxRecord.toolsRequired;
         appContext = restoredOutboxRecord.appContext;
+        generationProfileChangedByUser =
+          restoredOutboxRecord.generationProfileChangedByUser === true;
       }
       const clientSessionId = createClientSessionId(clientMessageId);
       const hasCommandCapabilities = Boolean(commandCapabilities?.length);
@@ -988,12 +1319,13 @@ export function useChatMessaging({
       // Composer retries also carry their persisted mode; an outbox record is
       // authoritative for Chat even if a stale composer option says otherwise.
       const isDeepResearchSubmission =
+        !dotsDialogueSubmission &&
         !restoredOutboxRecord &&
         !hasCommandCapabilities &&
         (options?.dispatchMode
           ? options.dispatchMode === "deep_research"
           : deepResearchEnabled);
-      if (activeSessionId && !isDeepResearchSubmission) {
+      if (activeSessionId && !isDeepResearchSubmission && !dotsDialogueSubmission) {
         dispatchGeneration({
           type: "dispatch_started",
           sessionId: activeSessionId,
@@ -1060,6 +1392,7 @@ export function useChatMessaging({
       const submittedHref = window.location.href;
       const submittedUserId = sendUserId;
       const submittedAgentId = sendAgentId;
+      const submittedAsNewChat = sendSessionId === null;
       const ownsSubmittedDraftView = () =>
         submittedDraftView !== null &&
         draftViewRef.current === submittedDraftView &&
@@ -1068,6 +1401,22 @@ export function useChatMessaging({
         window.location.href === submittedHref;
       const ownsSubmittedUserScope = () =>
         (draftUserIdRef.current ?? null) === submittedUserId;
+      const ownsSubmittedNewChatDotsSelection = () => {
+        if (!submittedAsNewChat || !submittedPendingSnapshot) return false;
+        const route = submittedPendingSnapshot.settings.main_route;
+        return (
+          ownsSubmittedNewChatRouteRevision() &&
+          route?.provider?.trim().toLowerCase() === DOTS_DIALOGUE_PROVIDER_ID &&
+          route?.model?.trim().toLowerCase() === DOTS_DIALOGUE_ROUTE_MODEL_ID
+        );
+      };
+      const ownsSubmittedNewChatRouteRevision = () => {
+        if (!submittedAsNewChat || !submittedPendingSnapshot) return false;
+        return (
+          getPendingNewChatLlmSettingsSnapshot(submittedUserId).revision ===
+          submittedPendingSnapshot.revision
+        );
+      };
       let generationReadyMain = null as {
         provider?: string;
         model?: string;
@@ -1075,6 +1424,22 @@ export function useChatMessaging({
       } | null;
       const provisionalSessionId = `${OPTIMISTIC_NEW_CHAT_SESSION_PREFIX}${clientMessageId}`;
       let optimisticSessionId = sessionId ?? provisionalSessionId;
+      if (dotsDialogueSubmission && !sessionId) {
+        if (!pendingNewChatDotsRoute) {
+          const message =
+            "GPT dotsの新規Chat選択を確認できないため、Chatは作成していません。Provider設定を選択してから再試行してください。";
+          toast.error(message);
+          settleOutbox(optimisticSessionId, clientMessageId, "failed", message);
+          return "retained" as ChatComposerSendResult;
+        }
+        if (restoredOutboxRecord && !restoredDotsOutboxProof) {
+          const message =
+            "このGPT dots送信記録を所有者確認できないため、Chatは作成していません。";
+          toast.error(message);
+          settleOutbox(optimisticSessionId, clientMessageId, "failed", message);
+          return "retained" as ChatComposerSendResult;
+        }
+      }
       const optimisticGenerationProfile = normalizeGenerationProfile(
         generationProfile,
       );
@@ -1094,7 +1459,8 @@ export function useChatMessaging({
         messageIncludeProjectContext,
         messageAppContext,
         toolsRequired,
-        executionProfileId,
+        generationProfileChangedByUser,
+        dotsDialogueSubmission,
       );
 
       // 送信処理が REST / WebSocket / 設定保存のいずれを選ぶ場合でも、
@@ -1116,14 +1482,79 @@ export function useChatMessaging({
         ),
       });
 
+      const normalizedDotsGenerationProfile =
+        normalizeGenerationProfile(generationProfile);
+      const dotsGenerationProfileExplicit =
+        generationProfileChangedByUser ||
+        (Boolean(generationProfile?.trim()) &&
+          (normalizedDotsGenerationProfile === null ||
+            (normalizedDotsGenerationProfile !== DEFAULT_GENERATION_PROFILE &&
+              normalizedDotsGenerationProfile !== inheritedGenerationProfile)));
+      if (
+        dotsDialogueSubmission &&
+        !sessionId &&
+        (isGroupChat ||
+          currentSession?.is_group_chat === true ||
+          currentSession?.agent_id ||
+          sendAgentId ||
+          dotsGenerationProfileExplicit &&
+            normalizedDotsGenerationProfile !== DEFAULT_GENERATION_PROFILE ||
+          files?.length ||
+          mentions?.length ||
+          hasCommandCapabilities ||
+          toolsRequired ||
+          messageAppContext)
+      ) {
+        const message =
+          "GPT dotsの新規Chatは通常テキスト送信のみ対応します。指定した添付・メンション・Agent・実行プロファイル設定は送信していません。";
+        settleOutbox(optimisticSessionId, clientMessageId, "failed", message);
+        toast.error(message);
+        return "retained" as ChatComposerSendResult;
+      }
+
       if (!sessionId && !sendAgentId) {
         try {
           // Resolve from the captured user/draft scope after the local bubble
           // and composer clear boundary. This request may be slow, but it can
           // no longer hide the submitted turn from the user.
-          generationReadyMain = (
-            await resolveNewChatSendRoute(submittedUserId)
-          ).route;
+          if (dotsDialogueSubmission) {
+            // Use the exact owner-selected route captured before Composer
+            // clears the draft; do not synthesize or re-resolve it later.
+            generationReadyMain = pendingNewChatRoute
+              ? { ...pendingNewChatRoute }
+              : null;
+          } else {
+            generationReadyMain = (
+              await resolveNewChatSendRoute(
+                submittedUserId,
+                undefined,
+                submittedPendingSnapshot ?? undefined,
+              )
+            ).route;
+          }
+          if (
+            submittedAsNewChat &&
+            !ownsSubmittedNewChatRouteRevision()
+          ) {
+            settleOutbox(
+              optimisticSessionId,
+              clientMessageId,
+              "failed",
+              "Provider設定が送信中に変更されたため、Chatは作成していません。設定を確認してから再試行してください。",
+            );
+            return "retained" as ChatComposerSendResult;
+          }
+          if (
+            !dotsDialogueSubmission &&
+            generationReadyMain?.provider?.trim().toLowerCase() ===
+              DOTS_DIALOGUE_PROVIDER_ID
+          ) {
+            const message =
+              "GPT dotsはこの新規Chatで選択されていないため、Chatは作成していません。Provider設定を選択してから再試行してください。";
+            toast.error(message);
+            settleOutbox(optimisticSessionId, clientMessageId, "failed", message);
+            return "retained" as ChatComposerSendResult;
+          }
           if (!ownsSubmittedDraftView()) {
             settleOutbox(
               optimisticSessionId,
@@ -1154,12 +1585,20 @@ export function useChatMessaging({
       if (!sessionId) {
         try {
           const canPersistInitialMessage =
-            !files?.length && !mentions?.length && !hasCommandCapabilities;
+            !dotsDialogueSubmission &&
+            !files?.length &&
+            !mentions?.length &&
+            !hasCommandCapabilities;
           const createCharacterName = await chatApi.getCurrentCharacterName();
           // The route was resolved before this server await. Check the draft
           // ownership again after character lookup so a late result can never
           // create or activate a session in a different view.
-          if ((!submittedAgentId && !generationReadyMain) || !ownsSubmittedDraftView()) {
+          if (
+            (!submittedAgentId && !generationReadyMain) ||
+            !ownsSubmittedDraftView() ||
+            (submittedAsNewChat && !ownsSubmittedNewChatRouteRevision()) ||
+            (dotsDialogueSubmission && !ownsSubmittedNewChatDotsSelection())
+          ) {
             throw new PendingLlmHandoffError(
               "送信中に新規チャットの表示が切り替わったため、送信を取り消しました。",
             );
@@ -1222,6 +1661,30 @@ export function useChatMessaging({
             );
             return "retained" as ChatComposerSendResult;
           }
+          if (
+            dotsDialogueSubmission &&
+            (!data.session.user_id?.trim() ||
+              data.session.user_id.trim() !== submittedUserId ||
+              data.initial_message ||
+              !ownsSubmittedDraftView())
+          ) {
+            throw new Error(
+              "新規GPT dots Chatの所有者または初期メッセージを確認できないため、送信を開始しませんでした。",
+            );
+          }
+          if (
+            dotsDialogueSubmission &&
+            !sendSessionId &&
+            restoredOutboxRecord?.dotsDialogue === true &&
+            !restoredOutboxRecord.sessionId.startsWith(
+              OPTIMISTIC_NEW_CHAT_SESSION_PREFIX,
+            ) &&
+            restoredOutboxRecord.sessionId !== data.session.id
+          ) {
+            throw new Error(
+              "GPT dots送信記録のChat IDを同じowner session createで確認できないため、送信を開始しませんでした。",
+            );
+          }
           sessionId = data.session.id;
           const outboxRecord = outboxRecordsRef.current.get(clientMessageId);
           if (outboxRecord) {
@@ -1252,7 +1715,10 @@ export function useChatMessaging({
           const initialMessagePersisted = Boolean(data.initial_message);
           if (!submittedAgentId) {
             await awaitSessionLlmSettingsReady(sessionId);
-            if (!ownsSubmittedUserScope()) {
+            if (
+              !ownsSubmittedUserScope() ||
+              (submittedAsNewChat && !ownsSubmittedNewChatRouteRevision())
+            ) {
               settleOutbox(
                 optimisticSessionId,
                 clientMessageId,
@@ -1273,6 +1739,28 @@ export function useChatMessaging({
                   "表示中の Provider / Model をセッションへ確定できませんでした。",
                 );
               }
+              if (
+                submittedAsNewChat &&
+                !ownsSubmittedNewChatRouteRevision()
+              ) {
+                throw new PendingLlmHandoffError(
+                  "送信中にProvider設定が変更されたため、会話への保存結果を再確認してください。",
+                );
+              }
+              if (
+                dotsDialogueSubmission &&
+                (applied.settings.main_route?.provider?.trim().toLowerCase() !==
+                  DOTS_DIALOGUE_PROVIDER_ID ||
+                  applied.settings.main_route?.model?.trim().toLowerCase() !==
+                    DOTS_DIALOGUE_ROUTE_MODEL_ID)
+              ) {
+                throw new PendingLlmHandoffError(
+                  "GPT dotsのProvider / Model設定を会話へ確定できませんでした。",
+                );
+              }
+              if (dotsDialogueSubmission) {
+                rememberDotsDialogueRoute(submittedUserId, sessionId, true);
+              }
             } catch (error) {
               console.error("Failed to apply pending new-chat LLM settings:", error);
               settleOutbox(
@@ -1281,6 +1769,14 @@ export function useChatMessaging({
                 "uncertain",
                 error instanceof Error ? error.message : LLM_HANDOFF_FAILURE_MESSAGE,
               );
+              if (dotsDialogueSubmission) {
+                toast.error(
+                  error instanceof Error
+                    ? error.message
+                    : "GPT dotsのProvider / Model設定を会話へ確定できませんでした。",
+                );
+                return "retained" as ChatComposerSendResult;
+              }
               if (!ownsSubmittedUserScope() || !ownsSubmittedDraftView()) {
                 return "retained" as ChatComposerSendResult;
               }
@@ -1307,7 +1803,10 @@ export function useChatMessaging({
               });
               return "retained" as ChatComposerSendResult;
             }
-            if (!ownsSubmittedUserScope()) {
+            if (
+              !ownsSubmittedUserScope() ||
+              (dotsDialogueSubmission && !ownsSubmittedDraftView())
+            ) {
               settleOutbox(
                 optimisticSessionId,
                 clientMessageId,
@@ -1317,6 +1816,7 @@ export function useChatMessaging({
               return "retained" as ChatComposerSendResult;
             }
           }
+          if (!dotsDialogueSubmission) {
           if (data.initial_message) {
             // createSession が初回メッセージを同時保存した場合は、既存の
             // optimistic bubble を server id へ昇格させるだけで再 append
@@ -1372,7 +1872,6 @@ export function useChatMessaging({
                   ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
                   : null,
                 undefined,
-                executionProfileId,
               );
               if (accepted) {
                 bumpSession(sessionId);
@@ -1399,7 +1898,6 @@ export function useChatMessaging({
               includeProjectContext: messageIncludeProjectContext,
               commandCapabilities,
               toolsRequired,
-              executionProfileId,
               appContext: messageAppContext,
             });
           } else {
@@ -1422,12 +1920,11 @@ export function useChatMessaging({
                 messageAppContext,
                 mentions,
                 messageIncludeProjectContext,
-                executionProfileId,
               );
               markWaitingResponse(sessionId, clientMessageId);
             } catch (err) {
               console.error("新規セッションのREST送信失敗:", err);
-              notifyRuntimeRejection(err, executionProfileId);
+              notifyRuntimeRejection(err);
               // createSession already committed the user row. A later
               // generation-dispatch failure must not downgrade that row to an
               // uncertain/retryable send after its outbox key was deleted.
@@ -1470,6 +1967,7 @@ export function useChatMessaging({
           return files?.length
             ? ("pending" as ChatComposerSendResult)
             : ("accepted" as ChatComposerSendResult);
+          }
         } catch (err) {
           console.error("セッション自動作成失敗:", err);
           settleOutbox(
@@ -1518,6 +2016,234 @@ export function useChatMessaging({
         });
         return "retained" as ChatComposerSendResult;
       }
+
+      // The route snapshot above can race a selector change while the queued
+      // session-settings PUT drains. Re-read the explicit keyed selection
+      // before any generic Muse/CLI dispatch so a late GPT dots selection can
+      // never be silently downgraded to the normal transport.
+      if (
+        !dotsDialogueSubmission &&
+        (isDotsDialogueRoutePending(sendUserId, sessionId) ||
+          isDotsDialogueRouteSelected(
+            sendUserId,
+            sessionId,
+            currentSession?.context,
+          ))
+      ) {
+        const message =
+          "Provider設定が送信中にGPT dotsへ切り替わったため、通常経路へは送信していません。Providerを再確認して再試行してください。";
+        settleOutbox(sessionId, clientMessageId, "failed", message);
+        toast.error(message);
+        return "retained" as ChatComposerSendResult;
+      }
+
+      if (dotsDialogueSubmission) {
+        const failWithoutSending = (message: string) => {
+          settleOutbox(sessionId, clientMessageId, "failed", message);
+          toast.error(message);
+          return "retained" as ChatComposerSendResult;
+        };
+        const isNewDotsSession = sendSessionId === null;
+        const normalizedGenerationProfile =
+          normalizeGenerationProfile(generationProfile);
+        // ChatComposer always forwards its generic generation profile. For a
+        // DOTS request this is ambient composer state, not part of the request:
+        // accept the user setting / stored default and the neutral "chat"
+        // profile, while rejecting a different explicit profile selection.
+        const hasExplicitGenerationProfileIntent =
+          generationProfileChangedByUser ||
+          (Boolean(generationProfile?.trim()) &&
+            normalizedGenerationProfile !== DEFAULT_GENERATION_PROFILE &&
+            normalizedGenerationProfile !== inheritedGenerationProfile);
+        const hasUnsupportedGenerationProfile =
+          Boolean(generationProfile?.trim()) &&
+          normalizedGenerationProfile !== DEFAULT_GENERATION_PROFILE &&
+          hasExplicitGenerationProfileIntent;
+        if (
+          !sendUserId ||
+          !sessionId ||
+          (isNewDotsSession
+            ? !ownsSubmittedDraftView() || activeSessionIdRef.current !== null
+            : !activeSessionId ||
+              sessionId !== sendSessionId ||
+              activeSessionIdRef.current !== sessionId)
+        ) {
+          return failWithoutSending(
+            "送信先Chatが切り替わったため、GPT dotsへは送信していません。",
+          );
+        }
+        if (
+          isGroupChat ||
+          currentSession?.is_group_chat === true ||
+          currentSession?.agent_id ||
+          sendAgentId ||
+          hasUnsupportedGenerationProfile ||
+          files?.length ||
+          mentions?.length ||
+          hasCommandCapabilities ||
+          toolsRequired ||
+          messageAppContext
+        ) {
+          return failWithoutSending(
+            "GPT dotsは承認済みChatの通常テキスト送信のみ対応します。添付・メンション・Agent・実行プロファイル設定は送信していません。",
+          );
+        }
+
+        if (
+          !ownsSubmittedUserScope() ||
+          (isNewDotsSession
+            ? !ownsSubmittedDraftView() || activeSessionIdRef.current !== null
+            : activeSessionIdRef.current !== sessionId)
+        ) {
+          settleOutbox(
+            sessionId,
+            clientMessageId,
+            "uncertain",
+            "送信中にChat表示が切り替わりました。再試行時は同じ送信IDを使います。",
+          );
+          return "retained" as ChatComposerSendResult;
+        }
+
+        if (isNewDotsSession && !ownsSubmittedNewChatRouteRevision()) {
+          return failWithoutSending(
+            "GPT dotsのProvider設定が送信中に変わったため、依頼は送信していません。Providerを再選択して再試行してください。",
+          );
+        }
+
+        // A normal provider selection may have raced this send while the
+        // settings queue was draining. Re-read the keyed explicit selection
+        // before the official DOTS request so it cannot fall back to stale
+        // provider state.
+        if (
+          !isDotsDialogueRouteSelected(
+            sendUserId,
+            sessionId,
+            currentSession?.context,
+          )
+        ) {
+          return failWithoutSending(
+            "GPT dotsのProvider選択が解除されたため、依頼は送信していません。",
+          );
+        }
+
+        let availability;
+        try {
+          availability = await chatApi.getDotsDialogueChatAvailability(sessionId);
+        } catch (error) {
+          return failWithoutSending(dotsDialogueErrorMessage(error, "availability"));
+        }
+        const recoverableExpiredReplay = Boolean(
+          restoredOutboxRecord?.status === "uncertain" &&
+            restoredOutboxRecord.userId === sendUserId &&
+            restoredOutboxRecord.sessionId === sessionId &&
+            availability.state === "subscription_expired",
+        );
+        const availabilityConversationId =
+          availability.target_chat_id ?? availability.conversation_id;
+        const availabilityBindingId = availability.binding_id;
+        const availabilityOwnerId = availability.owner_user_id;
+        if (
+          typeof availabilityConversationId !== "string" ||
+          availabilityConversationId !== sessionId ||
+          typeof availabilityBindingId !== "string" ||
+          !availabilityBindingId.trim() ||
+          (isNewDotsSession && availabilityOwnerId !== sendUserId) ||
+          (typeof availabilityOwnerId === "string" &&
+            availabilityOwnerId.trim() !== sendUserId) ||
+          typeof availability.generation !== "number" ||
+          !Number.isFinite(availability.generation) ||
+          availability.generation <= 0 ||
+          (availability.selectable !== true && !recoverableExpiredReplay)
+        ) {
+          return failWithoutSending(dotsAvailabilityErrorMessage(availability.state));
+        }
+        const trustedAvailabilityGeneration = availability.generation;
+        if (
+          !ownsSubmittedUserScope() ||
+          (isNewDotsSession
+            ? !ownsSubmittedDraftView() || activeSessionIdRef.current !== null
+            : activeSessionIdRef.current !== sessionId)
+        ) {
+          settleOutbox(
+            sessionId,
+            clientMessageId,
+            "failed",
+            "送信先Chatが切り替わったため、依頼は送信していません。",
+          );
+          return "retained" as ChatComposerSendResult;
+        }
+
+        if (isNewDotsSession && !ownsSubmittedNewChatDotsSelection()) {
+          return failWithoutSending(
+            "GPT dotsのProvider設定が送信中に変わったため、依頼は送信していません。Providerを再選択して再試行してください。",
+          );
+        }
+
+        let receipt;
+        try {
+          receipt = await chatApi.createDotsDialogueRequest({
+            binding_id: availabilityBindingId,
+            conversation_id: availabilityConversationId,
+            idempotency_key: clientMessageId,
+            message: content,
+          });
+        } catch (error) {
+          const message = dotsDialogueErrorMessage(
+            error,
+            "request",
+            trustedAvailabilityGeneration,
+          );
+          const status = error instanceof ChatApiError ? error.status : null;
+          settleOutbox(
+            sessionId,
+            clientMessageId,
+            status != null && status >= 400 && status < 500 ? "failed" : "uncertain",
+            message,
+          );
+          toast.error(message);
+          return "retained" as ChatComposerSendResult;
+        }
+
+        if (
+          receipt.conversation_id !== availabilityConversationId ||
+          receipt.conversation_id !== sessionId ||
+          !UUID_VALUE.test(receipt.request_id) ||
+          !UUID_VALUE.test(receipt.user_message_id)
+        ) {
+          settleOutbox(
+            sessionId,
+            clientMessageId,
+            "uncertain",
+            "GPT dotsの受付結果を確認できません。再試行時は同じ送信IDを使います。",
+          );
+          toast.error("GPT dotsの受付結果を確認できません。再試行時は同じ送信IDを使います。");
+          return "retained" as ChatComposerSendResult;
+        }
+
+        dispatchChatTimeline({
+          type: "promote_client_message",
+          sessionId,
+          clientMessageId,
+          serverMessageId: receipt.user_message_id,
+        });
+        settleOutbox(sessionId, clientMessageId, "accepted");
+        bumpSession(sessionId);
+        if (isNewDotsSession && ownsSubmittedDraftView()) {
+          dispatchGeneration({ type: "reset", sessionId });
+          options?.onSessionPromoted?.(sessionId);
+          activateSession(sessionId);
+          const href = `/chat?s=${encodeURIComponent(sessionId)}`;
+          if (!navigateChatSessionInPlace(href)) {
+            router.push(href);
+          }
+        }
+        if (activeSessionIdRef.current === sessionId) {
+          watchDotsDialogueRequest(receipt.request_id);
+        }
+        toast.info("GPT dotsへの依頼を受け付けました。返信は保存後にこのChatの履歴へ表示されます。");
+        return "accepted" as ChatComposerSendResult;
+      }
+
       const knownAssistantIds = new Set(
         messages
           .filter(
@@ -1542,7 +2268,6 @@ export function useChatMessaging({
             includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
-            executionProfileId,
             appContext: messageAppContext,
           });
         } else {
@@ -1560,7 +2285,6 @@ export function useChatMessaging({
               messageAppContext,
               mentions,
               messageIncludeProjectContext,
-              executionProfileId,
             );
             markWaitingResponse(sessionId, clientMessageId);
             void waitForPersistedAssistantResponse(
@@ -1570,7 +2294,7 @@ export function useChatMessaging({
             );
           } catch (err) {
             console.error("WebSocket未接続時のREST送信失敗:", err);
-            notifyRuntimeRejection(err, executionProfileId);
+            notifyRuntimeRejection(err);
             settleOutbox(
               optimisticSessionId,
               clientMessageId,
@@ -1618,7 +2342,6 @@ export function useChatMessaging({
               ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
             undefined,
-            executionProfileId,
           );
         } catch (err) {
           console.error("グループチャットのWebSocket送信失敗:", err);
@@ -1656,7 +2379,6 @@ export function useChatMessaging({
             includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
-            executionProfileId,
             appContext: messageAppContext,
           });
         } else {
@@ -1697,7 +2419,6 @@ export function useChatMessaging({
               ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
             undefined,
-            executionProfileId,
           );
         } catch (err) {
           console.error("添付/メンションのWebSocket送信失敗:", err);
@@ -1733,7 +2454,6 @@ export function useChatMessaging({
             includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
-            executionProfileId,
             appContext: messageAppContext,
           });
         } else {
@@ -1762,7 +2482,6 @@ export function useChatMessaging({
             messageAppContext,
             mentions,
             messageIncludeProjectContext,
-            executionProfileId,
           );
           markWaitingResponse(sessionId, clientMessageId);
           void waitForPersistedAssistantResponse(
@@ -1773,7 +2492,7 @@ export function useChatMessaging({
           return "accepted" as ChatComposerSendResult;
         } catch (err) {
           console.error("メッセージ送信失敗:", err);
-          notifyRuntimeRejection(err, executionProfileId);
+          notifyRuntimeRejection(err);
           settleOutbox(
             optimisticSessionId,
             clientMessageId,
@@ -1829,6 +2548,8 @@ export function useChatMessaging({
       updateClientDeliveryState,
       normalizedNewSessionAgentId,
       onSessionAgentConsumed,
+      watchDotsDialogueRequest,
+      inheritedGenerationProfile,
     ],
   );
 
@@ -1875,7 +2596,6 @@ export function useChatMessaging({
         {
           clientMessageId: record.clientMessageId,
           dispatchMode: "chat",
-          executionProfileId: record.executionProfileId ?? null,
         },
       );
       if (result === "failed") {
@@ -2115,6 +2835,12 @@ export function useChatMessaging({
   return {
     maybeGenerateLoadedSessionTitle,
     refreshPersistedMessages,
+    loadOlderMessages,
+    hasMoreMessages,
+    isLoadingOlderMessages,
+    messageHistoryGeneration,
+    messageHistoryEpoch,
+    messageHistoryIndex,
     bumpSessionForAssistant,
     handleCreateGroupChat,
     handleSendMessage,

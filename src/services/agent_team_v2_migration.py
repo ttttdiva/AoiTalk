@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from . import agent_team_service as _runtime_facade  # noqa: F401
 from .agent_team_v3 import (
     AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER,
     AGENT_TEAM_DEFAULT_LLM_PROFILES,

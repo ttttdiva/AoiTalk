@@ -34,7 +34,7 @@ from openai import AsyncOpenAI
 from PIL import Image
 
 from src.llm.conversation_context import normalize_usage
-from src.services.agent_team_service import config_get
+from src.services.runtime_policy_utils import config_get
 from src.services.turn_context import get_turn_context
 from src.services.outbound_privacy_service import (
     EgressDescriptor,

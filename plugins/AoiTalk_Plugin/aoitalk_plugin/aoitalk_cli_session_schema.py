@@ -75,6 +75,67 @@ class Session(TypedDict, total=False):
     next_cursor: str | None
 
 
+class MuseToolOperationDiagnostic(TypedDict, total=False):
+    operation_id: str
+    call_id_sha256: str | None
+    tool: Literal["read_file", "edit_file", "execute_command"] | None
+    correlation: Literal[
+        "matched",
+        "receipt_mismatch",
+        "loop_receipt_only",
+        "executor_receipt_only",
+        "operation_id_matched_call_id_digest_missing",
+    ]
+    execution_evidence: Literal[
+        "receipt_missing",
+        "not_dispatched",
+        "dispatch_unconfirmed",
+        "router_completed_without_execution",
+        "command_timed_out",
+        "child_return_code_unknown",
+        "child_completed",
+        "tool_completed",
+        "unknown",
+    ]
+    executor_call_id_sha256: str | None
+    loop_status: str | None
+    loop_success: bool | None
+    loop_executed: bool | None
+    mutation_epoch: int | None
+    executor_state: str | None
+    executor_status: str | None
+    executor_success: bool | None
+    executor_executed: bool | None
+    output_truncated: bool | None
+    error_truncated: bool | None
+    admitted_at: float | None
+    started_at: float | None
+    operation_updated_at: float | None
+    receipt_terminal_at: float | None
+    command_return_code: int | None
+    command_timed_out: bool | None
+    receipt_present: bool
+
+
+class MuseToolLoopDiagnostics(TypedDict, total=False):
+    schema_version: int
+    status: str
+    run_id: str
+    session_id: str
+    work_item_id: str
+    loop_status: str | None
+    error_code: str | None
+    loop_summary_present: bool
+    tool_call_count: int | None
+    round_count: int | None
+    successful_tools: list[str]
+    latest_mutation_epoch: int | None
+    verification_epoch: int | None
+    requirements_diagnosis: str
+    executor_journal_status: str
+    operations: Annotated[list[MuseToolOperationDiagnostic], Field(max_length=32)]
+
+
 class SessionReply(BusinessReply, total=False):
     session_id: str | None
     session: Session | None
@@ -104,6 +165,7 @@ class SessionReply(BusinessReply, total=False):
     work_item_id: str | None
     run: dict[str, Any] | None
     work: dict[str, Any] | None
+    muse_tool_loop_diagnostics: MuseToolLoopDiagnostics | None
     created: bool | None
     accepted: bool | None
     reconnected: bool | None

@@ -1803,6 +1803,7 @@ class CLIBackendBase(ABC):
                     event_callback=event_callback or (lambda _type, _data: None),
                 )
             else:
+                self._notify_process_spawn_attempt()
                 process = backend.spawn(
                     scope,
                     command,
@@ -1822,6 +1823,7 @@ class CLIBackendBase(ABC):
                         "text": False,
                     },
                 )
+                self._notify_process_started(process)
                 try:
                     stdout, stderr = process.communicate(
                         input=scoped_stdin_input,
@@ -1974,6 +1976,38 @@ class CLIBackendBase(ABC):
             )
         return False, error_msg
 
+    def _notify_process_stage(self, stage: str, process: Any = None) -> None:
+        """Notify an optional observer at Grok's process boundary."""
+
+        provider = str(getattr(self, "provider_name", "") or "").strip()
+        if not provider:
+            try:
+                provider = str(self.get_provider_name() or "")
+            except Exception:
+                provider = ""
+        provider = provider.casefold()
+        if "grok" not in provider:
+            return
+        observer = getattr(self, "_aoitalk_stage_observer", None)
+        if not callable(observer):
+            return
+        try:
+            observer(stage, process)
+        except Exception as exc:
+            # Diagnostics must never alter provider execution semantics.
+            logger.debug(
+                "Grok process stage observation failed; exception_type=%s",
+                type(exc).__name__,
+            )
+
+    def _notify_process_spawn_attempt(self) -> None:
+        self._notify_process_stage("grok_process_spawn_attempt")
+
+    def _notify_process_started(self, process: Any) -> None:
+        """Notify only after the Grok child process has actually been created."""
+
+        self._notify_process_stage("grok_process_started", process)
+
     def _run_scoped_streaming_process(
         self,
         backend: Any,
@@ -1999,6 +2033,7 @@ class CLIBackendBase(ABC):
         pending_line = bytearray()
         receipt = current_cli_lease_receipt()
         ticket = receipt.begin_spawn() if receipt is not None else None
+        self._notify_process_spawn_attempt()
         process = backend.spawn(
             scope,
             command,
@@ -2018,6 +2053,7 @@ class CLIBackendBase(ABC):
                 "text": False,
             },
         )
+        self._notify_process_started(process)
         if receipt is not None:
             # WSL publication finalization does not establish process-tree
             # termination. Keep an unknown scoped tree until it is proven.
@@ -2152,6 +2188,7 @@ class CLIBackendBase(ABC):
         manual_options = self.get_invocation_options() is not None
         suspended_windows = os.name == "nt" and (receipt is not None or manual_options)
         try:
+            self._notify_process_spawn_attempt()
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE if stdin_input_bytes is not None else subprocess.DEVNULL,
@@ -2174,6 +2211,7 @@ class CLIBackendBase(ABC):
             if receipt is not None:
                 receipt.no_process_started(ticket)
             raise
+        self._notify_process_started(process)
         if receipt is not None:
             receipt.bind_process(ticket, process, isolated_group=True)
         windows_job_handle = _create_windows_process_job(process)

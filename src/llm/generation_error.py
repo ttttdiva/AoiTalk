@@ -134,6 +134,7 @@ class GenerationFailure:
     kind: str
     user_message: str
     technical_detail: str
+    interruption_reason: str | None = None
 
     @property
     def is_empty_response(self) -> bool:
@@ -147,10 +148,18 @@ class ModelOutputIncompleteError(RuntimeError):
     was accepted and billed, but the requested artifact was never produced.
     """
 
-    def __init__(self, reason: str, *, transport: str, request_type: str = "") -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        transport: str,
+        request_type: str = "",
+        response_char_count: int = 0,
+    ) -> None:
         self.reason = str(reason or "unknown")
         self.transport = str(transport or "")
         self.request_type = str(request_type or "")
+        self.response_char_count = max(0, min(int(response_char_count), 1_000_000))
         super().__init__(
             f"model output incomplete: reason={self.reason} "
             f"transport={self.transport} request_type={self.request_type}"
@@ -181,14 +190,29 @@ def require_complete_model_output(
         if str(_response_field(response, "status") or "") == "incomplete":
             details = _response_field(response, "incomplete_details")
             reason = str(_response_field(details, "reason") or "incomplete")
-            raise ModelOutputIncompleteError(reason, transport=transport, request_type=request_type)
+            raise ModelOutputIncompleteError(
+                reason,
+                transport=transport,
+                request_type=request_type,
+                response_char_count=len(str(text or "")),
+            )
     else:
         choices = _response_field(response, "choices") or []
         first = choices[0] if choices else None
         if first is not None and str(_response_field(first, "finish_reason") or "") == "length":
-            raise ModelOutputIncompleteError("length", transport=transport, request_type=request_type)
+            raise ModelOutputIncompleteError(
+                "length",
+                transport=transport,
+                request_type=request_type,
+                response_char_count=len(str(text or "")),
+            )
     if not str(text or "").strip():
-        raise ModelOutputIncompleteError("empty_output", transport=transport, request_type=request_type)
+        raise ModelOutputIncompleteError(
+            "empty_output",
+            transport=transport,
+            request_type=request_type,
+            response_char_count=len(str(text or "")),
+        )
     return text
 
 

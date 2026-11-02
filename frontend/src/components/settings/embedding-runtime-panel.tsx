@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,6 +16,36 @@ const LABELS: Record<EmbeddingRuntimeStatus["state"], string> = {
 
 export function EmbeddingRuntimePanel({ isAdmin = false }: { isAdmin?: boolean } = {}) {
   const canManage = isAdmin === true;
+  const [resident, setResident] = useState<boolean | null>(null);
+  const [residentSaving, setResidentSaving] = useState(false);
+  const [residentError, setResidentError] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch("/api/python-proxy/settings", { credentials: "include", cache: "no-store", signal: controller.signal })
+      .then(async response => {
+        if (!response.ok) throw new Error();
+        const body = await response.json();
+        const value: unknown = body?.settings?.search?.embedding_resident;
+        if (typeof value !== "boolean") throw new Error();
+        setResident(value);
+      }).catch(() => { if (!controller.signal.aborted) setResidentError("常駐設定を取得できませんでした。"); });
+    return () => controller.abort();
+  }, []);
+  async function saveResident(next: boolean) {
+    setResidentSaving(true); setResidentError(null);
+    try {
+      const response = await fetch("/api/python-proxy/settings", {
+        method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: "search.embedding_resident", value: next, persist: true }),
+      });
+      const body = await response.json();
+      if (!response.ok || body.success !== true || body.persisted !== true || body.value !== next || body.key !== "search.embedding_resident") throw new Error();
+      setResident(next);
+    } catch {
+      setResident(null);
+      setResidentError("常駐設定の保存結果を確認できませんでした。画面を再読み込みしてください。");
+    } finally { setResidentSaving(false); }
+  }
   const {
     status, loaded, pending, error, message, refresh, release,
     enabled, settingsError, saving, saveError, saveMessage, setEnabled,
@@ -73,6 +104,23 @@ export function EmbeddingRuntimePanel({ isAdmin = false }: { isAdmin?: boolean }
             </button>
           </span>
         </div>
+        <div className="flex items-center justify-between gap-2 rounded-md border px-3 py-2">
+          <span className="inline-flex items-center gap-1 font-medium">モデルを常駐
+            <HelpPopover label="モデルを常駐">
+              <p>ON: 起動時にバックグラウンドで読み込み、アイドル時も保持します。意味検索・索引作成がOFFの場合は読み込みません。</p>
+              <p>OFF: 事前ロードせず、必要なときに読み込みます。使わない状態が一定時間（既定300秒）続くと解放します。</p>
+            </HelpPopover>
+          </span>
+          <span className="inline-flex items-center gap-2">
+            <span className="text-muted-foreground">{residentSaving ? "保存中…" : resident === null ? "確認中" : resident ? "ON" : "OFF"}</span>
+            <button type="button" role="switch" aria-label="モデルを常駐" aria-checked={resident === null ? "mixed" : resident}
+              disabled={!canManage || resident === null || residentSaving} onClick={() => { if (resident !== null) void saveResident(!resident); }}
+              className={cn("relative h-5 w-9 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50", resident ? "bg-primary" : "bg-muted-foreground/35")}>
+              <span className={cn("absolute top-0.5 size-4 rounded-full bg-background shadow transition-transform", resident ? "left-[18px]" : "left-0.5")} />
+            </button>
+          </span>
+        </div>
+        {residentError && <p role="alert" className="text-destructive">{residentError}</p>}
         {!canManage && <p role="status" className="text-muted-foreground">この設定の変更には管理者権限が必要です。</p>}
         {settingsError && <p role="alert" className="text-destructive">{settingsError}</p>}
         {canManage && saveError && <p role="alert" className="text-destructive">{saveError}</p>}
@@ -86,7 +134,7 @@ export function EmbeddingRuntimePanel({ isAdmin = false }: { isAdmin?: boolean }
         {canManage && status && <dl className="grid grid-cols-2 gap-2">
           <dt>実行 / 待機リクエスト</dt><dd>{status.active_requests} / {status.queued_requests}</dd>
           <dt>配置 / 精度</dt><dd>{status.effective_device ?? status.configured_device} / {status.precision ?? "未ロード"}</dd>
-          <dt>アイドル自動解放</dt><dd>{status.idle_timeout_seconds === 0 ? "OFF" : `${status.idle_timeout_seconds} 秒`}</dd>
+          <dt>アイドル自動解放</dt><dd>{resident ? "常駐中は無効" : status.idle_timeout_seconds === 0 ? "OFF" : `${status.idle_timeout_seconds} 秒`}</dd>
           <dt>Worker PID</dt><dd>{status.pid ?? "なし"}</dd>
         </dl>}
         {canManage && status?.metrics_source === "last_worker_response" && typeof status.metrics.rss_bytes === "number" && (

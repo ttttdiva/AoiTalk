@@ -397,10 +397,63 @@ _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _PRIVATE_IP_RE = re.compile(
     r"(?<![\w.])(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|127(?:\.\d{1,3}){3})(?![\w.])"
 )
+# This regex only finds whole IP-shaped tokens.  Every candidate is then
+# parsed by ``ipaddress`` before it can be redacted; the regex is not treated
+# as proof that the token is an address.  The broad IPv6 branch also consumes
+# invalid alphanumeric groups and scoped zone identifiers so they cannot be
+# partially redacted as a valid prefix.
+_IP_LITERAL_CANDIDATE_RE = re.compile(
+    r"(?<![\w.:])(?P<candidate>"
+    r"\[[^\[\]\s]+\](?::[0-9]+)?"
+    r"|[0-9]+(?:\.[0-9]+){3}(?:/[0-9]+)?(?::[0-9]+)?"
+    r"|(?=[A-Za-z0-9:.%_~-]*:)[A-Za-z0-9:.%_~-]+(?:/[0-9]+)?"
+    r")(?![\w.])"
+)
+_IP_BRACKETED_LITERAL_RE = re.compile(r"^\[(?P<address>[^\[\]\s]+)\](?P<suffix>:[0-9]+)?$")
+_IP_V4_LITERAL_RE = re.compile(
+    r"^(?P<address>[0-9]+(?:\.[0-9]+){3})(?P<suffix>(?:/[0-9]+)?(?::[0-9]+)?)$"
+)
+_IP_VERSION_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:version|release|build|ver)\s*(?:[:=#]\s*)?$"
+)
+_IP_PRIVATE_V4_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+_IP_LEGACY_V4_NETWORKS = _IP_PRIVATE_V4_NETWORKS + (
+    ipaddress.ip_network("127.0.0.0/8"),
+)
+_IP_PRIVATE_NETWORKS = _IP_LEGACY_V4_NETWORKS + (
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+)
 _URL_RE = re.compile(
     r"(?i)\bhttps?://(?:[^\s/@:]+(?::[^\s/@]*)?@)?(?:[A-Za-z0-9_-]+\.)*(?:internal|local|localhost|intranet|corp|lan)(?::\d+)?(?:/[^\s]*)?"
 )
-_WINDOWS_PATH_RE = re.compile(r"(?<![\w])(?:[A-Za-z]:\\|\\\\)[^\r\n\t\"']+")
+# Match path segments rather than consuming the rest of a line. This keeps a
+# JSON-escaped closing quote (\") outside the match, so redacting a path in a
+# serialized tool result cannot consume its JSON escape and corrupt the wire
+# document. Dot-prefixed relative paths such as ``.\\venv\\Scripts`` are not
+# absolute paths and must not be mistaken for a UNC prefix.
+_WINDOWS_PATH_SEPARATOR_RE = r"\\+"
+_WINDOWS_PATH_SEGMENT_RE = r"[^\\/:*\"<>|\r\n\t']+"
+_WINDOWS_PATH_PREFIX_RE = (
+    r"(?:[A-Za-z]:"
+    + _WINDOWS_PATH_SEPARATOR_RE
+    + r"|(?<!\\)\\{2,})"
+)
+_WINDOWS_PATH_RE = re.compile(
+    r"(?<![\w.])"
+    + _WINDOWS_PATH_PREFIX_RE
+    + _WINDOWS_PATH_SEGMENT_RE
+    + r"(?:"
+    + _WINDOWS_PATH_SEPARATOR_RE
+    + _WINDOWS_PATH_SEGMENT_RE
+    + r")*"
+)
 _UNIX_PATH_RE = re.compile(r"(?<![\w])/(?:home|Users|Users|var|tmp|opt|srv|mnt|workspace|work)/[^\r\n\t\"']+")
 _DATA_URL_RE = re.compile(r"^data:(?:image|audio|video)/[^;,]+(?:;[^,]*)?,", re.I)
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
@@ -675,6 +728,10 @@ class PrivacyConfig:
     semantic_max_calls_per_payload: int = 64
     semantic_max_input_chars_per_payload: int = 24_000
     semantic_max_entities_per_payload: int = 64
+    # ``legacy`` retains the historical RFC1918/loopback IPv4 rule.  The
+    # broader ``private`` and ``all`` choices are deliberately opt-in.  This
+    # stays at the end to preserve positional construction compatibility.
+    ip_address_policy: str = "legacy"
 
 
 def _get(config: Any, key: str, default: Any = None) -> Any:
@@ -751,6 +808,24 @@ def privacy_config(config: Any | None = None) -> PrivacyConfig:
     mode = str(mode_value or "direct").strip().lower()
     if mode not in {"direct", "protected", "local_only"}:
         mode = "direct"
+    missing_ip_policy = object()
+    configured_ip_policy = _get(
+        config,
+        "external_model_privacy.ip_address_policy",
+        missing_ip_policy,
+    )
+    if configured_ip_policy is missing_ip_policy:
+        ip_address_policy = "legacy"
+    elif isinstance(configured_ip_policy, str):
+        ip_address_policy = configured_ip_policy.strip().lower()
+    else:
+        ip_address_policy = ""
+    if ip_address_policy not in {"legacy", "off", "private", "all"}:
+        # The setting route normally rejects invalid choices. If another
+        # configuration source bypasses that validator, fail closed before a
+        # protected gateway can be constructed; falling back could silently
+        # omit an explicitly intended public-IP mask.
+        raise PrivacyError("invalid IP address masking policy")
     policy = str(_get(config, "external_model_privacy.review_policy", "high_risk") or "high_risk").strip().lower()
     if policy not in {"never", "high_risk", "always"}:
         policy = "high_risk"
@@ -873,6 +948,7 @@ def privacy_config(config: Any | None = None) -> PrivacyConfig:
     )
     return PrivacyConfig(
         mode=mode,
+        ip_address_policy=ip_address_policy,
         review_policy=policy,
         notify=_bool(_get(config, "external_model_privacy.notify", True), True),
         semantic_redaction_enabled=_bool(
@@ -891,6 +967,198 @@ def privacy_config(config: Any | None = None) -> PrivacyConfig:
         semantic_max_calls_per_payload=semantic_max_calls_per_payload,
         semantic_max_input_chars_per_payload=semantic_max_input_chars_per_payload,
         semantic_max_entities_per_payload=semantic_max_entities_per_payload,
+    )
+
+
+@dataclass(frozen=True)
+class _ParsedIPLiteral:
+    address: Any
+    network: Any | None
+    alias_value: str
+    restore_value: str
+    suffix: str = ""
+    bracketed: bool = False
+
+
+def _valid_ip_port(value: str) -> bool:
+    return bool(value) and len(value) <= 5 and value.isascii() and value.isdigit() and int(value) <= 65535
+
+
+def _parse_ip_literal(candidate: str) -> _ParsedIPLiteral | None:
+    """Semantically validate one complete IP token and normalize its alias key."""
+
+    # Scope identifiers vary by host and are not portable. Reject the complete
+    # candidate before either parser can accept a platform-specific scoped form.
+    if "%" in candidate:
+        return None
+
+    bracketed = _IP_BRACKETED_LITERAL_RE.fullmatch(candidate)
+    if bracketed:
+        address_text = bracketed.group("address")
+        suffix = bracketed.group("suffix") or ""
+        if suffix and "/" in address_text:
+            return None
+        if suffix and not _valid_ip_port(suffix[1:]):
+            return None
+        parsed = _parse_ip_address_or_network(address_text)
+        if parsed is None or parsed[0].version != 6:
+            return None
+        address, network = parsed
+        alias_value = (
+            f"{address.compressed}/{network.prefixlen}"
+            if network is not None
+            else address.compressed
+        )
+        return _ParsedIPLiteral(
+            address,
+            network,
+            alias_value,
+            address_text,
+            suffix,
+            bracketed=True,
+        )
+
+    ipv4 = _IP_V4_LITERAL_RE.fullmatch(candidate)
+    if ipv4:
+        address_text = ipv4.group("address")
+        suffix = ipv4.group("suffix") or ""
+        # A CIDR and a port are different token forms; accepting both would
+        # hide malformed syntax and make the port/address boundary unclear.
+        if "/" in suffix and ":" in suffix:
+            return None
+        if ":" in suffix:
+            port = suffix[1:]
+            if not _valid_ip_port(port):
+                return None
+            suffix = f":{port}"
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            return None
+        if "/" in (ipv4.group("suffix") or ""):
+            network_suffix = ipv4.group("suffix").split(":", 1)[0]
+            try:
+                network = ipaddress.ip_network(
+                    f"{address_text}{network_suffix}",
+                    strict=False,
+                )
+            except ValueError:
+                return None
+            return _ParsedIPLiteral(
+                address,
+                network,
+                f"{address.compressed}/{network.prefixlen}",
+                f"{address_text}{network_suffix}",
+            )
+        return _ParsedIPLiteral(address, None, address.compressed, address_text, suffix)
+
+    parsed = _parse_ip_address_or_network(candidate)
+    if parsed is None or parsed[0].version != 6:
+        return None
+    address, network = parsed
+    alias_value = (
+        f"{address.compressed}/{network.prefixlen}"
+        if network is not None
+        else address.compressed
+    )
+    return _ParsedIPLiteral(address, network, alias_value, candidate)
+
+
+def _scoped_ipv6_matches_policy(candidate: str, policy: str) -> bool:
+    """Return whether a complete, validated scoped IPv6 token needs fail-closed handling."""
+
+    bracketed = _IP_BRACKETED_LITERAL_RE.fullmatch(candidate)
+    if bracketed:
+        address_with_zone = bracketed.group("address")
+        suffix = bracketed.group("suffix") or ""
+        if suffix and not _valid_ip_port(suffix[1:]):
+            return False
+    else:
+        address_with_zone = candidate
+        # Unbracketed IPv6 ports are ambiguous, but treating a final numeric
+        # suffix as a port is conservative once a valid zone separator exists.
+        port = re.fullmatch(r"(?P<value>.+)(?P<port>:[0-9]+)", address_with_zone)
+        if port:
+            address_with_zone = port.group("value")
+
+    scope = re.fullmatch(
+        r"(?P<address>.+?)(?:%25|%)(?P<zone>(?:[A-Za-z0-9_.~-]|%[0-9A-Fa-f]{2})+)"
+        r"(?:/(?P<prefix>[0-9]+))?",
+        address_with_zone,
+    )
+    if not scope:
+        return False
+    try:
+        address = ipaddress.ip_address(scope.group("address"))
+    except ValueError:
+        return False
+    if address.version != 6:
+        return False
+    prefix = scope.group("prefix")
+    if prefix is not None:
+        try:
+            ipaddress.ip_network(f"{address.compressed}/{prefix}", strict=False)
+        except ValueError:
+            return False
+    # A scoped token identifies the validated base host. The prefix is checked
+    # for valid CIDR syntax, but must not downgrade a link-local base address
+    # by widening its network beyond the supported private ranges.
+    parsed = _ParsedIPLiteral(
+        address=address,
+        network=None,
+        alias_value=address.compressed,
+        restore_value=address.compressed,
+    )
+    return _ip_literal_matches_policy(parsed, policy)
+
+
+def _parse_ip_address_or_network(value: str) -> tuple[Any, Any | None] | None:
+    try:
+        if "/" in value:
+            network = ipaddress.ip_network(value, strict=False)
+            address = ipaddress.ip_address(value.split("/", 1)[0])
+            return address, network
+        return ipaddress.ip_address(value), None
+    except ValueError:
+        return None
+
+
+def _ip_literal_matches_policy(candidate: _ParsedIPLiteral, policy: str) -> bool:
+    if policy == "off":
+        return False
+    if policy == "all":
+        return True
+    if policy == "legacy":
+        return candidate.address.version == 4 and any(
+            candidate.address in network for network in _IP_LEGACY_V4_NETWORKS
+        )
+
+    # ``private`` is a deliberately narrow, stable set: RFC1918, IPv4
+    # loopback/link-local, IPv6 unique-local/link-local, and IPv6
+    # unspecified/loopback.  CIDR tokens are included only when wholly inside
+    # one of these blocks.  IPv4-mapped IPv6 addresses use their embedded IPv4
+    # scope for this selection, while retaining an IPv6-shaped alias on output.
+    if candidate.network is not None:
+        network = candidate.network
+        if network.version == 6 and network.prefixlen >= 96:
+            mapped = getattr(network.network_address, "ipv4_mapped", None)
+            if mapped is not None:
+                network = ipaddress.ip_network(
+                    f"{mapped}/{network.prefixlen - 96}", strict=False
+                )
+        return any(
+            network.version == private_network.version
+            and network.subnet_of(private_network)
+            for private_network in _IP_PRIVATE_NETWORKS
+        )
+
+    address = candidate.address
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return any(
+        address.version == private_network.version and address in private_network
+        for private_network in _IP_PRIVATE_NETWORKS
     )
 
 
@@ -1995,6 +2263,7 @@ class OutboundPrivacyGateway:
         self.review_callback = review_callback
         self._raw_to_alias: dict[str, str] = {}
         self._alias_to_raw: dict[str, str] = {}
+        self._ip_aliases_by_identity: dict[str, str] = {}
         self._counters: dict[str, int] = {}
         self.audit: list[dict[str, Any]] = []
         self._semantic_redactor = semantic_redactor
@@ -2178,15 +2447,30 @@ class OutboundPrivacyGateway:
             )
         return classification
 
-    def _placeholder(self, category: str, raw: str) -> str:
+    def _placeholder(
+        self,
+        category: str,
+        raw: str,
+        *,
+        identity_key: str | None = None,
+    ) -> str:
         existing = self._raw_to_alias.get(raw)
         if existing:
+            if identity_key:
+                self._ip_aliases_by_identity[identity_key] = existing
             return existing
+        if identity_key:
+            existing = self._ip_aliases_by_identity.get(identity_key)
+            if existing:
+                self._raw_to_alias[raw] = existing
+                return existing
         normalized_category = re.sub(r"[^A-Z0-9]+", "_", category.upper()).strip("_") or "VALUE"
         self._counters[normalized_category] = self._counters.get(normalized_category, 0) + 1
         alias = f"[AOI_{normalized_category}_{self._counters[normalized_category]}]"
         self._raw_to_alias[raw] = alias
         self._alias_to_raw[alias] = raw
+        if identity_key:
+            self._ip_aliases_by_identity[identity_key] = alias
         return alias
 
     def _replace_pattern(self, text: str, pattern: re.Pattern[str], category: str, findings: list[RedactionFinding]) -> str:
@@ -2222,6 +2506,70 @@ class OutboundPrivacyGateway:
             findings.extend(RedactionFinding(category, alias, 1) for alias in aliases[-count:])
         return result
 
+    def _replace_ip_candidates(
+        self,
+        text: str,
+        findings: list[RedactionFinding],
+    ) -> str:
+        policy = self.settings.ip_address_policy
+        if policy == "off":
+            return text
+
+        aliases: list[str] = []
+
+        def replace(match: re.Match[str]) -> str:
+            candidate_text = match.group("candidate")
+            if (
+                (match.start() > 0 and text[match.start() - 1] == "[")
+                or text[match.end() :].startswith("]")
+            ):
+                # An unmatched/nested bracket must not turn its interior into
+                # a separately maskable address token.
+                return candidate_text
+            if _scoped_ipv6_matches_policy(candidate_text, policy):
+                # Scoped interface identifiers are host-local and unsupported
+                # by the reversible alias format. With strict IP masking
+                # selected, withholding the entire projection is safer than
+                # exposing either the address or its zone.
+                raise PrivacyError(
+                    "scoped IPv6 value cannot be processed by the selected IP address policy"
+                )
+            prefix = text[max(0, match.start() - 32) : match.start()]
+            if _IP_VERSION_CONTEXT_RE.search(prefix):
+                # Four decimal components can also be a software version.
+                # Suppress the obvious labelled forms; an unlabelled
+                # ``1.2.3.4`` remains inherently ambiguous.
+                return candidate_text
+            # Do not mask a valid prefix of malformed continuation syntax such
+            # as ``192.0.2.1:80:90`` or ``[2001:db8::1]/64``. URL paths remain
+            # supported when the slash is followed by a non-digit.
+            remainder = text[match.end() :]
+            if remainder.startswith(":") or (
+                len(remainder) > 1 and remainder[0] == "/" and remainder[1].isdigit()
+            ):
+                return candidate_text
+            parsed = _parse_ip_literal(candidate_text)
+            if parsed is None or not _ip_literal_matches_policy(parsed, policy):
+                return candidate_text
+            alias = self._placeholder(
+                "INTERNAL_HOST",
+                parsed.restore_value,
+                identity_key=parsed.alias_value,
+            )
+            aliases.append(alias)
+            # Keep bracket delimiters outside the reversible token. Local
+            # restoration can then replace the alias without dropping the
+            # bracketed IPv6 host structure or its separate port suffix.
+            wrapped_alias = f"[{alias}]" if parsed.bracketed else alias
+            return f"{wrapped_alias}{parsed.suffix}"
+
+        result = _IP_LITERAL_CANDIDATE_RE.sub(replace, text)
+        findings.extend(
+            RedactionFinding("INTERNAL_HOST", alias)
+            for alias in dict.fromkeys(aliases)
+        )
+        return result
+
     def _deterministic_redact(self, text: str) -> tuple[str, list[RedactionFinding]]:
         findings: list[RedactionFinding] = []
         redacted = text
@@ -2239,12 +2587,25 @@ class OutboundPrivacyGateway:
             (HIGH_CONFIDENCE_API_TOKEN_RE, "SECRET"),
             (_SECRET_RE, "SECRET"),
             (_EMAIL_RE, "EMAIL"),
-            (_PRIVATE_IP_RE, "INTERNAL_HOST"),
+        ):
+            redacted = self._replace_pattern(redacted, pattern, category, findings)
+        if self.settings.ip_address_policy == "legacy":
+            # Keep the historical matcher in its original position and use
+            # the unchanged replacement semantics for all default callers.
+            redacted = self._replace_pattern(
+                redacted,
+                _PRIVATE_IP_RE,
+                "INTERNAL_HOST",
+                findings,
+            )
+        for pattern, category in (
             (_URL_RE, "INTERNAL_URL"),
             (_WINDOWS_PATH_RE, "LOCAL_PATH"),
             (_UNIX_PATH_RE, "LOCAL_PATH"),
         ):
             redacted = self._replace_pattern(redacted, pattern, category, findings)
+        if self.settings.ip_address_policy in {"private", "all"}:
+            redacted = self._replace_ip_candidates(redacted, findings)
         for term in self.settings.redaction_terms:
             if term and term in redacted:
                 alias = self._placeholder("CONFIDENTIAL_TERM", term)
@@ -2958,6 +3319,7 @@ class OutboundPrivacyGateway:
             model_key,
             _payload_hash(payload),
             self.settings.mode,
+            self.settings.ip_address_policy,
             self.settings.review_policy,
             self.settings.notify,
             self.settings.redaction_terms,
@@ -2992,6 +3354,10 @@ class OutboundPrivacyGateway:
             for raw, alias in aliases:
                 self._raw_to_alias[raw] = alias
                 self._alias_to_raw[alias] = raw
+                if alias.startswith("[AOI_INTERNAL_HOST_"):
+                    parsed_ip = _parse_ip_literal(raw)
+                    if parsed_ip is not None:
+                        self._ip_aliases_by_identity[parsed_ip.alias_value] = alias
             try:
                 cached_payload = json.loads(serialized)
                 cache_hit = True
@@ -3634,6 +4000,8 @@ class OutboundPrivacyGateway:
         model: str | None = None,
         semantic_exempt_values: Iterable[str] | None = None,
         credential_identity: Mapping[str, str] | None = None,
+        sdk_max_retries: int | None = None,
+        httpx_transport_retries: int | None = None,
     ) -> Any:
         """Protect, review and invoke one external sender exactly once.
 
@@ -3686,7 +4054,8 @@ class OutboundPrivacyGateway:
             return await execute_budgeted_openai_request(final_payload,
                 config=self.config, provider=active_provider,
                 model=model or active_descriptor.model, identity=credential_identity,
-                sender=active_sender)
+                sender=active_sender, sdk_max_retries=sdk_max_retries,
+                httpx_transport_retries=httpx_transport_retries)
         sent = active_sender(final_payload)
         return await sent if inspect.isawaitable(sent) else sent
 

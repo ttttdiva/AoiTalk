@@ -8,14 +8,12 @@ import type { ChatCommandCapability } from "@/lib/chat-commands";
 export type { ChatCommandCapability } from "@/lib/chat-commands";
 import type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
 export type { LlmDeploymentMetadata } from "@/lib/llm-provider-visibility";
-import type {
-  AgentExecutionProfileCatalog,
-} from "@/lib/agent-runtime-selection";
 import type { components } from "@/lib/api-types.gen";
 import {
   normalizeCharacterOptions,
   resolveCurrentCharacterSlug,
 } from "@/lib/character-options";
+import { readFileTransferCompatibilityPreference } from "@/lib/file-transfer-preference";
 
 // ─── OpenAPI 生成型ユーティリティ ───
 // FastAPI の OpenAPI スキーマから openapi-typescript が生成した型。
@@ -95,6 +93,43 @@ export type ConversationParticipant = {
   status?: string | null;
   auto_respond?: boolean;
   metadata?: Record<string, unknown>;
+};
+
+export type ConversationListPageOptions = {
+  /** Explicitly opt into bounded keyset paging. Omitted keeps legacy reads. */
+  limit?: number;
+  cursor?: string | null;
+};
+
+export type ConversationMessagePageOptions = {
+  /** Explicitly opt into the latest/older bounded message pages. */
+  limit?: number;
+  before?: string | null;
+  /** Attach compact rail IDs, absolute order, and short previews to a full reset. */
+  includeHistoryIndex?: boolean;
+};
+
+export type ConversationMessageHistoryIndexEntry = {
+  id: string;
+  role: ConversationMessage["role"];
+  position: number;
+  preview: string;
+  created_at?: string | null;
+};
+
+export type ConversationListResponse = {
+  conversations: ConversationSession[];
+  total?: number;
+  has_more?: boolean;
+  next_cursor?: string | null;
+};
+
+export type ConversationMessagesResponse = {
+  messages: ConversationMessage[];
+  server_time?: string;
+  has_more?: boolean;
+  next_cursor?: string | null;
+  history_index?: ConversationMessageHistoryIndexEntry[];
 };
 
 /** Generate the UUID used by canonical client-session create/replay requests. */
@@ -554,6 +589,16 @@ export type LlmCatalogProvider = {
     error?: string | null;
     message?: string | null;
   };
+  /** Ordinary Chat route status. Non-selectable entries may still be shown. */
+  chat_status?: {
+    state?: string;
+    label?: string;
+    selectable?: boolean;
+    message?: string;
+    required_configuration?: string;
+    latest_request_id?: string;
+    latest_request_state?: string;
+  };
   settings?: {
     api_key_configured?: boolean;
     reasoning_effort?: string | null;
@@ -568,6 +613,8 @@ export type LlmCatalogProvider = {
 export type LlmModelCatalogResponse = {
   current: ChatResponseModelSelection;
   providers: LlmCatalogProvider[];
+  /** Known Chat providers whose send/history adapter is not connected yet. */
+  chat_providers?: LlmCatalogProvider[];
   provider_visibility?: {
     hidden_provider_ids?: unknown;
   };
@@ -604,6 +651,40 @@ export type ConversationGenerationStatus = {
   client_message_id?: string | null;
   started_at?: string | null;
   updated_at?: string | null;
+};
+
+/** Owner-visible, server-bound state for the single dedicated DOTS Chat. */
+export type DotsDialogueChatAvailability = {
+  selectable: boolean;
+  state: string;
+  owner_user_id?: string | null;
+  binding_id?: string | null;
+  conversation_id?: string | null;
+  target_chat_id?: string | null;
+  connection_anchor_chat_id?: string | null;
+  generation?: number | null;
+  subscription_state?: string | null;
+  subscription_expires_at?: string | null;
+  latest_request_id?: string | null;
+  latest_request_state?: string | null;
+};
+
+export type DotsDialogueRequestReceipt = {
+  request_id: string;
+  user_message_id: string;
+  conversation_id: string;
+  state: string;
+  created_at: string;
+};
+
+export type DotsDialogueOwnerRequest = {
+  request_id: string;
+  conversation_id: string;
+  state: string;
+  reply?: string | null;
+  created_at: string;
+  delivery_accepted_at?: string | null;
+  replied_at?: string | null;
 };
 
 export type AgentRunUsage = {
@@ -742,47 +823,8 @@ export type AgentRunFetchOptions = {
   includeEvents?: boolean;
   includeToolCalls?: boolean;
   includeTimeline?: boolean;
+  signal?: AbortSignal;
 };
-
-export type AgentExecutionProfileCatalogRequest =
-  | {
-      sessionId: string;
-      agentRevisionId?: never;
-      projectId?: never;
-      workingDirectory?: string | null;
-      signal?: AbortSignal;
-    }
-  | {
-      sessionId?: never;
-      agentRevisionId: string;
-      projectId?: string | null;
-      workingDirectory?: string | null;
-      signal?: AbortSignal;
-    };
-
-export type CliSessionRoleContextMode = "raw" | "agent_role";
-
-type CliSessionCreateBase = Schemas["CLIDevelopmentSessionCreateRequest"] & {
-  /** Exact catalog revision assertion; older callers may omit it. */
-  agent_revision_id?: string;
-  /** Preserve the exact Project authority used by revision-path catalog admission. */
-  project_id?: string;
-  /** The managed local CLI launcher always supplies these validated route fields. */
-  model: string;
-  working_directory: string;
-};
-export type CliSessionCreateRequest =
-  | (CliSessionCreateBase & {
-      /** The server resolves and pins an omitted revision at admission. */
-      agent_revision_id?: string;
-      role_context_mode: "agent_role";
-    })
-  | (CliSessionCreateBase & {
-      /** Omit for legacy/raw CLI behavior. */
-      role_context_mode?: "raw";
-    });
-
-export type CliSessionResponse = Schemas["CLIDevelopmentSessionResponse"];
 
 // ─── ベースリクエスト関数 ───
 
@@ -838,6 +880,21 @@ export class ChatApiError extends Error {
 }
 
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const TRANSFER_COMPATIBILITY_READ_RETRIES = 2;
+const MAX_ERROR_BODY_LENGTH = 32 * 1024;
+const MAX_ERROR_MESSAGE_LENGTH = 512;
+
+function boundedErrorText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return text && text.length <= MAX_ERROR_MESSAGE_LENGTH ? text : null;
+}
+
+function isJsonContentType(contentType: string | null): boolean {
+  if (!contentType) return true;
+  const mediaType = (contentType.split(";", 1)[0] ?? "").trim().toLowerCase();
+  return mediaType === "application/json" || mediaType === "text/json" || mediaType.endsWith("+json");
+}
 
 function fallbackApiErrorMessage(status: number, statusText: string): string {
   if (status === 401) return "認証が必要です";
@@ -845,7 +902,7 @@ function fallbackApiErrorMessage(status: number, statusText: string): string {
   if (status === 404) return "要求されたリソースが見つかりません";
   if (status === 409) return "要求が競合したため完了できませんでした";
   if (status >= 500) return "サーバーで要求を処理できませんでした";
-  return statusText || "要求を処理できませんでした";
+  return boundedErrorText(statusText) ?? "要求を処理できませんでした";
 }
 
 function parseStructuredApiError(
@@ -853,11 +910,16 @@ function parseStructuredApiError(
   status: number,
   statusText: string,
   responseRequestId: string | null = null,
+  contentType: string | null = null,
 ): StructuredApiError {
   let payload: unknown;
-  try {
-    payload = raw ? JSON.parse(raw) : null;
-  } catch {
+  if (isJsonContentType(contentType)) {
+    try {
+      payload = raw ? JSON.parse(raw) : null;
+    } catch {
+      payload = null;
+    }
+  } else {
     payload = null;
   }
 
@@ -865,7 +927,15 @@ function parseStructuredApiError(
     payload && typeof payload === "object"
       ? (payload as Record<string, unknown>)
       : null;
-  const candidate = payloadRecord?.error;
+  const detail = payloadRecord?.detail;
+  const candidate =
+    payloadRecord?.error &&
+    typeof payloadRecord.error === "object" &&
+    !Array.isArray(payloadRecord.error)
+      ? payloadRecord.error
+      : detail && typeof detail === "object" && !Array.isArray(detail)
+        ? detail
+        : null;
   const requiredIngress = (value: unknown): RequiredAgentIngress | undefined =>
     value === "cli_session" || value === "remote_agent"
       ? value
@@ -877,13 +947,13 @@ function parseStructuredApiError(
         ? value.code.trim()
         : "chat_api_error";
     const message =
-      typeof value.message === "string" && value.message.trim()
-        ? value.message.trim()
-        : fallbackApiErrorMessage(status, statusText);
+      boundedErrorText(value.message) ?? fallbackApiErrorMessage(status, statusText);
     const requestId =
       typeof value.request_id === "string" && value.request_id.trim()
         ? value.request_id.trim()
-        : responseRequestId;
+        : typeof payloadRecord?.request_id === "string" && payloadRecord.request_id.trim()
+          ? payloadRecord.request_id.trim()
+          : responseRequestId;
     return {
       code,
       message,
@@ -900,7 +970,6 @@ function parseStructuredApiError(
 
   // Older proxy routes returned {detail: ...}. Keep the message for
   // compatibility, but cap it and avoid exposing a raw HTML/stack response.
-  const detail = payloadRecord?.detail;
   const topLevelCode =
     typeof payloadRecord?.error === "string" && payloadRecord.error.trim()
       ? payloadRecord.error.trim()
@@ -908,9 +977,7 @@ function parseStructuredApiError(
         ? payloadRecord.code.trim()
         : "chat_api_error";
   const message =
-    typeof detail === "string" && detail.trim() && detail.length <= 512
-      ? detail.trim()
-      : fallbackApiErrorMessage(status, statusText);
+    boundedErrorText(detail) ?? fallbackApiErrorMessage(status, statusText);
   return {
     code: topLevelCode,
     message,
@@ -920,18 +987,79 @@ function parseStructuredApiError(
   };
 }
 
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+function createAbortError(): Error {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException("The operation was aborted", "AbortError");
+  }
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
 }
 
-function isRetryableError(error: unknown) {
+function sleep(ms: number, signal?: AbortSignal | null) {
+  if (signal?.aborted) return Promise.reject(createAbortError());
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isRetryableError(error: unknown, callerSignal?: AbortSignal | null) {
+  if (callerSignal?.aborted) return false;
   if (error instanceof ChatApiError) {
-    return error.retryable;
+    return (
+      error.status != null &&
+      RETRYABLE_STATUSES.has(error.status) &&
+      error.retryable
+    );
   }
   if (error instanceof DOMException) {
-    return error.name === "AbortError" || error.name === "TimeoutError";
+    return error.name === "TimeoutError";
   }
   return error instanceof TypeError;
+}
+
+async function readBoundedErrorBody(response: Response): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    try {
+      return (await response.text()).slice(0, MAX_ERROR_BODY_LENGTH);
+    } catch {
+      return "";
+    }
+  }
+
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (text.length < MAX_ERROR_BODY_LENGTH) {
+      const { done, value } = await reader.read();
+      if (done) {
+        text += decoder.decode();
+        break;
+      }
+      text += decoder.decode(value, { stream: true });
+      if (text.length >= MAX_ERROR_BODY_LENGTH) {
+        text = text.slice(0, MAX_ERROR_BODY_LENGTH);
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+  } catch {
+    // Keep any bounded prefix collected before a stream error.
+  }
+  return text.slice(0, MAX_ERROR_BODY_LENGTH);
 }
 
 async function requestOnce<T>(
@@ -950,12 +1078,14 @@ async function requestOnce<T>(
   });
 
   if (!res.ok) {
-    const raw = await res.text().catch(() => "");
+    const contentType = res.headers.get("content-type");
+    const raw = await readBoundedErrorBody(res);
     const details = parseStructuredApiError(
       raw,
       res.status,
       res.statusText,
       res.headers.get("x-request-id"),
+      contentType,
     );
     if (res.status === 401) {
       const shouldRedirectToLogin = !path.startsWith("/api/python-proxy/");
@@ -977,22 +1107,32 @@ async function requestOnce<T>(
 
 async function request<T>(path: string, init?: ChatRequestInit): Promise<T> {
   const {
-    retries = 0,
+    retries: configuredRetries = 0,
     retryDelayMs = 500,
     timeoutMs = 5000,
     ...requestInit
   } = init ?? {};
+  const method = (requestInit.method ?? "GET").toString().toUpperCase();
+  const retries =
+    method === "GET" && readFileTransferCompatibilityPreference()
+      ? Math.max(configuredRetries, TRANSFER_COMPATIBILITY_READ_RETRIES)
+      : configuredRetries;
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
+    if (requestInit.signal?.aborted) throw createAbortError();
     try {
       return await requestOnce<T>(path, requestInit, timeoutMs);
     } catch (error) {
       lastError = error;
-      if (attempt >= retries || !isRetryableError(error)) {
+      if (requestInit.signal?.aborted) throw createAbortError();
+      if (
+        attempt >= retries ||
+        !isRetryableError(error, requestInit.signal)
+      ) {
         throw error;
       }
-      await sleep(retryDelayMs * 2 ** attempt);
+      await sleep(retryDelayMs * 2 ** attempt, requestInit.signal);
     }
   }
 
@@ -1031,57 +1171,55 @@ export function getLlmModelCatalog() {
   });
 }
 
-function executionProfileCatalogQuery(
-  options: AgentExecutionProfileCatalogRequest,
-): string {
-  const sessionId = options.sessionId?.trim() || "";
-  const revisionId = options.agentRevisionId?.trim() || "";
-  if (Boolean(sessionId) === Boolean(revisionId)) {
-    throw new Error("Execution Profile catalog requires exactly one binding context");
-  }
-  if (sessionId && options.projectId) {
-    throw new Error("project_id is valid only with an Agent revision catalog context");
-  }
-  const query = new URLSearchParams();
-  if (sessionId) query.set("session_id", sessionId);
-  else query.set("agent_revision_id", revisionId);
-  const workingDirectory = options.workingDirectory?.trim();
-  if (workingDirectory) query.set("working_directory", workingDirectory);
-  const projectId = options.projectId?.trim();
-  if (projectId) query.set("project_id", projectId);
-  return query.toString();
-}
-
 // ─── API関数 ───
 
 export const chatApi = {
-  getAgentExecutionProfileCatalog: (
-    agentId: string,
-    options: AgentExecutionProfileCatalogRequest,
-  ) =>
-    request<AgentExecutionProfileCatalog>(
-      `/api/python-proxy/agents/${encodeURIComponent(agentId)}/execution-profiles?${executionProfileCatalogQuery(options)}`,
-      { cache: "no-store", timeoutMs: 10_000, signal: options.signal },
-    ),
+  getDotsDialogueChatAvailability: (
+    conversationId?: string | null,
+    signal?: AbortSignal,
+  ) => {
+    const normalizedConversationId = conversationId?.trim() || "";
+    const query = normalizedConversationId
+      ? `?conversation_id=${encodeURIComponent(normalizedConversationId)}`
+      : "";
+    return request<DotsDialogueChatAvailability>(
+      `/api/python-proxy/dots/dialogue/availability${query}`,
+      {
+        cache: "no-store",
+        retries: 0,
+        timeoutMs: 5000,
+        signal,
+      },
+    );
+  },
 
-  createCliSession: (data: CliSessionCreateRequest) =>
-    request<CliSessionResponse>("/api/python-proxy/cli-sessions", {
+  createDotsDialogueRequest: (
+    data: {
+      binding_id: string;
+      conversation_id: string;
+      idempotency_key: string;
+      message: string;
+    },
+    signal?: AbortSignal,
+  ) =>
+    request<DotsDialogueRequestReceipt>("/api/python-proxy/dots/dialogue/requests", {
       method: "POST",
       body: JSON.stringify(data),
+      retries: 0,
       timeoutMs: 15_000,
+      signal,
     }),
 
-  sendCliSessionMessage: (
-    sessionId: string,
-    data: { message: string; idempotency_key: string },
-  ) =>
-    request<CliSessionResponse>(
-      `/api/python-proxy/cli-sessions/${encodeURIComponent(sessionId)}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify(data),
-        timeoutMs: 15_000,
-      },
+  getDotsDialogueOwnerRequest: (requestId: string, signal?: AbortSignal) =>
+    request<DotsDialogueOwnerRequest>(
+      `/api/python-proxy/dots/dialogue/requests/${encodeURIComponent(requestId)}`,
+      { cache: "no-store", retries: 0, timeoutMs: 5000, signal },
+    ),
+
+  cancelDotsDialogueRequest: (requestId: string) =>
+    request<void>(
+      `/api/python-proxy/dots/dialogue/requests/${encodeURIComponent(requestId)}`,
+      { method: "DELETE", retries: 0, timeoutMs: 5000 },
     ),
 
   /** ヘッダーで現在選択されているキャラクターを取得 */
@@ -1153,18 +1291,31 @@ export const chatApi = {
   },
 
   /** セッション一覧取得 */
-  listSessions: (projectId?: string, appId?: string) => {
+  listSessions: (
+    projectId?: string,
+    appId?: string,
+    signal?: AbortSignal,
+    pagination?: ConversationListPageOptions,
+  ) => {
     const params = new URLSearchParams();
     if (projectId) params.set("project_id", projectId);
     if (appId) params.set("app_id", appId);
+    if (pagination?.limit !== undefined) {
+      params.set("limit", String(pagination.limit));
+    }
+    if (pagination?.cursor) params.set("cursor", pagination.cursor);
     const query = params.toString();
-    return request<{ conversations: ConversationSession[] }>(
+    return request<ConversationListResponse>(
       `/api/conversations${query ? `?${query}` : ""}`,
-      { retries: 3, retryDelayMs: 500 },
+      { retries: 3, retryDelayMs: 500, signal },
     );
   },
 
-  searchConversations: (query: string, projectId?: string | null) => {
+  searchConversations: (
+    query: string,
+    projectId?: string | null,
+    signal?: AbortSignal,
+  ) => {
     const params = new URLSearchParams({ q: query });
     if (projectId) params.set("project_id", projectId);
     return request<{
@@ -1174,6 +1325,7 @@ export const chatApi = {
       retries: 1,
       retryDelayMs: 300,
       timeoutMs: 8000,
+      signal,
     });
   },
 
@@ -1236,22 +1388,35 @@ export const chatApi = {
    * セッションのメッセージ一覧取得。
    * since（ISO8601）を渡すと差分のみ取得し、レスポンスの server_time を次回 since に使う。
    */
-  getMessages: (sessionId: string, since?: string) => {
-    const query = since ? `?since=${encodeURIComponent(since)}` : "";
+  getMessages: (
+    sessionId: string,
+    since?: string,
+    signal?: AbortSignal,
+    pagination?: ConversationMessagePageOptions,
+  ) => {
+    const params = new URLSearchParams();
+    if (since) params.set("since", since);
+    if (pagination?.limit !== undefined) {
+      params.set("limit", String(pagination.limit));
+    }
+    if (pagination?.before) params.set("before", pagination.before);
+    if (pagination?.includeHistoryIndex) params.set("history_index", "1");
+    const query = params.toString() ? `?${params.toString()}` : "";
     // cache: "no-store" は付けない。サーバの ETag + Cache-Control: private, no-cache を活かし、
     // ブラウザの条件付き GET（If-None-Match → 304）で帯域を節約する。
     // 差分が無い間は ?since が一定になり同一 URL の 304 が成立する。
-    return request<{ messages: ConversationMessage[]; server_time?: string }>(
+    return request<ConversationMessagesResponse>(
       `/api/conversations/${sessionId}/messages${query}`,
       {
         headers: { "Cache-Control": "no-cache" },
         retries: 2,
         retryDelayMs: 500,
+        signal,
       },
     );
   },
 
-  getContextSnapshot: (sessionId: string) =>
+  getContextSnapshot: (sessionId: string, signal?: AbortSignal) =>
     request<ContextSnapshotResponse>(
       `/api/python-proxy/conversations/${sessionId}/context-snapshot`,
       {
@@ -1259,6 +1424,7 @@ export const chatApi = {
         headers: { "Cache-Control": "no-cache" },
         retries: 1,
         retryDelayMs: 300,
+        signal,
       },
     ),
 
@@ -1330,8 +1496,6 @@ export const chatApi = {
     > & {
       /** Optional CAS token checked against the canonical session binding. */
       expected_agent_id?: string | null;
-      /** Admission-time runtime for the bound Agent; omitted = role revision default. */
-      execution_profile_id?: string | null;
     },
   ) =>
     request<{
@@ -1361,6 +1525,7 @@ export const chatApi = {
         retries: 1,
         retryDelayMs: 300,
         timeoutMs: 10000,
+        signal: options?.signal,
       },
     );
   },
@@ -1381,7 +1546,7 @@ export const chatApi = {
       method: "POST",
     }),
 
-  getGenerationStatus: (sessionId: string) =>
+  getGenerationStatus: (sessionId: string, signal?: AbortSignal) =>
     request<ConversationGenerationStatus>(
       `/api/python-proxy/conversations/${sessionId}/generation/status`,
       {
@@ -1389,6 +1554,7 @@ export const chatApi = {
         headers: { "Cache-Control": "no-cache" },
         retries: 1,
         retryDelayMs: 300,
+        signal,
       },
     ),
 

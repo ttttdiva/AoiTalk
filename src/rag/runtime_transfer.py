@@ -557,7 +557,10 @@ def transfer(source, client, *, target_endpoint, receipt_path, canonical_proof,
     _require(options.get("url") and endpoint_identity(options["url"]) == endpoint,
              "Client target differs from the explicit server endpoint")
     receipt_path = Path(receipt_path).absolute()
-    locks = Path(__file__).resolve().parents[2] / "data" / "search" / "transfer-locks"
+    from src.runtime_release_contract import persistent_path
+
+    source_root = Path(__file__).resolve().parents[2]
+    locks = persistent_path("data/search/transfer-locks", source_root)
     receipt_outputs = [receipt_path] + [Path(str(receipt_path) + suffix)
                                         for suffix in (".lock", "-journal", "-wal", "-shm")]
     validate_output_paths(source, receipt_outputs + [locks, locks / (digest(endpoint) + ".lock")], evidence_paths)

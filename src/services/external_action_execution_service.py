@@ -14,6 +14,7 @@ from .agent_action_policy_service import uid, naive, record_action_event
 from .agent_work_runtime import ExecutionOutcome
 from .integration_action_registry import ActionPolicyError, DefinitelyNotSent, IntegrationActionResult
 from .procurement_action import validate_quote
+from .work_preemption import non_preemptible
 
 
 async def _origin_agent_routing(session, action) -> dict | None:
@@ -54,9 +55,13 @@ async def _origin_agent_routing(session, action) -> dict | None:
     return {
         "agent_id": pins.agent_id,
         "agent_revision_id": pins.agent_revision_id,
-        "agent_team_id": pins.agent_team_id,
-        "execution_profile_id": pins.execution_profile_id,
-        "allowed_subagent_ids": list(pins.allowed_subagent_ids),
+        "model_overrides": (
+            dict(pins.model_overrides) if pins.model_overrides is not None else None
+        ),
+        "tool_ids": list(pins.tool_ids) if pins.tool_ids is not None else None,
+        "delegate_policy": (
+            dict(pins.delegate_policy) if pins.delegate_policy is not None else None
+        ),
         "route_snapshot": dict(pins.route_snapshot or {}),
     }
 
@@ -193,9 +198,7 @@ class ExternalActionExecutionService:
 
     async def _claim(self, session, action, claim, agent_run_id):
         if claim is None:
-            if action.action_type != "telephony.transfer_call" or action.origin_work_item_id is not None or uid(agent_run_id) != action.origin_agent_run_id:
-                raise ActionPolicyError("action_execution_claim_required", 403)
-            return
+            raise ActionPolicyError("action_execution_claim_required", 403)
         row = await session.get(AgentWorkItem, uid(claim.work_item_id), populate_existing=True)
         run = await session.get(AgentRun, uid(agent_run_id), populate_existing=True)
         if not row or not run or row.state != "running" or row.lease_token != claim.lease_token or row.lease_owner != claim.lease_owner or not row.lease_expires_at or row.lease_expires_at <= datetime.utcnow():
@@ -243,10 +246,10 @@ class ExternalActionExecutionService:
                 raise ActionPolicyError("action_not_executable", 409)
             if action.status == "failed":
                 previous = await session.scalar(select(ExternalActionAttempt).where(ExternalActionAttempt.action_id == action.id).order_by(ExternalActionAttempt.started_at.desc()).limit(1))
-                if not previous or previous.error_message != "provider_definitely_not_sent" or action.action_type == "telephony.transfer_call":
+                if not previous or previous.error_message != "provider_definitely_not_sent":
                     raise ActionPolicyError("action_not_retryable", 409)
             revision, definition, connection, ready, _, _ = await self.policies.authorize_action(session, action, allow_unapproved=True)
-            capability = "telephony.control" if action.action_type == "telephony.transfer_call" else action.action_type
+            capability = action.action_type
             if getattr(definition, "credential_mode", "vault") == "browser_session":
                 credential = None
             else:
@@ -332,8 +335,10 @@ class ExternalActionExecutionService:
 
         cancelled = False
         try:
-            result = await adapter.execute(action_id=str(action.id), attempt_id=str(attempt.id),
-                execution_key=attempt.execution_key, payload=payload, connection=binding, credential=credential, quote=quote)
+            # An external send must not be interrupted by a shutdown.
+            async with non_preemptible("external_send"):
+                result = await adapter.execute(action_id=str(action.id), attempt_id=str(attempt.id),
+                    execution_key=attempt.execution_key, payload=payload, connection=binding, credential=credential, quote=quote)
             if not isinstance(result, IntegrationActionResult):
                 result = IntegrationActionResult("uncertain")
             # Generic transient reports are not proof of no submission.
@@ -376,7 +381,7 @@ class ExternalActionExecutionService:
         record_action_event(session, action, "action.attempt." + result.status, attempt_id=attempt.id,
                             receipt_id=receipt.id if receipt else None)
         await session.commit()
-        classification = ("transient" if attempt.error_message == "provider_definitely_not_sent" and action.action_type != "telephony.transfer_call"
+        classification = ("transient" if attempt.error_message == "provider_definitely_not_sent"
                           else "permanent" if result.status == "failed" else result.status)
         if cancelled:
             raise asyncio.CancelledError

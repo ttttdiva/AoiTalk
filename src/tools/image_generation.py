@@ -195,9 +195,15 @@ async def generate_image(prompt: str) -> str:
             session_context=inherited.session_context,
             project_metadata=inherited.project_metadata,
         )
-        # Initialize model
-        # Using the specific model version requested by user
-        model_name = "gemini-3-pro-image-preview" 
+        # The image-generation role is the only model_roles role that owns its
+        # primary selection; retain the historical model until configured.
+        configured_image_model = privacy_config.get(
+            "model_roles.roles.image_generation.primary.model"
+        )
+        model_name = (
+            str(configured_image_model or "").strip()
+            or "gemini-3-pro-image-preview"
+        )
         try:
             model = genai.GenerativeModel(model_name)
         except Exception as e:

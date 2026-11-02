@@ -10,7 +10,6 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { mediaResearchApi } from "@/lib/media-operations-research-api";
 import type { PersonaWorkspaceScope } from "@/lib/persona-workspace-model";
-import { PersonaDelegationRequestPanel } from "./persona-delegation-request";
 
 export function PersonaBriefPanel({ scope, selectedContentItemId, onSelect, onContinue }: {
   scope: PersonaWorkspaceScope; selectedContentItemId: string;
@@ -96,7 +95,7 @@ export function PersonaBriefPanel({ scope, selectedContentItemId, onSelect, onCo
       <div className="space-y-3 rounded-xl border bg-card p-4"><h3 className="inline-flex items-center gap-1 font-semibold">保存済みの企画<HelpPopover label="保存済みの企画">最新100件を表示しています。過去の企画はResearchから確認できます。</HelpPopover></h3>
         {items.isLoading ? <p role="status">制作briefを確認中…</p> : !items.error && !content.length ? <p className="text-sm text-muted-foreground">この人格の制作briefはまだありません。</p> : null}
         {content.map(item => <button key={item.id} type="button" aria-pressed={item.id === selectedContentItemId} onClick={() => onSelect(item.id)} className={`block w-full rounded-lg border p-3 text-left ${item.id === selectedContentItemId ? "border-primary bg-primary/5" : ""}`}><span className="block break-words text-sm font-medium">{item.title}</span><span className="mt-1 block text-xs text-muted-foreground">{item.content_type} · {item.status}{item.input_kind === "user_authored" ? " · 本人入力" : item.input_kind === "research" ? " · 研究から採用" : ""}</span></button>)}
-        {selectedItem && <div className="space-y-3 border-t pt-3"><p className="whitespace-pre-wrap break-words text-sm">{selectedItem.brief}</p><p className="text-xs text-muted-foreground">{selectedItem.objective}</p><Button type="button" variant="outline" onClick={onContinue}>このbriefで計画・生成へ</Button><PersonaDelegationRequestPanel key={`${scope.ownerUserId}:${scope.projectId}:${scope.personaId}:${selectedItem.id}:${selectedItem.content_hash}`} scope={scope} brief={selectedItem} /></div>}
+        {selectedItem && <div className="space-y-3 border-t pt-3"><p className="whitespace-pre-wrap break-words text-sm">{selectedItem.brief}</p><p className="text-xs text-muted-foreground">{selectedItem.objective}</p><Button type="button" variant="outline" onClick={onContinue}>このbriefで計画・生成へ</Button></div>}
       </div>
     </div>
   </section>;

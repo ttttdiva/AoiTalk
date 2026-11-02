@@ -11,7 +11,7 @@ from typing import Any, Callable, Optional
 
 from ..tools.core import ToolDefinition
 from ..tools.registry import ToolRegistry
-from ..services.agent_team_service import (
+from ..services.runtime_policy_utils import (
     ToolFailureCircuitBreaker,
     parse_structured_tool_failure,
     tool_failure_family,

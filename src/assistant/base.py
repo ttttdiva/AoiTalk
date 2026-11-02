@@ -49,6 +49,46 @@ if platform.system() == 'Linux':
         pass
 
 
+class _GracefulShutdownBinding:
+    """Narrow, main-loop-only hook that lets the admin API end the run loop.
+
+    It only schedules ``assistant.running = False`` on the loop that started
+    the web interface; the assistant's own ``cleanup`` and the process
+    launcher then perform the normal exit.  It never signals or kills.
+    """
+
+    def __init__(self, assistant, loop: asyncio.AbstractEventLoop) -> None:
+        self._assistant = assistant
+        self._loop = loop
+        self._requested = False
+
+    def supported(self) -> bool:
+        assistant = self._assistant
+        if assistant.mode != "terminal" or self._requested:
+            return False
+        if assistant.running is not True or getattr(assistant, "_cleanup_started", False):
+            return False
+        if assistant.web_interface is None:
+            return False
+        if self._loop.is_closed() or not self._loop.is_running():
+            return False
+        from src.runtime_features import runtime_feature_manager
+
+        # The interactive console blocks in ``input`` and would not observe
+        # ``running = False``; only the non-interactive wait loop is supported.
+        return not runtime_feature_manager.feature_enabled("console_input")
+
+    def request_exit(self) -> None:
+        if not self.supported():
+            raise RuntimeError("graceful shutdown is not supported in this state")
+        self._requested = True
+        self._loop.call_soon_threadsafe(self._apply)
+
+    def _apply(self) -> None:
+        if not getattr(self._assistant, "_cleanup_started", False):
+            self._assistant.running = False
+
+
 class BaseAssistant(ABC):
     """Base class for all assistant modes"""
     
@@ -408,6 +448,11 @@ class BaseAssistant(ABC):
             self.web_interface = create_web_interface(self.config, self.character_name)
             current_loop = asyncio.get_running_loop()
             self.web_interface.set_user_input_callback(input_callback, current_loop)
+            web_server = getattr(self.web_interface, "server", None)
+            if web_server is not None and getattr(self, "mode", None) == "terminal":
+                web_server._graceful_shutdown_binding = _GracefulShutdownBinding(
+                    self, current_loop
+                )
             self.web_interface.set_llm_client_change_callback(self._activate_llm_client)
             retire_session_cache = getattr(
                 self,

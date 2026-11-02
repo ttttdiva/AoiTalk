@@ -79,6 +79,18 @@ _TAG_TOKEN_RE = re.compile(r"(?:^|\s)#([^\s#:\[]+)")
 _FIELD_TOKEN_RE = re.compile(r"([^|#\n]{1,80})::\s*([^|#\n]+)")
 
 
+def _reference_token_target_ids(node: KnowledgeNode) -> list[uuid.UUID]:
+    """Return the distinct, valid Docs target IDs explicitly named by a node."""
+    text = "\n".join([node.title or "", node.body_text or ""])
+    target_ids: list[uuid.UUID] = []
+    for match in _NODE_TOKEN_RE.finditer(text):
+        value = match.group(1) or match.group(2)
+        parsed = _coerce_uuid(value)
+        if parsed is not None and parsed != node.id and parsed not in target_ids:
+            target_ids.append(parsed)
+    return target_ids
+
+
 def is_explicit_blank_paragraph(
     title: Any,
     body_json: Any,
@@ -788,13 +800,7 @@ class DocsGraphService:
                 KnowledgeEdge.relation_type.in_(["inline_ref", "references"]),
             )
         )
-        text = "\n".join([node.title or "", node.body_text or ""])
-        target_ids: list[uuid.UUID] = []
-        for match in _NODE_TOKEN_RE.finditer(text):
-            value = match.group(1) or match.group(2)
-            parsed = _coerce_uuid(value)
-            if parsed is not None and parsed != node.id and parsed not in target_ids:
-                target_ids.append(parsed)
+        target_ids = _reference_token_target_ids(node)
         if not target_ids:
             return
         existing_result = await self.session.execute(
@@ -1165,6 +1171,18 @@ class DocsGraphService:
                 "", body_json, getattr(node, "node_type", "node")
             ):
                 body_json = None
+        title_only_reference_edit = (
+            title is not None
+            and description is None
+            and body_json is None
+            and body_text is None
+            and source_refs is None
+        )
+        previous_reference_target_ids = (
+            set(_reference_token_target_ids(node))
+            if title_only_reference_edit
+            else set()
+        )
         identity_key = str(getattr(node, "system_key", "") or "").strip()
         if identity_key == "project_information_root" or identity_key.startswith(
             "project_information:"
@@ -1283,7 +1301,17 @@ class DocsGraphService:
                 node.body_text = mirror
         node.updated_by = user_id
         node.updated_at = _now()
-        await self.record_node_change(node, user_id, change_summary, source_refs)
+        preserve_reference_edges = (
+            title_only_reference_edit
+            and previous_reference_target_ids == set(_reference_token_target_ids(node))
+        )
+        await self.record_node_change(
+            node,
+            user_id,
+            change_summary,
+            source_refs,
+            sync_references=not preserve_reference_edges,
+        )
         await self.session.flush()
         return node
 
@@ -2742,7 +2770,7 @@ class DocsGraphService:
         lines = []
         for node in nodes:
             tags = " ".join(f"#{name}" for name in tags_by_node.get(node.id, [])[:5])
-            project = f" project={_short_id(node.project_id)}" if node.project_id else ""
+            project = f" project={node.project_id}" if node.project_id else ""
             tag_text = f" {tags}" if tags else ""
             parent_title = parents_by_node.get(node.id)
             parent_text = f" ⤷ {parent_title}" if parent_title else ""

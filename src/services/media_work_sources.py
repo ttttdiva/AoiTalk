@@ -19,6 +19,7 @@ import hashlib
 import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
@@ -26,6 +27,8 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
+
+_generation_discovery_now: ContextVar[Any] = ContextVar("generation_discovery_now", default=None)
 
 MAX_CANDIDATES = 100
 MAX_TEXT = 8_000
@@ -1333,6 +1336,52 @@ class MediaGenerationWorkSource(MediaWorkSource):
             created = created.replace(tzinfo=timezone.utc)
         return created.astimezone(timezone.utc) + timedelta(minutes=30)
 
+    async def completed_recovery_pins(self, session: Any, claim: Any, detail: Any) -> dict[str, Any] | None:
+        """Validate the canonical completed receipt and current operator."""
+        metadata = _field(claim, "metadata", {}) or {}
+        payload = metadata.get("payload", {}) if isinstance(metadata, Mapping) else {}
+        intent, run = _field(detail, "intent"), _field(detail, "run")
+        plan_hash = _id(_field(detail, "plan_hash") or _field(detail, "content_hash"))
+        intent_id, request_hash = _id(_field(intent, "id")), _id(_field(intent, "request_hash"))
+        run_id, run_hash = _id(_field(run, "id")), _id(_field(run, "run_hash"))
+        owner = _id(_field(detail, "owner_user_id"))
+        project = _id(_field(detail, "project_id"))
+        persona_revision = _id(_field(detail, "persona_revision_id"))
+        persona = _id(_field(detail, "persona_id")) or await _persona_id_for_revision(session, persona_revision)
+        space = _id(_field(detail, "space_id")) or await _space_id_for_project(session, project)
+        outputs = _field(run, "outputs")
+        if not (plan_hash and intent_id and request_hash and run_id and run_hash and owner and persona_revision
+                and isinstance(outputs, Sequence) and not isinstance(outputs, (str, bytes)) and outputs):
+            return None
+        if (plan_hash != _id(_field(claim, "source_revision")) or
+                _id(payload.get("plan_hash")) != plan_hash or
+                _id(_field(intent, "plan_id")) != _id(_field(claim, "source_id")) or
+                _id(_field(run, "plan_id")) != _id(_field(claim, "source_id")) or
+                _id(_field(run, "intent_id")) != intent_id or
+                str(_field(run, "status", "")).lower() != "succeeded" or
+                _id(_field(intent, "owner_user_id")) != owner or _id(_field(run, "owner_user_id")) != owner or
+                _id(_field(intent, "project_id")) != project or _id(_field(run, "project_id")) != project or
+                project != _id(_field(claim, "project_id")) or space != _id(_field(claim, "space_id")) or
+                persona != _id(_field(claim, "persona_id")) or
+                _id(payload.get("persona_revision_id")) != persona_revision):
+            return None
+        if any(_id(_field(o, "generation_run_id")) != run_id or _id(_field(o, "owner_user_id")) != owner
+               or _id(_field(o, "project_id")) != project or not _id(_field(o, "id"))
+               or not _id(_field(o, "sha256")) for o in outputs):
+            return None
+        operator = await _resolve_optional_agent(session=session, persona_id=persona, project_id=project,
+            space_id=space, resolver=self.operator_resolver, service=self.service)
+        if not operator or _id(operator.get("agent_id")) != _id(_field(claim, "assigned_agent_id")):
+            return None
+        revision = _id(operator.get("agent_revision_id")) or await _agent_revision_id(session, operator.get("agent_id"))
+        if revision != _id(_field(claim, "agent_revision_id")) or _id(operator.get("assignment_id")) != _id(payload.get("operator_assignment_id")):
+            return None
+        pins = {"intent_id": intent_id, "intent_request_hash": request_hash, "run_id": run_id, "run_hash": run_hash}
+        for key, value in pins.items():
+            if payload.get(key) and _id(payload.get(key)) != value:
+                return None
+        return pins
+
     async def refresh(self, session: Any, claim: Any) -> bool:
         if not self.enabled:
             return False
@@ -1352,6 +1401,26 @@ class MediaGenerationWorkSource(MediaWorkSource):
         except Exception:
             return False
         status = str(_field(detail, "status", "") or "").strip().lower()
+        metadata = _field(claim, "metadata", {}) or {}
+        payload = metadata.get("payload", {}) if isinstance(metadata, Mapping) else {}
+        # The durable event keeps discovery or metadata edits from turning a
+        # scheduled receipt recovery back into a provider submission.
+        work_id = _field(claim, "work_item_id")
+        if work_id and not payload.get("completed_receipt_recovery"):
+            from sqlalchemy import select
+            from ..memory.models import AgentWorkEvent
+            try:
+                prior = await session.execute(select(AgentWorkEvent.id).where(
+                    AgentWorkEvent.work_item_id == UUID(str(work_id)),
+                    AgentWorkEvent.event_type == "media.completed_receipt_recovery").limit(1))
+                if prior.scalar_one_or_none() is not None:
+                    return False
+            except Exception:
+                return False
+        if payload.get("completed_receipt_recovery"):
+            if payload.get("mode") != "reconcile" or not all(payload.get(k) for k in ("intent_id", "intent_request_hash", "run_id", "run_hash")):
+                return False
+            return bool(await self.completed_recovery_pins(session, claim, detail))
         if status not in {"draft", "submitted", "uncertain"}:
             # Completed/unavailable/failed plans are not eligible for a fresh
             # provider submit; uncertain intents are handled by reconciliation.
@@ -1388,143 +1457,155 @@ class MediaGenerationWorkSource(MediaWorkSource):
         except Exception:
             return []
         result: list[WorkCandidate] = []
-        for plan in _rows(value)[:MAX_CANDIDATES]:
-            plan_id = _id(_field(plan, "id") or _field(plan, "plan_id"))
-            plan_hash = _id(_field(plan, "plan_hash") or _field(plan, "content_hash"))
-            if not plan_id or not plan_hash:
-                continue
-            status = str(_field(plan, "status", "draft") or "draft").strip().lower()
-            intent = _field(plan, "intent")
-            intent_status = str(_field(intent, "status", "") or "").strip().lower()
-            if status not in {"draft", "submitted", "unavailable"}:
-                continue
-            run = _field(plan, "run")
-            run_status = str(_field(run, "status", "") or "").strip().lower()
-            run_outputs = _field(run, "outputs") or []
-            if isinstance(run_outputs, (str, bytes)) or not isinstance(run_outputs, Sequence):
-                run_outputs = []
-            # A completed provider run with an output lacking the managed
-            # preview binding needs a same-run retrieval/import attempt.  The
-            # adapter's reconcile boundary performs only a 73 GET and the
-            # asset service skips Studio once bytes are already managed.
-            asset_import_needed = (
-                run_status in {"succeeded", "complete", "completed", "success"}
-                and bool(run_outputs)
-                and any(not _field(output, "preview_url") for output in run_outputs)
-            )
-            receipt_recovery_needed = (
-                run is None
-                and intent_status in {"pending", "submitted", "uncertain"}
-                and bool(_id(_field(intent, "request_hash")))
-            )
-            # A durable intent is authoritative.  Only uncertain intents or
-            # explicitly unmanaged completed outputs are eligible for
-            # reconciliation.  A missing local Run gets a read-only recovery
-            # lookup by the original intent key; it never falls through to a
-            # provider submit.
-            mode = "submit"
-            if receipt_recovery_needed:
-                mode = "recover"
-            elif intent_status == "uncertain" and run_status in {
-                "queued",
-                "running",
-                "output_pending",
-            }:
-                # A failed same-Intent GET may leave the last local queued
-                # snapshot in the envelope.  Treat it as bounded recovery,
-                # never as fresh provider progress eligible for 60 polls.
-                mode = "recover"
-            elif run_status in {"queued", "running", "output_pending"} and intent_status in {
-                "submitted",
-                "uncertain",
-            }:
-                if not _id(_field(intent, "request_hash")):
-                    continue
-                mode = "reconcile"
-            elif intent_status == "uncertain" or (
-                asset_import_needed and intent_status == "submitted"
-            ):
-                if not _id(_field(intent, "request_hash")):
-                    continue
-                mode = "reconcile"
-            elif intent_status in {"submitted", "pending", "failed", "unavailable"} or status in {"submitted", "unavailable"}:
-                continue
-            persona_id = _id(_field(plan, "persona_id"))
-            persona_revision_id = _id(_field(plan, "persona_revision_id"))
-            if persona_id is None:
-                persona_id = await _persona_id_for_revision(session, persona_revision_id)
-            project_ref = _id(_field(plan, "project_id"))
-            space_ref = _id(_field(plan, "space_id")) or await _space_id_for_project(
-                session, project_ref
-            )
-            operator = await _resolve_optional_agent(
-                session=session,
-                persona_id=persona_id,
-                project_id=project_ref,
-                space_id=space_ref,
-                resolver=self.operator_resolver,
-                service=self.service,
-            )
-            if operator is None or not operator.get("agent_id"):
-                continue
-            if not operator.get("agent_revision_id"):
-                operator["agent_revision_id"] = await _agent_revision_id(
-                    session, operator.get("agent_id")
-                )
-            if not operator.get("agent_revision_id"):
-                continue
-            authority = await _resolve_authority(
-                self.authority_resolver,
-                agent_id=operator["agent_id"],
-                revision_id=operator.get("agent_revision_id"),
-                persona_id=persona_id,
-                project_id=project_ref,
-                space_id=space_ref,
-                capabilities=self.required_capabilities,
-                session=session,
-            )
-            if authority is not None and not bool(authority.get("allowed", authority.get("is_allowed", False))):
-                continue
-            # Keep one durable Work item across submit → recovery → reconcile.
-            # The ``submit`` suffix is the historical canonical key used by
-            # already-materialized Work rows; mode is execution metadata, not
-            # a new origin identity.
-            intent_key = "generation:" + _hash_key(plan_id, plan_hash, "submit")[:48]
-            polling_reconcile = mode == "reconcile" and run_status in {
-                "queued",
-                "running",
-                "output_pending",
-            }
-            result.append(
-                WorkCandidate(
-                    source_type=self.source_type,
-                    source_id=plan_id,
-                    source_revision=plan_hash,
-                    intent_key=intent_key,
-                    project_id=project_ref,
-                    space_id=space_ref,
-                    persona_id=persona_id,
-                    assigned_agent_id=operator["agent_id"],
-                    agent_revision_id=operator["agent_revision_id"],
-                    required_capabilities=self.required_capabilities,
-                    execution_adapter=self.execution_adapter,
-                    max_attempts=60 if polling_reconcile else 3,
-                    deadline=self._generation_deadline(plan, intent, now),
-                    concurrency_key=f"media.generation:{plan_id}",
-                    metadata={
-                        "payload": {
-                            "mode": mode,
-                            "plan_hash": plan_hash,
-                            "persona_revision_id": persona_revision_id,
-                            "intent_id": _id(_field(intent, "id")),
-                            "intent_request_hash": _id(_field(intent, "request_hash")),
-                            "operator_assignment_id": operator.get("assignment_id"),
-                            "asset_import_only": bool(asset_import_needed),
-                        }
-                    },
-                )
-            )
+        token = _generation_discovery_now.set(now)
+        try:
+            for plan in _rows(value)[:MAX_CANDIDATES]:
+                candidate = await self.candidate_for_plan(session, actor, plan)
+                if candidate is not None:
+                    result.append(candidate)
+        finally:
+            _generation_discovery_now.reset(token)
         return result
+
+    async def candidate_for_plan(
+        self, session: Any, actor: Any, plan: Any
+    ) -> WorkCandidate | None:
+        """Project one plan using the same gates as ordinary discovery."""
+        if not self.enabled or actor is None:
+            return None
+        plan_id = _id(_field(plan, "id") or _field(plan, "plan_id"))
+        plan_hash = _id(_field(plan, "plan_hash") or _field(plan, "content_hash"))
+        if not plan_id or not plan_hash:
+            return None
+        status = str(_field(plan, "status", "draft") or "draft").strip().lower()
+        intent = _field(plan, "intent")
+        intent_status = str(_field(intent, "status", "") or "").strip().lower()
+        if status not in {"draft", "submitted", "unavailable"}:
+            return None
+        run = _field(plan, "run")
+        run_status = str(_field(run, "status", "") or "").strip().lower()
+        run_outputs = _field(run, "outputs") or []
+        if isinstance(run_outputs, (str, bytes)) or not isinstance(run_outputs, Sequence):
+            run_outputs = []
+        # A completed provider run with an output lacking the managed
+        # preview binding needs a same-run retrieval/import attempt.  The
+        # adapter's reconcile boundary performs only a 73 GET and the
+        # asset service skips Studio once bytes are already managed.
+        asset_import_needed = (
+            run_status in {"succeeded", "complete", "completed", "success"}
+            and bool(run_outputs)
+            and any(not _field(output, "preview_url") for output in run_outputs)
+        )
+        receipt_recovery_needed = (
+            run is None
+            and intent_status in {"pending", "submitted", "uncertain"}
+            and bool(_id(_field(intent, "request_hash")))
+        )
+        # A durable intent is authoritative.  Only uncertain intents or
+        # explicitly unmanaged completed outputs are eligible for
+        # reconciliation.  A missing local Run gets a read-only recovery
+        # lookup by the original intent key; it never falls through to a
+        # provider submit.
+        mode = "submit"
+        if receipt_recovery_needed:
+            mode = "recover"
+        elif intent_status == "uncertain" and run_status in {
+            "queued",
+            "running",
+            "output_pending",
+        }:
+            # A failed same-Intent GET may leave the last local queued
+            # snapshot in the envelope.  Treat it as bounded recovery,
+            # never as fresh provider progress eligible for 60 polls.
+            mode = "recover"
+        elif run_status in {"queued", "running", "output_pending"} and intent_status in {
+            "submitted",
+            "uncertain",
+        }:
+            if not _id(_field(intent, "request_hash")):
+                return None
+            mode = "reconcile"
+        elif intent_status == "uncertain" or (
+            asset_import_needed and intent_status == "submitted"
+        ):
+            if not _id(_field(intent, "request_hash")):
+                return None
+            mode = "reconcile"
+        elif intent_status in {"submitted", "pending", "failed", "unavailable"} or status in {"submitted", "unavailable"}:
+            return None
+        persona_id = _id(_field(plan, "persona_id"))
+        persona_revision_id = _id(_field(plan, "persona_revision_id"))
+        if persona_id is None:
+            persona_id = await _persona_id_for_revision(session, persona_revision_id)
+        project_ref = _id(_field(plan, "project_id"))
+        space_ref = _id(_field(plan, "space_id")) or await _space_id_for_project(
+            session, project_ref
+        )
+        operator = await _resolve_optional_agent(
+            session=session,
+            persona_id=persona_id,
+            project_id=project_ref,
+            space_id=space_ref,
+            resolver=self.operator_resolver,
+            service=self.service,
+        )
+        if operator is None or not operator.get("agent_id"):
+            return None
+        if not operator.get("agent_revision_id"):
+            operator["agent_revision_id"] = await _agent_revision_id(
+                session, operator.get("agent_id")
+            )
+        if not operator.get("agent_revision_id"):
+            return None
+        authority = await _resolve_authority(
+            self.authority_resolver,
+            agent_id=operator["agent_id"],
+            revision_id=operator.get("agent_revision_id"),
+            persona_id=persona_id,
+            project_id=project_ref,
+            space_id=space_ref,
+            capabilities=self.required_capabilities,
+            session=session,
+        )
+        if authority is not None and not bool(authority.get("allowed", authority.get("is_allowed", False))):
+            return None
+        # Keep one durable Work item across submit → recovery → reconcile.
+        # The ``submit`` suffix is the historical canonical key used by
+        # already-materialized Work rows; mode is execution metadata, not
+        # a new origin identity.
+        intent_key = "generation:" + _hash_key(plan_id, plan_hash, "submit")[:48]
+        polling_reconcile = mode == "reconcile" and run_status in {
+            "queued",
+            "running",
+            "output_pending",
+        }
+        return WorkCandidate(
+            source_type=self.source_type,
+            source_id=plan_id,
+            source_revision=plan_hash,
+            intent_key=intent_key,
+            project_id=project_ref,
+            space_id=space_ref,
+            persona_id=persona_id,
+            assigned_agent_id=operator["agent_id"],
+            agent_revision_id=operator["agent_revision_id"],
+            required_capabilities=self.required_capabilities,
+            execution_adapter=self.execution_adapter,
+            max_attempts=60 if polling_reconcile else 3,
+            deadline=self._generation_deadline(plan, intent, _generation_discovery_now.get()),
+            concurrency_key=f"media.generation:{plan_id}",
+            metadata={
+                "payload": {
+                    "mode": mode,
+                    "plan_hash": plan_hash,
+                    "persona_revision_id": persona_revision_id,
+                    "intent_id": _id(_field(intent, "id")),
+                    "intent_request_hash": _id(_field(intent, "request_hash")),
+                    "operator_assignment_id": operator.get("assignment_id"),
+                    "asset_import_only": bool(asset_import_needed),
+                }
+            },
+        )
 
 
 class MediaPublicationWorkSource(MediaWorkSource):

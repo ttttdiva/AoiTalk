@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -680,6 +681,22 @@ class PlatformAccount(Base):
             unique=True,
             postgresql_where=text("project_id IS NOT NULL"),
             sqlite_where=text("project_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_media_platform_accounts_personal_x_identity_casefold",
+            "owner_user_id",
+            func.lower(account_ref),
+            unique=True,
+            postgresql_where=text("project_id IS NULL AND platform = 'x'"),
+            sqlite_where=text("project_id IS NULL AND platform = 'x'"),
+        ),
+        Index(
+            "uq_media_platform_accounts_project_x_identity_casefold",
+            "project_id",
+            func.lower(account_ref),
+            unique=True,
+            postgresql_where=text("project_id IS NOT NULL AND platform = 'x'"),
+            sqlite_where=text("project_id IS NOT NULL AND platform = 'x'"),
         ),
         Index(
             "uq_media_platform_accounts_personal_idempotency",

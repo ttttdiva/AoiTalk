@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping
 from uuid import UUID
 
 from sqlalchemy import cast, func, select
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 
 from ..memory.models import (
     AppActionRun,
@@ -78,11 +78,20 @@ def chat_attachment_path_statement():
     """Select only the two persisted Chat path fields, never message text."""
 
     metadata = cast(ConversationMessage.message_metadata, JSONB)
-    return select(
-        func.jsonb_path_query_array(metadata, "$.attachments[*].path"),
+    return select(*_chat_attachment_path_expressions(metadata))
+
+
+def _chat_attachment_path_expressions(metadata):
+    """Build typed JSONPath selectors for the two path-bearing fields only."""
+
+    return (
         func.jsonb_path_query_array(
             metadata,
-            "$.attachments[*].project_relative_path",
+            cast("$.attachments[*].path", JSONPATH),
+        ),
+        func.jsonb_path_query_array(
+            metadata,
+            cast("$.attachments[*].project_relative_path", JSONPATH),
         ),
     )
 

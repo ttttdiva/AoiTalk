@@ -33,6 +33,7 @@ services:
       - caddy_gate_key
       - bootstrap_admin_password
       - openai_api_key
+      - openai_admin_key
       - openrouter_api_key
       - moonshot_api_key
       - gemini_api_key
@@ -76,6 +77,7 @@ services:
       - AIVISSPEECH_PORT=10101
       # API Keys (ホストの.envから引き継ぎ)
       - OPENAI_API_KEY_FILE=/run/secrets/openai_api_key
+      - OPENAI_ADMIN_KEY_FILE=/run/secrets/openai_admin_key
       - OPENROUTER_API_KEY_FILE=/run/secrets/openrouter_api_key
       - OPENROUTER_SITE_URL=${OPENROUTER_SITE_URL:-}
       - MOONSHOT_API_KEY_FILE=/run/secrets/moonshot_api_key
@@ -524,6 +526,8 @@ secrets:
     environment: AOITALK_BOOTSTRAP_ADMIN_PASSWORD
   openai_api_key:
     environment: OPENAI_API_KEY
+  openai_admin_key:
+    environment: OPENAI_ADMIN_KEY
   openrouter_api_key:
     environment: OPENROUTER_API_KEY
   moonshot_api_key:

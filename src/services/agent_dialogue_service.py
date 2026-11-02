@@ -13,8 +13,10 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -27,6 +29,7 @@ from ..memory.models import (
     AgentDialogueBudgetRoot,
     AgentDialogueDelivery,
     AgentDialogueInput,
+    AgentDialogueUsage,
     AgentExecutionBinding,
     AgentPrivateRoot,
     AgentRevision,
@@ -37,8 +40,22 @@ from ..memory.models import (
     ConversationMessage,
     ConversationSession,
     Task,
+    User,
 )
-from .agent_dialogue_projection import build_turn_context, project_dialogue, project_profile
+from .agent_dialogue_projection import (
+    build_turn_context,
+    dialogue_task_blocker,
+    project_dialogue,
+    project_profile,
+)
+from .agent_delegate_policy import (
+    intersect_revision_tool_ids,
+    revision_has_new_delegate_policy,
+    revision_allows_agent_delegate,
+    revision_allows_worker_delegate,
+    worker_delegate_required_capabilities,
+)
+from .agent_revision_v2 import revision_tool_ids
 from .agent_dialogue_answer import (
     AgentDialogueAnswer,
     AgentDialogueAnswerError,
@@ -67,6 +84,8 @@ _DISPATCH_BRIDGE_CACHE: dict[int, Any] = {}
 
 _ACTIVE_RUN_STATES = frozenset({"queued", "running", "awaiting_approval", "uncertain"})
 _TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled"})
+_ACTIVE_DIALOGUE_STATES = frozenset({"queued", "running", "waiting", "blocked"})
+_TERMINAL_DIALOGUE_STATES = frozenset({"succeeded", "failed", "cancelled", "expired"})
 _DELIVERY_KINDS = frozenset({"request", "response", "control", "event"})
 # These are the only post-CAS answer outcomes that are safe to report as a
 # successful durable answer.  The answer/Input rows are already committed;
@@ -89,6 +108,17 @@ _MAX_BUDGET = {
     "max_attempts": 16,
     "tokens": 1_000_000,
     "max_tokens": 1_000_000,
+}
+# The caller Run still has to read the delegate result and answer, so keep a real
+# margin instead of reserving its whole remaining budget for the Dialogue.
+_DELEGATE_CALLER_TOKEN_HEADROOM = 60_000
+_DELEGATE_CALLER_COST_HEADROOM_MAX_MICROS = 100_000
+_DELEGATE_WORKER_PROVIDER_BY_KIND = {
+    "codex": "codex-cli",
+    "antigravity": "antigravity-cli",
+    "claude": "claude-cli",
+    "grok": "grok-cli",
+    "muse": "muse-remote",
 }
 
 
@@ -119,6 +149,93 @@ class AgentDialogueConflictError(AgentDialogueError):
 class AgentDialogueValidationError(AgentDialogueError):
     code = "agent_dialogue_invalid"
     status_code = 422
+
+
+def _reserve_caller_run_cost_ceiling(
+    ledger: Any,
+    reservation_key: str,
+    requested_cost_micros: int | None,
+) -> int | None:
+    """Reserve a finite child ceiling whenever the caller has a cost limit."""
+
+    parent_cost_limit = getattr(ledger, "cost_limit_micros", None)
+    if parent_cost_limit is None:
+        # An explicit child cost ceiling is still meaningful when the caller
+        # Run has no finite cost cap. It is enforced by the child Dialogue's
+        # durable reservation/receipt; there is no caller ledger capacity to
+        # reserve against in this case.
+        if requested_cost_micros is None:
+            return None
+        requested = int(requested_cost_micros)
+        if requested <= 0:
+            raise AgentDialogueConflictError(
+                "requested cost budget is invalid",
+                code="delegate_budget_exceeds_run_remaining",
+            )
+        return requested
+    remaining = ledger.remaining_delegation_cost_micros()
+    if remaining is None:
+        raise AgentDialogueConflictError(
+            "caller Run cost usage is unavailable for delegation",
+            code="delegate_cost_budget_unavailable",
+        )
+    # Leave bounded room for the caller's post-tool provider response.  Use
+    # one tenth of small remainders so low-cost Runs are not zeroed by a fixed
+    # minimum, while capping headroom at ten cents for larger budgets.
+    headroom = min(
+        _DELEGATE_CALLER_COST_HEADROOM_MAX_MICROS,
+        (remaining + 9) // 10,
+    )
+    reservable = remaining - headroom
+    requested = reservable if requested_cost_micros is None else int(requested_cost_micros)
+    if requested <= 0 or requested > reservable:
+        raise AgentDialogueConflictError(
+            "requested cost budget exceeds the caller Run's reservable capacity",
+            code="delegate_budget_exceeds_run_remaining",
+        )
+    if ledger.reserve_delegation_cost_micros(reservation_key, requested) is None:
+        raise AgentDialogueConflictError(
+            "requested cost budget could not be reserved from the caller Run",
+            code="delegate_budget_exceeds_run_remaining",
+        )
+    return requested
+
+
+def _external_worker_budget_projection(budgets: DialogueBudget) -> dict[str, int]:
+    """Project every bounded worker ceiling into the managed runtime marker.
+
+    CLI/Muse calls cannot be interrupted at the exact token or cost boundary.
+    They still accept the requested ceiling, inspect the provider receipt after
+    return, and persist any uninterruptible overrun as post hoc evidence.
+    """
+
+    result = {"max_attempts": int(budgets.max_attempts)}
+    if budgets.max_tokens is not None:
+        result["max_tokens"] = int(budgets.max_tokens)
+    if budgets.max_cost_micros is not None:
+        result["max_cost_micros"] = int(budgets.max_cost_micros)
+    return result
+
+
+def _validate_worker_resume_usage_budget(
+    budget: DialogueBudget,
+    usage_state: str,
+) -> None:
+    """Keep bounded retries available when a provider omits its usage receipt.
+
+    A missing receipt is recorded as unknown and the persisted attempt counter
+    remains the hard retry fence. Rejecting resume here made a child Dialogue
+    permanently unusable; treating unknown as zero would permit free retries.
+    The caller therefore carries the same finite child ceiling forward while
+    ``max_attempts`` continues to decrease for every resumed Run.
+    """
+
+    del budget
+    if usage_state not in {"known", "unknown", "cost_unknown", "token_unknown"}:
+        raise AgentDialogueConflictError(
+            "worker Dialogue usage state is invalid",
+            code="dialogue_usage_state_invalid",
+        )
 
 
 def get_agent_dialogue_dispatch_bridge(
@@ -723,6 +840,12 @@ class AgentDialogueService:
                     "private AoiDots dialogue is owner-only",
                     code="private_root_owner_only",
                 )
+            owner = await session.get(User, actor)
+            if owner is None or not bool(getattr(owner, "is_active", False)):
+                raise AgentDialogueAuthorizationError(
+                    "active human owner is required for private AoiDots access",
+                    code="private_root_owner_revoked",
+                )
             # An administrator who owns this private root still needs the
             # human owner's canonical Project permission.  The admin role
             # must not turn a private root into a cross-owner read/write
@@ -733,6 +856,34 @@ class AgentDialogueService:
         if _text(actor_role, limit=32).casefold() != "admin":
             if actor != dialogue.owner_user_id and not await self._session_acl(session, dialogue.root_session_id, actor):
                 raise AgentDialogueAuthorizationError()
+            root_revision = await session.get(
+                AgentRevision,
+                _uuid(dialogue.root_agent_revision_id, "root_agent_revision_id"),
+            )
+            if revision_has_new_delegate_policy(root_revision):
+                root_session = await session.get(ConversationSession, dialogue.root_session_id)
+                if (
+                    root_session is None
+                    or root_session.deleted_at is not None
+                    or _uuid(root_session.user_id, "root_session_owner_id")
+                    != _uuid(dialogue.owner_user_id, "dialogue_owner_id")
+                    or _uuid(root_session.agent_id, "root_session_agent_id", required=False)
+                    != _uuid(dialogue.root_agent_id, "root_agent_id")
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "generic Agent root session binding is invalid",
+                        code="dialogue_root_binding_invalid",
+                    )
+                if root_session.project_id is not None and not await self._project_acl(
+                    session,
+                    _uuid(root_session.project_id, "root_session_project_id"),
+                    actor,
+                    permission,
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "root Agent Project access denied",
+                        code="project_access_denied",
+                    )
             if not await self._project_acl(session, dialogue.project_id, actor, permission):
                 raise AgentDialogueAuthorizationError("Project access denied", code="project_access_denied")
         return actor
@@ -742,7 +893,10 @@ class AgentDialogueService:
             (
                 await session.execute(
                     select(AgentDialogueInput)
-                    .where(AgentDialogueInput.dialogue_id == dialogue.id)
+                    .where(
+                        AgentDialogueInput.dialogue_id == dialogue.id,
+                        AgentDialogueInput.state == "pending",
+                    )
                     .order_by(AgentDialogueInput.revision.desc())
                     .limit(64)
                 )
@@ -764,6 +918,23 @@ class AgentDialogueService:
         worker_agent = await session.get(Agent, dialogue.worker_agent_id)
         root_agent_name = _text(getattr(root_agent, "display_name", None), limit=160) if root_agent is not None else None
         worker_agent_name = _text(getattr(worker_agent, "display_name", None), limit=160) if worker_agent is not None else None
+        task_blocker = None
+        if dialogue.task_id is not None:
+            task = await session.get(Task, dialogue.task_id)
+            task_blocker = dialogue_task_blocker(
+                getattr(task, "status", None),
+                missing=task is None,
+                deleted=task is not None and task.deleted_at is not None,
+            )
+        agent_identity_active = bool(
+            root_agent is not None
+            and (_text(getattr(root_agent, "state", None), limit=32) or "").casefold() == "active"
+            and worker_agent is not None
+            and (
+                (_text(getattr(worker_agent, "state", None), limit=32) or "").casefold()
+                == "active"
+            )
+        )
 
         def _same(left: Any, right: Any) -> bool:
             return left not in (None, "") and right not in (None, "") and str(left) == str(right)
@@ -780,8 +951,6 @@ class AgentDialogueService:
             except (TypeError, ValueError):
                 return False
             if expected_control != current_control_revision:
-                return False
-            if _text(getattr(item, "state", None), limit=32).casefold() in {"cancelled", "expired"}:
                 return False
             if kind in {"request", "control"}:
                 return (
@@ -810,6 +979,12 @@ class AgentDialogueService:
             if _text(getattr(candidate, "kind", None), limit=32).casefold() not in {"request", "control"} or not _current_delivery(candidate):
                 continue
             if candidate.receiver_run_id is None or candidate.receiver_work_item_id is None:
+                delivery_state = _text(
+                    getattr(candidate, "state", None), limit=32
+                ).casefold()
+                if delivery_state in {"cancelled", "canceled", "expired"}:
+                    worker_delivery = candidate
+                    break
                 # A fresh request can be queued before a receiver Run/Work is
                 # admitted; the base Dialogue status remains authoritative.
                 continue
@@ -874,7 +1049,32 @@ class AgentDialogueService:
             budget_owner=budget_owner,
             root_agent_name=root_agent_name,
             worker_agent_name=worker_agent_name,
+            task_blocker=task_blocker,
+            agent_identity_active=agent_identity_active,
         )
+        authorization = (
+            getattr(dialogue, "authorization_json", None)
+            if isinstance(getattr(dialogue, "authorization_json", None), Mapping)
+            else {}
+        )
+        caller_budget = authorization.get("caller_run_budget")
+        if isinstance(caller_budget, Mapping):
+            projection["caller_run_budget"] = {
+                key: caller_budget.get(key)
+                for key in (
+                    "state",
+                    "reserved_tokens",
+                    "reserved_cost_micros",
+                    "usage_state",
+                    "actual_tokens",
+                    "actual_cost_micros",
+                    "charged_tokens",
+                    "charged_cost_micros",
+                    "overrun_tokens",
+                    "overrun_cost_micros",
+                )
+                if key in caller_budget
+            }
         input_by_id = {str(item.id): item for item in inputs}
         for item in projection.get("pending_inputs", []):
             row = input_by_id.get(str(item.get("id")))
@@ -965,23 +1165,50 @@ class AgentDialogueService:
 
     async def list_work(self, *, actor_user_id: Any, actor_role: Any = None, root_session_id: Any = None, state: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         actor = _uuid(actor_user_id, "actor_user_id")
+        safe_limit = max(1, min(int(limit or 50), 100))
+        state_filter = _text(state, limit=32).casefold() if state else None
         db = await self._session()
         try:
             statement = select(AgentDialogue).where(AgentDialogue.owner_user_id == actor)
             if root_session_id:
                 statement = statement.where(AgentDialogue.root_session_id == _uuid(root_session_id, "root_session_id"))
-            if state:
-                statement = statement.where(AgentDialogue.state == _text(state, limit=32))
-            rows = (
-                await db.execute(
-                    statement.order_by(desc(AgentDialogue.updated_at)).limit(max(1, min(int(limit or 50), 100)))
+            if state_filter:
+                # Any active ledger state may project to another status from
+                # current Run/Work, delivery, Task, or Agent lifecycle evidence.
+                statement = statement.where(
+                    AgentDialogue.state.in_(_ACTIVE_DIALOGUE_STATES | {state_filter})
                 )
-            ).scalars().all()
+            ordered = statement.order_by(
+                desc(AgentDialogue.updated_at), desc(AgentDialogue.id)
+            )
             result: list[dict[str, Any]] = []
-            for row in rows:
-                if row.project_id and not await self._project_acl(db, row.project_id, actor):
-                    continue
-                result.append(await self._projection(db, row))
+            page_size = safe_limit if state_filter is None else max(100, safe_limit)
+            offset = 0
+            while len(result) < safe_limit:
+                rows = (
+                    await db.execute(ordered.limit(page_size).offset(offset))
+                ).scalars().all()
+                if not rows:
+                    break
+                for row in rows:
+                    if row.project_id and not await self._project_acl(
+                        db, row.project_id, actor
+                    ):
+                        continue
+                    await self._authorize(db, row, actor_user_id, actor_role)
+                    projection = await self._projection(db, row)
+                    if (
+                        state_filter
+                        and _text(projection.get("job_status"), limit=32).casefold()
+                        != state_filter
+                    ):
+                        continue
+                    result.append(projection)
+                    if len(result) >= safe_limit:
+                        break
+                offset += len(rows)
+                if len(rows) < page_size:
+                    break
             return result
         finally:
             await db.close()
@@ -989,11 +1216,206 @@ class AgentDialogueService:
     async def get_dialogue(self, dialogue_id: Any, *, actor_user_id: Any, actor_role: Any = None) -> dict[str, Any]:
         db = await self._session()
         try:
-            row = await self._load_dialogue(db, dialogue_id)
+            row = await self._load_dialogue(db, dialogue_id, lock=True)
             await self._authorize(db, row, actor_user_id, actor_role)
+            if await self._settle_caller_run_budget_from_dialogue(db, row):
+                await db.commit()
             return await self._projection(db, row)
         finally:
             await db.close()
+
+    async def has_pending_human_input(
+        self,
+        dialogue_id: Any,
+        *,
+        actor_user_id: Any,
+        actor_role: Any = None,
+    ) -> bool:
+        """Return whether this authorized Dialogue waits for a Human answer."""
+
+        db = await self._session()
+        try:
+            row = await self._load_dialogue(db, dialogue_id)
+            await self._authorize(db, row, actor_user_id, actor_role)
+            value = await db.scalar(
+                select(AgentDialogueInput.id)
+                .where(
+                    AgentDialogueInput.dialogue_id == row.id,
+                    AgentDialogueInput.state == "pending",
+                    AgentDialogueInput.input_kind == "human_question",
+                )
+                .limit(1)
+            )
+            return value is not None
+        finally:
+            await db.close()
+
+    async def _settle_caller_run_budget_from_dialogue(
+        self,
+        db: Any,
+        dialogue: Any,
+    ) -> bool:
+        """Settle a generic AgentDialogue child reservation from worker receipts."""
+
+        if str(getattr(dialogue, "state", "") or "").strip().casefold() not in _TERMINAL_DIALOGUE_STATES:
+            return False
+        authorization = (
+            dict(dialogue.authorization_json)
+            if isinstance(dialogue.authorization_json, Mapping)
+            else {}
+        )
+        if isinstance(authorization.get("delegate_worker"), Mapping):
+            # Managed CLI/Muse workers settle from their runtime receipt in
+            # _external_worker_status, whose result carries the provider usage.
+            return False
+        caller_budget = authorization.get("caller_run_budget")
+        if not isinstance(caller_budget, Mapping) or str(
+            caller_budget.get("state") or ""
+        ) not in {"reserved", "ledger_unavailable"}:
+            return False
+
+        receipts: list[Any] = []
+        if await self._dialogue_budget_schema_available(db):
+            try:
+                receipts = (
+                    await db.execute(
+                        select(AgentDialogueUsage)
+                        .join(AgentRun, AgentRun.id == AgentDialogueUsage.run_id)
+                        .where(
+                            AgentDialogueUsage.dialogue_id == dialogue.id,
+                            AgentRun.session_id == dialogue.worker_session_id,
+                        )
+                    )
+                ).scalars().all()
+            except OperationalError:
+                receipts = []
+
+        token_rows = [
+            row
+            for row in receipts
+            if str(getattr(row, "state", "") or "").casefold()
+            in {"known", "cost_unknown"}
+            and getattr(row, "total_tokens", None) is not None
+        ]
+        cost_rows = [
+            row
+            for row in receipts
+            if str(getattr(row, "state", "") or "").casefold() == "known"
+            and getattr(row, "cost_micros", None) is not None
+        ]
+        actual_tokens = (
+            sum(int(row.total_tokens or 0) for row in token_rows)
+            if receipts and len(token_rows) == len(receipts)
+            else None
+        )
+        actual_cost = (
+            sum(int(row.cost_micros or 0) for row in cost_rows)
+            if receipts and len(cost_rows) == len(receipts)
+            else None
+        )
+        usage_state = (
+            "unknown"
+            if actual_tokens is None
+            else "cost_unknown"
+            if actual_cost is None
+            else "known"
+        )
+        caller_budget = dict(caller_budget)
+        caller_run_id = _text(caller_budget.get("run_id"), limit=64)
+        reservation_key = _text(caller_budget.get("reservation_key"), limit=255)
+        reserved_tokens = max(0, int(caller_budget.get("reserved_tokens") or 0))
+        reserved_cost = max(0, int(caller_budget.get("reserved_cost_micros") or 0))
+        caller_budget["usage_state"] = usage_state
+        caller_budget["actual_tokens"] = actual_tokens
+        caller_budget["actual_cost_micros"] = actual_cost
+
+        settled: Mapping[str, Any] | None = None
+        if caller_run_id and reservation_key:
+            from ..llm.agent_run_budget import peek_agent_run_budget
+
+            caller_ledger = peek_agent_run_budget(caller_run_id)
+            if caller_ledger is not None:
+                settled = caller_ledger.settle_delegation(
+                    reservation_key,
+                    actual_tokens=actual_tokens,
+                    actual_cost_micros=actual_cost,
+                )
+        if settled is None:
+            caller_budget["state"] = "ledger_unavailable"
+            caller_budget["charged_tokens"] = (
+                actual_tokens if actual_tokens is not None else reserved_tokens
+            )
+            caller_budget["charged_cost_micros"] = (
+                actual_cost if actual_cost is not None else reserved_cost
+            )
+            caller_budget["overrun_tokens"] = (
+                max(0, actual_tokens - reserved_tokens)
+                if actual_tokens is not None
+                else None
+            )
+            caller_budget["overrun_cost_micros"] = (
+                max(0, actual_cost - reserved_cost)
+                if actual_cost is not None
+                else None
+            )
+        else:
+            token_receipt = settled.get("tokens")
+            cost_receipt = settled.get("cost")
+            token_overrun = (
+                actual_tokens is not None and actual_tokens > reserved_tokens
+            )
+            cost_overrun = actual_cost is not None and actual_cost > reserved_cost
+            caller_budget["state"] = (
+                "overrun"
+                if settled.get("overrun") or token_overrun or cost_overrun
+                else "settled_unknown"
+                if usage_state != "known"
+                else "settled"
+            )
+            caller_budget["charged_tokens"] = (
+                token_receipt.get("charged_tokens", reserved_tokens)
+                if isinstance(token_receipt, Mapping)
+                else actual_tokens
+                if actual_tokens is not None
+                else reserved_tokens
+            )
+            caller_budget["charged_cost_micros"] = (
+                cost_receipt.get("charged_cost_micros", reserved_cost)
+                if isinstance(cost_receipt, Mapping)
+                else actual_cost
+                if actual_cost is not None
+                else reserved_cost
+            )
+            caller_budget["overrun_tokens"] = (
+                token_receipt.get("overrun_tokens")
+                if isinstance(token_receipt, Mapping)
+                else max(0, actual_tokens - reserved_tokens)
+                if actual_tokens is not None
+                else None
+            )
+            caller_budget["overrun_cost_micros"] = (
+                cost_receipt.get("overrun_cost_micros")
+                if isinstance(cost_receipt, Mapping)
+                else max(0, actual_cost - reserved_cost)
+                if actual_cost is not None
+                else None
+            )
+
+        authorization["caller_run_budget"] = caller_budget
+        dialogue.authorization_json = authorization
+        dialogue.authorization_hash = hashlib.sha256(
+            json.dumps(
+                authorization,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if await self._dialogue_budget_schema_available(db):
+            budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+            if budget_root is not None:
+                budget_root.authorization_hash = dialogue.authorization_hash
+        return True
 
     @staticmethod
     def _bounded_budgets(value: Mapping[str, Any] | None) -> DialogueBudget:
@@ -1245,6 +1667,111 @@ class AgentDialogueService:
         finally:
             await db.close()
 
+    async def list_team_graph_groups(self, *, actor_user_id: Any, project_id: Any = None,
+                                     root_session_id: Any = None) -> list[dict[str, Any]]:
+        """List only the owner's graphs in the requested readable project scope."""
+        from .agent_run_service import get_current_agent_run_id
+        from .agent_team_graph_admission import admit_team_graph
+        from .agent_team_graph_schema import GraphDefinition
+        from .agent_team_graph_service import AgentTeamGraphService
+
+        owner = _uuid(actor_user_id, "actor_user_id")
+        pid = _uuid(project_id, "project_id", required=False)
+        db = await self._session()
+        try:
+            if pid is not None and not await self._project_acl(db, pid, owner, "read"):
+                raise AgentDialogueAuthorizationError("Project access denied", code="project_access_denied")
+            run_id = get_current_agent_run_id()
+            run = await db.get(AgentRun, _uuid(run_id, "run_id")) if run_id else None
+            if run is None or str(run.user_id) != str(owner) or (root_session_id and str(run.session_id) != str(root_session_id)):
+                return []
+            from .turn_context import get_turn_context
+            turn = get_turn_context()
+            source_session = await db.get(ConversationSession, run.session_id)
+            scopes = {_uuid(value, "project_id") for value in (
+                run.project_id, getattr(source_session, "project_id", None),
+                turn.project_id, turn.context_project_hint_id,
+            ) if value is not None}
+            if len(scopes) > 1:
+                return []
+            inherited = next(iter(scopes), None)
+            if pid is None:
+                pid = inherited
+            if inherited is None and pid is not None:
+                from .chat_execution_adapter import is_bound_initial_aoidots_root_turn
+                if not is_bound_initial_aoidots_root_turn(turn, turn.agent_execution_binding):
+                    return []
+            elif inherited is None or pid != inherited:
+                return []
+            if not await self._project_acl(db, pid, owner, "read"):
+                return []
+            from ..memory.project_repository import ProjectRepository
+            can_manage = await ProjectRepository.has_permission(db, pid, owner, "manage_members")
+            graphs = await AgentTeamGraphService(self._manager()).list(actor_user_id=owner)
+            result = []
+            for graph in graphs:
+                if graph["project_id"] is not None and graph["project_id"] != _id(pid):
+                    continue
+                definition = GraphDefinition.model_validate(graph["definition"])
+                nodes = {node.key: node for node in definition.nodes}
+                root_node = nodes.get(definition.root_key)
+                if root_node is None or root_node.agent_id != run.agent_id:
+                    continue
+                for group in definition.groups:
+                    ref = {"graph_id": graph["id"], "revision_id": graph["revision_id"], "group_key": group.key}
+                    leader = nodes.get(group.leader_key)
+                    item = {"ref": ref, "title": graph["title"], "group_title": group.title,
+                            "root": {"agent_id": str(root_node.agent_id), "revision_id": str(run.agent_revision_id)},
+                            "leader": None, "ready": False, "diagnostics": list(graph["diagnostics"])}
+                    try:
+                        if pid is None or leader is None or (root_node.revision_id and root_node.revision_id != run.agent_revision_id):
+                            raise ValueError("root, leader or project unavailable")
+                        identity = ConversationAgentService(self._manager(), config=self.config)
+                        _, rev = await identity._agent_for_selection(db, agent_id=leader.agent_id,
+                            actor_id=owner, actor_role=None, project_id=pid, revision_id=leader.revision_id)
+                        item["leader"] = {"agent_id": str(leader.agent_id), "revision_id": str(rev.id)}
+                        root_revision = await db.get(AgentRevision, run.agent_revision_id)
+                        root_agent = await db.get(Agent, run.agent_id)
+                        leader_agent = await db.get(Agent, leader.agent_id)
+                        tools = intersect_revision_tool_ids(root_revision, rev)
+                        required_tool = "delegate_media" if group.execution_kind in {"media_image", "media_video"} else "delegate_plan"
+                        if (required_tool == "delegate_media" or group.execution_kind == "software_code") and (
+                                revision_tool_ids(root_revision) is None or revision_tool_ids(rev) is None
+                                or tools is None or required_tool not in tools):
+                            raise AgentDialogueAuthorizationError(f"Graph leader cannot call {required_tool}",
+                                code="team_graph_media_tool_unavailable" if required_tool == "delegate_media" else "team_graph_plan_tool_unavailable")
+                        if (root_revision is None or root_agent is None or leader_agent is None
+                                or not can_manage or "aoi_tools" not in (rev.capability_ceiling_json or [])
+                                or not self._worker_route_readiness(rev)["ready"]
+                                or (tools is not None and required_tool not in tools)
+                                or not revision_allows_agent_delegate(root_revision, tool_name="delegate",
+                                    target_agent_id=leader.agent_id, target_agent_owner_id=leader_agent.created_by,
+                                    caller_agent_owner_id=root_agent.created_by, owner_user_id=owner)):
+                            raise ValueError("team_graph_delegate_unavailable")
+                        compiled = (await admit_team_graph(db, ref=ref, owner=owner, project_id=pid,
+                            leader_id=leader.agent_id, leader_revision_id=rev.id, planning={}, config=self.config))["graph_constraints"]
+                        compiled_nodes = {node["key"]: node for node in compiled["roster"]}
+                        valid_pair = False
+                        for worker_key, reviewer_key in compiled["allowed_pairs"]:
+                            targets = [await db.get(Agent, _uuid(compiled_nodes[key]["agent_id"], "agent_id"))
+                                       for key in (worker_key, reviewer_key)]
+                            if all(target is not None and revision_allows_agent_delegate(
+                                    rev, tool_name=required_tool, target_agent_id=target.id,
+                                    target_agent_owner_id=target.created_by, caller_agent_owner_id=leader_agent.created_by,
+                                    owner_user_id=owner) for target in targets):
+                                valid_pair = True
+                                break
+                        if not valid_pair:
+                            raise ValueError("team_graph_plan_policy_denied")
+                        item["edges"] = compiled["edges"]
+                        item["ready"] = not item["diagnostics"]
+                    except Exception as exc:
+                        item["diagnostics"].append(str(getattr(exc, "code", "team_graph_not_ready")))
+                    result.append(item)
+            return result
+        finally:
+            await db.close()
+
     def _worker_route_readiness(self, revision: Any) -> dict[str, Any]:
         """Read-only preflight for a generic worker before job creation."""
 
@@ -1254,7 +1781,7 @@ class AgentDialogueService:
         if ceiling is None and isinstance(revision, Mapping):
             ceiling = revision.get("capability_ceiling") or revision.get("capability_ceiling_json")
         capabilities = {str(item).strip() for item in (ceiling or ()) if str(item).strip()}
-        if "aoi_tools" not in capabilities:
+        if "aoi_tools" not in capabilities and not revision_has_new_delegate_policy(revision):
             return {"ready": False, "safe_reason": "agent_dialogue_capability_unavailable"}
         try:
             from .agent_model_routing import AgentModelRouteError, AgentRoutingPins, resolve_agent_role_route
@@ -1266,6 +1793,181 @@ class AgentDialogueService:
         except Exception:
             return {"ready": False, "safe_reason": "agent_route_unavailable"}
         return {"ready": True, "safe_reason": None}
+
+    async def _select_managed_external_worker(
+        self,
+        db: Any,
+        *,
+        actor_user_id: Any,
+        actor_role: Any,
+        kind: str,
+        project_id: Any | None,
+        model: str | None,
+        effort: str | None,
+        exclude_agent_id: Any | None = None,
+        target_agent_id: Any | None = None,
+        scope_mode: str = "",
+    ) -> tuple[Any, Any, Any]:
+        """Resolve a real active managed Agent pin for one external worker kind."""
+
+        from .agent_model_routing import (
+            AgentModelRouteError,
+            AgentRoutingPins,
+            resolve_agent_role_route,
+        )
+
+        from .agent_delegate_policy import revision_has_new_delegate_policy, worker_delegate_required_capabilities
+
+        expected_provider = _DELEGATE_WORKER_PROVIDER_BY_KIND[kind]
+        identity = ConversationAgentService(self._manager(), config=self.config)
+        candidates = list(
+            (
+                await db.execute(
+                    select(Agent)
+                    .where(Agent.state == "active")
+                    .order_by(Agent.display_name.asc(), Agent.id.asc())
+                )
+            ).scalars().all()
+        )
+        selection_actor_role = (
+            None
+            if _text(actor_role, limit=32).casefold() == "admin"
+            else actor_role
+        )
+        for candidate in candidates:
+            if exclude_agent_id is not None and str(candidate.id) == str(exclude_agent_id):
+                continue
+            if target_agent_id is not None and str(candidate.id) != str(target_agent_id):
+                continue
+            revision = (
+                await db.execute(
+                    select(AgentRevision)
+                    .where(AgentRevision.agent_id == candidate.id)
+                    .order_by(AgentRevision.version.desc(), AgentRevision.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if revision is None:
+                continue
+            if not revision_has_new_delegate_policy(revision):
+                continue
+            raw_caps = revision.capability_ceiling_json or ()
+            caps = {str(k).casefold() for k, v in raw_caps.items() if v is True} if isinstance(raw_caps, Mapping) else {str(v).casefold() for v in raw_caps}
+            if not worker_delegate_required_capabilities(kind, "" if kind == "muse" else scope_mode).issubset(caps):
+                continue
+            try:
+                route = resolve_agent_role_route(
+                    self.config,
+                    AgentRoutingPins.from_revision(revision),
+                    "operator",
+                )
+            except AgentModelRouteError:
+                continue
+            except Exception:
+                continue
+            if route is None or str(route.provider or "").casefold() != expected_provider:
+                continue
+            if model is not None and str(route.model or "") != str(model):
+                continue
+            if effort is not None and str(route.effort or "") != str(effort):
+                continue
+            try:
+                worker, worker_revision = await identity.validate_agent_selection(
+                    agent_id=candidate.id,
+                    actor_user_id=actor_user_id,
+                    actor_role=selection_actor_role,
+                    project_id=project_id,
+                    db_session=db,
+                )
+            except Exception:
+                continue
+            if (
+                worker.id != candidate.id
+                or worker_revision.id != revision.id
+                or str(worker.state or "").casefold() != "active"
+            ):
+                continue
+            return worker, worker_revision, route
+        raise AgentDialogueAuthorizationError(
+            "no active owner/project-authorized managed Agent has the requested worker route",
+            code="worker_agent_unavailable",
+        )
+
+    @staticmethod
+    def _normalize_worker_workspace_scope(
+        value: Any,
+        *,
+        run_id: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        from ..security.agent_run_scope import get_current_run_scope
+
+        scope = get_current_run_scope()
+        if scope is None or str(getattr(scope, "run_id", "")) != str(run_id):
+            raise AgentDialogueAuthorizationError(
+                "current AgentRun workspace scope is unavailable",
+                code="worker_workspace_scope_unavailable",
+            )
+        if not isinstance(value, Mapping) or set(value) != {"mode", "paths"}:
+            raise AgentDialogueValidationError(
+                "workspace_scope must contain only mode and paths",
+                code="worker_workspace_scope_invalid",
+            )
+        requested_mode = str(value.get("mode") or "").strip().casefold()
+        if requested_mode != mode or requested_mode not in {"read", "write"}:
+            raise AgentDialogueValidationError(
+                "workspace_scope mode is invalid",
+                code="worker_workspace_scope_invalid",
+            )
+        raw_paths = value.get("paths")
+        if not isinstance(raw_paths, list) or not raw_paths or len(raw_paths) > 64:
+            raise AgentDialogueValidationError(
+                "workspace_scope paths must be a non-empty bounded list",
+                code="worker_workspace_scope_invalid",
+            )
+        root = Path(scope.canonical_root).resolve(strict=True)
+        normalized_paths: list[str] = []
+        seen: set[str] = set()
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise AgentDialogueValidationError(
+                    "workspace_scope path is invalid",
+                    code="worker_workspace_scope_invalid",
+                )
+            raw_text = raw_path.strip().replace("\\", "/")
+            windows_path = PureWindowsPath(raw_text)
+            relative = Path(raw_text)
+            if (
+                windows_path.is_absolute()
+                or windows_path.drive
+                or relative.is_absolute()
+                or any(part == ".." for part in relative.parts)
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "workspace_scope path escapes the caller workspace",
+                    code="worker_workspace_scope_denied",
+                )
+            candidate = (root / relative).resolve(strict=False)
+            try:
+                candidate.relative_to(root)
+                if mode == "write":
+                    scope.assert_mutation_allowed(candidate, "write")
+                else:
+                    scope.assert_read_allowed(candidate)
+            except Exception as exc:
+                raise AgentDialogueAuthorizationError(
+                    "workspace_scope path is outside the caller's effective scope",
+                    code="worker_workspace_scope_denied",
+                ) from exc
+            normalized = str(candidate)
+            if normalized not in seen:
+                normalized_paths.append(normalized)
+                seen.add(normalized)
+        return {
+            "mode": mode,
+            "root": str(root),
+            "paths": normalized_paths,
+        }
 
     async def _cost_budget_rate_card(
         self,
@@ -1371,6 +2073,14 @@ class AgentDialogueService:
         cached_rate = _max_per_1k("cached_input")
         if cached_rate is not None:
             card["cached_per_1k"] = cached_rate
+        if str(route.provider).strip().lower() == "openai" and str(route.model).strip().lower() in {"gpt-5.6-sol", "gpt-5.6"}:
+            from src.llm.image_budget import serialize_image_price_rule
+
+            try:
+                card["image_price"] = serialize_image_price_rule(rule, str(route.model))
+            except ValueError:
+                # Old/text-only cards remain usable; image requests fail closed.
+                pass
         return card
 
     async def _validate_delegate_source(self, actor_user_id: Any, anchor: Mapping[str, Any]) -> None:
@@ -1755,10 +2465,24 @@ class AgentDialogueService:
         anchor: Mapping[str, Any],
         context_project_hint_id: Any | None,
         predecessor_dialogue_id: Any | None = None,
+        tool_name: str = "delegate_agent_work",
+        prepared_worker: Mapping[str, Any] | None = None,
+        prepared_dialogue_id: Any | None = None,
+        team_graph_ref: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         owner = _uuid(actor_user_id, "actor_user_id")
+        dialogue_id = _uuid(prepared_dialogue_id, "dialogue_id") if prepared_worker is not None else uuid4()
+        run_budget_ledger = None
+        run_budget_reservation_key: str | None = None
+        run_budget_remaining_after: int | None = None
+        run_budget_cost_reserved: int | None = None
         db = await self._session()
         try:
+            source_run_id = _uuid(anchor.get("source_run_id"), "source_run_id")
+            source_run = await db.get(AgentRun, source_run_id)
+            if team_graph_ref is not None and source_run is not None:
+                await db.scalar(select(ConversationSession).where(
+                    ConversationSession.id == source_run.session_id).with_for_update())
             root = (
                 await db.execute(
                     select(AgentPrivateRoot)
@@ -1766,35 +2490,95 @@ class AgentDialogueService:
                     .with_for_update()
                 )
             ).scalars().first()
-            if root is None:
-                raise AgentDialogueError("private AoiDots root is unavailable", code="private_root_unavailable")
-            root_session = await db.get(ConversationSession, root.session_id)
-            root_agent = await db.get(Agent, root.agent_id)
-            source_run_id = _uuid(anchor.get("source_run_id"), "source_run_id")
-            source_run = await db.get(AgentRun, source_run_id)
-            if (
-                root_session is None
-                or root_agent is None
-                or source_run is None
-                or root_session.project_id is not None
-                or source_run.session_id != root_session.id
-                or source_run.agent_id != root_agent.id
-                or source_run.parent_run_id is not None
-                or source_run.agent_revision_id is None
-            ):
-                raise AgentDialogueAuthorizationError("private root binding is invalid", code="private_root_invalid")
+            if source_run is None or source_run.agent_revision_id is None:
+                raise AgentDialogueAuthorizationError(
+                    "source AgentRun revision is unavailable",
+                    code="source_revision_invalid",
+                )
             # The dialogue must pin the exact immutable revision that admitted
-            # this root Run.  Looking up the latest AgentRevision here would
+            # this source Run. Looking up the latest AgentRevision here would
             # make an in-flight Run fail admission after a newer revision is
             # published concurrently, and would make callback/retry refs
             # disagree with the original source Run.
             root_revision = await db.get(AgentRevision, source_run.agent_revision_id)
-            if root_revision is None or root_revision.agent_id != root_agent.id:
+            root_agent = await db.get(Agent, source_run.agent_id)
+            generic_agent_delegate = revision_has_new_delegate_policy(root_revision)
+            if root_revision is None or root_agent is None or root_revision.agent_id != root_agent.id:
                 raise AgentDialogueAuthorizationError(
-                    "source AgentRun revision is not bound to the private root",
+                    "source AgentRun revision is not bound to its Agent",
                     code="source_revision_invalid",
                 )
+            if generic_agent_delegate:
+                root_session = await db.get(ConversationSession, source_run.session_id)
+                if (
+                    root_session is None
+                    or source_run.parent_run_id is not None
+                    or _uuid(root_session.user_id, "source_session_owner_id") != owner
+                    or _uuid(root_session.agent_id, "source_session_agent_id", required=False)
+                    != _uuid(root_agent.id, "source_agent_id")
+                    or source_run.session_id != root_session.id
+                    or source_run.agent_id != root_agent.id
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "source Agent session binding is invalid",
+                        code="source_agent_binding_invalid",
+                    )
+                binding = (
+                    await db.execute(
+                        select(AgentExecutionBinding)
+                        .where(
+                            AgentExecutionBinding.session_id == root_session.id,
+                            AgentExecutionBinding.agent_id == root_agent.id,
+                            AgentExecutionBinding.agent_revision_id == root_revision.id,
+                        )
+                        .order_by(AgentExecutionBinding.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if binding is None:
+                    raise AgentDialogueAuthorizationError(
+                        "source Agent binding is unavailable",
+                        code="source_agent_binding_invalid",
+                    )
+                if root_session.project_id is not None and not await self._project_acl(
+                    db,
+                    _uuid(root_session.project_id, "source_session_project_id"),
+                    owner,
+                    "read",
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "source Agent Project is not readable",
+                        code="source_agent_project_access_denied",
+                    )
+            else:
+                if root is None:
+                    raise AgentDialogueError(
+                        "private AoiDots root is unavailable",
+                        code="private_root_unavailable",
+                    )
+                root_session = await db.get(ConversationSession, root.session_id)
+                if (
+                    root_session is None
+                    or root_agent.id != root.agent_id
+                    or root_session.project_id is not None
+                    or source_run.session_id != root_session.id
+                    or source_run.agent_id != root_agent.id
+                    or source_run.parent_run_id is not None
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "private root binding is invalid",
+                        code="private_root_invalid",
+                    )
             source_work = await db.get(AgentWorkItem, source_run.work_item_id) if source_run.work_item_id else None
+            if prepared_worker is not None and (
+                source_run.status not in _ACTIVE_RUN_STATES
+                or str(source_run.user_id or "") != str(owner)
+                or source_work is None
+                or source_work.active_agent_run_id != source_run.id
+                or not source_work.lease_owner or not source_work.lease_token
+                or source_work.lease_expires_at is None or source_work.lease_expires_at <= _now()
+            ):
+                raise AgentDialogueAuthorizationError("source Run lease changed", code="source_work_lease_invalid")
             chain_context = await self._validate_root_receipt_parent(
                 db,
                 anchor=anchor,
@@ -1805,20 +2589,246 @@ class AgentDialogueService:
                 root_agent=root_agent,
             )
             identity = ConversationAgentService(self._manager(), config=self.config)
+            graph_auth = None
+            if team_graph_ref is not None:
+                from .turn_context import get_turn_context
+
+                actual_projects = {str(value) for value in (
+                    source_run.project_id, getattr(source_work, "project_id", None),
+                    root_session.project_id, get_turn_context().project_id) if value is not None}
+                # A projectless Root can choose an authorized target. Non-null
+                # source scopes still constrain the target; a UI hint does not.
+                if not project_id or (actual_projects and actual_projects != {str(project_id)}):
+                    raise AgentDialogueAuthorizationError("Graph source project mismatch", code="team_graph_project_mismatch")
+                from .agent_team_graph_admission import TeamGraphRef, admit_team_graph
+                from .agent_team_graph_schema import GraphDefinition
+                from .agent_team_graph_service import AgentTeamGraphService
+
+                ref = TeamGraphRef.model_validate(team_graph_ref)
+                envelope = await AgentTeamGraphService().get_in_session(
+                    db, ref.graph_id, actor_user_id=owner, revision_id=ref.revision_id)
+                if not project_id or (envelope["project_id"] is not None and envelope["project_id"] != str(project_id)):
+                    raise AgentDialogueAuthorizationError("Graph project mismatch", code="team_graph_project_mismatch")
+                definition = GraphDefinition.model_validate(envelope["definition"])
+                nodes = {node.key: node for node in definition.nodes}
+                group = next((g for g in definition.groups if g.key == ref.group_key), None)
+                if group is None or not group.leader_key or not definition.root_key:
+                    raise AgentDialogueAuthorizationError("Graph group incomplete", code="team_graph_invalid")
+                root_node, leader_node = nodes[definition.root_key], nodes[group.leader_key]
+                if (root_node.agent_id != root_agent.id or
+                        (root_node.revision_id and root_node.revision_id != root_revision.id)):
+                    raise AgentDialogueAuthorizationError("Graph root mismatch", code="team_graph_root_mismatch")
+                if worker_agent_id and str(worker_agent_id) != str(leader_node.agent_id):
+                    raise AgentDialogueAuthorizationError("Graph leader mismatch", code="team_graph_leader_mismatch")
+                graph_auth = {"ref": ref.model_dump(mode="json"), "graph_hash": envelope["content_hash"],
+                              "target_project_id": str(project_id)}
+                graph_auth["case_key"] = hashlib.sha256(json.dumps({
+                    "owner": str(owner), "human_message_id": anchor["trigger_message_id"],
+                    "project_id": str(project_id), "graph_revision_id": str(ref.revision_id),
+                }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                graph_auth["request_digest"] = hashlib.sha256(json.dumps({
+                    "title": title, "instruction": instruction, "group_key": ref.group_key,
+                    "task_id": _id(task_id), "budget": budgets.to_dict(), "deadline": str(deadline),
+                    "predecessor_dialogue_id": _id(predecessor_dialogue_id),
+                }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                existing_rows = (await db.scalars(select(AgentDialogue).where(
+                    AgentDialogue.owner_user_id == owner,
+                    AgentDialogue.human_message_id == _uuid(anchor["trigger_message_id"], "trigger_message_id"),
+                    AgentDialogue.project_id == _uuid(project_id, "project_id")))).all()
+                for existing in existing_rows:
+                    stored_auth = existing.authorization_json or {}
+                    prior = stored_auth.get("team_graph") if isinstance(stored_auth, Mapping) else None
+                    if (isinstance(prior, Mapping) and prior.get("ref") == graph_auth["ref"]
+                            and existing.root_session_id == root_session.id
+                            and prior.get("case_key") == graph_auth["case_key"]
+                            and prior.get("request_digest") == graph_auth["request_digest"]):
+                        expected_hash = hashlib.sha256(json.dumps(stored_auth, ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                        if existing.authorization_hash != expected_hash:
+                            raise AgentDialogueAuthorizationError("Dialogue authorization invalid", code="team_graph_authorization_invalid")
+                        delivery_row = await db.scalar(select(AgentDialogueDelivery).where(
+                            AgentDialogueDelivery.dialogue_id == existing.id,
+                            AgentDialogueDelivery.kind == "request").order_by(AgentDialogueDelivery.sequence))
+                        if run_budget_ledger is not None and run_budget_reservation_key is not None:
+                            run_budget_ledger.release_delegation_tokens(run_budget_reservation_key)
+                            if run_budget_cost_reserved is not None:
+                                run_budget_ledger.release_delegation_cost_micros(run_budget_reservation_key)
+                        return {"dialogue_id": str(existing.id), "root_session_id": str(existing.root_session_id),
+                            "worker_session_id": str(existing.worker_session_id), "root_agent_id": str(existing.root_agent_id),
+                            "root_agent_revision_id": str(existing.root_agent_revision_id),
+                            "worker_agent_id": str(existing.worker_agent_id),
+                            "worker_agent_revision_id": str(existing.worker_agent_revision_id),
+                            "chat_link": f"/chat/{existing.worker_session_id}",
+                            "delivery": delivery_row.to_safe_dict() if delivery_row else None,
+                            "team_graph": dict(prior), "case_key": prior["case_key"]}
+                from .agent_delegation_service import AgentDelegationService, DelegationError
+                from .agent_team_handoff_inputs import resolve_group_handoff_inputs
+                try:
+                    graph_auth["handoff_inputs"] = await resolve_group_handoff_inputs(
+                        db, service=AgentDelegationService(self._manager(), config=self.config),
+                        owner_user_id=owner, root_session_id=root_session.id, case_key=graph_auth["case_key"],
+                        graph={**envelope, "case_project_id": str(project_id)}, target_group=ref.group_key)
+                except DelegationError as exc:
+                    raise AgentDialogueAuthorizationError("Graph group handoff is not ready", code=exc.code) from exc
+                pins = {}
+                for key in set(group.node_keys) | {definition.root_key}:
+                    node = nodes[key]
+                    if key == definition.root_key:
+                        revision = root_revision
+                    elif group.execution_kind in {"media_image", "media_video", "software_code"} and node.role == "worker":
+                        # The media producer executes through MediaWork, not the LLM selection route.
+                        # Admission below validates ownership, active state, revision and media authority.
+                        revision = (await db.get(AgentRevision, node.revision_id) if node.revision_id
+                                    else await identity._latest_revision(db, node.agent_id))
+                        if revision is None or revision.agent_id != node.agent_id:
+                            raise AgentDialogueAuthorizationError("Graph revision unavailable", code="team_graph_revision_invalid")
+                    else:
+                        _, revision = await identity._agent_for_selection(
+                            db, agent_id=node.agent_id, actor_id=owner, actor_role=None,
+                            project_id=_uuid(project_id, "project_id"), revision_id=node.revision_id)
+                    pins[key] = {"agent_id": str(node.agent_id), "revision_id": str(revision.id)}
+                worker_agent_id = leader_node.agent_id
+                graph_auth.update({"nodepins": pins, "root_key": definition.root_key, "leader_key": group.leader_key})
+                # Compile and check all routes before any session is created.
+                admitted = await admit_team_graph(
+                    db, ref=graph_auth["ref"], owner=owner, project_id=_uuid(project_id, "project_id"),
+                    leader_id=leader_node.agent_id, leader_revision_id=UUID(pins[group.leader_key]["revision_id"]),
+                    planning={}, config=self.config, authorization=graph_auth)
+                graph_auth["compiled"] = admitted["graph_constraints"]
+                graph_auth["execution_kind"] = admitted.get("execution_kind", "generic")
+                from ..memory.project_repository import ProjectRepository
+                leader_revision = await db.get(AgentRevision, UUID(pins[group.leader_key]["revision_id"]))
+                if ("aoi_tools" not in (leader_revision.capability_ceiling_json or []) or not
+                        await ProjectRepository.has_permission(db, _uuid(project_id, "project_id"), owner, "manage_members")):
+                    raise AgentDialogueAuthorizationError("Graph plan authority unavailable", code="team_graph_plan_unavailable")
+            if budgets.max_tokens is not None or budgets.max_cost_micros is not None:
+                from ..llm.agent_run_budget import peek_agent_run_budget
+
+                run_budget_ledger = peek_agent_run_budget(str(source_run.id))
+                remaining_tokens = (
+                    run_budget_ledger.remaining_delegation_tokens()
+                    if run_budget_ledger is not None
+                    else None
+                )
+                if remaining_tokens is None:
+                    raise AgentDialogueConflictError(
+                        "caller Run token usage is not available for delegation",
+                        code="delegate_run_budget_unavailable",
+                    )
+                reservable_tokens = remaining_tokens - _DELEGATE_CALLER_TOKEN_HEADROOM
+                if reservable_tokens <= 0:
+                    raise AgentDialogueConflictError(
+                        "requested token budget exceeds the caller Run's reservable capacity",
+                        code="delegate_budget_exceeds_run_remaining",
+                    )
+                reservation_key = str(dialogue_id)
+                requested_tokens = None
+                if budgets.max_tokens is not None:
+                    run_budget_reservation_key = reservation_key
+                    requested_tokens = int(budgets.max_tokens)
+                    if requested_tokens <= 0 or requested_tokens > reservable_tokens:
+                        raise AgentDialogueConflictError(
+                            "requested token budget exceeds the caller Run's reservable capacity",
+                            code="delegate_budget_exceeds_run_remaining",
+                        )
+                    run_budget_remaining_after = run_budget_ledger.reserve_delegation_tokens(
+                        run_budget_reservation_key,
+                        requested_tokens,
+                    )
+                    if run_budget_remaining_after is None:
+                        raise AgentDialogueConflictError(
+                            "requested token budget could not be reserved from the caller Run",
+                            code="delegate_budget_exceeds_run_remaining",
+                        )
+                run_budget_cost_reserved = _reserve_caller_run_cost_ceiling(
+                    run_budget_ledger,
+                    reservation_key,
+                    budgets.max_cost_micros,
+                )
+                if (
+                    run_budget_cost_reserved is not None
+                    and getattr(run_budget_ledger, "cost_limit_micros", None) is not None
+                ):
+                    run_budget_reservation_key = reservation_key
+                budgets = replace(
+                    budgets,
+                    max_tokens=(
+                        requested_tokens
+                        if requested_tokens is not None
+                        else budgets.max_tokens
+                    ),
+                    max_cost_micros=(
+                        run_budget_cost_reserved
+                        if run_budget_cost_reserved is not None
+                        else budgets.max_cost_micros
+                    ),
+                )
+            if generic_agent_delegate and budgets.max_cost_micros is not None and chain_context is not None:
+                from .agent_dialogue_budget import (
+                    DialogueBudgetError,
+                    assert_dialogue_budget_available,
+                )
+
+                parent_dialogue = await db.get(
+                    AgentDialogue,
+                    _uuid(chain_context["parent_dialogue_id"], "parent_dialogue_id"),
+                )
+                if parent_dialogue is None:
+                    raise AgentDialogueAuthorizationError(
+                        "caller Dialogue budget owner is unavailable",
+                        code="delegate_budget_owner_invalid",
+                    )
+                caller_budget_owner = await get_dialogue_budget_owner(
+                    db,
+                    parent_dialogue,
+                    lock=True,
+                )
+                try:
+                    assert_dialogue_budget_available(
+                        caller_budget_owner,
+                        turns=0,
+                        attempts=0,
+                        cost_micros=budgets.max_cost_micros,
+                    )
+                except DialogueBudgetError as exc:
+                    raise AgentDialogueConflictError(
+                        "requested cost budget exceeds the caller Dialogue's remaining capacity",
+                        code="delegate_budget_exceeds_run_remaining",
+                    ) from exc
             # AoiDots worker admission is scoped to the human owner of the
             # private root.  ConversationAgentService's ``admin`` role is a
             # deliberate cross-session bypass for generic agent management;
             # carrying it into this private scope would bypass AgentProject
             # grants even after the owner's Project ACL was checked above.
             selection_actor_role = None if _text(actor_role, limit=32).casefold() == "admin" else actor_role
-            if worker_agent_id:
-                worker, worker_revision = await identity.validate_agent_selection(
-                    agent_id=worker_agent_id,
-                    actor_user_id=actor_user_id,
-                    actor_role=selection_actor_role,
-                    project_id=project_id,
-                    db_session=db,
+            if prepared_worker is not None:
+                worker_kind = str(prepared_worker.get("worker_kind") or "")
+                if not revision_has_new_delegate_policy(root_revision) or not revision_allows_worker_delegate(root_revision, worker_kind):
+                    raise AgentDialogueAuthorizationError("worker policy changed", code="worker_revision_policy_denied")
+                if (str(prepared_worker.get("source_agent_id")) != str(root_agent.id)
+                    or str(prepared_worker.get("source_revision_id")) != str(root_revision.id)):
+                    raise AgentDialogueAuthorizationError("prepared source identity changed", code="worker_revision_invalid")
+                worker, worker_revision, _ = await self._select_managed_external_worker(
+                    db, actor_user_id=actor_user_id, actor_role=selection_actor_role,
+                    kind=worker_kind, project_id=project_id,
+                    model=prepared_worker.get("target_model"),
+                    effort=prepared_worker.get("target_effort"),
+                    exclude_agent_id=root_agent.id, target_agent_id=prepared_worker.get("agent_id"),
+                    scope_mode=str(prepared_worker.get("scope_mode") or ""),
                 )
+                if (str(prepared_worker.get("agent_id")) != str(worker.id)
+                    or str(prepared_worker.get("agent_revision_id")) != str(worker_revision.id)):
+                    raise AgentDialogueAuthorizationError("prepared worker identity changed", code="worker_revision_invalid")
+            elif worker_agent_id:
+                if graph_auth is not None:
+                    worker, worker_revision = await identity._agent_for_selection(
+                        db, agent_id=_uuid(worker_agent_id, "worker_agent_id"), actor_id=owner,
+                        actor_role=selection_actor_role, project_id=_uuid(project_id, "project_id"),
+                        revision_id=UUID(graph_auth["nodepins"][graph_auth["leader_key"]]["revision_id"]))
+                else:
+                    worker, worker_revision = await identity.validate_agent_selection(
+                        agent_id=worker_agent_id, actor_user_id=actor_user_id,
+                        actor_role=selection_actor_role, project_id=project_id, db_session=db)
             else:
                 roster = await identity.list_available_agents(
                     actor_user_id=actor_user_id,
@@ -1841,16 +2851,14 @@ class AgentDialogueService:
                 worker, worker_revision = await identity.validate_agent_selection(
                     agent_id=selected["id"], actor_user_id=actor_user_id, actor_role=selection_actor_role, project_id=project_id, db_session=db
                 )
-            readiness = self._worker_route_readiness(worker_revision)
-            if not readiness["ready"]:
-                raise AgentDialogueAuthorizationError(
-                    "worker execution route is unavailable",
-                    code=str(readiness["safe_reason"] or "agent_route_unavailable"),
-                )
-            server_rate_card = await self._cost_budget_rate_card(
-                worker_revision,
-                budgets,
-            )
+            if prepared_worker is None:
+                readiness = self._worker_route_readiness(worker_revision)
+                if not readiness["ready"]:
+                    raise AgentDialogueAuthorizationError(
+                        "worker execution route is unavailable",
+                        code=str(readiness["safe_reason"] or "agent_route_unavailable"),
+                    )
+            server_rate_card = await self._cost_budget_rate_card(worker_revision, budgets)
             effective_deadline = deadline
             if chain_context is not None and chain_context.get("parent_deadline") is not None:
                 parent_deadline = chain_context["parent_deadline"]
@@ -1866,8 +2874,35 @@ class AgentDialogueService:
                     worker=worker,
                     anchor=anchor,
                 )
-            if worker.id == root_agent.id:
+            if prepared_worker is None and worker.id == root_agent.id:
                 raise AgentDialogueValidationError("source Agent cannot be its own worker", code="dialogue_self_loop")
+            if prepared_worker is None and not revision_allows_agent_delegate(
+                root_revision,
+                tool_name=tool_name,
+                target_agent_id=worker.id,
+                target_agent_owner_id=getattr(worker, "created_by", None),
+                caller_agent_owner_id=getattr(root_agent, "created_by", None),
+                owner_user_id=owner,
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "source AgentRevision delegation policy does not allow the exact tool and target",
+                    code="delegate_policy_denied",
+                )
+            caller_tool_ids = revision_tool_ids(root_revision)
+            worker_tool_ids = revision_tool_ids(worker_revision)
+            delegated_tool_ids = intersect_revision_tool_ids(
+                root_revision,
+                worker_revision,
+            )
+            if prepared_worker is not None:
+                delegated_tool_ids = []
+            if graph_auth is not None:
+                required_tool = "delegate_media" if graph_auth["execution_kind"] in {"media_image", "media_video"} else "delegate_plan"
+                if (((required_tool == "delegate_media" or graph_auth["execution_kind"] == "software_code") and (caller_tool_ids is None or worker_tool_ids is None))
+                        or (delegated_tool_ids is not None and required_tool not in delegated_tool_ids)):
+                    raise AgentDialogueAuthorizationError(
+                        f"Graph leader cannot call {required_tool}",
+                        code="team_graph_media_tool_unavailable" if required_tool == "delegate_media" else "team_graph_plan_tool_unavailable")
             if task_id:
                 task_uuid = _uuid(task_id, "task_id")
                 project_uuid = _uuid(project_id, "project_id", required=False)
@@ -1876,6 +2911,16 @@ class AgentDialogueService:
                 task = await db.get(Task, task_uuid)
                 if task is None or task.deleted_at is not None or task.project_id != project_uuid:
                     raise AgentDialogueAuthorizationError("Task is outside the selected Project", code="task_scope_invalid")
+                task_blocker = dialogue_task_blocker(
+                    task.status,
+                    deleted=task.deleted_at is not None,
+                )
+                if task_blocker is not None:
+                    blocker_state, blocker_reason = task_blocker
+                    raise AgentDialogueAuthorizationError(
+                        "Task is not active for Agent work",
+                        code=("task_cancelled" if blocker_state == "cancelled" else blocker_reason),
+                    )
                 if not await self._project_acl(db, project_uuid, owner, "write"):
                     raise AgentDialogueAuthorizationError("Task Project write permission is required", code="task_project_write_denied")
                 assignment = (
@@ -1889,7 +2934,6 @@ class AgentDialogueService:
                 ).scalars().first()
                 if assignment is None:
                     raise AgentDialogueAuthorizationError("Worker is not assigned to the Task", code="task_agent_assignment_required")
-            dialogue_id = uuid4()
             if chain_context is not None:
                 child_request_key = f"dialogue-request:{dialogue_id}:{anchor['source_run_id']}"
                 child_receiver_run_id = uuid5(
@@ -1905,40 +2949,77 @@ class AgentDialogueService:
                 )
                 chain_context["reservation_key"] = f"run:{child_receiver_run_id}"
                 chain_context["receiver_run_id"] = str(child_receiver_run_id)
-            child_session_id = uuid4()
-            child = ConversationSession(
-                id=child_session_id,
-                user_id=str(owner),
-                character_name=str(worker.display_name)[:200],
-                title=_text(title, limit=200),
-                project_id=_uuid(project_id, "project_id", required=False),
-                agent_id=worker.id,
-                parent_session_id=root_session.id,
-                context={
-                    "kind": "agent_dialogue",
-                    "parent_root_session_id": str(root_session.id),
-                    "dialogue_id": str(dialogue_id),
-                    "source_agent_id": str(root_agent.id),
-                    "worker_agent_id": str(worker.id),
-                    "context_project_hint_id": _id(context_project_hint_id),
-                },
-                is_active=True,
-                message_count=0,
-            )
-            db.add(child)
-            for participant_type, participant_id, display_name, role, auto_respond in (
-                ("user", str(owner), "User", "owner", False),
-                ("agent", str(root_agent.id), str(root_agent.display_name)[:200], "member", False),
-                ("agent", str(worker.id), str(worker.display_name)[:200], "member", True),
-            ):
-                db.add(
-                    ConversationParticipant(
-                        id=uuid4(), session_id=child_session_id, participant_type=participant_type, participant_id=participant_id,
-                        display_name=display_name, role=role, status="joined", auto_respond=auto_respond,
-                    )
+            if prepared_worker is not None:
+                from .cli_development_sessions import CLI_DEVELOPMENT_CONTEXT_KEY
+
+                child_session_id = _uuid(prepared_worker.get("session_id"), "worker_session_id")
+                child = await db.get(ConversationSession, child_session_id)
+                context = child.context if child is not None and isinstance(child.context, Mapping) else {}
+                cli_context = context.get(CLI_DEVELOPMENT_CONTEXT_KEY)
+                marker = cli_context.get("delegate_worker") if isinstance(cli_context, Mapping) else None
+                if (child is None or child.deleted_at is not None or str(child.user_id) != str(owner)
+                    or child.agent_id != worker.id or not isinstance(marker, Mapping)
+                    or str(marker.get("dialogue_id")) != str(dialogue_id)
+                    or str(marker.get("agent_revision_id")) != str(worker_revision.id)
+                    or str(marker.get("owner_id")) != str(owner)
+                    or str(marker.get("agent_id")) != str(worker.id)
+                    or marker.get("workspace_scope_sha256") != prepared_worker.get("workspace_scope_sha256")
+                    or marker.get("kind") != prepared_worker.get("worker_kind")
+                    or marker.get("budgets") != prepared_worker.get("budgets")
+                    or any(marker.get("budgets", {}).get(key) != value for key, value in {
+                        "max_attempts": budgets.max_attempts,
+                        **({"max_tokens": budgets.max_tokens} if budgets.max_tokens is not None else {}),
+                        **({"max_cost_micros": budgets.max_cost_micros} if budgets.max_cost_micros is not None else {}),
+                    }.items())
+                    or marker.get("timeout_seconds") != prepared_worker.get("timeout_seconds")):
+                    raise AgentDialogueAuthorizationError("prepared worker session binding invalid", code="worker_session_scope_mismatch")
+                marker = dict(marker)
+                marker["session_id"] = str(child_session_id)
+                snapshot_binding_id = cli_context.get("binding_id")
+            else:
+                child_session_id = uuid4()
+                from .agent_private_provisioning import aoidots_worker_session_context
+
+                child_context = aoidots_worker_session_context(
+                    {
+                        "kind": "agent_dialogue",
+                        "parent_root_session_id": str(root_session.id),
+                        "dialogue_id": str(dialogue_id),
+                        "source_agent_id": str(root_agent.id),
+                        "worker_agent_id": str(worker.id),
+                        "context_project_hint_id": _id(context_project_hint_id),
+                    },
+                    root_context=root_session.context,
                 )
-            await db.flush()
-            snapshot = await identity._persist_snapshot(db, row=child, agent=worker, revision=worker_revision, actor_id=owner, config=self.config)
+                if graph_auth is not None:
+                    child_context["team_graph_dispatch"] = True
+                child = ConversationSession(
+                    id=child_session_id,
+                    user_id=str(owner),
+                    character_name=str(worker.display_name)[:200],
+                    title=_text(title, limit=200),
+                    project_id=_uuid(project_id, "project_id", required=False),
+                    agent_id=worker.id,
+                    parent_session_id=root_session.id,
+                    context=child_context,
+                    is_active=True,
+                    message_count=0,
+                )
+                db.add(child)
+                for participant_type, participant_id, display_name, role, auto_respond in (
+                    ("user", str(owner), "User", "owner", False),
+                    ("agent", str(root_agent.id), str(root_agent.display_name)[:200], "member", False),
+                    ("agent", str(worker.id), str(worker.display_name)[:200], "member", True),
+                ):
+                    db.add(
+                        ConversationParticipant(
+                            id=uuid4(), session_id=child_session_id, participant_type=participant_type, participant_id=participant_id,
+                            display_name=display_name, role=role, status="joined", auto_respond=auto_respond,
+                        )
+                    )
+                await db.flush()
+                snapshot = await identity._persist_snapshot(db, row=child, agent=worker, revision=worker_revision, actor_id=owner, config=self.config)
+                snapshot_binding_id = snapshot.binding_id
             auth = {
                 "source_human_message_id": anchor["trigger_message_id"],
                 "source_human_sender_id": anchor["sender_id"],
@@ -1947,7 +3028,32 @@ class AgentDialogueService:
                 "binding_hash": anchor["binding_hash"],
                 "context_project_hint_id": _id(context_project_hint_id),
                 "budget": budgets.to_dict(),
+                "tool_policy": {
+                    "source_agent_revision_id": str(root_revision.id),
+                    "worker_agent_revision_id": str(worker_revision.id),
+                    "source_tool_ids": caller_tool_ids,
+                    "worker_tool_ids": worker_tool_ids,
+                    "source_tool_name": tool_name,
+                },
             }
+            if graph_auth is not None:
+                auth["team_graph"] = graph_auth
+            if prepared_worker is not None:
+                auth["delegate_worker"] = marker
+            if delegated_tool_ids is not None:
+                auth["tool_policy"]["agent_dialogue_tool_ids"] = delegated_tool_ids
+            if run_budget_reservation_key is not None:
+                auth["caller_run_budget"] = {
+                    "run_id": str(source_run.id),
+                    "reservation_key": run_budget_reservation_key,
+                    "reserved_tokens": int(budgets.max_tokens or 0),
+                    "reserved_cost_micros": (
+                        int(run_budget_cost_reserved)
+                        if run_budget_cost_reserved is not None
+                        else None
+                    ),
+                    "state": "reserved",
+                }
             if chain_context is not None:
                 auth["causal_chain"] = {
                     "chain_id": chain_context["chain_id"],
@@ -2062,6 +3168,11 @@ class AgentDialogueService:
                 )
             digest = hashlib.sha256(_text(instruction, limit=_MAX_INSTRUCTION).encode("utf-8")).hexdigest()
             transport = self._transport()
+            supersede = getattr(
+                transport, "supersede_terminal_dialogue_deliveries", None
+            )
+            if callable(supersede):
+                await supersede(root_session_id=str(root_session.id), session=db)
             delivery = await transport.enqueue_delivery(
                 dialogue_id=str(dialogue.id),
                 source_session_id=str(root_session.id),
@@ -2084,6 +3195,7 @@ class AgentDialogueService:
                     "provenance_hash": authorization_hash,
                     "source_human_message_id": anchor["trigger_message_id"],
                     "source_human_authorization_hash": authorization_hash,
+                    **({"team_graph": graph_auth} if graph_auth is not None else {}),
                     **(
                         {
                             "causal_chain_id": chain_context["chain_id"],
@@ -2105,14 +3217,41 @@ class AgentDialogueService:
                 "root_agent_revision_id": str(root_revision.id),
                 "worker_agent_id": str(worker.id),
                 "worker_agent_revision_id": str(worker_revision.id),
-                "binding_id": snapshot.binding_id,
+                "binding_id": snapshot_binding_id,
                 "status": "queued",
+                "budget_reservation": (
+                    {
+                        "strategy": "refuse_if_exceeds",
+                        "reserved_tokens": int(budgets.max_tokens or 0),
+                        "caller_remaining_tokens_after": run_budget_remaining_after,
+                        "reserved_cost_micros": run_budget_cost_reserved,
+                        "caller_remaining_cost_micros_after": (
+                            run_budget_ledger.remaining_delegation_cost_micros()
+                            if run_budget_ledger is not None
+                            and run_budget_cost_reserved is not None
+                            else None
+                        ),
+                        "caller_headroom_tokens": _DELEGATE_CALLER_TOKEN_HEADROOM,
+                        "caller_cost_headroom_max_micros": _DELEGATE_CALLER_COST_HEADROOM_MAX_MICROS,
+                    }
+                    if run_budget_reservation_key is not None
+                    else None
+                ),
                 "chat_link": f"/chat/{child_session_id}",
                 "delivery": delivery,
+                **({"team_graph": graph_auth, "case_key": graph_auth["case_key"]} if graph_auth else {}),
             }
         except Exception:
             with suppress(Exception):
                 await db.rollback()
+            if run_budget_ledger is not None and run_budget_reservation_key is not None:
+                run_budget_ledger.release_delegation_tokens(
+                    run_budget_reservation_key
+                )
+                if run_budget_cost_reserved is not None:
+                    run_budget_ledger.release_delegation_cost_micros(
+                        run_budget_reservation_key
+                    )
             raise
         finally:
             await db.close()
@@ -2132,16 +3271,29 @@ class AgentDialogueService:
         deadline: Any = None,
         source_human_anchor: Mapping[str, Any] | None = None,
         predecessor_dialogue_id: Any | None = None,
+        tool_name: str = "delegate_agent_work",
+        team_graph_ref: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not _text(title, limit=_MAX_TITLE) or not _text(instruction, limit=_MAX_INSTRUCTION):
             raise AgentDialogueValidationError("title and instruction are required", code="delegate_input_required")
-        if context_project_hint_id is None:
-            from .turn_context import get_turn_context
+        from .turn_context import get_turn_context
 
-            context_project_hint_id = get_turn_context().context_project_hint_id
+        turn = get_turn_context()
+        if context_project_hint_id is None:
+            context_project_hint_id = turn.context_project_hint_id
+        if team_graph_ref is not None and project_id is None:
+            project_id = turn.project_id or context_project_hint_id
         anchor = validate_source_human_anchor(source_human_anchor, actor_user_id=actor_user_id) if source_human_anchor else await self._root_anchor_from_context(actor_user_id)
         if not anchor.get("source_run_id"):
             raise AgentDialogueAuthorizationError("canonical source AgentRun is required", code="source_run_required")
+        if str(tool_name or "").strip().casefold() not in {
+            "delegate",
+            "delegate_agent_work",
+        }:
+            raise AgentDialogueValidationError(
+                "delegation tool name is invalid",
+                code="delegate_tool_invalid",
+            )
         await self._validate_delegate_source(actor_user_id, anchor)
         budget_values = self._bounded_budgets(budgets)
         deadline_value = self._bounded_deadline(deadline)
@@ -2168,6 +3320,8 @@ class AgentDialogueService:
             project_id=project_id, task_id=task_id, budgets=budget_values, deadline=deadline_value,
             anchor=anchor, context_project_hint_id=context_project_hint_id,
             predecessor_dialogue_id=predecessor_dialogue_id,
+            tool_name=str(tool_name).strip().casefold(),
+            team_graph_ref=team_graph_ref,
         )
         return {
             "success": True,
@@ -2177,10 +3331,1433 @@ class AgentDialogueService:
             "chat_link": created["chat_link"],
             "refs": _safe_refs(created),
             "delivery": created.get("delivery"),
+            **({"team_graph": created["team_graph"], "case_key": created["case_key"]} if created.get("team_graph") else {}),
+            **(
+                {"budget_reservation": created["budget_reservation"]}
+                if created.get("budget_reservation") is not None
+                else {}
+            ),
         }
 
+    async def delegate_worker_work(
+        self,
+        *,
+        actor_user_id: Any,
+        actor_role: Any = None,
+        kind: str,
+        instruction: str,
+        workspace_scope: Mapping[str, Any],
+        model: str | None = None,
+        effort: str | None = None,
+        timeout_seconds: Any = None,
+        budgets: Mapping[str, Any] | None = None,
+        project_id: Any | None = None,
+        context_project_hint_id: Any | None = None,
+    ) -> dict[str, Any]:
+        """Queue a managed external CLI/Muse session under an AgentDialogue id."""
+
+        normalized_kind = str(kind or "").strip().casefold()
+        if normalized_kind not in _DELEGATE_WORKER_PROVIDER_BY_KIND:
+            raise AgentDialogueValidationError(
+                "worker kind is invalid",
+                code="worker_kind_invalid",
+            )
+        if not _text(instruction, limit=_MAX_INSTRUCTION):
+            raise AgentDialogueValidationError(
+                "worker instruction is required",
+                code="delegate_input_required",
+            )
+        raw_budgets = dict(budgets or {})
+        unknown_budget_keys = set(raw_budgets) - {
+            "max_tokens",
+            "max_cost_micros",
+            "max_attempts",
+        }
+        if unknown_budget_keys:
+            raise AgentDialogueValidationError(
+                "worker budget keys are invalid",
+                code="budget_key_invalid",
+            )
+        normalized_budgets = self._bounded_budgets(
+            {
+                "max_turns": raw_budgets.get("max_attempts", 1),
+                "max_depth": 1,
+                "max_attempts": raw_budgets.get("max_attempts", 1),
+                **{
+                    key: value
+                    for key, value in raw_budgets.items()
+                    if key in {"max_tokens", "max_cost_micros"}
+                },
+            }
+        )
+        unmetered_muse = normalized_kind == "muse"
+        try:
+            timeout = (
+                300
+                if timeout_seconds in (None, "")
+                else int(timeout_seconds)
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AgentDialogueValidationError(
+                "worker timeout is invalid",
+                code="worker_timeout_invalid",
+            ) from exc
+        if timeout < 1 or timeout > 3600:
+            raise AgentDialogueValidationError(
+                "worker timeout is outside the bounded range",
+                code="worker_timeout_invalid",
+            )
+
+        from .turn_context import get_turn_context
+
+        turn = get_turn_context()
+        current_run_id = _id(
+            getattr(turn, "agent_execution_config", None).get("agent_run_id")
+            if isinstance(getattr(turn, "agent_execution_config", None), Mapping)
+            else None
+        )
+        if current_run_id is None:
+            from .agent_run_service import get_current_agent_run_id
+
+            current_run_id = _id(get_current_agent_run_id())
+        anchor = await self._root_anchor_from_context(actor_user_id)
+        if not anchor.get("source_run_id"):
+            raise AgentDialogueAuthorizationError(
+                "canonical source AgentRun is required",
+                code="source_run_required",
+            )
+        source_run_id = str(anchor["source_run_id"])
+        if current_run_id and current_run_id != source_run_id:
+            raise AgentDialogueAuthorizationError(
+                "worker delegation source Run is not current",
+                code="source_run_invalid",
+            )
+        await self._validate_delegate_source(actor_user_id, anchor)
+
+        requested_project = (
+            project_id
+            if project_id is not None
+            else getattr(turn, "project_id", None)
+        )
+        if context_project_hint_id is None:
+            context_project_hint_id = getattr(turn, "context_project_hint_id", None)
+        scope_mode = (
+            str(workspace_scope.get("mode") or "").strip().casefold()
+            if isinstance(workspace_scope, Mapping)
+            else ""
+        )
+        normalized_scope = self._normalize_worker_workspace_scope(
+            workspace_scope,
+            run_id=source_run_id,
+            mode=scope_mode,
+        )
+        dialogue_id = uuid4()
+        run_budget_ledger = None
+        run_budget_reservation_key: str | None = None
+        run_budget_cost_reserved: int | None = None
+        run_remaining_after: int | None = None
+        worker_runtime = None
+        prepared_session_id: str | None = None
+        started_run_id: str | None = None
+        started_work_item_id: str | None = None
+        worker_start_outcome_unknown = False
+        db = await self._session()
+        try:
+            owner = _uuid(actor_user_id, "actor_user_id")
+            source_run = await db.get(AgentRun, _uuid(source_run_id, "source_run_id"))
+            source_agent = (
+                await db.get(Agent, source_run.agent_id)
+                if source_run is not None and source_run.agent_id is not None
+                else None
+            )
+            source_revision = (
+                await db.get(AgentRevision, source_run.agent_revision_id)
+                if source_run is not None and source_run.agent_revision_id is not None
+                else None
+            )
+            root_session = (
+                await db.get(ConversationSession, source_run.session_id)
+                if source_run is not None and source_run.session_id is not None
+                else None
+            )
+            if (
+                source_run is None
+                or source_agent is None
+                or source_revision is None
+                or source_revision.agent_id != source_agent.id
+                or root_session is None
+                or source_run.session_id != root_session.id
+                or source_run.agent_id != source_agent.id
+                or source_run.agent_revision_id != source_revision.id
+                or source_run.parent_run_id is not None
+                or source_run.status not in _ACTIVE_RUN_STATES
+                or _uuid(source_run.user_id, "source_run_owner_id") != owner
+                or _uuid(root_session.user_id, "source_session_owner_id") != owner
+                or _uuid(root_session.agent_id, "source_session_agent_id", required=False)
+                != source_agent.id
+                or root_session.deleted_at is not None
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "source Agent session binding is invalid",
+                    code="source_agent_binding_invalid",
+                )
+            source_binding = (
+                await db.execute(
+                    select(AgentExecutionBinding)
+                    .where(
+                        AgentExecutionBinding.session_id == root_session.id,
+                        AgentExecutionBinding.agent_id == source_agent.id,
+                        AgentExecutionBinding.agent_revision_id == source_revision.id,
+                    )
+                    .order_by(AgentExecutionBinding.created_at.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if source_binding is None:
+                raise AgentDialogueAuthorizationError(
+                    "source Agent execution binding is unavailable",
+                    code="source_agent_binding_invalid",
+                )
+            root_project = _uuid(root_session.project_id, "source_session_project_id", required=False)
+            if root_project is not None and not await self._project_acl(
+                db,
+                root_project,
+                owner,
+                "read",
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "source Agent Project is not readable",
+                    code="source_agent_project_access_denied",
+                )
+            if requested_project is None and root_project is not None:
+                requested_project = root_project
+            target_project = _uuid(requested_project, "project_id", required=False)
+            if target_project is not None and not await self._project_acl(
+                db,
+                target_project,
+                owner,
+                "read",
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "Project access denied",
+                    code="project_access_denied",
+                )
+            if context_project_hint_id is not None:
+                hint_project = _uuid(context_project_hint_id, "context_project_hint_id")
+                if not await self._project_acl(db, hint_project, owner, "read"):
+                    raise AgentDialogueAuthorizationError(
+                        "context Project hint is not readable",
+                        code="project_hint_access_denied",
+                    )
+
+            if not revision_allows_worker_delegate(source_revision, normalized_kind):
+                raise AgentDialogueAuthorizationError(
+                    "source AgentRevision does not allow this worker kind",
+                    code="delegate_worker_not_allowed",
+                )
+            source_revision_is_new_shape = revision_has_new_delegate_policy(source_revision)
+            capabilities = {
+                str(item).strip().casefold()
+                for item in (
+                    getattr(source_revision, "capability_ceiling_json", None)
+                    or getattr(source_revision, "capability_ceiling", None)
+                    or []
+                )
+                if str(item).strip()
+            }
+            required_capabilities = worker_delegate_required_capabilities(
+                normalized_kind,
+                normalized_scope["mode"],
+            )
+            if not required_capabilities or not required_capabilities <= capabilities:
+                write_scope = normalized_scope["mode"] == "write"
+                raise AgentDialogueAuthorizationError(
+                    (
+                        "write worker scope requires workspace_write and command_execute"
+                        if write_scope
+                        else "caller Agent capability does not allow this worker"
+                    ),
+                    code=(
+                        "delegate_worker_write_denied"
+                        if write_scope
+                        else "delegate_worker_capability_denied"
+                    ),
+                )
+            worker, worker_revision, worker_route = await self._select_managed_external_worker(
+                db,
+                actor_user_id=actor_user_id,
+                actor_role=actor_role,
+                kind=normalized_kind,
+                project_id=target_project,
+                model=model,
+                effort=effort,
+            )
+
+            # Reserve explicitly requested caller Run ceilings before
+            # preparing or starting the managed session.  The provider call
+            # is uninterruptible, so a reservation remains held until terminal
+            # status settles its actual receipt.  A missing process-local
+            # ledger remains tolerated for legacy AoiDots callers; the durable
+            # Dialogue attempt ceiling still fences retries in that lane.
+            has_explicit_caller_budget = (
+                normalized_budgets.max_tokens is not None
+                or normalized_budgets.max_cost_micros is not None
+            )
+            if has_explicit_caller_budget:
+                from ..llm.agent_run_budget import peek_agent_run_budget
+
+                run_budget_ledger = peek_agent_run_budget(source_run_id)
+            if has_explicit_caller_budget and run_budget_ledger is not None:
+                remaining_tokens = run_budget_ledger.remaining_delegation_tokens()
+                if remaining_tokens is None:
+                    raise AgentDialogueConflictError(
+                        "caller Run token usage is not available for delegation",
+                        code="delegate_run_budget_unavailable",
+                    )
+                reservable_tokens = remaining_tokens - _DELEGATE_CALLER_TOKEN_HEADROOM
+                if reservable_tokens <= 0:
+                    raise AgentDialogueConflictError(
+                        "requested token budget exceeds the caller Run's reservable capacity",
+                        code="delegate_budget_exceeds_run_remaining",
+                    )
+                requested_tokens = None
+                if normalized_budgets.max_tokens is not None:
+                    run_budget_reservation_key = str(dialogue_id)
+                    requested_tokens = int(normalized_budgets.max_tokens)
+                    if requested_tokens <= 0 or requested_tokens > reservable_tokens:
+                        raise AgentDialogueConflictError(
+                            "requested token budget exceeds the caller Run's reservable capacity",
+                            code="delegate_budget_exceeds_run_remaining",
+                        )
+                    run_remaining_after = run_budget_ledger.reserve_delegation_tokens(
+                        run_budget_reservation_key,
+                        requested_tokens,
+                    )
+                    if run_remaining_after is None:
+                        raise AgentDialogueConflictError(
+                            "requested token budget could not be reserved from the caller Run",
+                            code="delegate_budget_exceeds_run_remaining",
+                        )
+                cost_reservation_key = str(dialogue_id)
+                run_budget_cost_reserved = _reserve_caller_run_cost_ceiling(
+                    run_budget_ledger,
+                    cost_reservation_key,
+                    normalized_budgets.max_cost_micros,
+                )
+                if (
+                    run_budget_cost_reserved is not None
+                    and getattr(run_budget_ledger, "cost_limit_micros", None) is not None
+                ):
+                    run_budget_reservation_key = cost_reservation_key
+                normalized_budgets = replace(
+                    normalized_budgets,
+                    max_tokens=(
+                        requested_tokens
+                        if requested_tokens is not None
+                        else normalized_budgets.max_tokens
+                    ),
+                    max_cost_micros=(
+                        run_budget_cost_reserved
+                        if run_budget_cost_reserved is not None
+                        else normalized_budgets.max_cost_micros
+                    ),
+                )
+            runtime_budgets = _external_worker_budget_projection(normalized_budgets)
+
+            timeout_deadline = _now() + timedelta(seconds=timeout)
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            if run_budget_ledger is not None:
+                run_budget_ledger.release_delegation_tokens(run_budget_reservation_key)
+                if run_budget_cost_reserved is not None:
+                    run_budget_ledger.release_delegation_cost_micros(run_budget_reservation_key)
+            await db.close()
+            raise
+        await db.close()
+
+        try:
+            from .delegate_worker_runtime import DelegateWorkerRuntime
+
+            worker_runtime = DelegateWorkerRuntime(
+                db_manager=self._manager(),
+                config=self.config,
+            )
+            prepared = await worker_runtime.prepare_session(
+                owner_id=str(owner),
+                actor_role=actor_role,
+                agent_id=str(worker.id),
+                agent_revision_id=str(worker_revision.id),
+                kind=normalized_kind,
+                model=model,
+                effort=effort,
+                workspace_scope=normalized_scope,
+                timeout_seconds=timeout,
+                dialogue_idempotency_key=f"delegate-worker:{dialogue_id}",
+                project_id=str(target_project) if target_project is not None else None,
+                dialogue_id=str(dialogue_id),
+                budgets=runtime_budgets,
+            )
+            prepared_session_id = _text(prepared.get("session_id"), limit=64)
+            if (
+                not prepared_session_id
+                or _uuid(prepared.get("agent_id"), "worker_agent_id") != worker.id
+                or _uuid(prepared.get("agent_revision_id"), "worker_revision_id")
+                != worker_revision.id
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "managed worker session did not preserve its exact Agent pin",
+                    code="worker_session_binding_invalid",
+                )
+            scope_digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "mode": normalized_scope["mode"],
+                        "root": normalized_scope["root"],
+                        "paths": list(normalized_scope["paths"]),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            prepared_digest = _text(prepared.get("workspace_scope_sha256"), limit=64)
+            if not prepared_digest or prepared_digest != scope_digest:
+                raise AgentDialogueAuthorizationError(
+                    "managed worker scope did not preserve the canonical path allowlist",
+                    code="worker_workspace_scope_denied",
+                )
+            allow_cli_native_tools = bool(prepared.get("allow_cli_native_tools"))
+            auth = {
+                "source_human_message_id": anchor["trigger_message_id"],
+                "source_human_sender_id": anchor["sender_id"],
+                "command_capabilities": list(anchor["command_capabilities"]),
+                "manifest_hash": anchor["manifest_hash"],
+                "binding_hash": anchor["binding_hash"],
+                "context_project_hint_id": _id(context_project_hint_id),
+                "budget": normalized_budgets.to_dict(),
+                "tool_policy": {
+                    "source_agent_revision_id": str(source_revision.id),
+                    "worker_agent_revision_id": str(worker_revision.id),
+                    "source_tool_ids": revision_tool_ids(source_revision),
+                    "worker_kind": normalized_kind,
+                },
+                "delegate_worker": {
+                    "kind": normalized_kind,
+                    "depth": 1,
+                    "session_id": prepared_session_id,
+                    "agent_id": str(worker.id),
+                    "agent_revision_id": str(worker_revision.id),
+                    "workspace_scope": normalized_scope,
+                    "workspace_scope_sha256": scope_digest,
+                    "allow_cli_native_tools": allow_cli_native_tools,
+                    "timeout_seconds": timeout,
+                    "budgets": runtime_budgets,
+                    "source_run_id": source_run_id,
+                    "instruction_message_id": str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"aoitalk:delegate-worker:{dialogue_id}:{source_run_id}",
+                        )
+                    ),
+                    "run_id": None,
+                    "work_item_id": None,
+                    "status": str(prepared.get("status") or "ready"),
+                },
+            }
+            if run_budget_reservation_key is not None:
+                auth["caller_run_budget"] = {
+                    "run_id": source_run_id,
+                    "reservation_key": run_budget_reservation_key,
+                    "reserved_tokens": int(normalized_budgets.max_tokens or 0),
+                    "reserved_cost_micros": (
+                        int(run_budget_cost_reserved)
+                        if run_budget_cost_reserved is not None
+                        else None
+                    ),
+                    "state": "reserved",
+                }
+            if source_revision_is_new_shape:
+                auth["tool_policy"]["agent_dialogue_tool_ids"] = []
+                auth["delegate_worker"]["agent_dialogue_tool_ids"] = []
+            authorization_hash = hashlib.sha256(
+                json.dumps(
+                    auth,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            db = await self._session()
+            try:
+                source_run = await db.get(AgentRun, _uuid(source_run_id, "source_run_id"))
+                root_session = await db.get(
+                    ConversationSession,
+                    source_run.session_id if source_run is not None else None,
+                )
+                child_session = await db.get(
+                    ConversationSession,
+                    _uuid(prepared_session_id, "worker_session_id"),
+                )
+                persisted_worker_revision = await db.get(
+                    AgentRevision,
+                    worker_revision.id,
+                )
+                child_binding = (
+                    await db.execute(
+                        select(AgentExecutionBinding)
+                        .where(
+                            AgentExecutionBinding.session_id
+                            == _uuid(prepared_session_id, "worker_session_id"),
+                            AgentExecutionBinding.agent_id == worker.id,
+                            AgentExecutionBinding.agent_revision_id
+                            == worker_revision.id,
+                        )
+                        .order_by(AgentExecutionBinding.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if (
+                    source_run is None
+                    or root_session is None
+                    or child_session is None
+                    or persisted_worker_revision is None
+                    or _uuid(child_session.user_id, "worker_session_owner_id") != owner
+                    or _uuid(child_session.agent_id, "worker_session_agent_id") != worker.id
+                    or _uuid(child_session.project_id, "worker_session_project_id", required=False)
+                    != target_project
+                    or child_binding is None
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "managed worker session binding changed before Dialogue admission",
+                        code="worker_session_binding_invalid",
+                    )
+                dialogue = AgentDialogue(
+                    id=dialogue_id,
+                    owner_user_id=owner,
+                    root_session_id=root_session.id,
+                    root_agent_id=source_run.agent_id,
+                    root_agent_revision_id=source_run.agent_revision_id,
+                    worker_session_id=child_session.id,
+                    worker_agent_id=worker.id,
+                    worker_agent_revision_id=worker_revision.id,
+                    budget_root_dialogue_id=dialogue_id,
+                    parent_dialogue_id=None,
+                    causal_depth=1,
+                    project_id=target_project,
+                    task_id=None,
+                    human_message_id=_uuid(anchor["trigger_message_id"], "trigger_message_id"),
+                    human_run_id=_uuid(anchor.get("human_run_id") or source_run.id, "human_run_id", required=False),
+                    human_work_item_id=_uuid(anchor.get("human_work_item_id") or anchor.get("source_work_item_id"), "human_work_item_id", required=False),
+                    authorization_json=auth,
+                    authorization_hash=authorization_hash,
+                    max_turns=normalized_budgets.max_attempts,
+                    max_depth=1,
+                    max_attempts=normalized_budgets.max_attempts,
+                    max_tokens=normalized_budgets.max_tokens,
+                    max_cost_micros=normalized_budgets.max_cost_micros,
+                    cost_currency=normalized_budgets.cost_currency,
+                    deadline=timeout_deadline,
+                    state="queued",
+                )
+                db.add(dialogue)
+                if await self._dialogue_budget_schema_available(db):
+                    db.add(
+                        AgentDialogueBudgetRoot(
+                            root_dialogue_id=dialogue.id,
+                            owner_user_id=owner,
+                            root_session_id=root_session.id,
+                            root_agent_id=source_run.agent_id,
+                            root_agent_revision_id=source_run.agent_revision_id,
+                            human_message_id=dialogue.human_message_id,
+                            human_run_id=dialogue.human_run_id,
+                            human_work_item_id=dialogue.human_work_item_id,
+                            authorization_hash=authorization_hash,
+                            state="active",
+                            max_turns=normalized_budgets.max_attempts,
+                            max_depth=1,
+                            max_attempts=normalized_budgets.max_attempts,
+                            max_tokens=normalized_budgets.max_tokens,
+                            max_cost_micros=normalized_budgets.max_cost_micros,
+                            cost_currency=normalized_budgets.cost_currency,
+                        )
+                    )
+                message_id = uuid5(
+                    NAMESPACE_URL,
+                    f"aoitalk:delegate-worker:{dialogue_id}:{source_run.id}",
+                )
+                db.add(
+                    ConversationMessage(
+                        id=message_id,
+                        session_id=root_session.id,
+                        role="assistant",
+                        content=_text(instruction, limit=_MAX_INSTRUCTION),
+                        client_message_id=f"delegate-worker:{dialogue_id}",
+                        sender_type="agent",
+                        sender_id=str(source_run.agent_id),
+                        sender_display_name=str(getattr(source_agent, "display_name", "Agent"))[:160],
+                        message_metadata={
+                            "agent_dialogue_id": str(dialogue_id),
+                            "source_agent_id": str(source_run.agent_id),
+                            "source_agent_revision_id": str(source_run.agent_revision_id),
+                            "source_human_message_id": anchor["trigger_message_id"],
+                            "control_revision": 0,
+                            "worker_kind": normalized_kind,
+                        },
+                        created_at=_now(),
+                        updated_at=_now(),
+                    )
+                )
+                if dialogue.human_run_id is not None:
+                    await get_agent_dialogue_dispatch_bridge(
+                        self._manager(),
+                        config=self.config,
+                    ).record_agent_dialogue_source_usage_in_session(
+                        db,
+                        dialogue_id=dialogue.id,
+                        human_run_id=dialogue.human_run_id,
+                    )
+                await db.commit()
+            except Exception:
+                with suppress(Exception):
+                    await db.rollback()
+                raise
+            finally:
+                await db.close()
+
+            try:
+                started = await worker_runtime.start_session(
+                    prepared_session_id,
+                    dialogue_id=str(dialogue_id),
+                    instruction=_text(instruction, limit=_MAX_INSTRUCTION),
+                    budgets=runtime_budgets,
+                    workspace_scope=normalized_scope,
+                    timeout_seconds=timeout,
+                )
+                started_run_id = _text(started.get("run_id"), limit=64)
+                started_work_item_id = _text(started.get("work_item_id"), limit=64)
+                if not started_run_id or not started_work_item_id:
+                    raise AgentDialogueError(
+                        "managed worker did not queue a Run and Work item",
+                        code="worker_session_start_failed",
+                    )
+                db = await self._session()
+                try:
+                    dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                    auth = dict(
+                        dialogue.authorization_json
+                        if isinstance(dialogue.authorization_json, Mapping)
+                        else {}
+                    )
+                    external = dict(auth.get("delegate_worker") or {})
+                    external["run_id"] = started_run_id
+                    external["work_item_id"] = started_work_item_id
+                    external["status"] = str(started.get("status") or "queued")
+                    auth["delegate_worker"] = external
+                    dialogue.authorization_json = auth
+                    dialogue.authorization_hash = hashlib.sha256(
+                        json.dumps(
+                            auth,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if await self._dialogue_budget_schema_available(db):
+                        budget_root = await db.get(
+                            AgentDialogueBudgetRoot,
+                            dialogue.id,
+                        )
+                        if budget_root is not None:
+                            budget_root.authorization_hash = dialogue.authorization_hash
+                    from .agent_dialogue_budget import DialogueBudgetError, reserve_dialogue_budget
+
+                    try:
+                        await reserve_dialogue_budget(
+                            db,
+                            dialogue.id,
+                            turns=1,
+                            attempts=1,
+                            tokens=int(normalized_budgets.max_tokens or 0),
+                            cost_micros=int(normalized_budgets.max_cost_micros or 0),
+                            reservation_key=f"run:{started_run_id}",
+                            run_id=started_run_id,
+                        )
+                    except DialogueBudgetError as exc:
+                        raise AgentDialogueConflictError(
+                            "worker budget could not be reserved in the Dialogue ledger",
+                            code=exc.code,
+                        ) from exc
+                    await db.commit()
+                except Exception:
+                    with suppress(Exception):
+                        await db.rollback()
+                    raise
+                finally:
+                    await db.close()
+            except Exception as exc:
+                start_outcome_unknown = False
+                try:
+                    receipt = await self._reconcile_external_worker_start(
+                        worker_runtime,
+                        dialogue_id=dialogue_id,
+                        session_id=prepared_session_id,
+                        owner_user_id=owner,
+                        expected_control_revision=0,
+                    )
+                    if receipt is not None:
+                        started_run_id = receipt.get("run_id") or started_run_id
+                        started_work_item_id = receipt.get("work_item_id") or started_work_item_id
+                        start_outcome_unknown = not bool(
+                            receipt.get("run_id") and receipt.get("work_item_id")
+                        ) or not bool(receipt.get("linked"))
+                except Exception:
+                    start_outcome_unknown = True
+                worker_start_outcome_unknown = start_outcome_unknown
+                if started_run_id:
+                    with suppress(Exception):
+                        await worker_runtime.cancel(
+                            prepared_session_id,
+                            started_run_id,
+                            owner_id=str(owner),
+                            dialogue_id=str(dialogue_id),
+                        )
+                db = await self._session()
+                try:
+                    dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                    if dialogue is not None:
+                        authorization = (
+                            dict(dialogue.authorization_json)
+                            if isinstance(dialogue.authorization_json, Mapping)
+                            else {}
+                        )
+                        external = dict(authorization.get("delegate_worker") or {})
+                        if (
+                            int(dialogue.control_revision or 0) == 0
+                            and _text(external.get("session_id"), limit=64)
+                            == prepared_session_id
+                        ):
+                            external["status"] = (
+                                "start_outcome_unknown"
+                                if start_outcome_unknown
+                                else "start_failed"
+                            )
+                            authorization["delegate_worker"] = external
+                            dialogue.authorization_json = authorization
+                            dialogue.authorization_hash = hashlib.sha256(
+                                json.dumps(
+                                    authorization,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest()
+                            dialogue.state = "blocked" if start_outcome_unknown else "failed"
+                            dialogue.updated_at = _now()
+                            if await self._dialogue_budget_schema_available(db):
+                                budget_root = await db.get(
+                                    AgentDialogueBudgetRoot,
+                                    dialogue.id,
+                                )
+                                if budget_root is not None:
+                                    budget_root.state = dialogue.state
+                                    budget_root.authorization_hash = dialogue.authorization_hash
+                            await db.commit()
+                finally:
+                    await db.close()
+                raise AgentDialogueError(
+                    "managed worker could not be queued",
+                    code=getattr(exc, "code", "worker_session_start_failed"),
+                ) from exc
+            return {
+                "success": True,
+                "status": "queued",
+                "job_id": str(dialogue_id),
+                "dialogue_id": str(dialogue_id),
+                "worker_kind": normalized_kind,
+                "worker_status": str(started.get("status") or "queued"),
+                "refs": {
+                    "dialogue_id": str(dialogue_id),
+                    "worker_session_id": prepared_session_id,
+                    "worker_agent_id": str(worker.id),
+                    "worker_agent_revision_id": str(worker_revision.id),
+                    "worker_run_id": started_run_id,
+                    "worker_work_item_id": started_work_item_id,
+                    "depth": 1,
+                },
+                "budget_reservation": {
+                    "strategy": (
+                        "caller_run_reservation"
+                        if run_budget_reservation_key is not None
+                        else "unmetered_caller_run"
+                    ),
+                    "reserved_tokens": int(normalized_budgets.max_tokens or 0),
+                    "caller_remaining_tokens_after": run_remaining_after,
+                    "reserved_cost_micros": (
+                        int(run_budget_cost_reserved)
+                        if run_budget_cost_reserved is not None
+                        else None
+                    ),
+                    **(
+                        {
+                            "caller_remaining_cost_micros_after": run_budget_ledger.remaining_delegation_cost_micros()
+                        }
+                        if run_budget_ledger is not None
+                        and run_budget_cost_reserved is not None
+                        else {}
+                    ),
+                    "usage_reporting": "unavailable" if unmetered_muse else "best_effort",
+                    "max_attempts": normalized_budgets.max_attempts,
+                },
+            }
+        except Exception:
+            if run_budget_ledger is not None and run_budget_reservation_key is not None:
+                run_budget_ledger.release_delegation_tokens(run_budget_reservation_key)
+                if run_budget_cost_reserved is not None:
+                    run_budget_ledger.release_delegation_cost_micros(run_budget_reservation_key)
+            if prepared_session_id and worker_runtime is not None and started_run_id:
+                with suppress(Exception):
+                    await worker_runtime.cancel(
+                        prepared_session_id,
+                        started_run_id,
+                        owner_id=str(actor_user_id),
+                        dialogue_id=str(dialogue_id),
+                    )
+            elif (
+                prepared_session_id
+                and worker_runtime is not None
+                and not worker_start_outcome_unknown
+            ):
+                with suppress(Exception):
+                    await worker_runtime.discard_prepared_session(
+                        prepared_session_id,
+                        owner_id=str(actor_user_id),
+                        dialogue_id=str(dialogue_id),
+                    )
+            raise
+
+    def _delegate_worker_runtime(self) -> Any:
+        from .delegate_worker_runtime import DelegateWorkerRuntime
+
+        return DelegateWorkerRuntime(
+            db_manager=self._manager(),
+            config=self.config,
+        )
+
+    async def _reconcile_external_worker_start(
+        self,
+        runtime: Any,
+        *,
+        dialogue_id: Any,
+        session_id: str,
+        owner_user_id: Any,
+        expected_control_revision: int,
+    ) -> dict[str, Any] | None:
+        """Recover a managed Run receipt after a start call fails ambiguously."""
+
+        status = await runtime.get_status(
+            session_id,
+            owner_id=str(_uuid(owner_user_id, "owner_user_id")),
+            dialogue_id=str(dialogue_id),
+        )
+        if not isinstance(status, Mapping):
+            raise AgentDialogueConflictError(
+                "managed worker start outcome is unknown",
+                code="worker_session_start_unknown",
+            )
+        run_id = _text(status.get("run_id"), limit=64)
+        work_item_id = _text(status.get("work_item_id"), limit=64)
+        status_text = _text(status.get("status"), limit=48).casefold()
+        safe_prestart_status = status_text in {"ready", "prepared", "created"}
+        if not run_id and not work_item_id and safe_prestart_status:
+            return None
+
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            authorization = (
+                dict(dialogue.authorization_json)
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            marker = dict(authorization.get("delegate_worker") or {})
+            linked = (
+                int(dialogue.control_revision or 0) == int(expected_control_revision)
+                and _text(marker.get("session_id"), limit=64) == session_id
+            )
+            if linked:
+                if run_id:
+                    marker["run_id"] = run_id
+                if work_item_id:
+                    marker["work_item_id"] = work_item_id
+                marker["status"] = (
+                    "start_outcome_unknown"
+                    if not run_id and not work_item_id
+                    else str(status.get("status") or "start_outcome_unknown")
+                )
+                authorization["delegate_worker"] = marker
+                dialogue.authorization_json = authorization
+                dialogue.authorization_hash = hashlib.sha256(
+                    json.dumps(
+                        authorization,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                dialogue.updated_at = _now()
+                await db.commit()
+            return {
+                "run_id": run_id or None,
+                "work_item_id": work_item_id or None,
+                "status": status_text or "unknown",
+                "linked": linked,
+                "ambiguous": not run_id and not work_item_id,
+            }
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def _external_worker_status(
+        self,
+        dialogue_id: Any,
+        *,
+        actor_user_id: Any,
+        actor_role: Any = None,
+    ) -> dict[str, Any] | None:
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id)
+            await self._authorize(db, dialogue, actor_user_id, actor_role)
+            observed_control_revision = int(dialogue.control_revision or 0)
+            observed_worker_session_id = _uuid(
+                dialogue.worker_session_id,
+                "worker_session_id",
+                required=False,
+            )
+            authorization = (
+                dialogue.authorization_json
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            marker = authorization.get("delegate_worker")
+            if not isinstance(marker, Mapping):
+                return None
+            marker = dict(marker)
+            session_id = _text(marker.get("session_id"), limit=64)
+            stop_requested = (
+                str(marker.get("last_control") or "").casefold() == "stop"
+                and str(marker.get("status") or "").casefold()
+                in {"cancel_requested", "cancelled"}
+            )
+        finally:
+            await db.close()
+        if not session_id:
+            raise AgentDialogueAuthorizationError(
+                "external worker session reference is missing",
+                code="worker_session_binding_invalid",
+            )
+        worker_status = await self._delegate_worker_runtime().get_status(
+            session_id,
+            owner_id=str(_uuid(actor_user_id, "actor_user_id")),
+            dialogue_id=str(dialogue_id),
+        )
+        status_text = _text(worker_status.get("status"), limit=48).casefold()
+        mapped_state = {
+            "pending": "queued",
+            "queued": "queued",
+            "running": "running",
+            "working": "running",
+            "waiting_input": "waiting",
+            "waiting_approval": "waiting",
+            "completed": "succeeded",
+            "complete": "succeeded",
+            "succeeded": "succeeded",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "canceled": "cancelled",
+        }.get(status_text)
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            await self._authorize(db, dialogue, actor_user_id, actor_role)
+            authorization = (
+                dict(dialogue.authorization_json)
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            marker = dict(authorization.get("delegate_worker") or {})
+            if (
+                int(dialogue.control_revision or 0) != observed_control_revision
+                or _uuid(
+                    dialogue.worker_session_id,
+                    "worker_session_id",
+                    required=False,
+                )
+                != observed_worker_session_id
+                or _text(marker.get("session_id"), limit=64) != session_id
+            ):
+                raise AgentDialogueConflictError(
+                    "external worker changed while status was being read",
+                    code="worker_status_stale",
+                )
+            current_run_id = _text(
+                marker.get("run_id") or worker_status.get("run_id"),
+                limit=64,
+            )
+            current_work_id = _text(
+                marker.get("work_item_id") or worker_status.get("work_item_id"),
+                limit=64,
+            )
+            if current_run_id:
+                marker["run_id"] = current_run_id
+            if current_work_id:
+                marker["work_item_id"] = current_work_id
+            preserve_stop_request = bool(
+                stop_requested
+                and mapped_state is not None
+                and mapped_state not in _TERMINAL_DIALOGUE_STATES
+            )
+            marker["status"] = (
+                "cancel_requested" if preserve_stop_request else status_text
+            )
+            if mapped_state is not None and not preserve_stop_request:
+                dialogue.state = mapped_state
+            is_terminal = str(dialogue.state or "").casefold() in _TERMINAL_DIALOGUE_STATES
+            dialogue.updated_at = _now()
+            authorization["delegate_worker"] = marker
+            dialogue.authorization_json = authorization
+            dialogue.authorization_hash = hashlib.sha256(
+                json.dumps(
+                    authorization,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if await self._dialogue_budget_schema_available(db):
+                budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                if budget_root is not None:
+                    budget_root.authorization_hash = dialogue.authorization_hash
+                    if is_terminal:
+                        budget_root.state = str(dialogue.state or "failed")
+                    elif dialogue.state not in _TERMINAL_DIALOGUE_STATES:
+                        budget_root.state = "active"
+            worker_result = (
+                worker_status.get("result")
+                if isinstance(worker_status.get("result"), Mapping)
+                else None
+            )
+            usage = (
+                worker_result.get("usage")
+                if isinstance(worker_result, Mapping)
+                else None
+            )
+            actual_usage: Mapping[str, Any] = {}
+            if is_terminal and current_run_id:
+                from .agent_dialogue_budget import (
+                    DialogueBudgetError,
+                    charge_dialogue_budget,
+                    record_dialogue_usage,
+                    release_dialogue_budget,
+                )
+                conservative_tokens = max(
+                    0, int(getattr(dialogue, "max_tokens", 0) or 0)
+                )
+                conservative_cost = max(
+                    0, int(getattr(dialogue, "max_cost_micros", 0) or 0)
+                )
+                usage_state = "known"
+                if isinstance(usage, Mapping):
+                    recorded = await record_dialogue_usage(
+                        db,
+                        dialogue_id=dialogue.id,
+                        run_id=current_run_id,
+                        usage=usage,
+                        role="worker",
+                    )
+                    actual_usage = (
+                        recorded.get("actual_usage")
+                        if isinstance(recorded, Mapping)
+                        and isinstance(recorded.get("actual_usage"), Mapping)
+                        else {}
+                    )
+                    usage_state = str(
+                        recorded.get("state") or actual_usage.get("state") or "known"
+                    )
+                else:
+                    # No provider receipt is available. Record an explicit
+                    # unknown receipt before consuming the reservation.
+                    try:
+                        recorded = await record_dialogue_usage(
+                            db,
+                            dialogue_id=dialogue.id,
+                            run_id=current_run_id,
+                            usage=None,
+                            role="worker",
+                        )
+                        actual_usage = (
+                            recorded.get("actual_usage")
+                            if isinstance(recorded, Mapping)
+                            and isinstance(recorded.get("actual_usage"), Mapping)
+                            else {}
+                        )
+                    except Exception:
+                        with suppress(Exception):
+                            await release_dialogue_budget(
+                                db,
+                                dialogue.id,
+                                f"run:{current_run_id}",
+                            )
+                        actual_usage = {}
+                    usage_state = str(
+                        actual_usage.get("state") or "unknown"
+                    )
+                token_known = usage_state not in {"unknown", "token_unknown"}
+                cost_known = usage_state == "known"
+                charge_tokens = (
+                    int(actual_usage.get("total_tokens") or 0)
+                    if token_known
+                    else conservative_tokens
+                )
+                charge_cost = (
+                    int(actual_usage.get("cost_micros") or 0)
+                    if cost_known
+                    else conservative_cost
+                )
+                try:
+                    charged = await charge_dialogue_budget(
+                        db,
+                        dialogue.id,
+                        f"run:{current_run_id}",
+                        tokens=charge_tokens,
+                        cost_micros=charge_cost,
+                    )
+                    if (
+                        not charged.get("idempotent")
+                        and (not token_known or not cost_known)
+                    ):
+                        if await self._dialogue_budget_schema_available(db):
+                            budget_root = await get_dialogue_budget_owner(
+                                db,
+                                dialogue,
+                                lock=True,
+                            )
+                            if not token_known and conservative_tokens:
+                                budget_root.total_tokens = int(
+                                    getattr(budget_root, "total_tokens", 0) or 0
+                                ) + conservative_tokens
+                            if not cost_known and conservative_cost:
+                                budget_root.cost_micros = int(
+                                    getattr(budget_root, "cost_micros", 0) or 0
+                                ) + conservative_cost
+                        else:
+                            if not token_known and conservative_tokens:
+                                dialogue.total_tokens = int(
+                                    getattr(dialogue, "total_tokens", 0) or 0
+                                ) + conservative_tokens
+                            if not cost_known and conservative_cost:
+                                dialogue.cost_micros = int(
+                                    getattr(dialogue, "cost_micros", 0) or 0
+                                ) + conservative_cost
+                except Exception:
+                    with suppress(Exception):
+                        await release_dialogue_budget(
+                            db,
+                            dialogue.id,
+                            f"run:{current_run_id}",
+                        )
+                if usage_state != "known" and await self._dialogue_budget_schema_available(db):
+                    budget_root = await get_dialogue_budget_owner(
+                        db,
+                        dialogue,
+                        lock=True,
+                    )
+                    budget_root.usage_state = "unknown"
+                    dialogue.usage_state = "unknown"
+
+            # Settle the caller AgentRun reservation after the child provider
+            # has returned.  Missing dimensions remain unknown, which fences
+            # later caller delegations without making this child Dialogue
+            # permanently unresumable; its finite attempt counter still
+            # limits retries.
+            if is_terminal:
+                caller_budget = authorization.get("caller_run_budget")
+                if isinstance(caller_budget, Mapping) and str(
+                    caller_budget.get("state") or ""
+                ) == "reserved":
+                    caller_budget = dict(caller_budget)
+                    caller_run_id = _text(caller_budget.get("run_id"), limit=64)
+                    reservation_key = _text(
+                        caller_budget.get("reservation_key"), limit=255
+                    )
+
+                    def _known_usage_int(name: str) -> int | None:
+                        value = actual_usage.get(name)
+                        if isinstance(value, bool) or not isinstance(value, int):
+                            return None
+                        return max(0, int(value))
+
+                    usage_state = str(actual_usage.get("state") or "unknown")
+                    actual_tokens = (
+                        _known_usage_int("total_tokens")
+                        if usage_state in {"known", "cost_unknown"}
+                        else None
+                    )
+                    actual_cost = (
+                        _known_usage_int("cost_micros")
+                        if usage_state == "known"
+                        else None
+                    )
+                    reserved_tokens = int(caller_budget.get("reserved_tokens") or 0)
+                    reserved_cost = int(
+                        caller_budget.get("reserved_cost_micros") or 0
+                    )
+                    settled: Mapping[str, Any] | None = None
+                    if caller_run_id and reservation_key:
+                        from ..llm.agent_run_budget import peek_agent_run_budget
+
+                        caller_ledger = peek_agent_run_budget(caller_run_id)
+                        if caller_ledger is not None:
+                            settled = caller_ledger.settle_delegation(
+                                reservation_key,
+                                actual_tokens=actual_tokens,
+                                actual_cost_micros=actual_cost,
+                            )
+                    caller_budget["usage_state"] = usage_state
+                    caller_budget["actual_tokens"] = actual_tokens
+                    caller_budget["actual_cost_micros"] = actual_cost
+                    if settled is None:
+                        caller_budget["state"] = "ledger_unavailable"
+                        caller_budget["charged_tokens"] = (
+                            actual_tokens if actual_tokens is not None else reserved_tokens
+                        )
+                        caller_budget["charged_cost_micros"] = (
+                            actual_cost if actual_cost is not None else reserved_cost
+                        )
+                        caller_budget["overrun_tokens"] = (
+                            max(0, actual_tokens - reserved_tokens)
+                            if actual_tokens is not None
+                            else None
+                        )
+                        caller_budget["overrun_cost_micros"] = (
+                            max(0, actual_cost - reserved_cost)
+                            if actual_cost is not None
+                            else None
+                        )
+                    else:
+                        token_receipt = settled.get("tokens")
+                        cost_receipt = settled.get("cost")
+                        posthoc_token_overrun = (
+                            actual_tokens is not None
+                            and actual_tokens > reserved_tokens
+                        )
+                        posthoc_cost_overrun = (
+                            actual_cost is not None
+                            and actual_cost > reserved_cost
+                        )
+                        caller_budget["state"] = (
+                            "overrun"
+                            if settled.get("overrun")
+                            or posthoc_token_overrun
+                            or posthoc_cost_overrun
+                            else "settled_unknown"
+                            if usage_state != "known"
+                            else "settled"
+                        )
+                        caller_budget["charged_tokens"] = (
+                            token_receipt.get("charged_tokens", reserved_tokens)
+                            if isinstance(token_receipt, Mapping)
+                            else actual_tokens
+                            if actual_tokens is not None
+                            else reserved_tokens
+                        )
+                        caller_budget["charged_cost_micros"] = (
+                            cost_receipt.get("charged_cost_micros", reserved_cost)
+                            if isinstance(cost_receipt, Mapping)
+                            else actual_cost
+                            if actual_cost is not None
+                            else reserved_cost
+                        )
+                        caller_budget["overrun_tokens"] = (
+                            token_receipt.get("overrun_tokens")
+                            if isinstance(token_receipt, Mapping)
+                            else max(0, actual_tokens - reserved_tokens)
+                            if actual_tokens is not None
+                            else None
+                        )
+                        caller_budget["overrun_cost_micros"] = (
+                            cost_receipt.get("overrun_cost_micros")
+                            if isinstance(cost_receipt, Mapping)
+                            else max(0, actual_cost - reserved_cost)
+                            if actual_cost is not None
+                            else None
+                        )
+                    authorization["caller_run_budget"] = caller_budget
+                    dialogue.authorization_json = authorization
+                    dialogue.authorization_hash = hashlib.sha256(
+                        json.dumps(
+                            authorization,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if await self._dialogue_budget_schema_available(db):
+                        budget_root = await db.get(
+                            AgentDialogueBudgetRoot,
+                            dialogue.id,
+                        )
+                        if budget_root is not None:
+                            budget_root.authorization_hash = dialogue.authorization_hash
+            projection = await self._projection(db, dialogue)
+            await db.commit()
+            return {"item": projection, "external_worker": worker_status}
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def delegate_worker(
+        self, *, actor_user_id: Any, kind: str, instruction: str,
+        workspace_scope: Mapping[str, Any], budgets: Mapping[str, Any] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Validate an external worker request before any durable admission."""
+        from .agent_delegate_policy import (
+            revision_allows_worker_delegate, revision_has_new_delegate_policy,
+            worker_delegate_required_capabilities,
+        )
+        from .delegate_worker_runtime import _bounded_timeout, _canonical_scope
+
+        if not isinstance(kind, str) or not kind.isascii() or kind.strip().casefold() not in {"codex", "antigravity", "claude", "grok", "muse"}:
+            raise AgentDialogueValidationError("worker kind is invalid", code="worker_kind_invalid")
+        kind = kind.strip().casefold()
+        if not isinstance(instruction, str) or not _text(instruction, limit=_MAX_INSTRUCTION):
+            raise AgentDialogueValidationError("instruction is required", code="delegate_input_required")
+        if not isinstance(workspace_scope, Mapping) or set(workspace_scope) != {"root", "mode", "paths"}:
+            raise AgentDialogueValidationError("worker scope is invalid", code="worker_scope_invalid")
+        scope = _canonical_scope(workspace_scope, revalidate_current_scope=True)
+        budget_values = self._bounded_budgets(budgets)
+        timeout = _bounded_timeout(timeout_seconds)
+        anchor = await self._root_anchor_from_context(actor_user_id)
+        await self._validate_delegate_source(actor_user_id, anchor)
+        db = await self._session()
+        try:
+            run = await db.get(AgentRun, _uuid(anchor.get("source_run_id"), "source_run_id"))
+            revision = await db.get(AgentRevision, run.agent_revision_id) if run and run.agent_revision_id else None
+            if (revision is None or revision.agent_id != run.agent_id
+                or not revision_has_new_delegate_policy(revision)
+                or not revision_allows_worker_delegate(revision, kind)):
+                raise AgentDialogueAuthorizationError("worker delegation is not authorized", code="worker_revision_policy_denied")
+            raw_caps = revision.capability_ceiling_json or ()
+            caps = ({str(k).strip().casefold() for k, enabled in raw_caps.items() if enabled is True}
+                    if isinstance(raw_caps, Mapping) else
+                    {str(k).strip().casefold() for k in raw_caps if isinstance(k, str)})
+            required = worker_delegate_required_capabilities(kind, scope["mode"])
+            if not required or not required <= caps:
+                raise AgentDialogueAuthorizationError("worker capability is not authorized", code="worker_revision_scope_capability_missing")
+            from .turn_context import get_turn_context
+
+            root_session = await db.get(ConversationSession, run.session_id)
+            if root_session is None:
+                raise AgentDialogueAuthorizationError("source session is unavailable", code="source_agent_binding_invalid")
+            turn = get_turn_context()
+            target_project = _uuid(turn.project_id or root_session.project_id, "project_id", required=False)
+            if target_project is not None and not await self._project_acl(db, target_project, _uuid(actor_user_id, "actor_user_id"), "read"):
+                raise AgentDialogueAuthorizationError("Project access denied", code="project_access_denied")
+            worker, worker_revision, route = await self._select_managed_external_worker(
+                db, actor_user_id=actor_user_id, actor_role=None, kind=kind,
+                project_id=target_project, model=None, effort=None,
+                exclude_agent_id=run.agent_id, scope_mode=scope["mode"],
+            )
+            source_agent_id, source_revision_id = str(run.agent_id), str(run.agent_revision_id)
+            agent_id, revision_id = str(worker.id), str(worker_revision.id)
+            target_model = str(route.model) if route.model else None
+            target_effort = str(route.effort) if route.effort else None
+        finally:
+            await db.close()
+        from .delegate_worker_runtime import DelegateWorkerRuntime
+        from .cli_development_sessions import CLIDevelopmentSessionService
+
+        runtime = DelegateWorkerRuntime(
+            cli_session_service=CLIDevelopmentSessionService(self._manager(), config=self.config),
+            db_manager=self._manager(), config=self.config,
+        )
+        dialogue_id = uuid4()
+        prepared = await runtime.prepare_session(
+            owner_id=str(_uuid(actor_user_id, "actor_user_id")), actor_role=None,
+            agent_id=agent_id, agent_revision_id=revision_id, kind=kind,
+            model=target_model, effort=target_effort, workspace_scope=scope, timeout_seconds=timeout,
+            dialogue_idempotency_key=str(dialogue_id), project_id=str(target_project) if target_project else None,
+            dialogue_id=str(dialogue_id),
+            budgets={k: v for k, v in budget_values.to_dict().items() if v is not None},
+        )
+        prepared = {**prepared, "source_agent_id": source_agent_id,
+                    "source_revision_id": source_revision_id, "scope_mode": scope["mode"],
+                    "target_model": target_model, "target_effort": target_effort}
+        try:
+            created = await self._create_dialogue(
+                actor_user_id=actor_user_id, actor_role=None,
+                title=f"External worker {kind}", instruction=instruction,
+                worker_agent_id=None, project_id=target_project, task_id=None,
+                budgets=budget_values, deadline=None, anchor=anchor,
+                context_project_hint_id=None, tool_name="delegate_worker",
+                prepared_worker=prepared, prepared_dialogue_id=dialogue_id,
+            )
+        except BaseException:
+            await runtime.discard_prepared_session(
+                str(prepared["session_id"]), owner_id=str(actor_user_id), dialogue_id=str(dialogue_id),
+            )
+            raise
+        return {"success": True, "status": "queued", "job_id": created["dialogue_id"],
+                "dialogue_id": created["dialogue_id"], "chat_link": created["chat_link"],
+                "refs": _safe_refs(created), "delivery": created.get("delivery"),
+                "budget_reservation": created.get("budget_reservation")}
+
     async def get_agent_work_status(self, dialogue_id: Any, *, actor_user_id: Any, actor_role: Any = None) -> dict[str, Any]:
-        return await self.get_dialogue(dialogue_id, actor_user_id=actor_user_id, actor_role=actor_role)
+        external = await self._external_worker_status(
+            dialogue_id,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+        )
+        if external is not None:
+            return external
+        result = await self.get_dialogue(
+            dialogue_id, actor_user_id=actor_user_id, actor_role=actor_role
+        )
+        terminal_status = str(result.get("job_status") or "").casefold()
+        if terminal_status in {"succeeded", "failed", "cancelled", "expired"}:
+            supersede = getattr(
+                self._transport(), "supersede_terminal_dialogue_deliveries", None
+            )
+            if callable(supersede):
+                await supersede(
+                    dialogue_id=str(dialogue_id),
+                    terminal_status=terminal_status,
+                )
+            status_label = {
+                "succeeded": "完了",
+                "failed": "失敗終了",
+                "cancelled": "取消終了",
+                "expired": "期限切れ終了",
+            }[terminal_status]
+            return {
+                "success": True,
+                "terminal": True,
+                "status": terminal_status,
+                "next": "delegate_new",
+                "allowed_actions": [],
+                "summary": (
+                    f"委任は{status_label}です。新しい依頼には新しい委任を作成してください。"
+                ),
+            }
+        return result
 
     async def enqueue_delivery(
         self,
@@ -2376,15 +4953,132 @@ class AgentDialogueService:
                 raise AgentDialogueError(str(exc), code=str(code)) from exc
             raise
 
+    async def terminalize_stale_control_delivery(
+        self,
+        dialogue_id: Any,
+        delivery_id: Any,
+        *,
+        body_dialogue_id: Any,
+        expected_state: str,
+        expected_control_revision: int,
+        idempotency_key: str,
+        actor_user_id: Any,
+        actor_role: Any = None,
+    ) -> dict[str, Any]:
+        """Close one proven-unconsumed stale control delivery as its Human owner.
+
+        All ownership checks, row locks, terminalization, and the audit event
+        share one transaction. The transport helper never dispatches a Run or
+        calls the provider.
+        """
+
+        from .agent_dialogue_transport import (
+            DialogueTransportConflict,
+            DialogueTransportError,
+        )
+
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            owner = await self._authorize(
+                db,
+                dialogue,
+                actor_user_id,
+                actor_role,
+                permission="write",
+            )
+            if (
+                owner != dialogue.owner_user_id
+                or _text(actor_role, limit=32).casefold() == "agent"
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "only the authenticated Human dialogue owner may close a stale control delivery",
+                    code="stale_control_delivery_owner_required",
+                )
+            if _uuid(body_dialogue_id, "dialogue_id") != dialogue.id:
+                raise AgentDialogueConflictError(
+                    "dialogue identity changed",
+                    code="stale_control_delivery_dialogue_mismatch",
+                )
+            result = await self._transport().terminalize_stale_control_delivery(
+                dialogue_id=str(dialogue.id),
+                delivery_id=delivery_id,
+                owner_user_id=str(owner),
+                actor_kind="human",
+                actor_user_id=str(owner),
+                expected_state=expected_state,
+                expected_control_revision=expected_control_revision,
+                idempotency_key=idempotency_key,
+                session=db,
+            )
+            await db.commit()
+            return dict(result)
+        except DialogueTransportConflict as exc:
+            with suppress(Exception):
+                await db.rollback()
+            raise AgentDialogueConflictError(str(exc), code=exc.code) from exc
+        except DialogueTransportError as exc:
+            with suppress(Exception):
+                await db.rollback()
+            raise AgentDialogueError(str(exc), code=exc.code) from exc
+        except AgentDialogueError:
+            with suppress(Exception):
+                await db.rollback()
+            raise
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def recover_native_outcome(self, dialogue_id: Any, delivery_id: Any, *,
+                                     expected_control_revision: int, actor_user_id: Any,
+                                     actor_role: Any = None) -> dict[str, Any]:
+        """Authorize the human owner and recover one native negative outcome."""
+        from .agent_dialogue_transport import DialogueTransportError
+        from .agent_delegation_service import DelegationError
+
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            owner = await self._authorize(db, dialogue, actor_user_id, actor_role, permission="write")
+            if owner != dialogue.owner_user_id or _text(actor_role, limit=32).casefold() == "agent":
+                raise AgentDialogueAuthorizationError("human owner required", code="native_outcome_owner_required")
+            result = await self._transport().recover_native_outcome(
+                str(dialogue.id), str(delivery_id), owner_user_id=str(owner),
+                expected_control_revision=expected_control_revision, session=db)
+            await db.commit()
+            return result
+        except (DialogueTransportError, DelegationError) as exc:
+            await db.rollback()
+            raise AgentDialogueConflictError(str(exc), code=getattr(exc, "code", "native_outcome_invalid")) from exc
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def send_agent_work_message(self, dialogue_id: Any, *, message: str, source_agent_run_id: Any) -> dict[str, Any]:
         from .turn_context import get_turn_context
 
         db = await self._session()
         try:
             dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
-            source_run = await db.get(AgentRun, _uuid(source_agent_run_id, "source_run_id"))
             turn = get_turn_context()
-            if str(turn.agent_dialogue_role or "").strip().casefold() == "worker":
+            dialogue_role = str(turn.agent_dialogue_role or "").strip().casefold()
+            if _text(dialogue.state, limit=32).casefold() not in _ACTIVE_DIALOGUE_STATES:
+                message = (
+                    "dialogue is terminal; worker messages are not allowed"
+                    if dialogue_role == "worker"
+                    else "dialogue is terminal; rework requires an owner control action"
+                )
+                raise AgentDialogueConflictError(
+                    message,
+                    code="dialogue_terminal",
+                )
+            source_run = await db.get(AgentRun, _uuid(source_agent_run_id, "source_run_id"))
+            if dialogue_role == "worker":
                 return await self._send_worker_work_message(
                     db,
                     dialogue=dialogue,
@@ -2404,6 +5098,25 @@ class AgentDialogueService:
                 raise AgentDialogueAuthorizationError("source Work is not current", code="source_work_invalid")
             if not source_work.lease_owner or not source_work.lease_token or source_work.lease_expires_at is None or source_work.lease_expires_at <= _now():
                 raise AgentDialogueAuthorizationError("source Work lease is not active", code="source_work_lease_invalid")
+            control_marker = (
+                source_run.run_metadata.get("agent_dialogue")
+                if isinstance(source_run.run_metadata, Mapping)
+                else None
+            )
+            if (
+                isinstance(control_marker, Mapping)
+                and control_marker.get("root_control_turn") is True
+                and control_marker.get("resume_answer") is not True
+                and str(control_marker.get("dialogue_id")) == str(dialogue.id)
+            ):
+                # The owner control already carries this instruction to the
+                # Worker.  A second copy would start a duplicate Worker Run.
+                return {
+                    "success": True,
+                    "status": "already_delivered",
+                    "dialogue_id": str(dialogue.id),
+                    "next": "The Worker already has this instruction. End this turn without calling another tool.",
+                }
             continuation_input = None
             continuation_source_run = None
             continuation_source_work = None
@@ -3071,7 +5784,6 @@ class AgentDialogueService:
             )
             db.add(message)
             input_row.input_kind = "human_question"
-            input_row.reference_id = str(message_id)
             input_row.updated_at = _now()
             await db.commit()
             return {
@@ -3081,7 +5793,7 @@ class AgentDialogueService:
                 "input_kind": "human_question",
                 "control_revision": int(dialogue.control_revision),
             }
-        except AgentDialogueError:
+        except Exception:
             with suppress(Exception):
                 await db.rollback()
             raise
@@ -3094,6 +5806,700 @@ class AgentDialogueService:
     async def resume_agent_work(self, dialogue_id: Any, *, expected_control_revision: int) -> dict[str, Any]:
         return await self._agent_control(dialogue_id, "queued", expected_control_revision)
 
+    async def _external_worker_control(
+        self,
+        dialogue_id: Any,
+        *,
+        action: str,
+        expected_control_revision: int,
+        actor_user_id: UUID,
+        marker: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        runtime = self._delegate_worker_runtime()
+        session_id = _text(marker.get("session_id"), limit=64)
+        run_id = _text(marker.get("run_id"), limit=64)
+        if not session_id:
+            raise AgentDialogueAuthorizationError(
+                "external worker session reference is missing",
+                code="worker_session_binding_invalid",
+            )
+        if action == "stop":
+            if not run_id:
+                raise AgentDialogueConflictError(
+                    "external worker has no active Run to stop",
+                    code="worker_run_unavailable",
+                )
+            db = await self._session()
+            try:
+                dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                if int(dialogue.control_revision or 0) != int(expected_control_revision):
+                    raise AgentDialogueConflictError(
+                        "dialogue control revision is stale",
+                        code="dialogue_control_stale",
+                    )
+                if dialogue.project_id is not None and not await self._project_acl(
+                    db,
+                    _uuid(dialogue.project_id, "dialogue_project_id"),
+                    actor_user_id,
+                    "write",
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "Dialogue Project write permission is required",
+                        code="project_access_denied",
+                    )
+                authorization = (
+                    dict(dialogue.authorization_json)
+                    if isinstance(dialogue.authorization_json, Mapping)
+                    else {}
+                )
+                current_marker = dict(authorization.get("delegate_worker") or {})
+                if _text(current_marker.get("session_id"), limit=64) != session_id or _text(
+                    current_marker.get("run_id"), limit=64
+                ) != run_id:
+                    raise AgentDialogueConflictError(
+                        "external worker Run changed during stop",
+                        code="worker_run_stale",
+                    )
+                dialogue.state = "cancelled"
+                dialogue.control_revision = int(dialogue.control_revision or 0) + 1
+                dialogue.updated_at = _now()
+                current_marker["status"] = "cancel_requested"
+                current_marker["last_control"] = "stop"
+                authorization["delegate_worker"] = current_marker
+                dialogue.authorization_json = authorization
+                dialogue.authorization_hash = hashlib.sha256(
+                    json.dumps(
+                        authorization,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if await self._dialogue_budget_schema_available(db):
+                    budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                    if budget_root is not None:
+                        budget_root.state = "cancelled"
+                        budget_root.authorization_hash = dialogue.authorization_hash
+                await db.commit()
+                committed_control_revision = int(dialogue.control_revision)
+            except Exception:
+                with suppress(Exception):
+                    await db.rollback()
+                raise
+            finally:
+                await db.close()
+            try:
+                result = await runtime.cancel(
+                    session_id,
+                    run_id,
+                    owner_id=str(actor_user_id),
+                    dialogue_id=str(dialogue_id),
+                )
+                if not isinstance(result, Mapping) or result.get("success") is not True:
+                    raise AgentDialogueConflictError(
+                        "managed worker did not accept the stop request",
+                        code="worker_stop_failed",
+                    )
+            except Exception as exc:
+                db = await self._session()
+                try:
+                    dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                    if int(dialogue.control_revision or 0) == committed_control_revision:
+                        dialogue.state = "blocked"
+                        dialogue.updated_at = _now()
+                        authorization = (
+                            dict(dialogue.authorization_json)
+                            if isinstance(dialogue.authorization_json, Mapping)
+                            else {}
+                        )
+                        current_marker = dict(authorization.get("delegate_worker") or {})
+                        current_marker["status"] = "stop_failed"
+                        authorization["delegate_worker"] = current_marker
+                        dialogue.authorization_json = authorization
+                        dialogue.authorization_hash = hashlib.sha256(
+                            json.dumps(
+                                authorization,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        await db.commit()
+                finally:
+                    await db.close()
+                if isinstance(exc, AgentDialogueError):
+                    raise
+                raise AgentDialogueError(
+                    "managed worker stop failed",
+                    code=getattr(exc, "code", "worker_stop_failed"),
+                ) from exc
+            db = await self._session()
+            try:
+                dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                authorization = (
+                    dict(dialogue.authorization_json)
+                    if isinstance(dialogue.authorization_json, Mapping)
+                    else {}
+                )
+                current_marker = dict(authorization.get("delegate_worker") or {})
+                if (
+                    int(dialogue.control_revision or 0) != committed_control_revision
+                    or _text(current_marker.get("session_id"), limit=64) != session_id
+                    or _text(current_marker.get("run_id"), limit=64) != run_id
+                ):
+                    raise AgentDialogueConflictError(
+                        "external worker changed after stop was accepted",
+                        code="worker_run_stale",
+                    )
+                current_marker["status"] = str(result.get("status") or "cancelled")
+                authorization["delegate_worker"] = current_marker
+                dialogue.authorization_json = authorization
+                dialogue.authorization_hash = hashlib.sha256(
+                    json.dumps(
+                        authorization,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if await self._dialogue_budget_schema_available(db):
+                    budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                    if budget_root is not None:
+                        budget_root.authorization_hash = dialogue.authorization_hash
+                await db.commit()
+                return {
+                    "success": True,
+                    "dialogue_id": str(dialogue.id),
+                    "status": "cancelled",
+                    "control_revision": int(dialogue.control_revision),
+                    "worker_control": dict(result),
+                }
+            except Exception:
+                with suppress(Exception):
+                    await db.rollback()
+                raise
+            finally:
+                await db.close()
+
+        if action != "resume":
+            raise AgentDialogueValidationError(
+                "external worker control action is invalid",
+                code="dialogue_control_action_unavailable",
+            )
+        # Refresh/settle the previous finite attempt before calculating the
+        # remaining Dialogue allowance for the fresh managed session.
+        prior_status = await self._external_worker_status(
+            dialogue_id,
+            actor_user_id=actor_user_id,
+            actor_role=None,
+        )
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            if int(dialogue.control_revision or 0) != int(expected_control_revision):
+                raise AgentDialogueConflictError(
+                    "dialogue control revision is stale",
+                    code="dialogue_control_stale",
+                )
+            authorization = (
+                dict(dialogue.authorization_json)
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            current_marker = dict(authorization.get("delegate_worker") or {})
+            old_session_id = _text(current_marker.get("session_id"), limit=64)
+            old_run_id = _text(current_marker.get("run_id"), limit=64)
+            if not old_session_id:
+                raise AgentDialogueAuthorizationError(
+                    "external worker session reference is missing",
+                    code="worker_session_binding_invalid",
+                )
+            from .agent_dialogue_budget import budget_from_dialogue
+
+            budget_owner = await get_dialogue_budget_owner(db, dialogue, lock=True)
+            budget = budget_from_dialogue(budget_owner)
+            if (
+                int(getattr(budget_owner, "attempt_count", 0) or 0) + 1
+                > budget.max_attempts
+                or int(getattr(budget_owner, "turn_count", 0) or 0) + 1
+                > budget.max_turns
+            ):
+                raise AgentDialogueConflictError(
+                    "worker Dialogue attempt budget is exhausted",
+                    code="dialogue_attempt_budget_exhausted",
+                )
+            usage_state = str(getattr(budget_owner, "usage_state", "known") or "known")
+            _validate_worker_resume_usage_budget(budget, usage_state)
+            remaining_tokens = (
+                max(
+                    0,
+                    int(budget.max_tokens)
+                    - int(getattr(budget_owner, "total_tokens", 0) or 0)
+                    - int(getattr(budget_owner, "reserved_tokens", 0) or 0),
+                )
+                if budget.max_tokens is not None
+                else None
+            )
+            if budget.max_tokens is not None and not remaining_tokens:
+                raise AgentDialogueConflictError(
+                    "worker Dialogue token budget is exhausted",
+                    code="dialogue_token_budget_exhausted",
+                )
+            remaining_cost = (
+                max(
+                    0,
+                    int(budget.max_cost_micros)
+                    - int(getattr(budget_owner, "cost_micros", 0) or 0)
+                    - int(getattr(budget_owner, "reserved_cost_micros", 0) or 0),
+                )
+                if budget.max_cost_micros is not None
+                else None
+            )
+            original_message_id = _uuid(
+                current_marker.get("instruction_message_id"),
+                "worker_instruction_message_id",
+            )
+            original_message = await db.get(ConversationMessage, original_message_id)
+            if original_message is None or original_message.session_id != dialogue.root_session_id:
+                raise AgentDialogueAuthorizationError(
+                    "external worker instruction reference is invalid",
+                    code="worker_instruction_invalid",
+                )
+            original_instruction = _text(original_message.content, limit=_MAX_INSTRUCTION)
+            project_id = str(dialogue.project_id) if dialogue.project_id else None
+            if dialogue.project_id is not None and not await self._project_acl(
+                db,
+                dialogue.project_id,
+                actor_user_id,
+                "write",
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "Dialogue Project write permission is required",
+                    code="project_access_denied",
+                )
+            workspace_scope = current_marker.get("workspace_scope")
+            timeout = int(current_marker.get("timeout_seconds") or 300)
+            worker_agent_id = str(dialogue.worker_agent_id)
+            worker_revision_id = str(dialogue.worker_agent_revision_id)
+            next_control_revision = int(dialogue.control_revision or 0) + 1
+            remaining_attempts = max(
+                0,
+                budget.max_attempts
+                - int(getattr(budget_owner, "attempt_count", 0) or 0),
+            )
+            if not remaining_attempts:
+                raise AgentDialogueConflictError(
+                    "worker Dialogue attempt budget is exhausted",
+                    code="dialogue_attempt_budget_exhausted",
+                )
+            resumed_budgets: dict[str, int] = {
+                "max_attempts": remaining_attempts,
+            }
+            if remaining_tokens is not None:
+                resumed_budgets["max_tokens"] = remaining_tokens
+            if remaining_cost is not None:
+                resumed_budgets["max_cost_micros"] = remaining_cost
+        finally:
+            await db.close()
+
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            if int(dialogue.control_revision or 0) != int(expected_control_revision):
+                raise AgentDialogueConflictError(
+                    "dialogue control revision is stale",
+                    code="dialogue_control_stale",
+                )
+            if dialogue.project_id is not None and not await self._project_acl(
+                db,
+                dialogue.project_id,
+                actor_user_id,
+                "write",
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "Dialogue Project write permission was revoked during resume",
+                    code="project_access_denied",
+                )
+            authorization = (
+                dict(dialogue.authorization_json)
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            current_marker = dict(authorization.get("delegate_worker") or {})
+            if _text(current_marker.get("session_id"), limit=64) != old_session_id:
+                raise AgentDialogueConflictError(
+                    "external worker session changed during resume",
+                    code="worker_session_stale",
+                )
+            if dialogue.project_id is not None and not await self._project_acl(
+                db,
+                dialogue.project_id,
+                actor_user_id,
+                "write",
+            ):
+                raise AgentDialogueAuthorizationError(
+                    "Dialogue Project write permission was revoked during resume",
+                    code="project_access_denied",
+                )
+            current_marker["status"] = "resume_preparing"
+            current_marker["last_control"] = "resume"
+            authorization["delegate_worker"] = current_marker
+            dialogue.control_revision = next_control_revision
+            dialogue.state = "blocked"
+            dialogue.authorization_json = authorization
+            dialogue.authorization_hash = hashlib.sha256(
+                json.dumps(
+                    authorization,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            dialogue.updated_at = _now()
+            if await self._dialogue_budget_schema_available(db):
+                budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                if budget_root is not None:
+                    budget_root.state = "blocked"
+                    budget_root.authorization_hash = dialogue.authorization_hash
+            await db.commit()
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+        try:
+            prepared = await runtime.prepare_resume_session(
+                previous_session_id=old_session_id,
+                owner_id=str(actor_user_id),
+                dialogue_id=str(dialogue_id),
+                project_id=project_id,
+                workspace_scope=workspace_scope,
+                timeout_seconds=timeout,
+                control_revision=next_control_revision,
+                budgets=resumed_budgets,
+            )
+        except Exception as exc:
+            db = await self._session()
+            try:
+                dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                authorization = (
+                    dict(dialogue.authorization_json)
+                    if isinstance(dialogue.authorization_json, Mapping)
+                    else {}
+                )
+                current_marker = dict(authorization.get("delegate_worker") or {})
+                current_marker["status"] = "resume_prepare_failed"
+                authorization["delegate_worker"] = current_marker
+                dialogue.authorization_json = authorization
+                dialogue.authorization_hash = hashlib.sha256(
+                    json.dumps(
+                        authorization,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                dialogue.state = "blocked"
+                dialogue.updated_at = _now()
+                await db.commit()
+            finally:
+                await db.close()
+            raise AgentDialogueError(
+                "managed worker resume preparation failed",
+                code=getattr(exc, "code", "worker_resume_failed"),
+            ) from exc
+        new_session_id = _text(prepared.get("session_id"), limit=64)
+        if not new_session_id or _uuid(prepared.get("agent_id"), "worker_agent_id") != _uuid(
+            worker_agent_id, "worker_agent_id"
+        ) or _uuid(prepared.get("agent_revision_id"), "worker_revision_id") != _uuid(
+            worker_revision_id, "worker_revision_id"
+        ) or new_session_id == old_session_id or _text(
+            prepared.get("workspace_scope_sha256"), limit=64
+        ) != _text(marker.get("workspace_scope_sha256"), limit=64):
+            raise AgentDialogueAuthorizationError(
+                "resumed managed worker changed its Agent pin",
+                code="worker_session_binding_invalid",
+            )
+        previous_ref = {
+            key: marker.get(key)
+            for key in ("session_id", "run_id", "work_item_id", "status")
+            if marker.get(key) not in (None, "")
+        }
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            # The Dialogue was advanced to next_control_revision before the
+            # adapter side effect, so the final link update must fence against
+            # that value as well.
+            if int(dialogue.control_revision or 0) != int(next_control_revision):
+                raise AgentDialogueConflictError(
+                    "dialogue control revision is stale",
+                    code="dialogue_control_stale",
+                )
+            authorization = (
+                dict(dialogue.authorization_json)
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            current_marker = dict(authorization.get("delegate_worker") or {})
+            if _text(current_marker.get("session_id"), limit=64) != old_session_id:
+                raise AgentDialogueConflictError(
+                    "external worker session changed during resume",
+                    code="worker_session_stale",
+                )
+            history = list(current_marker.get("previous_sessions") or [])
+            history.append(previous_ref)
+            current_marker.update(
+                {
+                    "session_id": new_session_id,
+                    "workspace_scope_sha256": _text(
+                        prepared.get("workspace_scope_sha256"),
+                        limit=64,
+                    ),
+                    "allow_cli_native_tools": bool(
+                        prepared.get("allow_cli_native_tools")
+                    ),
+                    "budgets": resumed_budgets,
+                    "run_id": None,
+                    "work_item_id": None,
+                    "status": str(prepared.get("status") or "ready"),
+                    "previous_sessions": history[-32:],
+                    "last_control": "resume",
+                }
+            )
+            authorization["delegate_worker"] = current_marker
+            dialogue.worker_session_id = _uuid(new_session_id, "worker_session_id")
+            dialogue.state = "queued"
+            dialogue.updated_at = _now()
+            dialogue.authorization_json = authorization
+            dialogue.authorization_hash = hashlib.sha256(
+                json.dumps(
+                    authorization,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if await self._dialogue_budget_schema_available(db):
+                budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                if budget_root is not None:
+                    budget_root.state = "active"
+                    budget_root.authorization_hash = dialogue.authorization_hash
+            await db.commit()
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+        prior_worker_status = (
+            prior_status.get("external_worker")
+            if isinstance(prior_status, Mapping)
+            and isinstance(prior_status.get("external_worker"), Mapping)
+            else {}
+        )
+        prior_result = (
+            prior_worker_status.get("result")
+            if isinstance(prior_worker_status.get("result"), Mapping)
+            else {}
+        )
+        prior_summary = _text(prior_result.get("summary"), limit=3_000)
+        resume_instruction = (
+            "Continue the same bounded external worker task.\n\n"
+            "Original instruction:\n"
+            + original_instruction
+            + (
+                "\n\nPrevious attempt summary:\n" + prior_summary
+                if prior_summary
+                else ""
+            )
+        )
+        resumed_budgets = {
+            "max_attempts": max(1, min(budget.max_attempts, budget.max_attempts - int(getattr(budget_owner, "attempt_count", 0) or 0))),
+        }
+        if remaining_tokens is not None:
+            resumed_budgets["max_tokens"] = remaining_tokens
+        if remaining_cost is not None:
+            resumed_budgets["max_cost_micros"] = remaining_cost
+        new_run_id: str | None = None
+        new_work_item_id: str | None = None
+        try:
+            started = await runtime.start_session(
+                new_session_id,
+                dialogue_id=str(dialogue_id),
+                instruction=resume_instruction,
+                budgets=resumed_budgets,
+                workspace_scope=workspace_scope,
+                timeout_seconds=timeout,
+            )
+            new_run_id = _text(started.get("run_id"), limit=64)
+            new_work_item_id = _text(started.get("work_item_id"), limit=64)
+            if not new_run_id or not new_work_item_id:
+                raise AgentDialogueError(
+                    "resumed managed worker did not queue a Run and Work item",
+                    code="worker_session_start_failed",
+                )
+        except Exception as exc:
+            start_outcome_unknown = False
+            resume_start_stale = False
+            try:
+                receipt = await self._reconcile_external_worker_start(
+                    runtime,
+                    dialogue_id=dialogue_id,
+                    session_id=new_session_id,
+                    owner_user_id=actor_user_id,
+                    expected_control_revision=next_control_revision,
+                )
+                if receipt is not None:
+                    new_run_id = receipt.get("run_id") or new_run_id
+                    new_work_item_id = receipt.get("work_item_id") or new_work_item_id
+                    start_outcome_unknown = not bool(
+                        receipt.get("run_id") and receipt.get("work_item_id")
+                    ) or not bool(receipt.get("linked"))
+                    resume_start_stale = not bool(receipt.get("linked"))
+            except Exception:
+                start_outcome_unknown = True
+            if new_run_id:
+                with suppress(Exception):
+                    await runtime.cancel(
+                        new_session_id,
+                        new_run_id,
+                        owner_id=str(actor_user_id),
+                        dialogue_id=str(dialogue_id),
+                    )
+            elif not start_outcome_unknown:
+                with suppress(Exception):
+                    await runtime.discard_prepared_session(
+                        new_session_id,
+                        owner_id=str(actor_user_id),
+                        dialogue_id=str(dialogue_id),
+                    )
+            db = await self._session()
+            try:
+                dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+                authorization = (
+                    dict(dialogue.authorization_json)
+                    if isinstance(dialogue.authorization_json, Mapping)
+                    else {}
+                )
+                current_marker = dict(authorization.get("delegate_worker") or {})
+                if (
+                    int(dialogue.control_revision or 0) == int(next_control_revision)
+                    and _text(current_marker.get("session_id"), limit=64) == new_session_id
+                ):
+                    if new_run_id:
+                        current_marker["run_id"] = new_run_id
+                    if new_work_item_id:
+                        current_marker["work_item_id"] = new_work_item_id
+                    current_marker["status"] = (
+                        "resume_start_unknown"
+                        if start_outcome_unknown
+                        else "resume_start_failed"
+                    )
+                    authorization["delegate_worker"] = current_marker
+                    dialogue.authorization_json = authorization
+                    dialogue.authorization_hash = hashlib.sha256(
+                        json.dumps(
+                            authorization,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    dialogue.state = "blocked" if start_outcome_unknown else "failed"
+                    dialogue.updated_at = _now()
+                    if await self._dialogue_budget_schema_available(db):
+                        budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                        if budget_root is not None:
+                            budget_root.state = dialogue.state
+                            budget_root.authorization_hash = dialogue.authorization_hash
+                    await db.commit()
+                else:
+                    resume_start_stale = True
+            finally:
+                await db.close()
+            if resume_start_stale:
+                raise AgentDialogueConflictError(
+                    "external worker resume changed after Run start",
+                    code="worker_session_stale",
+                ) from exc
+            raise AgentDialogueError(
+                "managed worker resume start failed",
+                code=getattr(exc, "code", "worker_resume_failed"),
+            ) from exc
+        db = await self._session()
+        try:
+            dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
+            authorization = (
+                dict(dialogue.authorization_json)
+                if isinstance(dialogue.authorization_json, Mapping)
+                else {}
+            )
+            current_marker = dict(authorization.get("delegate_worker") or {})
+            if (
+                int(dialogue.control_revision or 0) != int(next_control_revision)
+                or _text(current_marker.get("session_id"), limit=64) != new_session_id
+            ):
+                raise AgentDialogueConflictError(
+                    "external worker resume changed before Run linkage",
+                    code="worker_session_stale",
+                )
+            current_marker["run_id"] = new_run_id
+            current_marker["work_item_id"] = new_work_item_id
+            current_marker["status"] = str(started.get("status") or "queued")
+            authorization["delegate_worker"] = current_marker
+            dialogue.authorization_json = authorization
+            dialogue.authorization_hash = hashlib.sha256(
+                json.dumps(
+                    authorization,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if await self._dialogue_budget_schema_available(db):
+                budget_root = await db.get(AgentDialogueBudgetRoot, dialogue.id)
+                if budget_root is not None:
+                    budget_root.authorization_hash = dialogue.authorization_hash
+            from .agent_dialogue_budget import reserve_dialogue_budget
+
+            await reserve_dialogue_budget(
+                db,
+                dialogue.id,
+                turns=1,
+                attempts=1,
+                tokens=int(resumed_budgets.get("max_tokens") or 0),
+                cost_micros=int(resumed_budgets.get("max_cost_micros") or 0),
+                reservation_key=f"run:{new_run_id}",
+                run_id=new_run_id,
+            )
+            await db.commit()
+            return {
+                "success": True,
+                "dialogue_id": str(dialogue.id),
+                "status": "queued",
+                "control_revision": int(dialogue.control_revision or 0),
+                "worker_session_id": new_session_id,
+                "worker_run_id": new_run_id,
+                "worker_work_item_id": new_work_item_id,
+            }
+        except Exception:
+            with suppress(Exception):
+                await db.rollback()
+            with suppress(Exception):
+                await runtime.cancel(
+                    new_session_id,
+                    new_run_id,
+                    owner_id=str(actor_user_id),
+                    dialogue_id=str(dialogue_id),
+                )
+            raise
+        finally:
+            await db.close()
+
     async def _agent_control(self, dialogue_id: Any, state: str, expected_control_revision: int) -> dict[str, Any]:
         try:
             from .turn_context import get_turn_context
@@ -3105,18 +6511,70 @@ class AgentDialogueService:
             current_run_id = get_current_agent_run_id()
             if actor_agent_id is None or actor_user_id is None or not current_run_id:
                 raise AgentDialogueAuthorizationError("current Root Agent turn is required", code="agent_control_actor_required")
+            external_worker_marker: dict[str, Any] | None = None
             db = await self._session()
             try:
                 dialogue = await self._load_dialogue(db, dialogue_id, lock=True)
                 if dialogue.root_agent_id != actor_agent_id or dialogue.owner_user_id != actor_user_id:
                     raise AgentDialogueAuthorizationError("only the canonical Root Agent may control this job", code="agent_control_agent_mismatch")
+                if int(dialogue.control_revision or 0) != int(expected_control_revision):
+                    raise AgentDialogueConflictError(
+                        "dialogue control revision is stale",
+                        code="dialogue_control_stale",
+                    )
+                authorization = (
+                    dialogue.authorization_json
+                    if isinstance(dialogue.authorization_json, Mapping)
+                    else {}
+                )
+                raw_external_worker = authorization.get("delegate_worker")
+                if isinstance(raw_external_worker, Mapping):
+                    external_worker_marker = dict(raw_external_worker)
                 run = await db.get(AgentRun, _uuid(current_run_id, "source_run_id"))
-                if run is None or run.session_id != dialogue.root_session_id or run.agent_id != dialogue.root_agent_id or run.status not in _ACTIVE_RUN_STATES:
+                if (
+                    run is None
+                    or run.session_id != dialogue.root_session_id
+                    or run.agent_id != dialogue.root_agent_id
+                    or run.agent_revision_id != _uuid(context.agent_revision_id, "agent_revision_id")
+                    or run.status not in _ACTIVE_RUN_STATES
+                ):
                     raise AgentDialogueAuthorizationError("Root Agent Run is not active/current", code="agent_control_run_invalid")
+                root_session = await db.get(ConversationSession, dialogue.root_session_id)
+                if (
+                    root_session is None
+                    or root_session.deleted_at is not None
+                    or _uuid(root_session.user_id, "root_session_owner_id") != actor_user_id
+                    or _uuid(root_session.agent_id, "root_session_agent_id", required=False)
+                    != actor_agent_id
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "Root Agent session binding is invalid",
+                        code="agent_control_agent_mismatch",
+                    )
+                if root_session.project_id is not None and not await self._project_acl(
+                    db,
+                    _uuid(root_session.project_id, "root_session_project_id"),
+                    actor_user_id,
+                    "write",
+                ):
+                    raise AgentDialogueAuthorizationError(
+                        "Root Agent Project write permission is required",
+                        code="project_access_denied",
+                    )
                 if run.agent_revision_id is None:
                     raise AgentDialogueAuthorizationError("Root Agent revision is missing", code="agent_control_revision_invalid")
                 work = await db.get(AgentWorkItem, run.work_item_id) if run.work_item_id else None
-                if work is None or work.active_agent_run_id != run.id or not work.lease_owner or not work.lease_token or work.lease_expires_at is None or work.lease_expires_at <= _now():
+                if (
+                    work is None
+                    or work.active_agent_run_id != run.id
+                    or work.conversation_session_id != dialogue.root_session_id
+                    or work.assigned_agent_id != actor_agent_id
+                    or work.agent_revision_id != run.agent_revision_id
+                    or not work.lease_owner
+                    or not work.lease_token
+                    or work.lease_expires_at is None
+                    or work.lease_expires_at <= _now()
+                ):
                     raise AgentDialogueAuthorizationError("Root Agent Work lease is not active", code="agent_control_work_lease_invalid")
                 continuation_input = None
                 continuation_source_run = None
@@ -3169,6 +6627,14 @@ class AgentDialogueService:
             finally:
                 await db.close()
             action = "stop" if state == "cancelled" else "resume"
+            if external_worker_marker is not None:
+                return await self._external_worker_control(
+                    dialogue_id,
+                    action=action,
+                    expected_control_revision=expected_control_revision,
+                    actor_user_id=actor_user_id,
+                    marker=external_worker_marker,
+                )
             return dict(await get_agent_dialogue_dispatch_bridge(self._manager(), config=self.config).apply_agent_dialogue_control(
                 dialogue_id=str(dialogue_id),
                 owner_user_id=str(actor_user_id),

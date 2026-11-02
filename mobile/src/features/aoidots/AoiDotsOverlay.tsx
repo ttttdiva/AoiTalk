@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BackHandler, Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { BackHandler, Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
 import { ActivityIndicator, Button, Portal, Surface, Text, TextInput } from "react-native-paper";
 import { useRouter } from "expo-router";
 import { useAuth } from "../../contexts/AuthContext";
@@ -116,12 +116,17 @@ export function AoiDotsWorkRail({
   error: string | null;
   onRetry: () => void;
 }) {
+  const { height: windowHeight } = useWindowDimensions();
+  const workRailDetailsMaxHeight = Number.isFinite(windowHeight) && windowHeight > 0
+    ? Math.min(280, Math.floor(windowHeight * 0.4))
+    : 280;
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [selectedChoices, setSelectedChoices] = useState<Record<string, string[]>>({});
   const [reworkDrafts, setReworkDrafts] = useState<Record<string, string>>({});
   const [reworkOpen, setReworkOpen] = useState<Record<string, boolean>>({});
   const [reworkPending, setReworkPending] = useState<Record<string, boolean>>({});
   const [actionError, setActionError] = useState<string | null>(null);
+  const [isExpanded, setIsExpanded] = useState(false);
   const runAction = useCallback((action: () => Promise<void>) => {
     setActionError(null);
     void action().catch((error) => {
@@ -155,170 +160,188 @@ export function AoiDotsWorkRail({
   );
   return (
     <Surface testID="aoidots-work-rail" style={styles.workRail} elevation={0}>
-      <View style={styles.workRailHeading}>
-        <Text style={styles.workRailTitle}>仕事・確認待ち</Text>
-        <Text style={styles.workRailCount}>{loading ? "更新中…" : `${items.length}件`}</Text>
+      <View testID="aoidots-work-rail-heading" style={styles.workRailHeading}>
+        <View style={styles.workRailSummary}>
+          <Text style={styles.workRailTitle} numberOfLines={1}>
+            仕事・確認待ち {items.length}件
+          </Text>
+          <Text style={styles.workRailPending} numberOfLines={1}>
+            確認待ち {pendingInputs.length}件
+          </Text>
+        </View>
+        <Pressable
+          testID="aoidots-work-rail-toggle"
+          accessibilityRole="button"
+          accessibilityLabel={`AoiDotsの仕事と確認を${isExpanded ? "折り畳む" : "展開"}`}
+          accessibilityState={{ expanded: isExpanded }}
+          onPress={() => setIsExpanded((expanded) => !expanded)}
+          hitSlop={7}
+          style={styles.workRailToggle}
+        >
+          <Text style={styles.workRailToggleText}>{isExpanded ? "折り畳む" : "展開"}</Text>
+        </Pressable>
       </View>
+      {loading ? <Text style={styles.workRailLoading} numberOfLines={1}>更新中…</Text> : null}
       {error ? (
         <View style={styles.workErrorRow}>
-          <Text style={styles.workError} accessibilityRole="alert">{error}</Text>
+          <Text style={styles.workError} accessibilityRole="alert" numberOfLines={1}>{error}</Text>
           <Button compact textColor="#89b4fa" onPress={onRetry}>再試行</Button>
         </View>
       ) : null}
-      {actionError ? <Text style={styles.workError} accessibilityRole="alert">{actionError}</Text> : null}
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.workRailList}>
-        {items.length === 0 ? <Text style={styles.muted}>実行中の仕事はありません。</Text> : items.map((item) => (
-          <View key={item.dialogue_id} style={styles.workCard}>
-            <Text style={styles.workTitle}>{item.title || item.label || item.dialogue_id}</Text>
-            <Text style={styles.workStatus}>{humanWorkStatus(item)}</Text>
-            <Text style={styles.workAgents}>
-              {item.root_agent_name || "相談窓口"} → {item.worker_agent_name || "担当Agent"}
-            </Text>
-            {item.safe_error ? <Text style={styles.workSummary} numberOfLines={2}>{item.safe_error}</Text> : null}
-            {item.artifacts?.length ? (
-              <View style={styles.workArtifacts}>
-                <Text style={styles.workArtifactsTitle}>成果 {item.artifacts.length}件</Text>
-                {item.artifacts.slice(0, 3).map((artifact, index) => (
-                  <Text
-                    key={artifact.id || artifact.artifact_ref || `${item.dialogue_id}:artifact:${index}`}
-                    style={styles.workArtifact}
-                    numberOfLines={1}
-                  >
-                    {artifact.phase ? `${artifact.phase}: ` : ""}{artifact.artifact_ref || artifact.id || "成果"}
+      {actionError ? <Text style={styles.workError} accessibilityRole="alert" numberOfLines={1}>{actionError}</Text> : null}
+      {isExpanded ? (
+        <ScrollView
+          testID="aoidots-work-rail-details"
+          style={[styles.workRailDetails, { maxHeight: workRailDetailsMaxHeight }]}
+          contentContainerStyle={styles.workRailDetailsContent}
+          nestedScrollEnabled
+          keyboardShouldPersistTaps="handled"
+        >
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.workRailList}>
+            {items.length === 0 ? <Text style={styles.muted}>実行中の仕事はありません。</Text> : items.map((item) => (
+              <View key={item.dialogue_id} style={styles.workCard}>
+                <Text style={styles.workTitle} numberOfLines={2}>{item.title || item.label || item.dialogue_id}</Text>
+                <Text style={styles.workStatus} numberOfLines={1}>{humanWorkStatus(item)}</Text>
+                <Text style={styles.workAgents} numberOfLines={1}>
+                  {item.root_agent_name || "相談窓口"} → {item.worker_agent_name || "担当Agent"}
+                </Text>
+                {item.safe_error ? <Text style={styles.workSummary} numberOfLines={2}>{item.safe_error}</Text> : null}
+                {item.artifacts?.length ? (
+                  <View style={styles.workArtifacts}>
+                    <Text style={styles.workArtifactsTitle}>成果 {item.artifacts.length}件</Text>
+                    {item.artifacts.slice(0, 3).map((artifact, index) => (
+                      <Text
+                        key={artifact.id || artifact.artifact_ref || `${item.dialogue_id}:artifact:${index}`}
+                        style={styles.workArtifact}
+                        numberOfLines={1}
+                      >
+                        {artifact.phase ? `${artifact.phase}: ` : ""}{artifact.artifact_ref || artifact.id || "成果"}
+                      </Text>
+                    ))}
+                    {item.artifacts.length > 3 ? (
+                      <Text style={styles.workArtifact}>ほか {item.artifacts.length - 3}件</Text>
+                    ) : null}
+                  </View>
+                ) : null}
+                {item.dialogue_id ? (
+                  <View style={styles.workControlRow}>
+                    {item.refs.work_item_id ? (
+                      <Button compact textColor="#89b4fa" onPress={() => onOpenWork(item.refs.work_item_id!)}>Work</Button>
+                    ) : null}
+                    {item.allowed_actions.includes("resume") ? <Button compact textColor="#89b4fa" onPress={() => runAction(() => onControl(item, "resume"))}>再開</Button> : null}
+                    {item.allowed_actions.includes("stop") ? <Button compact textColor="#f38ba8" onPress={() => runAction(() => onControl(item, "stop"))}>停止</Button> : null}
+                    {item.allowed_actions.includes("rework") ? (
+                      <Button
+                        compact
+                        textColor="#f9e2af"
+                        onPress={() => setReworkOpen((current) => ({ ...current, [item.dialogue_id]: true }))}
+                        disabled={Boolean(reworkPending[item.dialogue_id])}
+                      >
+                        修正
+                      </Button>
+                    ) : null}
+                  </View>
+                ) : null}
+                {item.dialogue_id && reworkOpen[item.dialogue_id] ? (
+                  <View style={styles.reworkEditor}>
+                    <TextInput
+                      dense
+                      mode="outlined"
+                      value={reworkDrafts[item.dialogue_id] ?? ""}
+                      onChangeText={(value) => setReworkDrafts((current) => ({ ...current, [item.dialogue_id]: value }))}
+                      placeholder="修正指示（任意）"
+                      maxLength={30_000}
+                      multiline
+                      numberOfLines={3}
+                      disabled={Boolean(reworkPending[item.dialogue_id])}
+                      style={styles.reworkInput}
+                    />
+                    <View style={styles.workControlRow}>
+                      <Button
+                        compact
+                        onPress={() => setReworkOpen((current) => ({ ...current, [item.dialogue_id]: false }))}
+                        disabled={Boolean(reworkPending[item.dialogue_id])}
+                      >
+                        キャンセル
+                      </Button>
+                      <Button
+                        compact
+                        mode="contained"
+                        buttonColor="#7c3aed"
+                        onPress={() => {
+                          setReworkOpen((current) => ({ ...current, [item.dialogue_id]: false }));
+                          setReworkPending((current) => ({ ...current, [item.dialogue_id]: true }));
+                          runAction(() => onControl(item, "rework", reworkDrafts[item.dialogue_id] ?? "").finally(() => {
+                            setReworkPending((current) => ({ ...current, [item.dialogue_id]: false }));
+                          }));
+                        }}
+                        disabled={Boolean(reworkPending[item.dialogue_id])}
+                      >
+                        送信
+                      </Button>
+                    </View>
+                  </View>
+                ) : null}
+              </View>
+            ))}
+          </ScrollView>
+          {pendingInputs.length > 0 ? (
+            <View style={styles.inputRail}>
+              <Text style={styles.inputRailTitle}>AoiDotsからの確認</Text>
+              {pendingInputs.map((input) => (
+                <View key={input.id} style={styles.inputCard}>
+                  <Text style={styles.inputPrompt}>
+                    {input.question || input.question_message_id || "確認が必要です"}
                   </Text>
-                ))}
-                {item.artifacts.length > 3 ? (
-                  <Text style={styles.workArtifact}>ほか {item.artifacts.length - 3}件</Text>
-                ) : null}
-              </View>
-            ) : null}
-            {item.dialogue_id ? (
-              <View style={styles.workControlRow}>
-                {item.refs.work_item_id ? (
-                  <Button compact textColor="#89b4fa" onPress={() => onOpenWork(item.refs.work_item_id!)}>Work</Button>
-                ) : null}
-                {item.allowed_actions.includes("resume") ? <Button compact textColor="#89b4fa" onPress={() => runAction(() => onControl(item, "resume"))}>再開</Button> : null}
-                {item.allowed_actions.includes("stop") ? <Button compact textColor="#f38ba8" onPress={() => runAction(() => onControl(item, "stop"))}>停止</Button> : null}
-                {item.allowed_actions.includes("rework") ? (
-                  <Button
-                    compact
-                    textColor="#f9e2af"
-                    onPress={() => setReworkOpen((current) => ({ ...current, [item.dialogue_id]: true }))}
-                    disabled={Boolean(reworkPending[item.dialogue_id])}
-                  >
-                    修正
-                  </Button>
-                ) : null}
-              </View>
-            ) : null}
-            {item.dialogue_id && reworkOpen[item.dialogue_id] ? (
-              <View style={styles.reworkEditor}>
-                <TextInput
-                  dense
-                  mode="outlined"
-                  value={reworkDrafts[item.dialogue_id] ?? ""}
-                  onChangeText={(value) => setReworkDrafts((current) => ({ ...current, [item.dialogue_id]: value }))}
-                  placeholder="修正指示（任意）"
-                  maxLength={30_000}
-                  multiline
-                  numberOfLines={3}
-                  disabled={Boolean(reworkPending[item.dialogue_id])}
-                  style={styles.reworkInput}
-                />
-                <View style={styles.workControlRow}>
-                  <Button
-                    compact
-                    onPress={() => setReworkOpen((current) => ({ ...current, [item.dialogue_id]: false }))}
-                    disabled={Boolean(reworkPending[item.dialogue_id])}
-                  >
-                    キャンセル
-                  </Button>
-                  <Button
-                    compact
-                    mode="contained"
-                    buttonColor="#7c3aed"
-                    onPress={() => {
-                      setReworkOpen((current) => ({ ...current, [item.dialogue_id]: false }));
-                      setReworkPending((current) => ({ ...current, [item.dialogue_id]: true }));
-                      runAction(() => onControl(item, "rework", reworkDrafts[item.dialogue_id] ?? "").finally(() => {
-                        setReworkPending((current) => ({ ...current, [item.dialogue_id]: false }));
-                      }));
-                    }}
-                    disabled={Boolean(reworkPending[item.dialogue_id])}
-                  >
-                    送信
-                  </Button>
-                </View>
-              </View>
-            ) : null}
-          </View>
-        ))}
-      </ScrollView>
-      {pendingInputs.length > 0 ? (
-        <View style={styles.inputRail}>
-          <Text style={styles.inputRailTitle}>AoiDotsからの確認</Text>
-          {pendingInputs.slice(0, 3).map((input) => (
-            <View key={input.id} style={styles.inputRow}>
-              <Text style={styles.inputPrompt} numberOfLines={2}>{input.question || input.question_message_id || "確認が必要です"}</Text>
-              {input.choices.map((choice) => (
-                <Button
-                  key={choice}
-                  compact
-                  mode={selectedChoices[input.id]?.includes(choice) ? "contained" : "outlined"}
-                  onPress={() => toggleChoice(input.id, choice, input.allow_multiple)}
-                >
-                  {choice}
-                </Button>
-              ))}
-              {input.allow_free_text ? (
-                <>
-                  <TextInput
-                    dense
-                    mode="outlined"
-                    value={answers[input.id] ?? ""}
-                    onChangeText={(value) => setAnswers((current) => ({ ...current, [input.id]: value }))}
-                    placeholder="回答"
-                    style={styles.inputField}
-                  />
-                  {input.choices.length === 0 ? (
-                    <Button
-                      compact
-                      mode="contained"
-                      buttonColor="#7c3aed"
-                      disabled={
-                        !canSubmitAoiDotsAnswer(
-                          input,
-                          answers[input.id] ?? "",
-                          selectedChoices[input.id] ?? [],
-                        ) || !input.dialogue_id
-                      }
-                      onPress={() => runAction(() => onAnswer(input, answerPayload(input)))}
-                    >
-                      回答
-                    </Button>
+                  {input.choices.length > 0 ? (
+                    <View style={styles.inputChoiceRow}>
+                      {input.choices.map((choice, choiceIndex) => (
+                        <Button
+                          key={choice}
+                          testID={`aoidots-input-choice-${input.id}-${choiceIndex}`}
+                          compact
+                          mode={selectedChoices[input.id]?.includes(choice) ? "contained" : "outlined"}
+                          onPress={() => toggleChoice(input.id, choice, input.allow_multiple)}
+                        >
+                          {choice}
+                        </Button>
+                      ))}
+                    </View>
                   ) : null}
-                </>
-              ) : null}
-              {input.choices.length > 0 ? (
-                <Button
-                  compact
-                  mode="contained"
-                  buttonColor="#7c3aed"
-                  disabled={
-                    !canSubmitAoiDotsAnswer(
-                      input,
-                      answers[input.id] ?? "",
-                      selectedChoices[input.id] ?? [],
-                    ) || !input.dialogue_id
-                  }
-                  onPress={() => runAction(() => onAnswer(input, answerPayload(input)))}
-                >
-                  回答
-                </Button>
-              ) : null}
+                  {input.allow_free_text ? (
+                    <TextInput
+                      dense
+                      mode="outlined"
+                      value={answers[input.id] ?? ""}
+                      onChangeText={(value) => setAnswers((current) => ({ ...current, [input.id]: value }))}
+                      placeholder="回答"
+                      style={styles.inputField}
+                    />
+                  ) : null}
+                  {(input.choices.length > 0 || input.allow_free_text) ? (
+                    <View style={styles.inputActions}>
+                      <Button
+                        compact
+                        mode="contained"
+                        buttonColor="#7c3aed"
+                        disabled={
+                          !canSubmitAoiDotsAnswer(
+                            input,
+                            answers[input.id] ?? "",
+                            selectedChoices[input.id] ?? [],
+                          ) || !input.dialogue_id
+                        }
+                        onPress={() => runAction(() => onAnswer(input, answerPayload(input)))}
+                      >
+                        回答
+                      </Button>
+                    </View>
+                  ) : null}
+                </View>
+              ))}
             </View>
-          ))}
-        </View>
+          ) : null}
+        </ScrollView>
       ) : null}
     </Surface>
   );
@@ -536,6 +559,7 @@ export function AoiDotsProvider({ children }: { children: React.ReactNode }) {
                     runtimeFocus={{ isFocused: conversationActive, focusEpoch }}
                     active={conversationActive}
                     embedded
+                    aoiDotsRoot
                     embeddedHeaderAccessory={(
                       <AoiDotsWorkRail
                         items={workItems}
@@ -588,12 +612,18 @@ const styles = StyleSheet.create({
   modal: { flex: 1, overflow: "hidden", borderRadius: 16, backgroundColor: "#11111b" },
   surfaceWrap: { flex: 1, minHeight: 0 },
   surfaceBody: { flex: 1, minHeight: 0 },
-  workRail: { backgroundColor: "#181825", paddingHorizontal: 10, paddingVertical: 6, borderBottomColor: "#313244", borderBottomWidth: StyleSheet.hairlineWidth },
-  workRailHeading: { flexDirection: "row", alignItems: "center", gap: 8 },
+  workRail: { backgroundColor: "#181825", paddingHorizontal: 10, paddingVertical: 0, borderBottomColor: "#313244", borderBottomWidth: StyleSheet.hairlineWidth },
+  workRailHeading: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  workRailSummary: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 10 },
   workRailTitle: { color: "#cdd6f4", fontSize: 12, fontWeight: "700" },
-  workRailCount: { color: "#a6adc8", fontSize: 11 },
+  workRailPending: { color: "#f9e2af", fontSize: 11 },
+  workRailToggle: { minHeight: 30, justifyContent: "center", paddingHorizontal: 9, borderColor: "#45475a", borderWidth: 1, borderRadius: 7 },
+  workRailToggleText: { color: "#cdd6f4", fontSize: 11, fontWeight: "700" },
+  workRailLoading: { color: "#a6adc8", fontSize: 10 },
   workErrorRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   workError: { flex: 1, color: "#f38ba8", fontSize: 11 },
+  workRailDetails: { maxHeight: 280 },
+  workRailDetailsContent: { gap: 8, paddingTop: 7, paddingBottom: 4 },
   workRailList: { gap: 8, paddingVertical: 5 },
   workCard: { width: 170, borderColor: "#45475a", borderWidth: 1, borderRadius: 8, padding: 7, backgroundColor: "#1e1e2e" },
   workTitle: { color: "#cdd6f4", fontSize: 12, fontWeight: "700" },
@@ -603,12 +633,14 @@ const styles = StyleSheet.create({
   workArtifacts: { marginTop: 4, gap: 1 },
   workArtifactsTitle: { color: "#f9e2af", fontSize: 10, fontWeight: "700" },
   workArtifact: { color: "#a6adc8", fontSize: 9 },
-  inputRail: { borderTopColor: "#313244", borderTopWidth: StyleSheet.hairlineWidth, paddingTop: 5 },
+  inputRail: { borderTopColor: "#313244", borderTopWidth: StyleSheet.hairlineWidth, paddingTop: 7, gap: 7 },
   inputRailTitle: { color: "#f9e2af", fontSize: 11, fontWeight: "700", marginBottom: 3 },
-  inputRow: { flexDirection: "row", alignItems: "center", gap: 5 },
-  inputPrompt: { color: "#cdd6f4", flex: 1, fontSize: 11 },
-  inputField: { width: 110, height: 38, backgroundColor: "#1e1e2e" },
-  workControlRow: { flexDirection: "row", justifyContent: "flex-end", gap: 0, marginTop: 3 },
+  inputCard: { borderColor: "#45475a", borderWidth: 1, borderRadius: 8, padding: 8, gap: 5, backgroundColor: "#1e1e2e" },
+  inputPrompt: { color: "#cdd6f4", fontSize: 11 },
+  inputChoiceRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 4 },
+  inputActions: { flexDirection: "row", justifyContent: "flex-end" },
+  inputField: { minHeight: 40, backgroundColor: "#1e1e2e" },
+  workControlRow: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 0, marginTop: 3 },
   reworkEditor: { marginTop: 5, gap: 3 },
   reworkInput: { minHeight: 66, backgroundColor: "#1e1e2e" },
   loading: { flex: 1, alignItems: "center", justifyContent: "center", gap: 14, padding: 24 },

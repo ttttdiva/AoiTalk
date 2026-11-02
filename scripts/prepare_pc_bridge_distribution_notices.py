@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pc_bridge.browser_backend import load_helper_bundle  # noqa: E402
+from pc_bridge.agent_browser_bundle import load_helper_bundle  # noqa: E402
 from pc_bridge.agent_browser_supervisor import AgentBrowserPreparationError  # noqa: E402
 from pc_bridge.license_bundle import LicenseBundleError, load_bundle  # noqa: E402
 

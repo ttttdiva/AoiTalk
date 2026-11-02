@@ -27,7 +27,7 @@ from ..llm.generation_error import (
     user_message_for_generation_kind,
 )
 from ..memory.models import ClipIngestReceipt, DocsLibrary, KnowledgeNode
-from .agent_team_service import AGENT_TEAM_PROVIDERS, config_get
+from .runtime_policy_utils import MODEL_PROVIDER_IDS, config_get
 from .clip_ingest_service import ClipIngestError, ClipIngestResult, ClipIngestService
 from .clip_ingest_storage import ClipIngestStorage, ClipUpload, ClipUploadError
 from .llm_model_catalog import model_supports_vision
@@ -736,7 +736,7 @@ def resolve_clip_ingest_llm_client(
         )
     provider = str(route.get("provider") or "").strip().lower()
     model = str(route.get("model") or "").strip()
-    if not provider or not model or provider not in AGENT_TEAM_PROVIDERS:
+    if not provider or not model or provider not in MODEL_PROVIDER_IDS:
         if not allow_fallback:
             raise DocsIngestUnavailableError(
                 "専用ClipIngest routeのprovider/modelが未対応または未設定です"

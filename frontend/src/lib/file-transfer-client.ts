@@ -239,28 +239,55 @@ type DownloadParseState = {
 
 async function createDiskBackedDownloadSink(): Promise<DiskBackedDownloadSink> {
   if (typeof navigator === "undefined" || !navigator.storage) {
-    throw new Error("このブラウザでは大容量ファイルの互換ダウンロードを利用できません");
+    throw new FileTransferNativeRequiredError(
+      "このブラウザでは大容量ファイルの互換ダウンロードを利用できません",
+    );
   }
   const storage = navigator.storage as StorageManager & {
     getDirectory?: () => Promise<FileSystemDirectoryHandle>;
   };
   if (typeof storage.getDirectory !== "function") {
-    throw new Error("このブラウザでは大容量ファイルの互換ダウンロードを利用できません");
+    throw new FileTransferNativeRequiredError(
+      "このブラウザでは大容量ファイルの互換ダウンロードを利用できません",
+    );
   }
-  const root = await storage.getDirectory();
-  const directory = await root.getDirectoryHandle("aoitalk-file-transfer", { create: true });
+  let root: FileSystemDirectoryHandle;
+  try {
+    root = await storage.getDirectory();
+  } catch {
+    throw new FileTransferNativeRequiredError(
+      "このブラウザでは大容量ファイルの互換ダウンロードを利用できません",
+    );
+  }
+  let directory: FileSystemDirectoryHandle;
+  try {
+    directory = await root.getDirectoryHandle("aoitalk-file-transfer", { create: true });
+  } catch {
+    throw new FileTransferNativeRequiredError(
+      "このブラウザでは大容量ファイルの互換ダウンロードを利用できません",
+    );
+  }
   const id =
     typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const name = `download-${id}.tmp`;
-  const handle = await directory.getFileHandle(name, { create: true });
+  let handle: FileSystemFileHandle;
+  try {
+    handle = await directory.getFileHandle(name, { create: true });
+  } catch {
+    throw new FileTransferNativeRequiredError(
+      "このブラウザでは大容量ファイルの互換ダウンロードを利用できません",
+    );
+  }
   let writable: FileSystemWritableFileStream;
   try {
     writable = await handle.createWritable();
-  } catch (error) {
+  } catch {
     await directory.removeEntry(name).catch(() => undefined);
-    throw error;
+    throw new FileTransferNativeRequiredError(
+      "このブラウザでは大容量ファイルの互換ダウンロードを利用できません",
+    );
   }
   let closed = false;
   let removed = false;
@@ -361,11 +388,14 @@ async function parseDownloadLine(
         MAX_COMPAT_METADATA_BYTES,
       ),
     );
+    const expectedContentType = responseContract?.expectedContentType;
     if (
       responseContract &&
-      (state.metadata.mimeType.split(";", 1)[0].trim().toLowerCase() !==
-        responseContract.expectedContentType ||
-        state.metadata.attachment !== true)
+      ((expectedContentType !== undefined &&
+        state.metadata.mimeType.split(";", 1)[0].trim().toLowerCase() !==
+          expectedContentType) ||
+        (responseContract.requireAttachment === true &&
+          state.metadata.attachment !== true))
     ) {
       throw new Error("download response does not meet the required contract");
     }

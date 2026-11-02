@@ -28,6 +28,7 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
 SOURCE_INPUT_PATHS = (
     "mobile",
+    "shared",
     "resources/chat-background",
     "resources/seethrough-rig/runtime",
     "scripts/build_apk.bat",
@@ -39,11 +40,13 @@ SOURCE_INPUT_PATHS = (
     "scripts/publish_latest_json.ps1",
     "scripts/stage_chat_background.py",
     "scripts/stage_mobile_runtime.py",
+    "scripts/stage_mobile_shared.py",
     "scripts/verify_mobile_apk.ps1",
     "Publish.bat",
 )
 COMPILED_INPUT_PATHS = (
     "mobile",
+    "shared",
     "resources/chat-background",
     "resources/seethrough-rig/runtime",
     "scripts/build_apk.bat",
@@ -51,10 +54,12 @@ COMPILED_INPUT_PATHS = (
     "scripts/build_mobile_apk.ps1",
     "scripts/stage_chat_background.py",
     "scripts/stage_mobile_runtime.py",
+    "scripts/stage_mobile_shared.py",
 )
 
 MOBILE_HASH_INPUT_PATHS = (
     "mobile",
+    "shared",
     "resources/chat-background",
 )
 

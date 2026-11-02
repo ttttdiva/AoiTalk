@@ -8,11 +8,21 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ConversationMessage } from "@/lib/chat-api";
+import type {
+  ConversationMessage,
+  ConversationMessageHistoryIndexEntry,
+} from "@/lib/chat-api";
 import { CHAT_COMMANDS, commandCapabilitiesFromMessageMetadata } from "@/lib/chat-commands";
 import { cn } from "@/lib/utils";
 
 const MAX_PREVIEW_LENGTH = 120;
+
+export type ChatMessageHistoryRailEntry = Pick<
+  ConversationMessage,
+  "id" | "role"
+> &
+  Partial<Pick<ConversationMessage, "content" | "metadata">> &
+  Partial<Pick<ConversationMessageHistoryIndexEntry, "position" | "preview">>;
 
 /**
  * Return an id that is safe to use in the DOM without relying on CSS selector
@@ -35,7 +45,10 @@ function truncatePreview(value: string): string {
   return `${normalized.slice(0, MAX_PREVIEW_LENGTH - 1)}…`;
 }
 
-function messagePreview(message: ConversationMessage): string {
+function messagePreview(message: ChatMessageHistoryRailEntry): string {
+  if (typeof message.preview === "string" && message.preview.trim()) {
+    return truncatePreview(message.preview);
+  }
   const content = truncatePreview(message.content || "");
   if (content) return content;
 
@@ -65,25 +78,19 @@ function messagePreview(message: ConversationMessage): string {
   return "（内容のないメッセージ）";
 }
 
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  );
-}
-
 type ChatMessageHistoryRailProps = {
-  messages: ConversationMessage[];
+  messages: ChatMessageHistoryRailEntry[];
+  onScrollToMessage: (messageId: string) => Promise<boolean>;
 };
 
 /**
- * A compact, desktop-only history rail for the user messages visible in the
- * current chat branch. It intentionally renders from the already filtered
- * visible message list so inactive branch messages never get a marker.
+ * A compact, desktop-only history rail for the user messages in the active
+ * chat branch. The compact server index keeps older targets available while
+ * message bodies remain paged; loaded rows supply their richer local preview.
  */
 export function ChatMessageHistoryRail({
   messages,
+  onScrollToMessage,
 }: ChatMessageHistoryRailProps) {
   const userMessages = useMemo(
     () => messages.filter((message) => message.role === "user"),
@@ -168,16 +175,9 @@ export function ChatMessageHistoryRail({
     };
   }, [updatePreviewPosition]);
 
-  const scrollToMessage = useCallback((message: ConversationMessage) => {
-    const target = document.getElementById(getChatMessageDomId(message.id));
-    if (!target) return;
-
-    setSelectedMessageId(message.id);
-    target.scrollIntoView({
-      behavior: prefersReducedMotion() ? "auto" : "smooth",
-      block: "center",
-    });
-  }, []);
+  const scrollToMessage = useCallback(async (message: ChatMessageHistoryRailEntry) => {
+    if (await onScrollToMessage(message.id)) setSelectedMessageId(message.id);
+  }, [onScrollToMessage]);
 
   if (userMessages.length === 0) return null;
 
@@ -242,12 +242,6 @@ export function ChatMessageHistoryRail({
                     }
                   }}
                   onClick={() => scrollToMessage(message)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      scrollToMessage(message);
-                    }
-                  }}
                 >
                   <span
                     aria-hidden="true"

@@ -12,6 +12,7 @@ on the stable Agent row.  Mutable worker definition lives in immutable
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict
@@ -125,10 +126,68 @@ def _safe_json(value: Any, default: Any) -> Any:
     return None
 
 
+_REVISION_V2_SECRET_MARKERS = (
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "api_key",
+    "cookie",
+    "authorization",
+)
+
+
+def _safe_revision_v2_json(value: Any, default: Any) -> Any:
+    """Bound v2 route/tool JSON while retaining legitimate model metadata."""
+
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        if len(value) > 64:
+            return {}
+        return {
+            str(key): _safe_revision_v2_json(item, None)
+            for key, item in value.items()
+            if not any(marker in str(key).casefold() for marker in _REVISION_V2_SECRET_MARKERS)
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_safe_revision_v2_json(item, None) for item in list(value)[:128]]
+    if isinstance(value, (str, int, float, bool)):
+        if isinstance(value, str):
+            lowered = value.casefold()
+            if any(
+                marker in lowered
+                for marker in (
+                    "bearer ",
+                    "api_key",
+                    "apikey",
+                    "password=",
+                    "token=",
+                    "secret=",
+                    "credential=",
+                    "authorization:",
+                    "cookie=",
+                )
+            ):
+                return "[REDACTED]"
+            if ("/" in value or "\\" in value) and len(value) > 160:
+                return "[REDACTED]"
+        return value
+    return None
+
+
+_INSTRUCTION_PATH_FRAGMENT_RE = re.compile(
+    r"(?i)https?://[^\s<>()]+"
+    r"|(?<![\w])(?:[a-z]:[\\/][^\s,;]+|\\\\[^\s,;]+"
+    r"|/(?:[^/\s,;]+/)*[^/\s,;]+|(?:\.\.?|~)/(?:[^/\s,;]+/)*[^/\s,;]+)"
+    r"|(?<![\w])(?:[\w.-]+/)+[\w.-]+\.[a-z0-9]{1,8}\b"
+)
+
+
 def _safe_instruction(value: Any, *, limit: int = 1200) -> str:
     """Bound revision prose before exposing it through operator APIs.
 
-    Agent instructions are executable context, not an authority grant.  Keep
+    Agent instructions are executable context, not an authority grant. Keep
     a short diagnostic preview for administrators while removing obvious
     credential/path-shaped fragments and never returning an unbounded prompt.
     """
@@ -141,6 +200,22 @@ def _safe_instruction(value: Any, *, limit: int = 1200) -> str:
         return "[REDACTED]"
     if "/" in text or "\\" in text:
         # Paths and command snippets are not needed in a safe identity DTO.
+        return "[REDACTED]"
+    return text[:limit]
+
+
+def _safe_responsibility_summary(value: Any, *, limit: int = 1200) -> str:
+    """Keep owner-facing summary prose while hiding credentials and paths."""
+
+    text = str(value or "")
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if any(marker in lowered for marker in ("api_key", "apikey", "password", "secret", "token", "credential", "authorization:")):
+        return "[REDACTED]"
+    if _INSTRUCTION_PATH_FRAGMENT_RE.search(text):
+        # Keep the all-or-nothing path protection so quoted paths containing
+        # spaces cannot leak through a partially redacted preview.
         return "[REDACTED]"
     return text[:limit]
 
@@ -369,13 +444,21 @@ class AgentRevision(Base):
     mission = Column(Text, nullable=False, default="", server_default="")
     responsibility_summary = Column(Text, nullable=False, default="", server_default="")
     operational_instructions = Column(Text, nullable=False, default="", server_default="")
-    agent_team_id = Column(String(100), nullable=False)
-    execution_profile_id = Column(String(100), nullable=False)
-    allowed_subagent_ids = Column(JSON, nullable=False, default=list, server_default="[]")
+    # Retired P5 topology pins are nullable on new revisions and retained only
+    # as historical data for old revisions and route displays.
+    agent_team_id = Column(String(100), nullable=True)
+    execution_profile_id = Column(String(100), nullable=True)
+    allowed_subagent_ids = Column(JSON, nullable=True, default=None)
     capability_ceiling_json = Column("capability_ceiling", JSON, nullable=False, default=list, server_default="[]")
     wake_policy_json = Column("wake_policy", JSON, nullable=False, default=dict, server_default="{}")
     budget_policy_json = Column("budget_policy", JSON, nullable=False, default=dict, server_default="{}")
     concurrency_policy_json = Column("concurrency_policy", JSON, nullable=False, default=dict, server_default="{}")
+    # P2 fields are nullable so rows written before the migration remain
+    # valid.  New revision writers normalize omitted values before hashing;
+    # direct legacy rows therefore continue to expose ``None`` here.
+    model_overrides = Column(JSON, nullable=True)
+    tool_ids = Column(JSON, nullable=True)
+    delegate_policy = Column(JSON, nullable=True)
     content_hash = Column(String(64), nullable=False, index=True)
     idempotency_key = Column(String(255), nullable=False)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -432,6 +515,26 @@ class AgentRevision(Base):
         self.allowed_subagent_ids = value
 
     @property
+    def model_overrides_json(self) -> Any:
+        """Compatibility alias for callers that use the existing JSON suffix."""
+
+        return self.model_overrides
+
+    @model_overrides_json.setter
+    def model_overrides_json(self, value: Any) -> None:
+        self.model_overrides = value
+
+    @property
+    def delegate_policy_json(self) -> Any:
+        """Compatibility alias for callers that use the existing JSON suffix."""
+
+        return self.delegate_policy
+
+    @delegate_policy_json.setter
+    def delegate_policy_json(self, value: Any) -> None:
+        self.delegate_policy = value
+
+    @property
     def revision_idempotency_key(self) -> str:
         return self.idempotency_key
 
@@ -440,22 +543,29 @@ class AgentRevision(Base):
         self.idempotency_key = value
 
     def to_safe_dict(self) -> Dict[str, Any]:
+        legacy = {
+            "agent_team_id": self.agent_team_id,
+            "execution_profile_id": self.execution_profile_id,
+            "allowed_subagent_ids": list(_json(self.allowed_subagent_ids, []) or []),
+        }
+        if not any(value not in (None, "", []) for value in legacy.values()):
+            legacy = None
         return {
             "id": _uuid(self.id),
             "agent_id": _uuid(self.agent_id),
             "version": int(self.version or 1),
             "display_name": self.display_name,
             "mission": _safe_instruction(self.mission),
-            "responsibility_summary": _safe_instruction(self.responsibility_summary),
+            "responsibility_summary": _safe_responsibility_summary(self.responsibility_summary),
             "operational_instructions": _safe_instruction(self.operational_instructions),
-            "agent_team_id": self.agent_team_id,
-            "team_id": self.agent_team_id,
-            "execution_profile_id": self.execution_profile_id,
-            "allowed_subagent_ids": list(_json(self.allowed_subagent_ids, [])),
+            "legacy": legacy,
             "capability_ceiling": list(_safe_json(self.capability_ceiling_json, []) or []),
             "wake_policy": _safe_json(self.wake_policy_json, {}),
             "budget_policy": _safe_json(self.budget_policy_json, {}),
             "concurrency_policy": _safe_json(self.concurrency_policy_json, {}),
+            "model_overrides": _safe_revision_v2_json(self.model_overrides, None),
+            "tool_ids": _safe_revision_v2_json(self.tool_ids, None),
+            "delegate_policy": _safe_revision_v2_json(self.delegate_policy, None),
             "content_hash": self.content_hash,
             "created_by": _uuid(self.created_by),
             "created_by_user_id": _uuid(self.created_by),

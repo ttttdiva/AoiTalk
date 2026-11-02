@@ -6,12 +6,11 @@ type UsageTier = "tier_1_2" | "tier_3_plus";
 
 async function mockBudgetApis(page: Page, tier: UsageTier = "tier_3_plus") {
   const main = { provider: "gemini", model: "fixture-base" };
-  const team = { schema_version: 3, delegation_enabled: false, teams: [], execution_profiles: [] };
   const profile = {
     enabled: true, main_pool_id: "coordinator", max_fallbacks: 2,
-    pools: {}, llm_profiles: {},
+    pools: {},
   };
-  const before = structuredClone({ main, team, profile });
+  const before = structuredClone({ main, profile });
   let quotas = [
     { id: "openai-sol-daily", limit: 1000000, safety_margin_ratio: 0, safety_margin_units: 40000 },
     { id: "openai-luna-daily", limit: 10000000, safety_margin_ratio: 0.01, safety_margin_units: 0 },
@@ -59,9 +58,7 @@ async function mockBudgetApis(page: Page, tier: UsageTier = "tier_3_plus") {
           models: [{ id: main.model, label: "Fixture Base" }] }],
       } });
     } else if (path === "/api/python-proxy/settings") {
-      await route.fulfill({ json: { settings: { agent_team: team } } });
-    } else if (path === "/api/python-proxy/agent-team/config") {
-      await route.fulfill({ json: { agent_team: team } });
+      await route.fulfill({ json: { settings: {} } });
     } else if (path === "/api/python-proxy/free-team/settings") {
       await route.fulfill({ json: { profile, credentials: [], candidates: [] } });
     } else if (path === "/api/python-proxy/free-team/usage") {
@@ -73,7 +70,7 @@ async function mockBudgetApis(page: Page, tier: UsageTier = "tier_3_plus") {
       await route.fallback();
     }
   });
-  return { writes, freeTeamReads, before, current: () => ({ main, team, profile }) };
+  return { writes, freeTeamReads, before, current: () => ({ main, profile }) };
 }
 
 async function expandModels(page: Page) {

@@ -7,14 +7,24 @@ import {
   useCallback,
   useRef,
   useEffect,
+  useLayoutEffect,
   type ReactNode,
 } from "react";
-import { chatApi, type ConversationSession } from "@/lib/chat-api";
+import {
+  chatApi,
+  type ConversationListResponse,
+  type ConversationSession,
+} from "@/lib/chat-api";
 
 type ChatSessionContextValue = {
   sessions: ConversationSession[];
   sessionsError: string | null;
+  sessionsLoadMoreError: string | null;
+  hasLoadedSessions: boolean;
+  hasMoreSessions: boolean;
+  isLoadingMoreSessions: boolean;
   fetchSessions: () => Promise<void>;
+  loadMoreSessions: () => Promise<void>;
   /** Mark a session read while preserving the assistant-completion fence. */
   markSessionRead: (sessionId: string) => Promise<void>;
   addSession: (session: ConversationSession) => void;
@@ -40,6 +50,11 @@ type ChatSessionContextValue = {
 
 /** 会話履歴はProviderを正本にして全Workspace/Quick Panelから共有する。 */
 const SESSIONS_REFRESH_INTERVAL_MS = 15000;
+const SESSION_PAGE_LIMIT = 10;
+const useClientLayoutEffect =
+  typeof window === "undefined" ? useEffect : useLayoutEffect;
+
+type SessionMergeMode = "refresh" | "append";
 // The history lifecycle is projected by the server from completion/read
 // fences.  Optimistic read handling may update these fields for immediate UI
 // feedback, but a later list response must be allowed to restore a newer
@@ -100,6 +115,10 @@ const ChatSessionContext = createContext<ChatSessionContextValue | null>(null);
 export function ChatSessionProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<ConversationSession[]>([]);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const [sessionsLoadMoreError, setSessionsLoadMoreError] = useState<string | null>(null);
+  const [hasLoadedSessions, setHasLoadedSessions] = useState(false);
+  const [hasMoreSessions, setHasMoreSessions] = useState(false);
+  const [isLoadingMoreSessions, setIsLoadingMoreSessions] = useState(false);
   const [requestedSessionId, setRequestedSessionId] = useState<string | null>(
     null,
   );
@@ -117,8 +136,21 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
   // 同時に走る fetchSessions() を1リクエストへ束ねる。各画面のQuick Panelや
   // route遷移直後の再試行が重なっても、GET /api/conversationsは1本にする。
   const inFlightFetchRef = useRef<Promise<void> | null>(null);
+  const inFlightLoadMoreRef = useRef<Promise<void> | null>(null);
+  const pageOneCursorStateRef = useRef<{
+    cursor: string | null;
+    hasMore: boolean;
+  } | null>(null);
+  const loadedPageCountRef = useRef(0);
+  const nextSessionsCursorRef = useRef<string | null>(null);
+  const hasMoreSessionsRef = useRef(false);
+  const pageOneGenerationRef = useRef(0);
+  const appliedPageOneGenerationRef = useRef(0);
+  const loadMoreCursorRef = useRef<string | null>(null);
   const sessionsRef = useRef<ConversationSession[]>([]);
-  sessionsRef.current = sessions;
+  useClientLayoutEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   const markSessionMutation = useCallback((id: string, fields: string[]) => {
     if (fields.length === 0) return;
@@ -135,10 +167,16 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
       fetched: ConversationSession[],
       previous: ConversationSession[],
       mutationSnapshot: Map<string, Map<string, number>>,
+      mode: SessionMergeMode,
     ): ConversationSession[] => {
       const previousById = new Map(previous.map((session) => [session.id, session]));
-      const fetchedIds = new Set(fetched.map((session) => session.id));
+      const fetchedIds = new Set<string>();
       const mergedFetched = fetched.flatMap((session) => {
+        // A page-one refresh can overlap a load-more response while a new
+        // session is also being projected. Keep the first occurrence in the
+        // server's stable order and never render duplicate IDs.
+        if (fetchedIds.has(session.id)) return [];
+        fetchedIds.add(session.id);
         if (removedSessionIdsRef.current.has(session.id)) return [];
         const previousSession = previousById.get(session.id);
         if (!previousSession) return [session];
@@ -200,22 +238,20 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
       const preservedSessions = previous.filter((session) => {
         if (fetchedIds.has(session.id)) return false;
         if (removedSessionIdsRef.current.has(session.id)) return false;
-        const mutationVersions = sessionMutationVersionRef.current.get(session.id);
-        const requestVersions = mutationSnapshot.get(session.id);
-        const changedAfterRequest = [...(mutationVersions?.entries() ?? [])].some(
-          ([field, version]) => version > (requestVersions?.get(field) ?? 0),
-        );
-        return (
-          optimisticSessionIdsRef.current.has(session.id) ||
-          changedAfterRequest
-        );
+        // The first page is intentionally bounded. Older pages already loaded
+        // by the user must survive a polling refresh, even when they are no
+        // longer part of page one because a session became more active.
+        return true;
       });
 
       for (const session of fetched) {
         optimisticSessionIdsRef.current.delete(session.id);
       }
 
-      const next = [...preservedSessions, ...mergedFetched];
+      const next =
+        mode === "refresh"
+          ? [...mergedFetched, ...preservedSessions]
+          : [...preservedSessions, ...mergedFetched];
       sessionsRef.current = next;
       return next;
     },
@@ -226,18 +262,55 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
     // 進行中の取得があれば、それに相乗りして重複 GET を避ける。
     if (inFlightFetchRef.current) return inFlightFetchRef.current;
 
+    const requestGeneration = pageOneGenerationRef.current + 1;
+    pageOneGenerationRef.current = requestGeneration;
+    const mutationSnapshot = new Map(
+      [...sessionMutationVersionRef.current.entries()].map(
+        ([id, versions]) => [id, new Map(versions)],
+      ),
+    );
     const pending = (async () => {
       try {
-        const mutationSnapshot = new Map(
-          [...sessionMutationVersionRef.current.entries()].map(
-            ([id, versions]) => [id, new Map(versions)],
+        const data: ConversationListResponse = await chatApi.listSessions(
+          undefined,
+          undefined,
+          undefined,
+          { limit: SESSION_PAGE_LIMIT, cursor: null },
+        );
+        // A future adapter may allow overlapping refreshes. Never let an older
+        // page-one response replace the cursor metadata from a newer refresh.
+        if (requestGeneration < appliedPageOneGenerationRef.current) return;
+        appliedPageOneGenerationRef.current = requestGeneration;
+        const pageOneCursor =
+          typeof data.next_cursor === "string" && data.next_cursor.length > 0
+            ? data.next_cursor
+            : null;
+        const pageOneHasMore = data.has_more === true && pageOneCursor !== null;
+        pageOneCursorStateRef.current = {
+          cursor: pageOneCursor,
+          hasMore: pageOneHasMore,
+        };
+        setSessions((prev) =>
+          mergeFetchedSessions(
+            data.conversations,
+            prev,
+            mutationSnapshot,
+            "refresh",
           ),
         );
-        const data = await chatApi.listSessions();
-        setSessions((prev) =>
-          mergeFetchedSessions(data.conversations, prev, mutationSnapshot),
-        );
+        // Refreshing page one updates the visible head, not the cursor at the
+        // end of pages the user has already loaded. During the first append,
+        // hold the existing tail until that request either advances it or
+        // fails and falls back to this latest page-one state.
+        if (loadedPageCountRef.current <= 1 && loadMoreCursorRef.current === null) {
+          loadedPageCountRef.current = 1;
+          nextSessionsCursorRef.current = pageOneCursor;
+          hasMoreSessionsRef.current = pageOneHasMore;
+          setHasMoreSessions(pageOneHasMore);
+        }
+        setHasLoadedSessions(true);
         setSessionsError(null);
+        setSessionsLoadMoreError(null);
       } catch (err) {
         console.error("会話履歴取得エラー:", err);
         setSessionsError("会話履歴を取得できません");
@@ -246,6 +319,81 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
       }
     })();
     inFlightFetchRef.current = pending;
+    return pending;
+  }, [mergeFetchedSessions]);
+
+  const loadMoreSessions = useCallback(async () => {
+    // A user can reach the bottom while the initial page is still loading.
+    // Wait for that page, then use its cursor; concurrent callers share the
+    // same subsequent request as well.
+    if (inFlightFetchRef.current) await inFlightFetchRef.current;
+    if (inFlightLoadMoreRef.current) return inFlightLoadMoreRef.current;
+
+    const cursor = nextSessionsCursorRef.current;
+    if (!hasMoreSessionsRef.current || !cursor) return;
+    if (loadMoreCursorRef.current === cursor) return;
+
+    loadMoreCursorRef.current = cursor;
+    const mutationSnapshot = new Map(
+      [...sessionMutationVersionRef.current.entries()].map(
+        ([id, versions]) => [id, new Map(versions)],
+      ),
+    );
+    setIsLoadingMoreSessions(true);
+    setSessionsLoadMoreError(null);
+    let appendSucceeded = false;
+    const pending = (async () => {
+      try {
+        const data: ConversationListResponse = await chatApi.listSessions(
+          undefined,
+          undefined,
+          undefined,
+          { limit: SESSION_PAGE_LIMIT, cursor },
+        );
+        setSessions((prev) =>
+          mergeFetchedSessions(
+            data.conversations,
+            prev,
+            mutationSnapshot,
+            "append",
+          ),
+        );
+
+        // Page-one polling may run concurrently with this request, but it no
+        // longer owns the tail cursor. Advance from the page that actually
+        // completed as long as this response still belongs to the current tail.
+        if (nextSessionsCursorRef.current === cursor) {
+          const nextCursor =
+            typeof data.next_cursor === "string" && data.next_cursor.length > 0
+              ? data.next_cursor
+              : null;
+          const hasMore = data.has_more === true && nextCursor !== null;
+          loadedPageCountRef.current = Math.max(1, loadedPageCountRef.current) + 1;
+          nextSessionsCursorRef.current = nextCursor;
+          hasMoreSessionsRef.current = hasMore;
+          setHasMoreSessions(hasMore);
+        }
+        appendSucceeded = true;
+        setSessionsLoadMoreError(null);
+      } catch (err) {
+        console.error("会話履歴の追加取得エラー:", err);
+        setSessionsLoadMoreError("会話履歴の追加取得に失敗しました");
+      } finally {
+        loadMoreCursorRef.current = null;
+        if (!appendSucceeded && loadedPageCountRef.current <= 1) {
+          const latestPageOne = pageOneCursorStateRef.current;
+          if (latestPageOne) {
+            loadedPageCountRef.current = 1;
+            nextSessionsCursorRef.current = latestPageOne.cursor;
+            hasMoreSessionsRef.current = latestPageOne.hasMore;
+            setHasMoreSessions(latestPageOne.hasMore);
+          }
+        }
+        setIsLoadingMoreSessions(false);
+        inFlightLoadMoreRef.current = null;
+      }
+    })();
+    inFlightLoadMoreRef.current = pending;
     return pending;
   }, [mergeFetchedSessions]);
 
@@ -463,7 +611,12 @@ export function ChatSessionProvider({ children }: { children: ReactNode }) {
       value={{
         sessions,
         sessionsError,
+        sessionsLoadMoreError,
+        hasLoadedSessions,
+        hasMoreSessions,
+        isLoadingMoreSessions,
         fetchSessions,
+        loadMoreSessions,
         markSessionRead,
         addSession,
         registerSession,

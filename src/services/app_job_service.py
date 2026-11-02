@@ -11,20 +11,26 @@ import shlex
 import shutil
 import subprocess
 import sys
+import stat
 import threading
 import time
 import zipfile
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 
 from ..memory.models import App, AppArtifact, AppJob, AppRelease, AppTarget, ProjectApp, User
 from .app_service import AppService, permission_at_least
 from .app_manifest_service import AppManifestError, parse_manifest_text
-from .app_operation_lock import AppOperationLockError, app_operation_lock
+from .app_operation_lock import (
+    AppOperationLockError,
+    app_job_input_reference_lock,
+    app_operation_lock,
+)
 from .app_job_execution_policy import (
     ServerJobExecutionDenied,
     assert_user_may_start_server_job,
@@ -40,6 +46,7 @@ from .app_job_isolation import (
 from .app_storage import (
     ensure_app_instance,
     ensure_app_workspace,
+    get_app_instance_path,
     get_app_workspace_path,
     resolve_app_artifact_file,
     normalize_app_relative_path,
@@ -72,6 +79,7 @@ _PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 #: （別ワーカーが実行中の Job など）でも無制限に溜めない。
 _CANCELLED_JOB_TTL_SECONDS = 6 * 60 * 60
 _CANCELLED_JOBS_MAX = 2_000
+_RUNTIME_OWNER_MARKER = ".aoitalk-runtime-owner.json"
 
 
 def _parse_command(command: str) -> list[str]:
@@ -188,6 +196,7 @@ async def _materialize_release_target(
     app: App,
     target: AppTarget,
     release_id: UUID,
+    project_id: UUID,
     instance_path: Path,
     session: Any,
     workspace_root: str | os.PathLike[str] | None,
@@ -220,12 +229,46 @@ async def _materialize_release_target(
         )
     except (OSError, ValueError) as exc:
         raise AppJobError(f"固定ReleaseのArtifactを検証できません: {exc}") from exc
-    runtime_root = (instance_path / ".runtime" / str(job_id)).resolve()
+    runtime_parent = instance_path / ".runtime"
+    runtime_entry = runtime_parent / str(job_id)
+    # A retry must create a fresh directory for the same durable Job.  It must
+    # never follow a junction/symlink at the boundary or reuse an old
+    # directory by name, because that could remove another attempt's tree.
+    if _is_reparse_or_symlink(runtime_parent) or _is_reparse_or_symlink(runtime_entry):
+        raise AppJobError("Release runtime sandbox にreparse pathがあります")
+    runtime_parent.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_symlink(runtime_parent):
+        raise AppJobError("Release runtime sandbox にreparse pathがあります")
+    try:
+        runtime_entry.mkdir(parents=False, exist_ok=False)
+    except FileExistsError as exc:
+        raise AppJobError("Release runtime sandbox が既に存在します") from exc
+    if _is_reparse_or_symlink(runtime_entry):
+        raise AppJobError("Release runtime sandbox にreparse pathがあります")
+    runtime_root = runtime_entry.resolve()
     instance_root = instance_path.resolve()
     try:
         runtime_root.relative_to(instance_root)
     except ValueError as exc:
         raise AppJobError("Release runtime path がProject App instance外です") from exc
+    runtime_identity = _capture_runtime_identity(runtime_root)
+    if runtime_identity is None:
+        raise AppJobError("Release runtime sandbox のidentityを確定できません")
+    try:
+        _write_runtime_owner_marker(
+            runtime_root,
+            job_id=job_id,
+            app_id=app.id,
+            project_id=project_id,
+            release_id=release_id,
+            identity=runtime_identity,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        _remove_runtime_directory_by_identity(runtime_root, runtime_identity)
+        raise AppJobError("Release runtime sandbox のowner markerを保存できません") from exc
+    if not _register_runtime_sandbox(job_id, runtime_root, runtime_identity):
+        _remove_runtime_directory_by_identity(runtime_root, runtime_identity)
+        raise AppJobError("Release runtime sandbox のidentityを登録できません")
     # rmtree + zip 全展開は Release サイズに比例した同期 I/O で、しかもここは
     # App operation lock と App/AppJob 行ロックを保持中。event loop 上で回すと
     # 同一プロセスの他リクエストごと止まるため、必ずスレッドへ逃がす。
@@ -233,15 +276,32 @@ async def _materialize_release_target(
         _extract_release_bundle,
         artifact_path=artifact_path,
         runtime_root=runtime_root,
+        expected_identity=runtime_identity,
     )
     return runtime_root
 
 
-def _extract_release_bundle(*, artifact_path: Path, runtime_root: Path) -> None:
-    """Blocking part of release materialization (rmtree + zip extraction)."""
-    if runtime_root.exists():
-        shutil.rmtree(runtime_root)
-    runtime_root.mkdir(parents=True, exist_ok=True)
+def _extract_release_bundle(
+    *,
+    artifact_path: Path,
+    runtime_root: Path,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> None:
+    """Blocking part of release materialization (new directory + extraction)."""
+    runtime_root = Path(runtime_root)
+    if expected_identity is None:
+        if _is_reparse_or_symlink(runtime_root.parent) or _is_reparse_or_symlink(runtime_root):
+            raise AppJobError("Release runtime sandbox にreparse pathがあります")
+        runtime_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            runtime_root.mkdir(parents=False, exist_ok=False)
+        except FileExistsError as exc:
+            raise AppJobError("Release runtime sandbox が既に存在します") from exc
+        expected_identity = _capture_runtime_identity(runtime_root)
+        if expected_identity is None:
+            raise AppJobError("Release runtime sandbox のidentityを確定できません")
+    elif not _runtime_identity_matches(runtime_root, expected_identity):
+        raise AppJobError("Release runtime sandbox がmaterialize中に置換されました")
     try:
         with zipfile.ZipFile(artifact_path) as archive:
             for member in archive.infolist():
@@ -249,6 +309,8 @@ def _extract_release_bundle(*, artifact_path: Path, runtime_root: Path) -> None:
                     relative = normalize_app_relative_path(member.filename)
                 except ValueError:
                     raise AppJobError("Release Artifactに不正なpathがあります") from None
+                if relative.casefold() == _RUNTIME_OWNER_MARKER.casefold():
+                    raise AppJobError("Release Artifactがruntime owner markerを上書きします")
                 destination = (runtime_root / Path(relative)).resolve()
                 try:
                     destination.relative_to(runtime_root)
@@ -262,6 +324,539 @@ def _extract_release_bundle(*, artifact_path: Path, runtime_root: Path) -> None:
                     shutil.copyfileobj(source, target_file)
     except (zipfile.BadZipFile, OSError) as exc:
         raise AppJobError(f"Release Artifactを展開できません: {exc}") from exc
+    if not _runtime_identity_matches(runtime_root, expected_identity):
+        raise AppJobError("Release runtime sandbox がmaterialize後に置換されました")
+
+
+_TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+_RUNTIME_SANDBOX_IDENTITIES: dict[str, tuple[Path, tuple[int, int, int]]] = {}
+_RUNTIME_SANDBOX_LOCK = threading.Lock()
+
+
+def _capture_runtime_identity(path: Path) -> tuple[int, int, int] | None:
+    """Capture the filesystem identity of one newly-created directory."""
+    try:
+        # lstat is required here: stat would follow a link inserted between
+        # the mkdir and this ownership check and record the target directory
+        # as if it were this job's sandbox.
+        item_stat = path.lstat()
+    except (FileNotFoundError, OSError):
+        return None
+    if stat.S_ISLNK(item_stat.st_mode):
+        return None
+    if getattr(item_stat, "st_file_attributes", 0) & getattr(
+        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+    ):
+        return None
+    if not stat.S_ISDIR(item_stat.st_mode):
+        return None
+    # st_dev/st_ino are the stable directory identity on POSIX and Windows.
+    # Windows also exposes creation time, which distinguishes a rapid
+    # same-path replacement when a file index is reused.
+    creation_ns = int(item_stat.st_ctime_ns) if os.name == "nt" else 0
+    return (int(item_stat.st_dev), int(item_stat.st_ino), creation_ns)
+
+
+def _runtime_identity_matches(path: Path, identity: tuple[int, int, int]) -> bool:
+    return _capture_runtime_identity(path) == identity
+
+
+def _write_runtime_owner_marker(
+    runtime_root: Path,
+    *,
+    job_id: str | UUID,
+    app_id: str | UUID,
+    project_id: str | UUID,
+    release_id: str | UUID,
+    identity: tuple[int, int, int],
+) -> None:
+    """Persist the exact runtime owner so a later process can reconcile it."""
+
+    if not _runtime_identity_matches(runtime_root, identity):
+        raise OSError("runtime sandbox identity changed before owner marker creation")
+    marker_path = runtime_root / _RUNTIME_OWNER_MARKER
+    marker = {
+        "schema": "aoitalk.app_job_runtime_owner.v1",
+        "job_id": str(UUID(str(job_id))),
+        "app_id": str(UUID(str(app_id))),
+        "project_id": str(UUID(str(project_id))),
+        "release_id": str(UUID(str(release_id))),
+        "runtime_path": os.path.normcase(str(runtime_root.resolve(strict=True))),
+        "identity": [int(value) for value in identity],
+        "attempt_id": uuid4().hex,
+    }
+    with marker_path.open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(marker, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if not _runtime_identity_matches(runtime_root, identity):
+        raise OSError("runtime sandbox identity changed after owner marker creation")
+
+
+def _read_runtime_owner_marker(
+    job: Any,
+    runtime_root: Path,
+) -> tuple[int, int, int] | None:
+    marker_path = runtime_root / _RUNTIME_OWNER_MARKER
+    if _is_reparse_or_symlink(marker_path) or not marker_path.is_file():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        expected_path = os.path.normcase(str(runtime_root.resolve(strict=True)))
+        identity = tuple(int(value) for value in marker.get("identity", ()))
+        expected = {
+            "schema": "aoitalk.app_job_runtime_owner.v1",
+            "job_id": str(UUID(str(getattr(job, "id", "")))),
+            "app_id": str(UUID(str(getattr(job, "app_id", "")))),
+            "project_id": str(UUID(str(getattr(job, "project_id", "")))),
+            "release_id": str(UUID(str(getattr(job, "release_id", "")))),
+            "runtime_path": expected_path,
+        }
+    except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+        return None
+    if not isinstance(marker, Mapping) or any(marker.get(key) != value for key, value in expected.items()):
+        return None
+    if len(identity) != 3 or not str(marker.get("attempt_id") or ""):
+        return None
+    identity_value = (identity[0], identity[1], identity[2])
+    if not _runtime_identity_matches(runtime_root, identity_value):
+        return None
+    return identity_value
+
+
+def _register_runtime_sandbox(
+    job_id: str | UUID,
+    runtime_root: Path,
+    identity: tuple[int, int, int] | None = None,
+) -> bool:
+    identity = identity or _capture_runtime_identity(runtime_root)
+    if identity is None:
+        return False
+    if _capture_runtime_identity(runtime_root) != identity:
+        return False
+    try:
+        canonical_path = runtime_root.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return False
+    if _capture_runtime_identity(runtime_root) != identity:
+        return False
+    with _RUNTIME_SANDBOX_LOCK:
+        _RUNTIME_SANDBOX_IDENTITIES[str(job_id)] = (canonical_path, identity)
+    return True
+
+
+def _registered_runtime_identity(job_id: str | UUID, runtime_root: Path) -> tuple[int, int, int] | None:
+    key = str(job_id)
+    with _RUNTIME_SANDBOX_LOCK:
+        registered = _RUNTIME_SANDBOX_IDENTITIES.get(key)
+    if registered is None:
+        return None
+    registered_path, registered_identity = registered
+    try:
+        canonical_path = runtime_root.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        canonical_path = None
+    if canonical_path is None or os.path.normcase(str(canonical_path)) != os.path.normcase(str(registered_path)):
+        with _RUNTIME_SANDBOX_LOCK:
+            if _RUNTIME_SANDBOX_IDENTITIES.get(key) == registered:
+                _RUNTIME_SANDBOX_IDENTITIES.pop(key, None)
+        return None
+    if not _runtime_identity_matches(runtime_root, registered_identity):
+        with _RUNTIME_SANDBOX_LOCK:
+            if _RUNTIME_SANDBOX_IDENTITIES.get(key) == registered:
+                _RUNTIME_SANDBOX_IDENTITIES.pop(key, None)
+        return None
+    return registered_identity
+
+
+def _forget_runtime_sandbox(job_id: str | UUID, runtime_root: Path) -> None:
+    key = str(job_id)
+    with _RUNTIME_SANDBOX_LOCK:
+        registered = _RUNTIME_SANDBOX_IDENTITIES.get(key)
+        if registered is None:
+            return
+        registered_path, _ = registered
+        if os.path.normcase(str(registered_path)) == os.path.normcase(str(runtime_root)):
+            _RUNTIME_SANDBOX_IDENTITIES.pop(key, None)
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    """Return whether ``path`` is a link/reparse entry.
+
+    Runtime cleanup is deliberately conservative.  ``Path.resolve`` is not
+    enough here because it follows a junction before the caller can decide
+    whether the entry belongs to this job.  A failed stat is also treated as
+    unsafe so an inaccessible entry is left for an operator to inspect.
+    """
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        item_stat = path.lstat()
+        return bool(
+            getattr(item_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError):
+        return True
+
+
+def _contains_reparse_entry(root: Path) -> bool:
+    """Check a runtime tree without following links or junctions."""
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = list(os.scandir(current))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        for entry in entries:
+            entry_path = Path(entry.path)
+            if _is_reparse_or_symlink(entry_path):
+                return True
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry_path)
+            except OSError:
+                return True
+    return False
+
+
+def _remove_runtime_directory_by_identity(
+    runtime_root: Path,
+    identity: tuple[int, int, int],
+) -> bool:
+    """Remove only the exact, non-reparse directory created by this attempt."""
+
+    if not _runtime_identity_matches(runtime_root, identity) or _contains_reparse_entry(runtime_root):
+        return False
+    if not _runtime_identity_matches(runtime_root, identity) or _is_reparse_or_symlink(runtime_root):
+        return False
+    try:
+        shutil.rmtree(runtime_root)
+    except OSError:
+        return False
+    return not runtime_root.exists()
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _value_references_path(value: Any, root: Path) -> bool:
+    """Find an absolute persisted reference to a runtime path.
+
+    AppJob result payloads are command-defined JSON.  Treat every absolute
+    path value as a possible output reference rather than guessing a small
+    list of field names.  This preserves a command's output when it has been
+    recorded under the ephemeral runtime, while ordinary status/error text
+    remains untouched.
+    """
+    if isinstance(value, (str, os.PathLike)) and not isinstance(value, bytes):
+        raw = str(value).strip()
+        if not raw:
+            return False
+        try:
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                return False
+            return _path_is_under(candidate.resolve(strict=False), root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+    if isinstance(value, Mapping):
+        return any(_value_references_path(item, root) for item in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_value_references_path(item, root) for item in value)
+    return False
+
+
+def _cleanup_owned_runtime_sandbox(
+    job: Any,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+    referenced_inputs: Any = (),
+) -> bool:
+    """Remove one terminal AppJob's exact release runtime sandbox.
+
+    The instance itself is durable and remains untouched.  Cleanup is allowed
+    only when a durable terminal row still owns the deterministic
+    ``.runtime/<job-id>`` path.  Missing/active/unknown rows, output/log
+    references, collisions, and reparse entries are all retained.
+    """
+    if str(getattr(job, "status", "")) not in _TERMINAL_JOB_STATUSES:
+        return False
+    # A terminal status without its durable end timestamp is an incomplete
+    # claim.  Keep the sandbox until a later reconciliation can prove the
+    # owner has really reached a terminal state.
+    if getattr(job, "ended_at", None) is None:
+        return False
+
+    job_uuid = getattr(job, "id", None)
+    app_id = getattr(job, "app_id", None)
+    project_id = getattr(job, "project_id", None)
+    release_id = getattr(job, "release_id", None)
+    if not job_uuid or not app_id or not project_id or not release_id:
+        return False
+    try:
+        job_uuid = UUID(str(job_uuid))
+        UUID(str(release_id))
+        instance_root = get_app_instance_path(
+            project_id,
+            app_id,
+            workspace_root=workspace_root,
+        )
+    except (AttributeError, TypeError, ValueError, OSError):
+        return False
+
+    runtime_parent = instance_root / ".runtime"
+    runtime_root = runtime_parent / str(job_uuid)
+    try:
+        runtime_parent.relative_to(instance_root)
+        runtime_root.relative_to(instance_root)
+    except ValueError:
+        return False
+
+    # Do not follow a reparse point at any part of the cleanup boundary.  A
+    # regular file at this exact name is a collision, not a job sandbox.
+    if _is_reparse_or_symlink(runtime_parent) or _is_reparse_or_symlink(runtime_root):
+        return False
+    if not runtime_root.exists():
+        return False
+    if not runtime_root.is_dir():
+        return False
+    marker_identity = _read_runtime_owner_marker(job, runtime_root)
+    if marker_identity is None:
+        return False
+    registered_identity = _registered_runtime_identity(job_uuid, runtime_root)
+    if registered_identity is not None and registered_identity != marker_identity:
+        return False
+    runtime_identity = marker_identity
+    if _contains_reparse_entry(runtime_root):
+        return False
+
+    result_json = getattr(job, "result_json", None)
+    if _value_references_path(result_json, runtime_root):
+        return False
+    if _value_references_path(referenced_inputs, runtime_root):
+        return False
+    log_path = getattr(job, "log_path", None)
+    if _value_references_path(log_path, runtime_root):
+        return False
+
+    try:
+        # Recheck immediately before the destructive operation.  This closes
+        # the ordinary collision race without following or force-removing an
+        # entry that changed while the tree was inspected.
+        if (
+            _is_reparse_or_symlink(runtime_root)
+            or not runtime_root.is_dir()
+            or not _runtime_identity_matches(runtime_root, runtime_identity)
+        ):
+            return False
+        shutil.rmtree(runtime_root)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        logger.warning("App job runtime sandbox の後始末に失敗しました: %s", runtime_root, exc_info=True)
+        return False
+    _forget_runtime_sandbox(job_uuid, runtime_root)
+    return True
+
+
+async def _cleanup_job_runtime_sandbox(
+    db_manager: Any,
+    job_id: str | UUID,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Re-read durable Job ownership before cleaning a runtime sandbox."""
+    try:
+        job_uuid = UUID(str(job_id))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    probe_session = None
+    session = None
+    app_lock = None
+    lock_acquired = False
+    reference_lock = None
+    reference_lock_acquired = False
+    try:
+        # Keep cleanup in the same App -> AppJob lock order as creation and
+        # execution.  This prevents a new queued job from committing an input
+        # reference while an older runtime is being removed.
+        probe_session = await db_manager.get_session()
+        probe_job = await probe_session.scalar(
+            select(AppJob).where(AppJob.id == job_uuid).limit(1)
+        )
+        app_id = getattr(probe_job, "app_id", None) if probe_job is not None else None
+        if app_id is None:
+            return False
+        await probe_session.close()
+        probe_session = None
+        app_lock = app_operation_lock(app_id, workspace_root=workspace_root)
+        await app_lock.acquire()
+        lock_acquired = True
+        reference_lock = app_job_input_reference_lock(workspace_root=workspace_root)
+        await reference_lock.acquire()
+        reference_lock_acquired = True
+
+        session = await db_manager.get_session()
+        await session.scalar(
+            select(App.id).where(App.id == app_id).with_for_update().limit(1)
+        )
+        job = await session.scalar(
+            select(AppJob).where(AppJob.id == job_uuid).with_for_update().limit(1)
+        )
+        if job is None:
+            return False
+        referenced_inputs = [getattr(job, "input_json", None)]
+        if getattr(job, "app_id", None) and getattr(job, "project_id", None):
+            referenced_inputs.extend(
+                list(
+                    await session.scalars(
+                        select(AppJob.input_json).where(
+                            AppJob.status.in_({"queued", "running"}),
+                            AppJob.id != job_uuid,
+                        )
+                    )
+                )
+            )
+        return await asyncio.to_thread(
+            _cleanup_owned_runtime_sandbox,
+            job,
+            workspace_root=workspace_root,
+            referenced_inputs=referenced_inputs,
+        )
+    except Exception:
+        # Cleanup is best-effort and must never turn a durable terminal result
+        # into a second failure.  Leaving the exact sandbox is safer than
+        # guessing when the durable owner cannot be read.
+        logger.warning("App job runtime sandbox の所有状態を確認できません", exc_info=True)
+        return False
+    finally:
+        if session is not None:
+            await session.close()
+        if probe_session is not None:
+            await probe_session.close()
+        if reference_lock_acquired and reference_lock is not None:
+            reference_lock.release()
+        if lock_acquired and app_lock is not None:
+            app_lock.release()
+
+
+def _existing_runtime_job_ids(instance_root: Path) -> list[UUID]:
+    """List UUID-named direct runtime children without following reparse points."""
+
+    runtime_parent = instance_root / ".runtime"
+    if _is_reparse_or_symlink(runtime_parent) or not runtime_parent.is_dir():
+        return []
+    job_ids: list[UUID] = []
+    try:
+        with os.scandir(runtime_parent) as entries:
+            for entry in entries:
+                try:
+                    job_id = UUID(entry.name)
+                    runtime_entry = Path(entry.path)
+                    if _is_reparse_or_symlink(runtime_entry):
+                        continue
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except (OSError, TypeError, ValueError):
+                    continue
+                job_ids.append(job_id)
+    except OSError:
+        return []
+    return job_ids
+
+
+async def _reconcile_terminal_app_runtime_sandboxes(
+    session: Any,
+    current_job: Any,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> int:
+    """Recover marked terminal runtimes present in one app instance.
+
+    A process can stop after the durable Job becomes terminal but before its
+    normal ``finally`` block runs.  A newly queued Job for the same instance
+    scans only that instance's existing ``.runtime`` children, then checks
+    each candidate's durable owner row.  It never scans historical Job rows.
+    """
+
+    reference_lock = None
+    reference_lock_acquired = False
+    try:
+        reference_lock = app_job_input_reference_lock(workspace_root=workspace_root)
+        await reference_lock.acquire()
+        reference_lock_acquired = True
+        try:
+            if (
+                str(getattr(current_job, "status", "")) != "queued"
+                or not getattr(current_job, "app_id", None)
+                or not getattr(current_job, "project_id", None)
+            ):
+                return 0
+            instance_root = get_app_instance_path(
+                current_job.project_id,
+                current_job.app_id,
+                workspace_root=workspace_root,
+            )
+            candidate_ids = await asyncio.to_thread(_existing_runtime_job_ids, instance_root)
+            if not candidate_ids:
+                return 0
+            terminal_jobs: list[Any] = []
+            for offset in range(0, len(candidate_ids), 256):
+                batch = candidate_ids[offset : offset + 256]
+                terminal_jobs.extend(
+                    list(
+                        await session.scalars(
+                            select(AppJob)
+                            .where(
+                                AppJob.id.in_(batch),
+                                AppJob.app_id == current_job.app_id,
+                                AppJob.project_id == current_job.project_id,
+                                AppJob.status.in_(_TERMINAL_JOB_STATUSES),
+                                AppJob.ended_at.is_not(None),
+                            )
+                            .with_for_update()
+                        )
+                    )
+                )
+            active_inputs = list(
+                await session.scalars(
+                    select(AppJob.input_json).where(
+                        AppJob.status.in_({"queued", "running"}),
+                    )
+                )
+            )
+        except Exception:
+            logger.warning("App job terminal runtime reconciliation lookup failed", exc_info=True)
+            return 0
+
+        removed = 0
+        for terminal_job in terminal_jobs:
+            if await asyncio.to_thread(
+                _cleanup_owned_runtime_sandbox,
+                terminal_job,
+                workspace_root=workspace_root,
+                referenced_inputs=active_inputs,
+            ):
+                removed += 1
+        return removed
+    finally:
+        if reference_lock_acquired and reference_lock is not None:
+            reference_lock.release()
 
 
 def _prune_cancelled_jobs_locked(now: float) -> None:
@@ -473,7 +1068,7 @@ async def _stop_and_reap_process_task(
         process_task.add_done_callback(_discard_task_outcome)
 
 
-async def execute_app_job(
+async def _execute_app_job(
     db_manager: Any,
     job_id: str | UUID,
     *,
@@ -533,6 +1128,11 @@ async def execute_app_job(
         if job.status != "queued":
             _clear_job_cancellation(job_id)
             return job.to_dict()
+        await _reconcile_terminal_app_runtime_sandboxes(
+            session,
+            job,
+            workspace_root=workspace_root,
+        )
         target = await session.scalar(select(AppTarget).where(AppTarget.id == job.target_id).limit(1)) if job.target_id else None
         if target is None or app is None or target.app_id != app.id:
             job.status = "failed"
@@ -691,6 +1291,7 @@ async def execute_app_job(
                     app=app,
                     target=target,
                     release_id=job.release_id,
+                    project_id=job.project_id,
                     instance_path=instance_path,
                     session=session,
                     workspace_root=workspace_root,
@@ -804,6 +1405,41 @@ async def execute_app_job(
         return job.to_dict()
     finally:
         await session.close()
+
+
+async def execute_app_job(
+    db_manager: Any,
+    job_id: str | UUID,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+    timeout_seconds: int = 900,
+    deployment_config: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Execute a Job and reconcile its exact terminal runtime sandbox."""
+    # If a process stopped after persisting a terminal Job but before its
+    # finally cleanup, the next invocation can recover the exact runtime from
+    # its durable in-directory owner marker before the job is inspected.
+    await _cleanup_job_runtime_sandbox(
+        db_manager,
+        job_id,
+        workspace_root=workspace_root,
+    )
+    try:
+        return await _execute_app_job(
+            db_manager,
+            job_id,
+            workspace_root=workspace_root,
+            timeout_seconds=timeout_seconds,
+            deployment_config=deployment_config,
+        )
+    finally:
+        # This re-reads the durable row, so task cancellation or a retry race
+        # cannot cause cleanup while the Job is still active or unknown.
+        await _cleanup_job_runtime_sandbox(
+            db_manager,
+            job_id,
+            workspace_root=workspace_root,
+        )
 
 
 __all__ = [

@@ -16,7 +16,7 @@ import logging
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -69,6 +69,190 @@ def _coerce_agent_run_uuid(value: Any) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+@dataclass(frozen=True)
+class _OpenAIUsageAttribution:
+    billing_scope_id: str
+    quota_reservation_id: uuid.UUID | None
+    metrics_source: str | None
+
+
+def _append_metrics_source_reason(
+    source: str | None,
+    reason: str,
+) -> str:
+    """Append a stable accounting reason without storing caller payloads."""
+    base = str(source or "").strip()
+    marker = f"openai_{reason}"
+    if marker in base.split("|"):
+        return base[:50]
+    if not base:
+        return marker[:50]
+    keep = max(0, 49 - len(marker))
+    return f"{base[:keep]}|{marker}"[:50]
+
+
+def resolve_openai_usage_attribution(
+    *,
+    requested_model: str,
+    current_scope: str,
+    supplied_scope: str | None,
+    supplied_reservation_id: Any,
+    reservation: Any | None = None,
+    candidate: Any | None = None,
+    quota_scopes: Iterable[str] = (),
+    metrics_source: str | None = None,
+) -> _OpenAIUsageAttribution:
+    """Trust only a matching local OpenAI reservation marker.
+
+    An orphan marker is removed but a supplied mismatching scope is preserved
+    and labeled. A matching scope without a reservation remains eligible for
+    the deterministic free-tier allocator; reservation presence is not an
+    eligibility condition.
+    """
+    active_scope = str(current_scope or "default").strip() or "default"
+    marker_scope = str(supplied_scope or "").strip() or None
+    raw_id = supplied_reservation_id
+    if raw_id in (None, ""):
+        reason = "scope_mismatch_no_reservation" if marker_scope and marker_scope != active_scope else None
+        source = _append_metrics_source_reason(metrics_source, reason) if reason else metrics_source
+        return _OpenAIUsageAttribution(marker_scope or active_scope, None, source)
+
+    reservation_uuid = _coerce_agent_run_uuid(raw_id)
+    if reservation_uuid is None:
+        preserved_scope = marker_scope or active_scope
+        reason = (
+            "reservation_id_invalid_scope_mismatch"
+            if marker_scope and marker_scope != active_scope
+            else "reservation_id_invalid"
+        )
+        return _OpenAIUsageAttribution(
+            preserved_scope,
+            None,
+            _append_metrics_source_reason(metrics_source, reason),
+        )
+    if reservation is None:
+        preserved_scope = marker_scope or active_scope
+        reason = (
+            "reservation_missing_scope_mismatch"
+            if marker_scope and marker_scope != active_scope
+            else "reservation_missing"
+        )
+        return _OpenAIUsageAttribution(
+            preserved_scope,
+            None,
+            _append_metrics_source_reason(metrics_source, reason),
+        )
+
+    status = str(getattr(reservation, "status", "") or "").strip().lower()
+    candidate_id = str(getattr(reservation, "candidate_id", "") or "").strip()
+    provider = str(getattr(candidate, "provider", "") or "").strip().lower()
+    candidate_model = str(getattr(candidate, "model", "") or "").strip().casefold()
+    expected_pool_id = f"{candidate_id}-daily" if candidate_id else ""
+    reservation_pools = {
+        str(value).strip()
+        for value in (getattr(reservation, "quota_pool_ids", None) or ())
+        if str(value).strip()
+    }
+    if (
+        status not in {"reserved", "committed", "uncertain"}
+        or provider != "openai"
+        or candidate_model != str(requested_model or "").strip().casefold()
+        or not expected_pool_id
+        or expected_pool_id not in reservation_pools
+    ):
+        preserved_scope = marker_scope or active_scope
+        reason = (
+            "reservation_mismatch_scope_mismatch"
+            if marker_scope and marker_scope != active_scope
+            else "reservation_mismatch"
+        )
+        return _OpenAIUsageAttribution(
+            preserved_scope,
+            None,
+            _append_metrics_source_reason(metrics_source, reason),
+        )
+
+    estimated = getattr(reservation, "estimated_usage", None)
+    estimated = estimated if isinstance(estimated, Mapping) else {}
+    reservation_scope = estimated.get("billing_scope_id")
+    metrics = estimated.get("metrics")
+    if not reservation_scope and isinstance(metrics, Mapping):
+        reservation_scope = metrics.get("billing_scope_id")
+    if not reservation_scope:
+        unique_scopes = {str(value).strip() for value in quota_scopes if str(value).strip()}
+        if len(unique_scopes) == 1:
+            reservation_scope = next(iter(unique_scopes))
+    reservation_scope = str(reservation_scope or "").strip()
+    if not reservation_scope:
+        preserved_scope = marker_scope or active_scope
+        return _OpenAIUsageAttribution(
+            preserved_scope,
+            None,
+            _append_metrics_source_reason(metrics_source, "reservation_scope_missing"),
+        )
+
+    reason = "scope_from_reservation" if marker_scope and marker_scope != reservation_scope else None
+    source = _append_metrics_source_reason(metrics_source, reason) if reason else metrics_source
+    return _OpenAIUsageAttribution(reservation_scope, reservation_uuid, source)
+
+
+async def _resolve_openai_usage_attribution_from_session(
+    session: Any,
+    *,
+    requested_model: str,
+    current_scope: str,
+    supplied_scope: str | None,
+    supplied_reservation_id: Any,
+    metrics_source: str | None,
+) -> _OpenAIUsageAttribution:
+    raw_id = supplied_reservation_id
+    reservation_uuid = _coerce_agent_run_uuid(raw_id)
+    if raw_id in (None, "") or reservation_uuid is None:
+        return resolve_openai_usage_attribution(
+            requested_model=requested_model,
+            current_scope=current_scope,
+            supplied_scope=supplied_scope,
+            supplied_reservation_id=raw_id,
+            metrics_source=metrics_source,
+        )
+
+    from ..memory.models.free_team import (
+        FreeTeamCandidateModel,
+        FreeTeamQuotaPool,
+        FreeTeamReservation,
+    )
+
+    reservation = await session.get(FreeTeamReservation, reservation_uuid)
+    candidate = None
+    quota_scopes: list[str] = []
+    if reservation is not None:
+        candidate = await session.get(FreeTeamCandidateModel, reservation.candidate_id)
+        quota_ids = [
+            str(value).strip()
+            for value in (reservation.quota_pool_ids or [])
+            if str(value).strip()
+        ]
+        if quota_ids:
+            result = await session.execute(
+                select(FreeTeamQuotaPool.reset_policy).where(
+                    FreeTeamQuotaPool.id.in_(quota_ids)
+                )
+            )
+            for policy in result.scalars().all():
+                if isinstance(policy, Mapping) and policy.get("billing_scope_id"):
+                    quota_scopes.append(str(policy["billing_scope_id"]).strip())
+    return resolve_openai_usage_attribution(
+        requested_model=requested_model,
+        current_scope=current_scope,
+        supplied_scope=supplied_scope,
+        supplied_reservation_id=reservation_uuid,
+        reservation=reservation,
+        candidate=candidate,
+        quota_scopes=quota_scopes,
+        metrics_source=metrics_source,
+    )
 
 
 async def _validated_agent_run_id(
@@ -532,6 +716,7 @@ class TokenTrackingService:
         resolved_model: Optional[str] = None,
         billing_scope_id: Optional[str] = None,
         quota_reservation_id: Optional[str] = None,
+        reported_total_tokens: Optional[int] = None,
         provider_reported_cost: Any = None,
         provider_reported_cost_details: Optional[Mapping[str, Any]] = None,
         tool_invocations: Optional[Mapping[str, int]] = None,
@@ -597,11 +782,19 @@ class TokenTrackingService:
             output_tokens = max(int(output_tokens or 0), 0)
 
             requested = str(requested_model or model or "")
-            scope = (
-                str(billing_scope_id).strip()
-                if billing_scope_id
-                else (self._free_tier_config().billing_scope_id or "default")
+            openai_usage = canonical_provider(provider) == "openai"
+            free_tier_config = (
+                self._free_tier_config()
+                if openai_usage
+                else None
             )
+            current_scope = (
+                str(getattr(free_tier_config, "billing_scope_id", None) or "default")
+                if free_tier_config is not None
+                else "default"
+            )
+            scope = str(billing_scope_id).strip() if billing_scope_id else current_scope
+            reservation_uuid = _coerce_agent_run_uuid(quota_reservation_id)
 
             breakdown = await self._calculate_breakdown(
                 UsageInput(
@@ -623,6 +816,20 @@ class TokenTrackingService:
                 )
             )
 
+            reported_total = (
+                max(int(reported_total_tokens), 0)
+                if reported_total_tokens is not None else None
+            )
+            if (reported_total is not None
+                and reported_total > input_tokens + output_tokens
+                and breakdown.provider_reported_cost is None):
+                # A provider total with an incomplete breakdown cannot be priced.
+                breakdown = replace(
+                    breakdown, pricing_status=PricingStatus.UNKNOWN, is_unknown=True,
+                    list_input_cost=ZERO, list_output_cost=ZERO,
+                    list_tool_cost=ZERO, list_total_cost=ZERO,
+                )
+
             row = TokenUsage(
                 id=uuid.uuid4(),
                 session_id=session_id,
@@ -636,11 +843,11 @@ class TokenTrackingService:
                 requested_model=requested,
                 resolved_model=resolved_model,
                 billing_scope_id=scope,
-                quota_reservation_id=uuid.UUID(str(quota_reservation_id)) if quota_reservation_id else None,
+                quota_reservation_id=reservation_uuid,
                 agent_name=agent_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                total_tokens=input_tokens + output_tokens,
+                total_tokens=(reported_total if reported_total is not None else input_tokens + output_tokens),
                 cached_tokens=cache_read_tokens,
                 reasoning_tokens=max(int(reasoning_tokens or 0), 0),
                 cache_read_tokens=cache_read_tokens,
@@ -680,6 +887,43 @@ class TokenTrackingService:
             )
 
             async with await get_db_session() as session:
+                if openai_usage:
+                    try:
+                        nested = getattr(session, "begin_nested", None)
+                        if callable(nested):
+                            async with nested():
+                                attribution = await _resolve_openai_usage_attribution_from_session(
+                                    session,
+                                    requested_model=requested,
+                                    current_scope=current_scope,
+                                    supplied_scope=billing_scope_id,
+                                    supplied_reservation_id=quota_reservation_id,
+                                    metrics_source=metrics_source,
+                                )
+                        else:
+                            attribution = await _resolve_openai_usage_attribution_from_session(
+                                session,
+                                requested_model=requested,
+                                current_scope=current_scope,
+                                supplied_scope=billing_scope_id,
+                                supplied_reservation_id=quota_reservation_id,
+                                metrics_source=metrics_source,
+                            )
+                        row.billing_scope_id = attribution.billing_scope_id
+                        row.quota_reservation_id = attribution.quota_reservation_id
+                        row.metrics_source = attribution.metrics_source
+                    except Exception as exc:
+                        # The provider response has already completed. Preserve
+                        # the usage row and original correlation on lookup errors;
+                        # never make audio/generation success depend on this
+                        # optional attribution check.
+                        row.metrics_source = _append_metrics_source_reason(
+                            metrics_source, "reservation_validation_unavailable"
+                        )
+                        logger.warning(
+                            "OpenAI usage attribution validation failed: exception_type=%s",
+                            type(exc).__name__,
+                        )
                 row.agent_run_id = await _validated_agent_run_id(
                     session,
                     agent_run_id,

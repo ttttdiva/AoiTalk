@@ -132,6 +132,7 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_ADMIN_KEY_FILE: /run/secrets/openai_admin_key
       OPENROUTER_API_KEY_FILE: /run/secrets/openrouter_api_key
       OPENROUTER_SITE_URL: ${OPENROUTER_SITE_URL:-}
       OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-AoiTalk Enterprise}
@@ -191,7 +192,6 @@ services:
       HF_TOKEN_FILE: /run/secrets/hf_token
       HUGGING_FACE_HUB_TOKEN_FILE: /run/secrets/hugging_face_hub_token
       HUGGINGFACE_API_KEY_FILE: /run/secrets/huggingface_api_key
-      OPENAI_FREE_TEAM_API_KEY_FILE: /run/secrets/openai_free_team_api_key
       GEMINI_FREE_API_KEY_FILE: /run/secrets/gemini_free_api_key
       OPENROUTER_FREE_TEAM_API_KEY_FILE: /run/secrets/openrouter_free_team_api_key
       GEMINI_PROMO_API_KEY_FILE: /run/secrets/gemini_promo_api_key
@@ -213,6 +213,7 @@ services:
       - caddy_gate_key
       - bootstrap_admin_password
       - openai_api_key
+      - openai_admin_key
       - openrouter_api_key
       - moonshot_api_key
       - gemini_api_key
@@ -234,7 +235,6 @@ services:
       - hf_token
       - hugging_face_hub_token
       - huggingface_api_key
-      - openai_free_team_api_key
       - gemini_free_api_key
       - openrouter_free_team_api_key
       - gemini_promo_api_key
@@ -344,6 +344,8 @@ secrets:
     file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/bootstrap_admin_password
   openai_api_key:
     file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openai_api_key
+  openai_admin_key:
+    file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openai_admin_key
   openrouter_api_key:
     file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openrouter_api_key
   moonshot_api_key:
@@ -386,8 +388,6 @@ secrets:
     file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/hugging_face_hub_token
   huggingface_api_key:
     file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/huggingface_api_key
-  openai_free_team_api_key:
-    file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/openai_free_team_api_key
   gemini_free_api_key:
     file: ${AOITALK_SECRETS_DIR:?AOITALK_SECRETS_DIR is required}/gemini_free_api_key
   openrouter_free_team_api_key:

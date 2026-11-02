@@ -24,6 +24,7 @@ import {
 const MAX_TRANSFER_ERROR_RESPONSE_BYTES = 1024 * 1024;
 const MAX_TRANSFER_URL_BYTES = 8192;
 const MAX_TRANSFER_STRING_BYTES = 4096;
+const MAX_TRANSFER_FILENAME_BYTES = 512;
 // These guards cover only the request-envelope buffering/decoding phase. A
 // successful download releases its slot when the NDJSON Response is returned;
 // the response stream itself is bounded per chunk and is not admission-limited.
@@ -36,6 +37,7 @@ const MAX_TRANSFER_METADATA_BASE64_LENGTH =
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const APP_RUN_FILE_ID_PATTERN = /^af_[A-Za-z0-9_-]{32}$/;
 let activeBufferedTransferRequests = 0;
 const activeBufferedTransferRequestsByUser = new Map<string, number>();
 
@@ -67,7 +69,15 @@ class TransferRequestTimeoutError extends TransferRequestError {
 
 type TransferTarget = {
   canonicalUrl: URL;
-  kind: "upload" | "save" | "explorer-download" | "remote-download" | "app-archive-download";
+  kind:
+    | "upload"
+    | "save"
+    | "explorer-download"
+    | "remote-download"
+    | "app-file-download"
+    | "app-artifact-download"
+    | "app-run-file-download"
+    | "app-archive-download";
   pathParts: string[];
   method: "GET" | "POST" | "PUT";
 };
@@ -149,19 +159,25 @@ function parseTransferMeta(value: unknown): FileTransferMeta {
     }
     let responseContract: Extract<FileTransferMeta, { operation: "download" }>["responseContract"];
     if (value.responseContract !== undefined) {
+      const contract = value.responseContract;
       if (
-        !isRecord(value.responseContract) ||
-        !hasOnlyKeys(value.responseContract, ["expectedContentType", "requireAttachment", "rejectRedirects"]) ||
-        value.responseContract.expectedContentType !== "application/zip" ||
-        value.responseContract.requireAttachment !== true ||
-        value.responseContract.rejectRedirects !== true
+        !isRecord(contract) ||
+        !hasOnlyKeys(contract, ["expectedContentType", "requireAttachment", "rejectRedirects"]) ||
+        (contract.expectedContentType !== undefined && contract.expectedContentType !== "application/zip") ||
+        (contract.requireAttachment !== undefined && contract.requireAttachment !== true) ||
+        (contract.rejectRedirects !== undefined && contract.rejectRedirects !== true) ||
+        (contract.expectedContentType === undefined &&
+          contract.requireAttachment === undefined &&
+          contract.rejectRedirects === undefined)
       ) {
         throw new TransferRequestError(400, "Invalid download response contract");
       }
       responseContract = {
-        expectedContentType: "application/zip",
-        requireAttachment: true,
-        rejectRedirects: true,
+        ...(contract.expectedContentType === "application/zip"
+          ? { expectedContentType: "application/zip" as const }
+          : {}),
+        ...(contract.requireAttachment === true ? { requireAttachment: true as const } : {}),
+        ...(contract.rejectRedirects === true ? { rejectRedirects: true as const } : {}),
       };
     }
     return {
@@ -458,6 +474,55 @@ function validateArchiveQueryShape(metaUrl: string, parsed: URL): void {
   }
 }
 
+function validateRawQueryKeys(metaUrl: string, allowed: readonly string[]): void {
+  const question = metaUrl.indexOf("?");
+  if (question < 0) return;
+  const rawQuery = metaUrl.slice(question + 1);
+  if (!rawQuery) throw new TransferRequestError(400, "Invalid transfer query");
+  const allowedSet = new Set(allowed);
+  for (const pair of rawQuery.split("&")) {
+    const rawKey = pair.split("=", 1)[0];
+    if (!rawKey || rawKey.includes("%") || !allowedSet.has(rawKey)) {
+      throw new TransferRequestError(403, "Transfer target query is not allowed");
+    }
+  }
+}
+
+function validateOptionalProjectQuery(metaUrl: string, parsed: URL): void {
+  validateRawQueryKeys(metaUrl, ["project_id"]);
+  rejectUnknownQuery(parsed, ["project_id"]);
+  const projectId = singleQueryValue(parsed, "project_id", false);
+  if (projectId !== undefined && !UUID_PATTERN.test(projectId)) {
+    throw new TransferRequestError(400, "Invalid project_id");
+  }
+}
+
+function validateAppFilePathQuery(metaUrl: string, parsed: URL): void {
+  validateRawQueryKeys(metaUrl, ["path", "project_id"]);
+  rejectUnknownQuery(parsed, ["path", "project_id"]);
+  const path = singleQueryValue(parsed, "path", true);
+  if (!path || path.length > MAX_TRANSFER_STRING_BYTES || path !== path.trim()) {
+    throw new TransferRequestError(400, "Invalid app file path");
+  }
+  if (
+    path.includes("\\") ||
+    path.includes("\u0000") ||
+    path.startsWith("/") ||
+    /^[a-z]:/i.test(path) ||
+    path.split("/").some((part) => !part || part === "." || part === "..")
+  ) {
+    throw new TransferRequestError(400, "Invalid app file path");
+  }
+  const projectId = singleQueryValue(parsed, "project_id", false);
+  if (projectId !== undefined && !UUID_PATTERN.test(projectId)) {
+    throw new TransferRequestError(400, "Invalid project_id");
+  }
+}
+
+function validateSimpleAppDownloadQuery(metaUrl: string, parsed: URL): void {
+  validateOptionalProjectQuery(metaUrl, parsed);
+}
+
 function parseTransferTarget(
   meta: FileTransferMeta,
   request: NextRequest,
@@ -511,6 +576,25 @@ function parseTransferTarget(
   );
   const appArchiveDownload =
     appArchiveMatch !== null && UUID_PATTERN.test(appArchiveMatch[1]);
+  const appFileMatch = pathname.match(
+    new RegExp(`^${prefix}apps/([0-9a-f-]{36})/files/download$`, "i"),
+  );
+  const appFileDownload = appFileMatch !== null && UUID_PATTERN.test(appFileMatch[1]);
+  const appArtifactMatch = pathname.match(
+    new RegExp(`^${prefix}apps/([0-9a-f-]{36})/artifacts/([0-9a-f-]{36})/download$`, "i"),
+  );
+  const appArtifactDownload =
+    appArtifactMatch !== null &&
+    UUID_PATTERN.test(appArtifactMatch[1]) &&
+    UUID_PATTERN.test(appArtifactMatch[2]);
+  const appRunFileMatch = pathname.match(
+    new RegExp(`^${prefix}apps/([0-9a-f-]{36})/runs/([0-9a-f-]{36})/files/([^/]+)/download$`, "i"),
+  );
+  const appRunFileDownload =
+    appRunFileMatch !== null &&
+    UUID_PATTERN.test(appRunFileMatch[1]) &&
+    UUID_PATTERN.test(appRunFileMatch[2]) &&
+    APP_RUN_FILE_ID_PATTERN.test(appRunFileMatch[3]);
   const projectUploadMatch = pathname.match(
     new RegExp(`^${prefix}projects/([0-9a-f-]{36})/files/upload$`, "i"),
   );
@@ -594,11 +678,77 @@ function parseTransferTarget(
     };
   }
 
+  if (meta.operation === "download" && appFileMatch) {
+    if (
+      !appFileDownload ||
+      meta.paths !== undefined ||
+      !meta.responseContract ||
+      meta.responseContract.expectedContentType !== undefined ||
+      meta.responseContract.requireAttachment !== true ||
+      meta.responseContract.rejectRedirects !== true
+    ) {
+      throw new TransferRequestError(400, "Invalid App file transfer contract");
+    }
+    validateAppFilePathQuery(meta.url, parsed);
+    return {
+      canonicalUrl: canonicalTargetUrl(request.nextUrl.origin, pathname, parsed),
+      kind: "app-file-download",
+      pathParts: pathname.slice(prefix.length).split("/"),
+      method: "GET",
+    };
+  }
+
+  if (meta.operation === "download" && appArtifactMatch) {
+    if (
+      !appArtifactDownload ||
+      meta.paths !== undefined ||
+      !meta.responseContract ||
+      meta.responseContract.expectedContentType !== undefined ||
+      meta.responseContract.requireAttachment !== true ||
+      meta.responseContract.rejectRedirects !== true
+    ) {
+      throw new TransferRequestError(400, "Invalid App artifact transfer contract");
+    }
+    validateSimpleAppDownloadQuery(meta.url, parsed);
+    return {
+      canonicalUrl: canonicalTargetUrl(request.nextUrl.origin, pathname, parsed),
+      kind: "app-artifact-download",
+      pathParts: pathname.slice(prefix.length).split("/"),
+      method: "GET",
+    };
+  }
+
+  if (meta.operation === "download" && appRunFileMatch) {
+    if (
+      !appRunFileDownload ||
+      meta.paths !== undefined ||
+      !meta.responseContract ||
+      meta.responseContract.requireAttachment !== true ||
+      meta.responseContract.rejectRedirects !== true ||
+      meta.responseContract.expectedContentType !== undefined
+    ) {
+      throw new TransferRequestError(400, "Invalid App run-file transfer contract");
+    }
+    validateSimpleAppDownloadQuery(meta.url, parsed);
+    return {
+      canonicalUrl: canonicalTargetUrl(request.nextUrl.origin, pathname, parsed),
+      kind: "app-run-file-download",
+      pathParts: pathname.slice(prefix.length).split("/"),
+      method: "GET",
+    };
+  }
+
   if (meta.operation === "download" && appArchiveMatch) {
     if (!appArchiveDownload) {
       throw new TransferRequestError(403, "App archive target is not allowed");
     }
-    if (meta.paths !== undefined || !meta.responseContract) {
+    if (
+      meta.paths !== undefined ||
+      !meta.responseContract ||
+      meta.responseContract.expectedContentType !== "application/zip" ||
+      meta.responseContract.requireAttachment !== true ||
+      meta.responseContract.rejectRedirects !== true
+    ) {
       throw new TransferRequestError(400, "Invalid App archive transfer contract");
     }
     validateArchiveQueryShape(meta.url, parsed);
@@ -760,6 +910,19 @@ async function executeTransferTarget(
       rejectRedirects: true,
     });
   }
+  if (
+    target.kind === "app-file-download" ||
+    target.kind === "app-artifact-download" ||
+    target.kind === "app-run-file-download"
+  ) {
+    return proxyRequestToPythonApi(synthetic, {
+      path: target.pathParts,
+      user: authorityUser,
+      forwardHeaders: transferForwardHeaders(),
+      downstreamResponseLifetime: true,
+      rejectRedirects: true,
+    });
+  }
   return proxyRequestToPythonApi(synthetic, {
     path: target.pathParts,
     user: authorityUser,
@@ -787,10 +950,19 @@ function downloadMetadata(
   response: Response,
   fallbackFilename: string | undefined,
 ): FileTransferDownloadMetadata {
-  const filename = headerFilename(response) || fallbackFilename || "download";
+  const headerName = headerFilename(response);
+  const candidateFilename = headerName || fallbackFilename || "download";
+  const filename =
+    candidateFilename.length <= MAX_TRANSFER_FILENAME_BYTES
+      ? candidateFilename
+      : fallbackFilename && fallbackFilename.length <= MAX_TRANSFER_FILENAME_BYTES
+        ? fallbackFilename
+        : "download";
+  const candidateMimeType = response.headers.get("content-type")?.split(";", 1)[0].trim();
   const mimeType =
-    response.headers.get("content-type")?.split(";", 1)[0].trim() ||
-    "application/octet-stream";
+    candidateMimeType && candidateMimeType.length <= MAX_TRANSFER_STRING_BYTES
+      ? candidateMimeType
+      : "application/octet-stream";
   const rawSize = response.headers.get("content-length");
   const parsedSize =
     rawSize !== null && /^\d+$/.test(rawSize) ? Number(rawSize) : undefined;
@@ -936,8 +1108,9 @@ async function cancelDownloadBody(response: Response): Promise<void> {
   }
 }
 
-async function enforceAppArchiveResponseContract(
+async function enforceDownloadResponseContract(
   response: NextResponse,
+  contract: Extract<FileTransferMeta, { operation: "download" }>["responseContract"],
 ): Promise<void> {
   if (response.status >= 300 && response.status < 400) {
     await cancelDownloadBody(response);
@@ -947,19 +1120,24 @@ async function enforceAppArchiveResponseContract(
     );
   }
   if (!response.ok) return;
-  const contentType = response.headers
-    .get("content-type")
-    ?.split(";", 1)[0]
-    .trim()
-    .toLowerCase();
-  if (contentType !== "application/zip") {
-    await cancelDownloadBody(response);
-    throw new TransferRequestError(
-      502,
-      "ZIPを取得できませんでした。ログイン状態を確認して再試行してください",
-    );
+  if (contract?.expectedContentType !== undefined) {
+    const contentType = response.headers
+      .get("content-type")
+      ?.split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (contentType !== contract.expectedContentType) {
+      await cancelDownloadBody(response);
+      throw new TransferRequestError(
+        502,
+        "ZIPを取得できませんでした。ログイン状態を確認して再試行してください",
+      );
+    }
   }
-  if (!/^\s*attachment(?:\s*;|\s*$)/i.test(response.headers.get("content-disposition") || "")) {
+  if (
+    contract?.requireAttachment === true &&
+    !/^\s*attachment(?:\s*;|\s*$)/i.test(response.headers.get("content-disposition") || "")
+  ) {
     await cancelDownloadBody(response);
     throw new TransferRequestError(
       502,
@@ -1086,8 +1264,29 @@ export async function proxyFileTransfer(
       }
 
       const upstream = await executeTransferTarget(request, target, meta, data, user);
-      if (target.kind === "app-archive-download") {
-        await enforceAppArchiveResponseContract(upstream);
+      if (
+        target.kind === "app-archive-download" ||
+        target.kind === "app-run-file-download"
+      ) {
+        await enforceDownloadResponseContract(
+          upstream,
+          meta.operation === "download" ? meta.responseContract : undefined,
+        );
+        if (!upstream.ok) return preserveUpstreamError(upstream);
+        return streamDownloadResponse(
+          upstream,
+          meta.operation === "download" ? meta.fallbackFilename : undefined,
+          true,
+        );
+      }
+      if (
+        target.kind === "app-file-download" ||
+        target.kind === "app-artifact-download"
+      ) {
+        await enforceDownloadResponseContract(
+          upstream,
+          meta.operation === "download" ? meta.responseContract : undefined,
+        );
         if (!upstream.ok) return preserveUpstreamError(upstream);
         return streamDownloadResponse(
           upstream,

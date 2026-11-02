@@ -259,6 +259,12 @@ class TaskIndexService:
             if qdrant.local_path:
                 self.client = await self._io(SharedQdrantClient.get_client, qdrant.local_path)
             else:
+                from ..utils import qdrant_readiness
+
+                try:
+                    await qdrant_readiness.await_ready()
+                except qdrant_readiness.QdrantNotReady as exc:
+                    raise TaskIndexUnavailable("qdrant_starting") from exc
                 self.client = QdrantClient(
                     host=qdrant.host,
                     port=qdrant.port,

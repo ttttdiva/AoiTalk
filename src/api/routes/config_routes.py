@@ -1,6 +1,7 @@
 """アプリ設定・音声状態・キャラクター系ルート (server.py から移設)"""
 
 import asyncio
+import copy
 import logging
 import math
 import os
@@ -8,11 +9,12 @@ from ...services.browser_agent_models import browser_settings_payload, validate_
 import re
 import sys
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...config_errors import (
     CharacterLookupError,
@@ -25,27 +27,17 @@ from ..router_helpers import cookie_auth_dependency
 from ...features import Features
 from ...services.character_service import canonicalize_character_slug
 from .payloads import SettingsPayload
-from ...services.agent_team_service import (
-    AGENT_TEAM_PROVIDERS,
-    MODEL_ROUTING_PROVIDERS,
-    AGENT_TEAM_SCHEMA_VERSION,
-    AGENT_TEAM_CAPABILITY_CATALOG,
-    AGENT_TEAM_CONTEXT_TAGS,
-    normalize_agent_team_v3,
-    agent_team_v3_teams,
-    agent_team_v3_subagents,
-    resolve_agent_team_v3_route,
-)
-from ...services.agent_team_v3 import (
-    AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER,
-)
-from ...services.execution_profile_service import (
-    validate_execution_route,
-    validate_team_execution_profile,
+from ...services.runtime_policy_utils import MODEL_ROUTING_PROVIDERS
+from ...services.model_roles_service import (
+    ModelRolesPersistenceError,
+    ModelRolesVersionConflict,
+    model_roles_view,
+    update_model_roles,
 )
 from ...llm.sglang_url import enforce_enterprise_sglang_model
 from ...agent_harness.config import public_agent_harness_settings
 from ...security.settings_public import (
+    CLI_TRUSTED_WINDOWS_AGENT_IDS_SETTING_KEY,
     format_setting_log_value,
     is_admin_only_setting_key,
     mask_model_routing_classes,
@@ -62,6 +54,8 @@ from ...services.embedding_feature import (
     invalidate_runtime_embedding_cache,
 )
 from ...app_config_store import (
+    load_stored_app_config_sync,
+    update_app_config_keys_sync,
     OPENROUTER_ENABLE_TOOLS_KEY,
     OPENROUTER_ENABLE_TOOLS_SOURCE_PATH,
     OPENROUTER_ENABLE_TOOLS_USER_PROVENANCE,
@@ -82,12 +76,108 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class MuseAllowedAgentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: uuid.UUID
+
+
+class MuseCanonicalPair(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_id: uuid.UUID
+    revision_id: uuid.UUID
+
+
+class MuseCanonicalUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pair: MuseCanonicalPair
+    expected: MuseCanonicalPair | None
+
+
+class ModelRolesErrorResponse(BaseModel):
+    detail: str
+
+
+class ModelRolesLLMRouteSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["llm"]
+    provider: str
+    model: str
+    effort: str | None
+
+
+class ModelRolesPoolRouteSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["pool"]
+    pool_id: str
+
+
+ModelRolesRouteSchema = ModelRolesLLMRouteSchema | ModelRolesPoolRouteSchema
+
+
+class ModelRolesChatSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fallbacks: list[ModelRolesRouteSchema] = Field(max_length=5)
+    allow_paid_fallback: bool
+
+
+class ModelRolesImageGenerationSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary: ModelRolesLLMRouteSchema | None
+
+
+class ModelRolesRolesSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chat: ModelRolesChatSchema
+    image_generation: ModelRolesImageGenerationSchema
+
+
+class ModelRolesViewSchema(BaseModel):
+    version: int
+    roles: ModelRolesRolesSchema
+    billing_classes: dict[str, Literal["free", "subscription", "paid", "local"]]
+
+
+_MODEL_ROLES_UPDATE_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["expected_version", "roles"],
+                    "properties": {
+                        "expected_version": {"type": "integer", "minimum": 0},
+                        "roles": {
+                            "$ref": "#/components/schemas/ModelRolesRolesSchema"
+                        },
+                    },
+                }
+            }
+        },
+    }
+}
+
+_MODEL_ROLES_AUTH_RESPONSES = {
+    401: {"model": ModelRolesErrorResponse, "description": "Authentication required"},
+}
+
 _MUSE_REMOTE_TARGET_KEY = "remote_targets.muse"
 _MUSE_REMOTE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,256}$")
 _MUSE_REMOTE_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 _MUSE_REMOTE_MAX_LIST_ITEMS = 64
 _MUSE_REMOTE_MAX_STATE_ROOT_CHARS = 4096
 _MUSE_REMOTE_MAX_RECONCILE_SECONDS = 600.0
+_PERSONAL_DEADLINE_CHAT_DRAFT_KEY = "personal.deadline_chat_draft.enabled"
+_PC_BRIDGE_REMOTE_ENABLED_KEY = "pc_bridge.remote_enabled"
+_CLI_TRUSTED_WINDOWS_AGENT_IDS_MAX_ITEMS = 256
 _MUSE_REMOTE_MAX_POLL_SECONDS = 60.0
 
 
@@ -111,6 +201,10 @@ def _validate_muse_remote_target(value: Any) -> dict[str, Any]:
         "wait_seconds",
         "reconcile_timeout_seconds",
         "poll_interval_seconds",
+        "chat_agent_id",
+        "chat_agent_revision_id",
+        "agent_revision_id",
+        "revision_id",
     }
     if set(value) - allowed_fields:
         raise ValueError("Invalid Muse remote target settings")
@@ -191,6 +285,17 @@ def _validate_muse_remote_target(value: Any) -> dict[str, Any]:
                 ids.append(canonical_id)
         normalized[key] = ids
 
+    pin_keys = {"chat_agent_id", "chat_agent_revision_id", "agent_revision_id", "revision_id"}
+    if pin_keys & value.keys():
+        binding = _muse_canonical_binding(value)
+        if binding is None or "chat_agent_revision_id" not in value:
+            raise ValueError("Invalid Muse remote target settings")
+        normalized["chat_agent_id"] = binding.agent_id
+        normalized["chat_agent_revision_id"] = binding.agent_revision_id
+        for key in ("agent_revision_id", "revision_id"):
+            if key in value:
+                normalized[key] = binding.agent_revision_id
+
     from ...services.muse_remote_execution import MAX_WAIT_SECONDS
 
     timing_bounds = {
@@ -235,6 +340,36 @@ def _validate_muse_remote_target(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def _muse_canonical_binding(target: Any):
+    from ...services.remote_llm_consumers import resolve_canonical_muse_binding
+    return resolve_canonical_muse_binding({"remote_targets": {"muse": target}})
+
+
+def _muse_canonical_public(target: Any) -> dict[str, Any]:
+    binding = (_muse_canonical_binding(target)
+               if isinstance(target, dict) and "chat_agent_revision_id" in target else None)
+    return {"configured": binding is not None,
+            "agent_id": binding.agent_id if binding else None,
+            "revision_id": binding.agent_revision_id if binding else None}
+
+
+def _read_stored_muse_target():
+    # Read the parent to distinguish a missing key from JSON null, preserving the AAD path.
+    from sqlalchemy import select
+    from ...app_config_store import _db_deps, GLOBAL_CONFIG_KEY, APP_CONFIG_MISSING
+    from ...security.field_crypto import decrypt_json_secret_leaves
+    _, get_db, model = _db_deps()
+    with get_db().get_sync_session() as session:
+        parent = session.execute(select(model.value["remote_targets"]).where(
+            model.key == GLOBAL_CONFIG_KEY)).scalar_one_or_none()
+    if not isinstance(parent, dict) or "muse" not in parent:
+        return APP_CONFIG_MISSING
+    target = parent["muse"]
+    wrapped = decrypt_json_secret_leaves({"remote_targets": {"muse": target}},
+                                         aad_prefix="app_config_settings.value")
+    return wrapped["remote_targets"]["muse"]
+
+
 def _muse_remote_target_summary(value: Any) -> dict[str, Any]:
     """Expose only non-sensitive readiness assertions and allowlist counts."""
 
@@ -271,22 +406,6 @@ def _muse_remote_target_profile_enabled() -> bool:
         return not Features.is_enterprise() and Features.remote_server_view()
     except Exception:
         return False
-
-
-def _validate_execution_route_backend(route: dict[str, Any], *, label: str) -> None:
-    """Accept the explicit remote backend only on the canonical Muse route."""
-
-    if "backend" not in route:
-        return
-    if (
-        route.get("provider") != "muse-remote"
-        or route.get("inherit_model") is not False
-        or route.get("backend") != "remote"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{label} backend is only valid for the explicit muse-remote remote route",
-        )
 
 
 def _attach_server_timing(
@@ -571,6 +690,14 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         # The Muse remote target is one server-owned document with a dedicated
         # strict validator below; child dotted keys are intentionally absent.
         _MUSE_REMOTE_TARGET_KEY: {"type": "object"},
+        "muse_chat.native_link": {"type": "bool"},
+        _PC_BRIDGE_REMOTE_ENABLED_KEY: {"type": "bool"},
+        "crowdworks.agent_scan_shadow_enabled": {"type": "bool"},
+        "crowdworks.agent_scan_policy_id": {
+            "type": "uuid",
+            "nullable": True,
+            "empty_means_null": True,
+        },
         # Provider visibility is a global, UI-only preference.  The enclosing
         # application config is DB-backed and the route's existing admin gate
         # protects writes; it is deliberately not consulted by LLM execution
@@ -578,11 +705,6 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         "llm_provider_visibility": {"type": "object"},
         "llm_provider_visibility.hidden_provider_ids": {"type": "str_list"},
         "external_llm.auto_approve": {"type": "bool"},
-        "agent_team.orchestration_mode": {
-            "type": "enum",
-            "values": ["standard", "director"],
-        },
-        "agent_team.delegation_enabled": {"type": "bool"},
         "local_agent_tasks.default_agent_id": {"type": "str"},
         # Persistent command-workspace exemptions. Default is an empty
         # document, which keeps the harness-root confinement.
@@ -592,14 +714,21 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         # every key here; value must be an existing absolute directory, and
         # null/"" clears it.
         "harness_execution.workspace_root": {"type": "str"},
+        # This is the sole PATCH-configurable Trusted Windows allow-list key.
+        # Other trusted_windows controls remain outside the WebUI settings API.
+        CLI_TRUSTED_WINDOWS_AGENT_IDS_SETTING_KEY: {
+            "type": "uuid_list",
+            "max": _CLI_TRUSTED_WINDOWS_AGENT_IDS_MAX_ITEMS,
+        },
         "integrations.spotify.enabled": {"type": "bool"},
-        # Team/Subagent/Profile topology is edited atomically through
-        # /api/agent-team/config.  The old members/templates/model_groups
-        # dotted settings are intentionally not accepted here.
-        # 外部送信ポリシーは Agent Team のモデル分担と独立させる。
+        # 外部送信ポリシーはモデル役割の設定と独立させる。
         "external_model_privacy.mode": {
             "type": "enum",
             "values": ["direct", "protected", "local_only"],
+        },
+        "external_model_privacy.ip_address_policy": {
+            "type": "enum",
+            "values": ["legacy", "off", "private", "all"],
         },
         "external_model_privacy.review_policy": {
             "type": "enum",
@@ -620,7 +749,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         },
         "external_model_privacy.cache_enabled": {"type": "bool"},
         # Cloud Advisor is an independent parent-owned advisory capability;
-        # route/policy controls are intentionally separate from Agent Team v3
+        # route/policy controls are intentionally separate from role routing
         # topology and never expose credentials or review payloads.
         "browser_agent": {"type": "object"},
         "cloud_advisor.mode": {
@@ -664,11 +793,32 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "type": "enum",
             "values": ["tier_1_2", "tier_3_plus"],
         },
+        "openai.usage_api.refresh_seconds": {
+            "type": "int",
+            "min": 60,
+            "max": 3600,
+        },
+        "openai.usage_api.unavailable_margin_ratio": {
+            "type": "float",
+            "min": 0.0,
+            "max": 1.0,
+        },
+        "openai.provider_circuit.probe_interval_minutes": {
+            "type": "int",
+            "min": 5,
+            "max": 1440,
+        },
         "openai.billing_scope_id": {"type": "str"},
+        "live_voice.openai_realtime.daily_spend_cap_usd": {
+            "type": "float",
+            "min": 0.0,
+            "max": 1000.0,
+        },
         "search.knowledge_enabled": {"type": "bool"},
         # User-requested EmbeddingGemma2 master switch (typed bool; persisted
         # through the existing PATCH settings machinery unchanged).
         "search.embedding_enabled": {"type": "bool"},
+        "search.embedding_resident": {"type": "bool"},
         # The matching ``enable_tools_source`` marker is written by the store
         # in the same atomic patch; it is deliberately not a settable key.
         "openrouter.enable_tools": {"type": "bool"},
@@ -687,6 +837,12 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         # Agent/Tool toggles
         "agents.filesystem.enabled": {"type": "bool"},
         "agents.project_management.enabled": {"type": "bool"},
+        # Optional personal deadline chat draft tool; defaults off and is
+        # managed through the existing admin-only settings API.
+        _PERSONAL_DEADLINE_CHAT_DRAFT_KEY: {"type": "bool"},
+        # External DOTS dialogue remains off unless the fixed, owner-bound
+        # dedicated connection is configured and the administrator opts in.
+        "dots_dialogue.enabled": {"type": "bool"},
         "mcp_enabled": {"type": "bool"},
         "tts.yomi_linter.enabled": {"type": "bool"},
         "tts.yomi_linter.model_id": {"type": "str"},
@@ -749,7 +905,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         "vision": [""] + sorted(MODEL_ROUTING_PROVIDERS - {"claude-cli", "grok-cli", "deepseek"}),
         # 専用client factoryが生成できるproviderだけを許可する。
         # claude/grok はメディア向け互換APIでは使えるが、target factory未対応。
-        "clip_ingest": [""] + sorted(AGENT_TEAM_PROVIDERS),
+        "clip_ingest": [""] + sorted(MODEL_ROUTING_PROVIDERS),
         "project_automation": [""] + sorted(TARGET_CLIENT_PROVIDERS),
         "video": ["", "mage_vl"],
     }
@@ -810,6 +966,20 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 result.append(normalized)
         return result
 
+    def _normalize_optional_uuid(value: Any) -> str | None:
+        """Normalize a nullable UUID setting; an empty string means unselected."""
+
+        if value is None or value == "":
+            return None
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        if not isinstance(value, str):
+            raise ValueError("Value must be a UUID string or null")
+        try:
+            return str(uuid.UUID(value))
+        except (ValueError, AttributeError):
+            raise ValueError("Value must be a valid UUID or null") from None
+
     @app.get("/api/settings")
     async def get_settings(
         request: Request,
@@ -847,14 +1017,46 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             local_agent_tasks = {
                 "default_agent_id": server.config.get("local_agent_tasks.default_agent_id") or None,
             }
+            try:
+                crowdworks_agent_scan_policy_id = _normalize_optional_uuid(
+                    server.config.get("crowdworks.agent_scan_policy_id")
+                )
+            except ValueError:
+                # Invalid legacy values disable this optional lane in the
+                # runtime; present the same effective unselected state here.
+                crowdworks_agent_scan_policy_id = None
             if is_admin:
                 local_agent_tasks["command_workspace_unconfined"] = stored_unconfined_setting(server.config)
             settings = {
+                "live_voice": {
+                    "openai_realtime": {
+                        "daily_spend_cap_usd": server.config.get(
+                            "live_voice.openai_realtime.daily_spend_cap_usd",
+                            1.0,
+                        )
+                    }
+                },
                 "local_agent_tasks": local_agent_tasks,
                 "external_llm": {
                     "auto_approve": server.config.get(
                         "external_llm.auto_approve", True
                     )
+                },
+                "personal": {
+                    "deadline_chat_draft": {
+                        "enabled": server.config.get(
+                            _PERSONAL_DEADLINE_CHAT_DRAFT_KEY, False
+                        )
+                    }
+                },
+                "crowdworks": {
+                    "agent_scan_shadow_enabled": (
+                        server.config.get(
+                            "crowdworks.agent_scan_shadow_enabled", False
+                        )
+                        is True
+                    ),
+                    "agent_scan_policy_id": crowdworks_agent_scan_policy_id,
                 },
                 "llm_provider_visibility": {
                     "hidden_provider_ids": _normalize_provider_visibility_ids(
@@ -863,22 +1065,12 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                         )
                     )
                 },
-                "agent_team": {
-                    **normalize_agent_team_v3(
-                        server.config.get("agent_team", {}) or {},
-                        global_execution_profiles=server.config.get("execution_profiles"),
-                    ),
-                    # Read-only presentation metadata is deliberately kept
-                    # outside the persisted canonical envelope.
-                    "main_effective_route": {
-                        "provider": str(server.config.get("llm_provider", "") or ""),
-                        "model": str(server.config.get("llm_model", "") or ""),
-                    },
-                    "capability_catalog": AGENT_TEAM_CAPABILITY_CATALOG,
-                },
                 "external_model_privacy": {
                     "mode": server.config.get(
                         "external_model_privacy.mode", "direct"
+                    ),
+                    "ip_address_policy": server.config.get(
+                        "external_model_privacy.ip_address_policy", "legacy"
                     ),
                     "review_policy": server.config.get(
                         "external_model_privacy.review_policy", "high_risk"
@@ -915,6 +1107,11 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     **browser_settings_payload(server.config),
                     "pc_bridge_required": True,
                     "jev_configured": bool(os.environ.get("JEV_API_KEY", "").strip()),
+                },
+                "pc_bridge": {
+                    "remote_enabled": server.config.get(
+                        _PC_BRIDGE_REMOTE_ENABLED_KEY, False
+                    ) is True
                 },
                 "cloud_advisor": {
                     "mode": server.config.get(
@@ -965,6 +1162,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     ),
                     # Master ON/OFF for user-requested EmbeddingGemma2 usage.
                     # Effective boolean: absent key keeps the historical default.
+                    "embedding_resident": server.config.get("search.embedding_resident", False) is True,
                     "embedding_enabled": embedding_enabled(
                         {"search": server.config.get("search", {})}
                     ),
@@ -1037,69 +1235,49 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             logger.error(f"Failed to get settings: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.get("/api/agent-team/config")
-    async def get_agent_team_config(
-        request: Request,
+    @app.get(
+        "/api/model-roles",
+        response_model=ModelRolesViewSchema,
+        responses=_MODEL_ROLES_AUTH_RESPONSES,
+    )
+    async def get_model_roles(
         _: None = Depends(require_auth),
     ):
-        """Return the canonical Agent Team schema-v3 envelope.
+        return JSONResponse(model_roles_view(server.config))
 
-        Teams own Subagent membership and Team-scoped Execution Profiles.
-        Subagents are role/capability definitions only.  Compatibility
-        roster/templates/model-groups and user-facing LLM Profiles are omitted.
-        """
-        section = normalize_agent_team_v3(
-            server.config.get("agent_team", {}) or {},
-            global_execution_profiles=server.config.get("execution_profiles"),
-        )
-        envelope = {
-            "schema_version": AGENT_TEAM_SCHEMA_VERSION,
-            "delegation_enabled": bool(section.get("delegation_enabled", False)),
-            "orchestration_mode": str(section.get("orchestration_mode") or "standard"),
-            "teams": {
-                str(team.get("team_id")): team
-                for team in agent_team_v3_teams(server.config)
+    @app.put(
+        "/api/model-roles",
+        response_model=ModelRolesViewSchema,
+        openapi_extra=_MODEL_ROLES_UPDATE_OPENAPI,
+        responses={
+            **_MODEL_ROLES_AUTH_RESPONSES,
+            400: {
+                "model": ModelRolesErrorResponse,
+                "description": "Invalid JSON payload or model role settings",
             },
-            "subagents": {
-                str(subagent.get("subagent_id")): {
-                    **subagent,
-                    "effective_route": resolve_agent_team_v3_route(
-                        server.config,
-                        str(subagent.get("subagent_id") or ""),
-                    ),
-                }
-                for subagent in agent_team_v3_subagents(server.config)
+            403: {
+                "model": ModelRolesErrorResponse,
+                "description": "Administrator privileges required",
             },
-            "main_effective_route": {
-                "provider": str(server.config.get("llm_provider", "") or ""),
-                "model": str(server.config.get("llm_model", "") or ""),
-            },
-            "capability_catalog": AGENT_TEAM_CAPABILITY_CATALOG,
-        }
-        if AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER in section:
-            envelope[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = section[
-                AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER
-            ]
-        return JSONResponse(
-            {
-                "success": True,
-                "schema_version": AGENT_TEAM_SCHEMA_VERSION,
-                "agent_team": envelope,
-                "harness": {
-                    "independent": True,
-                    "settings": public_agent_harness_settings(
-                        server.config.get("agent_harness", {}) or {}
-                    ),
+            409: {
+                "model": ModelRolesErrorResponse,
+                "description": "The expected model_roles version is stale",
+                "content": {
+                    "application/json": {
+                        "example": {"detail": "model_roles_version_conflict"}
+                    }
                 },
-            }
-        )
-
-    @app.put("/api/agent-team/config")
-    async def update_agent_team_config(
+            },
+            500: {
+                "model": ModelRolesErrorResponse,
+                "description": "The model_roles setting could not be persisted",
+            },
+        },
+    )
+    async def put_model_roles(
         request: Request,
         _: None = Depends(require_auth),
     ):
-        """Validate and atomically persist the canonical Agent Team v3 graph."""
         if not await server._is_admin_user(request):
             raise HTTPException(status_code=403, detail="Administrator privileges required")
         try:
@@ -1107,350 +1285,176 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         except Exception as exc:
             raise HTTPException(status_code=400, detail="JSON payload is required") from exc
         if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Agent Team config must be an object")
-        raw = payload.get("agent_team") if isinstance(payload.get("agent_team"), dict) else payload
-        if not isinstance(raw, dict):
-            raise HTTPException(status_code=400, detail="agent_team must be an object")
-
-        # Only canonical schema-v3 fields may be written.  GET-only metadata is
-        # accepted for a read/modify/write client but is discarded below.
-        writable_fields = {
-            "schema_version",
-            "delegation_enabled",
-            "orchestration_mode",
-            "teams",
-            "subagents",
-            AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER,
-        }
-        readonly_fields = {
-            "main_effective_route",
-            "capability_catalog",
-            "provider_model",
-            "effective_route",
-            "llm_profiles",
-        }
-        unknown = set(raw) - writable_fields - readonly_fields
-        if unknown:
+            raise HTTPException(status_code=400, detail="model_roles payload must be an object")
+        if set(payload) != {"expected_version", "roles"}:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported Agent Team field: {sorted(str(item) for item in unknown)[0]}",
+                detail="model_roles payload requires expected_version and roles",
             )
-        try:
-            schema_version = int(raw.get("schema_version", AGENT_TEAM_SCHEMA_VERSION))
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="schema_version must be 3") from exc
-        if schema_version != AGENT_TEAM_SCHEMA_VERSION:
-            raise HTTPException(status_code=400, detail="Only Agent Team schema_version 3 is supported")
-        if "delegation_enabled" in raw and not isinstance(raw.get("delegation_enabled"), bool):
-            raise HTTPException(status_code=400, detail="delegation_enabled must be boolean")
-        seed_marker = raw.get(AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER)
-        if seed_marker is not None and (
-            isinstance(seed_marker, bool)
-            or not isinstance(seed_marker, int)
-            or seed_marker < 0
+        expected_version = payload.get("expected_version")
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
         ):
-            raise HTTPException(status_code=400, detail="Invalid Agent Team preset seed marker")
-        orchestration_mode = str(raw.get("orchestration_mode", "standard") or "standard").strip().lower()
-        if orchestration_mode not in {"standard", "director"}:
-            raise HTTPException(status_code=400, detail="Invalid orchestration_mode")
-
-        teams_raw = raw.get("teams")
-        subagents_raw = raw.get("subagents")
-        if not isinstance(teams_raw, dict) or not isinstance(subagents_raw, dict):
-            raise HTTPException(status_code=400, detail="teams and subagents must be objects")
-
-        id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-        for collection_name, collection in (("team", teams_raw), ("subagent", subagents_raw)):
-            for key in collection:
-                clean = str(key).strip()
-                if not id_pattern.fullmatch(clean):
-                    raise HTTPException(status_code=400, detail=f"Invalid {collection_name} id: {key}")
-
-        allowed_team_fields = {
-            "team_id", "name", "description", "enabled", "sort_order", "activation",
-            "subagent_ids", "execution_profiles",
-        }
-        allowed_activation_fields = {"mode", "contexts"}
-        allowed_subagent_fields = {
-            "subagent_id", "name", "description", "instructions", "enabled",
-            "capability_ids", "scalable", "default_instances", "max_instances",
-            "max_workspace_access", "allow_cli_native_tools",
-        }
-        readonly_subagent_fields = {"team_ids", "effective_route", "llm_profile_id"}
-        allowed_execution_profile_fields = {
-            "profile_id", "name", "display_name", "enabled", "default_route", "overrides",
-        }
-        allowed_execution_route_fields = {
-            "inherit_model", "provider", "model", "effort_policy", "effort", "backend",
-        }
-        for key, team in teams_raw.items():
-            if not isinstance(team, dict):
-                raise HTTPException(status_code=400, detail=f"Invalid Team: {key}")
-            extra = set(team) - allowed_team_fields
-            if extra:
-                raise HTTPException(status_code=400, detail=f"Unsupported Team field for {key}: {sorted(str(item) for item in extra)[0]}")
-            if team.get("team_id") is not None and str(team.get("team_id")).strip() != str(key).strip():
-                raise HTTPException(status_code=400, detail=f"Team id mismatch: {key}")
-            if "enabled" in team and not isinstance(team.get("enabled"), bool):
-                raise HTTPException(status_code=400, detail=f"Team enabled must be boolean: {key}")
-            if "sort_order" in team and (isinstance(team.get("sort_order"), bool) or not isinstance(team.get("sort_order"), int)):
-                raise HTTPException(status_code=400, detail=f"Team sort_order must be integer: {key}")
-            activation = team.get("activation", {})
-            if not isinstance(activation, dict):
-                raise HTTPException(status_code=400, detail=f"Invalid activation for Team: {key}")
-            activation_extra = set(activation) - allowed_activation_fields
-            if activation_extra:
-                raise HTTPException(status_code=400, detail=f"Unsupported activation field for {key}: {sorted(str(item) for item in activation_extra)[0]}")
-            mode = str(activation.get("mode") or "always").strip().lower()
-            if mode not in {"always", "contextual", "manual"}:
-                raise HTTPException(status_code=400, detail=f"Invalid activation mode for {key}")
-            contexts = activation.get("contexts", [])
-            if not isinstance(contexts, list) or any(not isinstance(item, str) for item in contexts):
-                raise HTTPException(status_code=400, detail=f"activation.contexts must be string[]: {key}")
-            normalized_contexts = {str(item).strip().lower() for item in contexts if str(item).strip()}
-            unknown_contexts = normalized_contexts - set(AGENT_TEAM_CONTEXT_TAGS)
-            # The retired Story context may survive in persisted schema-v3
-            # graphs. Preserve its exact stored Team on read/modify/write;
-            # never allow a new assignment, edited Team or arbitrary old tag.
-            retained_story_team = unknown_contexts == {"story"} and any(
-                str(existing.get("team_id")) == str(key) and existing == team
-                for existing in agent_team_v3_teams(server.config)
+            raise HTTPException(status_code=400, detail="expected_version must be a non-negative integer")
+        roles = payload.get("roles")
+        if not isinstance(roles, dict):
+            raise HTTPException(status_code=400, detail="roles must be an object")
+        try:
+            result = update_model_roles(
+                server.config,
+                roles,
+                expected_version,
             )
-            if unknown_contexts and not retained_story_team:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown activation context for {key}: {sorted(unknown_contexts)[0]}",
-                )
-            if mode == "contextual" and not normalized_contexts:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Contextual Team requires at least one activation context: {key}",
-                )
-            refs = team.get("subagent_ids", [])
-            if not isinstance(refs, list) or any(not isinstance(item, str) for item in refs):
-                raise HTTPException(status_code=400, detail=f"subagent_ids must be string[]: {key}")
-            invalid_refs = [
-                str(item).strip()
-                for item in refs
-                if not id_pattern.fullmatch(str(item).strip())
-            ]
-            if invalid_refs:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid Subagent reference in {key}: {invalid_refs[0]}",
-                )
-            execution_profiles = team.get("execution_profiles")
-            if execution_profiles is None:
-                continue
-            if not isinstance(execution_profiles, dict):
-                raise HTTPException(status_code=400, detail=f"execution_profiles must be an object: {key}")
-            for profile_key, profile in execution_profiles.items():
-                if not id_pattern.fullmatch(str(profile_key).strip()):
-                    raise HTTPException(status_code=400, detail=f"Invalid execution profile id: {profile_key}")
-                if not isinstance(profile, dict):
-                    raise HTTPException(status_code=400, detail=f"Invalid Execution Profile: {profile_key}")
-                extra_ep = set(profile) - allowed_execution_profile_fields
-                if extra_ep:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unsupported Execution Profile field for {profile_key}: {sorted(str(item) for item in extra_ep)[0]}",
-                    )
-                if profile.get("profile_id") is not None and str(profile.get("profile_id")).strip() != str(profile_key).strip():
-                    raise HTTPException(status_code=400, detail=f"Execution Profile id mismatch: {profile_key}")
-                if "enabled" in profile and not isinstance(profile.get("enabled"), bool):
-                    raise HTTPException(status_code=400, detail=f"Execution Profile enabled must be boolean: {profile_key}")
-                default_route = profile.get("default_route")
-                if default_route not in (None, "") and not isinstance(default_route, dict):
-                    raise HTTPException(status_code=400, detail=f"default_route must be an object: {profile_key}")
-                if isinstance(default_route, dict):
-                    extra_route = set(default_route) - allowed_execution_route_fields
-                    if extra_route:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unsupported ExecutionRoute field for {profile_key}: {sorted(str(item) for item in extra_route)[0]}",
-                        )
-                    _validate_execution_route_backend(
-                        default_route,
-                        label=f"Execution Profile {profile_key}",
-                    )
-                overrides = profile.get("overrides")
-                if overrides is None:
-                    continue
-                if not isinstance(overrides, dict):
-                    raise HTTPException(status_code=400, detail=f"overrides must be an object: {profile_key}")
-                for override_key, override in overrides.items():
-                    if not id_pattern.fullmatch(str(override_key).strip()):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Invalid Execution Profile override key in {profile_key}: {override_key}",
-                        )
-                    if not isinstance(override, dict):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"overrides[{override_key}] must be an object: {profile_key}",
-                        )
-                    extra_override = set(override) - allowed_execution_route_fields
-                    if extra_override:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unsupported ExecutionRoute field for {profile_key}.overrides[{override_key}]: {sorted(str(item) for item in extra_override)[0]}",
-                        )
-                    _validate_execution_route_backend(
-                        override,
-                        label=f"Execution Profile {profile_key}.overrides[{override_key}]",
-                    )
+        except ModelRolesVersionConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="model_roles_version_conflict",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ModelRolesPersistenceError as exc:
+            logger.error("Failed to persist model_roles configuration")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to persist model_roles configuration",
+            ) from exc
+        return JSONResponse(result)
 
-        for key, subagent in subagents_raw.items():
-            if not isinstance(subagent, dict):
-                raise HTTPException(status_code=400, detail=f"Invalid Subagent: {key}")
-            extra = set(subagent) - allowed_subagent_fields - readonly_subagent_fields
-            if extra:
-                raise HTTPException(status_code=400, detail=f"Unsupported Subagent field for {key}: {sorted(str(item) for item in extra)[0]}")
-            if subagent.get("subagent_id") is not None and str(subagent.get("subagent_id")).strip() != str(key).strip():
-                raise HTTPException(status_code=400, detail=f"Subagent id mismatch: {key}")
-            if "enabled" in subagent and not isinstance(subagent.get("enabled"), bool):
-                raise HTTPException(status_code=400, detail=f"Subagent enabled must be boolean: {key}")
-            if "scalable" in subagent and not isinstance(subagent.get("scalable"), bool):
-                raise HTTPException(status_code=400, detail=f"Subagent scalable must be boolean: {key}")
-            if "allow_cli_native_tools" in subagent and not isinstance(subagent.get("allow_cli_native_tools"), bool):
-                raise HTTPException(status_code=400, detail=f"allow_cli_native_tools must be boolean: {key}")
-            for field_name in ("default_instances", "max_instances"):
-                if field_name in subagent and (isinstance(subagent.get(field_name), bool) or not isinstance(subagent.get(field_name), int)):
-                    raise HTTPException(status_code=400, detail=f"{field_name} must be integer: {key}")
-            default_instances = subagent.get("default_instances", 1)
-            max_instances = subagent.get("max_instances", 1)
-            if default_instances < 0 or max_instances < 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Subagent instance limits must be non-negative/default and positive/max: {key}",
-                )
-            if default_instances > max_instances:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"default_instances must be <= max_instances: {key}",
-                )
-            access = str(subagent.get("max_workspace_access") or "none").strip().lower()
-            if access not in {"none", "read", "write"}:
-                raise HTTPException(status_code=400, detail=f"Invalid max_workspace_access for {key}")
-            capabilities = subagent.get("capability_ids", [])
-            if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
-                raise HTTPException(status_code=400, detail=f"capability_ids must be string[]: {key}")
-            if any(not str(item).strip() for item in capabilities):
-                raise HTTPException(status_code=400, detail=f"capability_ids cannot contain empty values: {key}")
-            unknown_capabilities = {item.strip() for item in capabilities if item.strip() not in AGENT_TEAM_CAPABILITY_CATALOG}
-            if unknown_capabilities:
-                raise HTTPException(status_code=400, detail=f"Unknown capability for {key}: {', '.join(sorted(unknown_capabilities))}")
+    async def canonical_admin(request: Request) -> str:
+        scope = dict(request.scope)
+        scope["headers"] = [(k, v) for k, v in request.scope.get("headers", [])
+                            if k.lower() != b"x-internal-auth" and not k.lower().startswith(b"x-forwarded-")]
+        user = await server._get_user_info_from_request(Request(scope))
+        if (not isinstance(user, dict) or str(user.get("role", "")).lower() != "admin"
+                or user.get("is_agent") or user.get("_authority_source") not in {"web_session", "bearer"}
+                or any(user.get(k) not in {None, "", "human", "user"}
+                       for k in ("actor_type", "principal_kind"))):
+            raise HTTPException(status_code=403, detail="Administrator privileges required")
+        try:
+            owner = str(uuid.UUID(str(user.get("id"))))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=403, detail="Authenticated human UUID is required") from None
+        if not _muse_remote_target_profile_enabled():
+            raise HTTPException(status_code=403, detail="This setting is disabled in the current profile")
+        return owner
 
-        # Cross-reference validation intentionally happens before normalization:
-        # deleting a Subagent requires removing its Team references in this
-        # same atomic update, while deleting a Team never deletes Subagents.
-        subagent_ids = {str(key).strip() for key in subagents_raw}
-        for team_id, team in teams_raw.items():
-            unknown_refs = {str(item).strip() for item in team.get("subagent_ids", []) if str(item).strip() not in subagent_ids}
-            if unknown_refs:
-                raise HTTPException(status_code=400, detail=f"Unknown Subagent reference in {team_id}: {sorted(unknown_refs)[0]}")
-            team_member_ids = {
-                str(item).strip()
-                for item in team.get("subagent_ids", [])
-                if str(item).strip()
-            }
-            execution_profiles = team.get("execution_profiles")
-            if not isinstance(execution_profiles, dict):
-                continue
-            for profile_key, profile in execution_profiles.items():
-                if not isinstance(profile, dict):
-                    continue
-                errors = validate_team_execution_profile(
-                    server.config,
-                    {
-                        **profile,
-                        "profile_id": str(profile.get("profile_id") or profile_key).strip(),
-                    },
-                    source_profile_id=str(profile_key),
-                    known_subagent_ids=team_member_ids,
-                )
-                if errors:
-                    raise HTTPException(status_code=400, detail=errors[0])
-                default_route = profile.get("default_route")
-                if isinstance(default_route, dict):
-                    provider = str(default_route.get("provider") or "").strip().lower()
-                    if provider and provider not in (
-                        MODEL_ROUTING_PROVIDERS | {"routing-profile", "muse-remote"}
-                    ):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unsupported provider for Execution Profile {profile_key}",
-                        )
-                    if Features.is_enterprise() and provider == "sglang" and str(default_route.get("model") or "").strip():
-                        try:
-                            enforce_enterprise_sglang_model(
-                                server.config,
-                                provider,
-                                str(default_route.get("model") or "").strip(),
-                            )
-                        except (RuntimeError, ValueError) as exc:
-                            raise HTTPException(status_code=400, detail=f"Execution Profile {profile_key}: {exc}") from exc
-                overrides = profile.get("overrides") if isinstance(profile.get("overrides"), dict) else {}
-                for override_key, override in overrides.items():
-                    if str(override_key).strip() not in team_member_ids:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unknown Subagent override in {team_id}/{profile_key}: {override_key}",
-                        )
-                    if not isinstance(override, dict):
-                        continue
-                    route_errors = validate_execution_route(
-                        server.config,
-                        override,
-                        label=f"{team_id}.execution_profiles[{profile_key}].overrides[{override_key}]",
-                    )
-                    if route_errors:
-                        raise HTTPException(status_code=400, detail=route_errors[0])
-                    provider = str(override.get("provider") or "").strip().lower()
-                    if provider and provider not in (
-                        MODEL_ROUTING_PROVIDERS | {"routing-profile", "muse-remote"}
-                    ):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unsupported provider for {team_id}/{profile_key}/{override_key}",
-                        )
+    @app.get("/api/settings/remote-targets/muse/canonical-agent")
+    async def get_muse_canonical_agent(request: Request, _: None = Depends(require_auth)):
+        await canonical_admin(request)
+        return _muse_canonical_public(_read_stored_muse_target())
 
-        canonical_payload = {
-            "schema_version": AGENT_TEAM_SCHEMA_VERSION,
-            "delegation_enabled": bool(raw.get("delegation_enabled", False)),
-            "orchestration_mode": orchestration_mode,
-            "teams": teams_raw,
-            "subagents": subagents_raw,
-        }
-        if seed_marker is not None:
-            canonical_payload[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = seed_marker
-        else:
-            # Preserve the durable marker for older clients that send a
-            # read/modify/write payload without this newly writable field.
-            existing_section = server.config.get("agent_team", {}) or {}
-            existing_marker = (
-                existing_section.get(AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER)
-                if isinstance(existing_section, dict)
-                else None
-            )
-            if isinstance(existing_marker, int) and not isinstance(existing_marker, bool):
-                canonical_payload[AGENT_TEAM_EXECUTION_PROFILE_PRESET_SEED_MARKER] = existing_marker
-        candidate = normalize_agent_team_v3(
-            canonical_payload,
-            global_execution_profiles=server.config.get("execution_profiles"),
-        )
-        if hasattr(server.config, "save_to_file"):
-            if not server.config.save_to_file("agent_team", candidate):
-                raise HTTPException(status_code=500, detail="Failed to persist Agent Team config")
-        else:
-            server.config.set("agent_team", candidate)
-        return JSONResponse(
-            {
-                "success": True,
-                "schema_version": AGENT_TEAM_SCHEMA_VERSION,
-                "agent_team": candidate,
-            }
-        )
+    @app.put("/api/settings/remote-targets/muse/canonical-agent")
+    async def put_muse_canonical_agent(payload: MuseCanonicalUpdate, request: Request,
+                                       _: None = Depends(require_auth)):
+        owner = await canonical_admin(request)
+        for _ in range(3):
+            target = _read_stored_muse_target()
+            if (not isinstance(target, dict) or not isinstance(target.get("allowed_owner_ids"), list)
+                    or owner not in target["allowed_owner_ids"]):
+                raise HTTPException(status_code=403, detail="Muse owner is not allowed")
+            current = _muse_canonical_public(target)
+            expected = payload.expected
+            if ((expected is None and current["configured"]) or
+                    (expected is not None and (current["agent_id"], current["revision_id"]) !=
+                     (str(expected.agent_id), str(expected.revision_id)))):
+                raise HTTPException(status_code=409, detail="Muse canonical binding changed")
+            agent_id, revision_id = str(payload.pair.agent_id), str(payload.pair.revision_id)
+            if not payload.pair.agent_id.int or not payload.pair.revision_id.int:
+                raise HTTPException(status_code=422, detail="Invalid canonical binding")
+            agents = target.get("allowed_agent_ids")
+            if not isinstance(agents, list) or agent_id not in agents:
+                raise HTTPException(status_code=403, detail="Muse agent is not allowed")
+            from sqlalchemy import select
+            from ...memory.models.agent_identity import Agent, AgentRevision
+            async with await server._db_manager.get_session() as session:
+                row = (await session.execute(select(Agent.id, Agent.created_by, Agent.state,
+                        AgentRevision.id).join(AgentRevision, AgentRevision.agent_id == Agent.id)
+                        .where(Agent.id == payload.pair.agent_id,
+                               AgentRevision.id == payload.pair.revision_id))).one_or_none()
+            if row is None or row.state != "active" or str(row.created_by) != owner:
+                raise HTTPException(status_code=404, detail="Eligible Agent revision not found")
+            updated = copy.deepcopy(target)
+            updated["chat_agent_id"] = agent_id
+            updated["chat_agent_revision_id"] = revision_id
+            for alias in ("agent_revision_id", "revision_id"):
+                if alias in updated:
+                    updated[alias] = revision_id
+            if _muse_canonical_binding(updated) is None:
+                raise HTTPException(status_code=409, detail="Conflicting legacy Muse binding")
+            if update_app_config_keys_sync({_MUSE_REMOTE_TARGET_KEY: updated},
+                    expected_values={_MUSE_REMOTE_TARGET_KEY: target}):
+                server.config.set(_MUSE_REMOTE_TARGET_KEY, updated)
+                return _muse_canonical_public(updated)
+        raise HTTPException(status_code=409, detail="Muse target changed or could not be saved")
+
+    @app.post("/api/settings/remote-targets/muse/allowed-agents")
+    async def register_muse_allowed_agent(
+        payload: MuseAllowedAgentPayload,
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        # Resolve the principal independently of any client-supplied identity.
+        scope = dict(request.scope)
+        scope["headers"] = [
+            (key, value) for key, value in request.scope.get("headers", [])
+            if key.lower() != b"x-internal-auth" and not key.lower().startswith(b"x-forwarded-")
+        ]
+        user = await server._get_user_info_from_request(Request(scope))
+        if (not isinstance(user, dict) or str(user.get("role", "")).lower() != "admin"
+                or user.get("is_agent") or user.get("_authority_source") not in {"web_session", "bearer"}
+                or any(user.get(key) not in {None, "", "human", "user"}
+                       for key in ("actor_type", "principal_kind"))):
+            raise HTTPException(status_code=403, detail="Administrator privileges required")
+        try:
+            owner_id = str(uuid.UUID(str(user.get("id"))))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=403, detail="Authenticated human UUID is required") from None
+        if not _muse_remote_target_profile_enabled():
+            raise HTTPException(status_code=403, detail="This setting is disabled in the current profile")
+
+        from ...services.agent_identity_service import AgentIdentityService
+        from ...services.agent_revision_v2 import resolve_agent_role_route_v2
+
+        agent_id = str(payload.agent_id)
+        identity = AgentIdentityService(server._db_manager, config=server.config)
+        agent = await identity.get_agent(agent_id)
+        if not agent or agent.get("state") != "active" or str(agent.get("created_by")) != owner_id:
+            raise HTTPException(status_code=404, detail="Eligible Agent not found")
+        revisions = await identity.list_revisions(agent_id, limit=1)
+        if not revisions or "remote_agent_delegate" not in revisions[0].get("capability_ceiling", []):
+            raise HTTPException(status_code=404, detail="Eligible Agent not found")
+        try:
+            route, _source = resolve_agent_role_route_v2(server.config, revisions[0], "operator")
+        except (ValueError, RuntimeError):
+            route = None
+        if not isinstance(route, dict) or (route.get("kind"), route.get("provider"), route.get("model")) != ("llm", "muse-remote", "muse-chat"):
+            raise HTTPException(status_code=404, detail="Eligible Agent not found")
+
+        # Compare the complete target under the existing store's row lock so
+        # owner authorization and all opaque options survive concurrent edits.
+        for _attempt in range(3):
+            config = load_stored_app_config_sync()
+            target = config.get("remote_targets", {}).get("muse")
+            if not isinstance(target, dict):
+                raise HTTPException(status_code=403, detail="Muse owner is not allowed")
+            owners = target.get("allowed_owner_ids")
+            if not isinstance(owners, list) or owner_id not in owners:
+                raise HTTPException(status_code=403, detail="Muse owner is not allowed")
+            agents = target.get("allowed_agent_ids")
+            if not isinstance(agents, list):
+                raise HTTPException(status_code=409, detail="Invalid Muse agent allowlist")
+            updated = copy.deepcopy(target)
+            if agent_id not in agents:
+                updated["allowed_agent_ids"].append(agent_id)
+            if update_app_config_keys_sync(
+                {_MUSE_REMOTE_TARGET_KEY: updated},
+                expected_values={_MUSE_REMOTE_TARGET_KEY: target},
+            ):
+                server.config.set(_MUSE_REMOTE_TARGET_KEY, updated)
+                return {"agent_id": agent_id, "allowed_agent_count": len(updated["allowed_agent_ids"])}
+        raise HTTPException(status_code=409, detail="Muse target changed or could not be saved")
 
     @app.patch("/api/settings")
     async def update_setting(
@@ -1488,6 +1492,9 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     status_code=400,
                     detail="Muse remote target settings must be persisted",
                 )
+            pin_keys = {"chat_agent_id", "chat_agent_revision_id", "agent_revision_id", "revision_id"}
+            if isinstance(value, dict) and pin_keys & value.keys():
+                raise HTTPException(status_code=409, detail="Use canonical binding settings")
             try:
                 value = _validate_muse_remote_target(value)
             except ValueError:
@@ -1497,11 +1504,21 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 ) from None
 
             try:
-                if not server.config.save_to_file(key, value):
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Failed to persist setting to DB",
-                    )
+                for _ in range(3):
+                    target = _read_stored_muse_target()
+                    updated = copy.deepcopy(value)
+                    if isinstance(target, dict):
+                        for pin in pin_keys:
+                            if pin in target:
+                                updated[pin] = copy.deepcopy(target[pin])
+                    if update_app_config_keys_sync(
+                        {key: updated}, expected_values={key: target}
+                    ):
+                        server.config.set(key, updated)
+                        value = updated
+                        break
+                else:
+                    raise HTTPException(status_code=409, detail="Muse target changed or could not be saved")
 
                 logger.info(
                     "Setting updated: %s = %s (persist=%s)",
@@ -1525,12 +1542,21 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     detail="Failed to update setting",
                 ) from None
 
-        if key == _EMBEDDING_MASTER_KEY:
+        if key in {_EMBEDDING_MASTER_KEY, "search.embedding_resident"}:
             # The embedding master switch is a privileged server setting even
             # when cookie authentication is disabled for local operation, the
             # same boundary as the Muse remote target above.  Refuse here so a
             # non-admin request is rejected before value validation,
             # persistence and any runtime notification.
+            if not await server._is_admin_user(request):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Administrator privileges required",
+                )
+
+        if key == _PERSONAL_DEADLINE_CHAT_DRAFT_KEY:
+            # This is a privileged feature gate even when cookie auth is
+            # disabled for local operation.
             if not await server._is_admin_user(request):
                 raise HTTPException(
                     status_code=403,
@@ -1588,7 +1614,15 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         setting_schema = ALLOWED_SETTINGS[key]
         try:
             if setting_schema["type"] == "bool":
-                if not isinstance(value, bool):
+                if key in {
+                    _PERSONAL_DEADLINE_CHAT_DRAFT_KEY,
+                    "search.embedding_resident",
+                    _PC_BRIDGE_REMOTE_ENABLED_KEY,
+                    "crowdworks.agent_scan_shadow_enabled",
+                }:
+                    if not isinstance(value, bool):
+                        raise ValueError(f"Setting '{key}' must be a boolean")
+                elif not isinstance(value, bool):
                     value = str(value).lower() in ("true", "1", "yes")
             elif setting_schema["type"] == "float":
                 value = float(value)
@@ -1619,6 +1653,8 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     value = str(value).strip()
                     if key == "chatgpt_web.profile_dir" and not value:
                         raise ValueError("ChatGPT会話プロファイルの保存先を指定してください")
+            elif setting_schema["type"] == "uuid":
+                value = _normalize_optional_uuid(value)
             elif setting_schema["type"] == "int":
                 if isinstance(value, bool):
                     raise ValueError(f"Setting '{key}' must be an integer")
@@ -1653,6 +1689,27 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     raise ValueError("Value must be a list of strings")
                 if key == "llm_provider_visibility.hidden_provider_ids":
                     value = _normalize_provider_visibility_ids(value)
+            elif setting_schema["type"] == "uuid_list":
+                if not isinstance(value, list) or not value:
+                    raise ValueError("Value must be a non-empty list of UUID strings")
+                if len(value) > setting_schema["max"]:
+                    raise ValueError(
+                        f"Value must contain no more than {setting_schema['max']} UUIDs"
+                    )
+                normalized_ids: list[str] = []
+                seen_ids: set[str] = set()
+                for item in value:
+                    if not isinstance(item, str):
+                        raise ValueError("Value must contain only UUID strings")
+                    try:
+                        normalized_id = str(uuid.UUID(item))
+                    except (ValueError, AttributeError):
+                        raise ValueError("Value must contain only UUID strings") from None
+                    if normalized_id in seen_ids:
+                        raise ValueError("Value must not contain duplicate UUIDs")
+                    seen_ids.add(normalized_id)
+                    normalized_ids.append(normalized_id)
+                value = normalized_ids
             elif setting_schema["type"] == "object":
                 if key == "browser_agent":
                     value = validate_browser_settings_update(value)
@@ -1672,33 +1729,6 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                             value.get("hidden_provider_ids", [])
                         )
                     }
-            if key == "agent_team.orchestration_mode" and value == "director":
-                if (
-                    str(server.config.get("llm_provider", "") or "")
-                    == "routing-profile"
-                    and str(server.config.get("llm_model", "") or "")
-                    == "free-team"
-                ):
-                    raise ValueError(
-                        "Directorモードは無料Teamルーティングプロファイルでは利用できません"
-                    )
-                profile_dir = str(
-                    server.config.get("chatgpt_web.profile_dir", "") or ""
-                ).strip()
-                timeout = int(
-                    server.config.get(
-                        "chatgpt_web.response_timeout_seconds", 900
-                    )
-                    or 0
-                )
-                max_rounds = int(
-                    server.config.get("chatgpt_web.max_rounds_per_turn", 20)
-                    or 0
-                )
-                if not profile_dir or timeout < 1 or max_rounds < 1:
-                    raise ValueError(
-                        "Directorモードを有効にする前にChatGPT接続設定を完成させてください"
-                    )
             if key.startswith("model_routing.classes.project_automation."):
                 from ...services.project_automation_model import (
                     ProjectAutomationRouteError,
@@ -1735,7 +1765,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         # Enterprise SGLang is a paired Compose service, not a user-selectable
         # arbitrary OpenAI-compatible endpoint.  Reject route values at the
         # settings boundary as well as in the client factory, so clip ingest
-        # and Agent Team cannot persist a model that the server does not serve.
+        # and role routing cannot persist a model that the server does not serve.
         if Features.is_enterprise():
             route_prefix = None
             route_field = None
@@ -1776,6 +1806,7 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         if Features.is_enterprise() and (
             key in {
                 "mcp_enabled",
+                "dots_dialogue.enabled",
             }
             or key.startswith("model_routing.media.")
         ) and value is not False:
@@ -1788,10 +1819,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         # reads the persisted row, so an in-memory-only update would silently
         # desync the gate from what the operator approved.  Refuse before any
         # config mutation.
-        if key == _EMBEDDING_MASTER_KEY and not persist:
+        if key in {_EMBEDDING_MASTER_KEY, "search.embedding_resident"} and not persist:
             raise HTTPException(
                 status_code=400,
-                detail="search.embedding_enabled must be persisted",
+                detail=f"{key} must be persisted",
             )
 
         # Apply the setting
@@ -1821,10 +1852,40 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             if key == _EMBEDDING_MASTER_KEY:
                 invalidate_runtime_embedding_cache()
                 _sync_embedding_master_runtime(value)
+                if value and server.config.get("search.embedding_resident", False) is True:
+                    server.apply_embedding_resident(True)
+
+            if key == "search.embedding_resident":
+                server.apply_embedding_resident(value)
 
             if key == "browser_agent":
                 from ...services.pc_bridge_service import get_pc_bridge_hub
                 await get_pc_bridge_hub().sync_dedicated_gate()
+
+            if key == _PC_BRIDGE_REMOTE_ENABLED_KEY and value is False:
+                from ...services.pc_bridge_service import get_pc_bridge_hub
+
+                hub = get_pc_bridge_hub()
+                with hub.lock:
+                    connections = list(hub.connections.values())
+                for connection in connections:
+                    try:
+                        await asyncio.wait_for(
+                            hub._on_loop(
+                                connection,
+                                connection.socket.close(
+                                    code=4003,
+                                    reason="pc_bridge_remote_disabled",
+                                ),
+                            ),
+                            timeout=5,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "PC Bridge connection close failed after remote disable"
+                        )
+                    finally:
+                        hub.detach(connection)
 
             logger.info(
                 "Setting updated: %s = %s (persist=%s)",

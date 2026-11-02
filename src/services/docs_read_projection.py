@@ -11,7 +11,7 @@ import hashlib
 import json
 from uuid import UUID
 
-from sqlalchemy import String, cast, literal, select
+from sqlalchemy import String, and_, cast, literal, or_, select
 
 from ..memory.models import (
     DocsLibrary, KnowledgeField, KnowledgeFieldValue, KnowledgeNode,
@@ -34,6 +34,7 @@ OUTLINE_METADATA_FORMATS = {
     "work_intake_generated_block", "work_intake_inline_source", "work_intake_attachment_link",
     "mail_management", "email", "email_message",
 }
+BOOKMARK_FIELDS = ("url", "title", "description", "domain", "favicon")
 
 
 def _json(value):
@@ -72,6 +73,10 @@ async def build_docs_read_projection(
     include_manifest: bool = False,
     record_only: bool = False,
     outline_only: bool = False,
+    personal_scope: bool = False,
+    scope_anchor_ids: tuple[UUID, ...] | None = None,
+    scope_canonical_seed_ids: tuple[UUID, ...] = (),
+    scope_related_seed_ids: tuple[UUID, ...] = (),
 ) -> dict:
     """Read canonical content as ID-anchored segments with explicit omissions.
 
@@ -123,6 +128,39 @@ async def build_docs_read_projection(
         # Match the canonical Project containment contract and legacy outline:
         # malformed cross-Project parent edges are not a document expansion.
         statement = statement.where(KnowledgeNode.project_id == root.project_id)
+    elif personal_scope:
+        # Personal point reads retain Personal rows and the direct Project
+        # seed closures proved by the scope resolver.  The tree path is already
+        # bounded to the requested root, so seed membership adds only a small
+        # SQL predicate and never materializes the surrounding corpus.
+        personal_rows = KnowledgeNode.project_id.is_(None)
+        project_rows = None
+
+        def seed_path(seed_id: UUID):
+            seed_text = str(seed_id)
+            seed_hex = seed_text.replace("-", "")
+            return or_(
+                tree.c.path.like(literal(f"%|{seed_text}|%")),
+                tree.c.path.like(literal(f"%|{seed_hex}|%")),
+            )
+
+        if scope_canonical_seed_ids and turn_project_id is not None:
+            canonical_paths = or_(
+                *(seed_path(seed_id) for seed_id in scope_canonical_seed_ids)
+            )
+            project_rows = and_(
+                KnowledgeNode.project_id == turn_project_id,
+                canonical_paths,
+            )
+        if scope_related_seed_ids:
+            related_paths = or_(
+                *(seed_path(seed_id) for seed_id in scope_related_seed_ids)
+            )
+            related_rows = and_(KnowledgeNode.project_id.is_not(None), related_paths)
+            project_rows = related_rows if project_rows is None else or_(project_rows, related_rows)
+        statement = statement.where(
+            personal_rows if project_rows is None else or_(personal_rows, project_rows)
+        )
     statement = service._query_email_turn_visibility(
         statement, docs_library_id=root.docs_library_id, turn_project_id=turn_project_id,
     )
@@ -172,6 +210,39 @@ async def build_docs_read_projection(
     selected = ordered + [entry for entry in selected if entry[0].id not in visited]
     segments = []
     content_chars = 0
+    reference_scope_cache: dict[UUID, bool] = {}
+
+    async def reference_target_in_scope(target_id: UUID) -> bool:
+        """Check one field target against the same bounded point scope."""
+
+        if scope_anchor_ids is None:
+            return allowed_node_ids is None or target_id in allowed_node_ids
+        cached = reference_scope_cache.get(target_id)
+        if cached is not None:
+            return cached
+        from .docs_scope import DocsScopeMode, resolve_docs_scope
+
+        try:
+            target_scope = await resolve_docs_scope(
+                session=session,
+                actor_user_id=user_id,
+                project_id=turn_project_id,
+                mode=(
+                    DocsScopeMode.PROJECT_PLUS_PERSONAL
+                    if turn_project_id is not None
+                    else DocsScopeMode.PERSONAL_ONLY
+                ),
+                target_node_id=target_id,
+            )
+        except Exception:
+            reference_scope_cache[target_id] = False
+            return False
+        authorized = bool(target_scope.anchor_node_ids) and target_id in (
+            set(target_scope.canonical_node_ids)
+            | set(target_scope.related_node_ids)
+        )
+        reference_scope_cache[target_id] = authorized
+        return authorized
 
     def append(node_id, kind, text, **metadata):
         nonlocal content_chars
@@ -205,10 +276,19 @@ async def build_docs_read_projection(
             raise PermissionError("Docs access changed during read; restart the read")
         body = node.body_json or {}
         block = {"type": "paragraph"}
+        bookmark_present = isinstance(body, dict) and "bookmark" in body
+        bookmark = body.get("bookmark") if bookmark_present else None
+        bookmark_valid = (
+            isinstance(bookmark, dict)
+            and set(bookmark) == set(BOOKMARK_FIELDS)
+            and all(type(bookmark[field]) is str for field in BOOKMARK_FIELDS)
+        )
+        body_format_supported = True
         if not isinstance(body, dict):
             body = {}
             reasons.add("unsupported_body_format")
             block = {"type": "unsupported"}
+            body_format_supported = False
         elif body.get("format") == "doc_block" or (
             not body.get("format") and any(key in body for key in ("block_type", "kind", "type"))
         ):
@@ -221,14 +301,21 @@ async def build_docs_read_projection(
             if kind not in {"paragraph", "heading_1", "heading_2", "heading_3", "checkbox",
                             "quote", "markdown", "code", "content_container"}:
                 reasons.add("unsupported_body_format")
+                body_format_supported = False
             if kind in {"markdown", "code"} and body.get("format") != "doc_block":
                 reasons.add("unsupported_body_format")
+                body_format_supported = False
         elif (body.get("format") and body.get("format") not in OUTLINE_METADATA_FORMATS
-              or any(key in body for key in ("verbatim_blocks", "verbatim_content", "bookmark"))
+              or any(key in body for key in ("verbatim_blocks", "verbatim_content"))
               or ("content" in body and body.get("format") != "doc_block")
-              or (body and not body.get("format"))):
+              or (body and not body.get("format") and set(body) != {"bookmark"})):
             block = {"type": "unsupported"}
             reasons.add("unsupported_body_format")
+            body_format_supported = False
+        if bookmark_present and not bookmark_valid:
+            block = {"type": "unsupported"}
+            reasons.add("invalid_typed_bookmark")
+            body_format_supported = False
         if node.node_type == "search":
             reasons.add("dynamic_query_not_materialized")
         policy = policy_for_node(node)
@@ -248,6 +335,12 @@ async def build_docs_read_projection(
                 append(node.id, "content", body["content"], block_type=body["block_type"])
             else:
                 reasons.add("invalid_typed_content")
+        if bookmark_present and bookmark_valid and body_format_supported and not outline_only:
+            for field in BOOKMARK_FIELDS:
+                append(
+                    node.id, "bookmark", bookmark[field],
+                    bookmark_field=field, value_type="string",
+                )
         if body.get("format") == "project_information_doc_block" and body.get("blocks"):
             # Match the human Project Information view: accepted live entries
             # only. Source chat/message provenance is not a grant to that chat.
@@ -304,7 +397,7 @@ async def build_docs_read_projection(
             if task is not None and field.system_key in TASK_FIELD_TO_TASK_UPDATE:
                 continue  # Authoritative Task values are resolved below.
             if field.field_type == "reference" and value.target_node_id is not None:
-                if (allowed_node_ids is not None and value.target_node_id not in allowed_node_ids):
+                if not await reference_target_in_scope(value.target_node_id):
                     continue
                 if not await service._query_reference_visible(
                     value.target_node_id, user_id=user_id, turn_project_id=turn_project_id,
@@ -324,7 +417,15 @@ async def build_docs_read_projection(
         "turn_project": str(turn_project_id),
         "record_only": record_only,
         "outline_only": outline_only,
+        "personal_scope": personal_scope,
         "scope": sorted(map(str, allowed_node_ids)) if allowed_node_ids is not None else None,
+        "scope_anchors": (
+            sorted(map(str, scope_anchor_ids))
+            if scope_anchor_ids is not None
+            else None
+        ),
+        "scope_canonical_seeds": sorted(map(str, scope_canonical_seed_ids)),
+        "scope_related_seeds": sorted(map(str, scope_related_seed_ids)),
         "segments": segments, "reasons": sorted(reasons),
     }
     fingerprint = _hash(binding)
@@ -346,7 +447,7 @@ async def build_docs_read_projection(
         "read_fingerprint": fingerprint, "fingerprint_is_write_revision": False,
         "consistency": "live_read",
         "coverage_complete": not reasons, "coverage_reasons": sorted(reasons),
-        "coverage": "authorized containment, descriptions, typed content, tags and fields",
+        "coverage": "authorized containment, descriptions, typed content, bookmarks, tags and fields",
         "excluded_relations": ["placements", "backlinks", "edges", "attachments"],
         "projected_nodes": len(selected), "depth": depth, "max_nodes": MAX_NODES,
         "segments": segments[start:end], "page_start": start, "page_end": end,

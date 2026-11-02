@@ -336,7 +336,6 @@ _SIMPLE_TASK_POST_CREATE_BLOCKED_TOOLS = frozenset(
         "execute_command",
         "generate_image",
         "media_assistant",
-        "agent_team_delegate",
         "create_record_table",
         "sync_wbs_tasks",
         "sync_issue_table",
@@ -2239,30 +2238,54 @@ def response_definitely_incomplete_after_review(
 ) -> bool:
     """Mechanical-only reasons that may override a reviewer done decision."""
 
+    return _response_incomplete_after_review_reason_code(
+        response,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+        completion_evidence=completion_evidence,
+        write_tools_available=write_tools_available,
+    ) is not None
+
+
+def _response_incomplete_after_review_reason_code(
+    response: str | None,
+    *,
+    user_input: str | None = None,
+    audit_tool_calls: Sequence[Any] | None = None,
+    completion_evidence: CompletionEvidence | None = None,
+    write_tools_available: bool | Callable[[], bool | None] | None = None,
+) -> str | None:
+    """Return the first mechanical reason that makes a reviewed answer incomplete.
+
+    Codes are intentionally content-free so review events can expose the
+    predicate that fired without copying additional response or tool data.
+    Keep predicate order aligned with ``response_definitely_incomplete_after_review``.
+    """
+
     text = str(response or "").strip()
     if not text:
-        return True
+        return "empty_response"
     lowered = text.casefold()
     if any(term.casefold() in lowered for term in UNVERIFIED_TOOL_FAILURE_TERMS):
-        return True
+        return "unverified_tool_failure_term"
     if required_project_mutation_tools_missing(
         user_input,
         audit_tool_calls,
     ):
-        return True
+        return "required_project_mutation_tool_missing"
     if _task_mutation_postcondition_failed(
         completion_evidence,
         user_input=user_input,
         audit_tool_calls=audit_tool_calls,
     ):
-        return True
+        return "task_mutation_postcondition_failed"
     if _response_claims_unproven_task_creation(
         response,
         user_input=user_input,
         audit_tool_calls=audit_tool_calls,
         completion_evidence=completion_evidence,
     ):
-        return True
+        return "unproven_task_creation_claim"
     if (
         not isinstance(completion_evidence, Mapping)
         or completion_evidence.get("authoritative") is not True
@@ -2273,12 +2296,43 @@ def response_definitely_incomplete_after_review(
             audit_tool_calls,
         ),
     ):
-        return True
+        return "simple_task_duplicate_search_blocked"
     if filesystem_outcome_unmet(
         user_input, response, audit_tool_calls, write_tools_available=write_tools_available
     ):
-        return True
-    return response_promises_unexecuted_tool(response, audit_tool_calls)
+        return "filesystem_outcome_unmet"
+    if response_promises_unexecuted_tool(response, audit_tool_calls):
+        return "unexecuted_tool_promise"
+    return None
+
+
+def _apply_deterministic_incomplete_override_with_reason(
+    decision: dict[str, str],
+    *,
+    user_input: str | None,
+    response: str | None,
+    audit_tool_calls: Sequence[Any] | None = None,
+    completion_evidence: CompletionEvidence | None = None,
+    write_tools_available: bool | Callable[[], bool | None] | None = None,
+) -> tuple[dict[str, str], str | None]:
+    """Apply the existing deterministic override and return its diagnostic code."""
+
+    if decision.get("status") == "continue":
+        return decision, None
+    if filesystem_outcome_unmet(
+        user_input, response, audit_tool_calls, write_tools_available=write_tools_available
+    ):
+        return filesystem_outcome_continuation_decision(), "filesystem_outcome_unmet"
+    reason_code = _response_incomplete_after_review_reason_code(
+        response,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+        completion_evidence=completion_evidence,
+        write_tools_available=write_tools_available,
+    )
+    if reason_code is not None:
+        return unfinished_work_decision(user_input, str(response or "")), reason_code
+    return decision, None
 
 
 def apply_deterministic_incomplete_override(
@@ -2292,21 +2346,15 @@ def apply_deterministic_incomplete_override(
 ) -> dict[str, str]:
     """Force continuation when reviewer says done but the answer is still incomplete."""
 
-    if decision.get("status") == "continue":
-        return decision
-    if filesystem_outcome_unmet(
-        user_input, response, audit_tool_calls, write_tools_available=write_tools_available
-    ):
-        return filesystem_outcome_continuation_decision()
-    if response_definitely_incomplete_after_review(
-        response,
+    result, _reason_code = _apply_deterministic_incomplete_override_with_reason(
+        decision,
         user_input=user_input,
+        response=response,
         audit_tool_calls=audit_tool_calls,
         completion_evidence=completion_evidence,
         write_tools_available=write_tools_available,
-    ):
-        return unfinished_work_decision(user_input, str(response or ""))
-    return decision
+    )
+    return result
 
 
 def tool_loop_completion_confirmed(
@@ -2911,6 +2959,23 @@ def normalize_agentic_review_decision(
     return decision
 
 
+def _parsed_review_decision_diagnostic_code(
+    decision: Mapping[str, Any],
+) -> str | None:
+    """Return a stable, content-free code for the parsed reviewer outcome."""
+
+    if decision.get("review_protocol_error") is True:
+        return "review_protocol_error"
+    if decision.get("status") == "continue":
+        return "reviewer_selected_continue"
+    if (
+        decision.get("status") == "done"
+        and decision.get("user_request_satisfied") is not True
+    ):
+        return "review_done_without_user_satisfaction"
+    return None
+
+
 def unfinished_work_decision(user_input: str | None, response: str) -> dict[str, str]:
     return {
         "status": "continue",
@@ -3185,13 +3250,22 @@ async def run_agentic_completion_loop_async(
             audit_tool_calls,
             write_tools_available=write_tools_available,
         )
-        if (
+        diagnostic_reason_codes: list[str] = []
+        future_tool_promise_unconfirmed = (
             response_promises_future_tool_use(response) and not completion_confirmed
-        ) or outcome_unmet:
+        )
+        if (
+            future_tool_promise_unconfirmed or outcome_unmet
+        ):
             decision = (
                 filesystem_outcome_continuation_decision()
                 if outcome_unmet
                 else unfinished_work_decision(user_input, response)
+            )
+            diagnostic_reason_codes.append(
+                "filesystem_outcome_unmet"
+                if outcome_unmet
+                else "future_tool_promise_without_completion"
             )
             review_response = ""
             reviewer_echo = False
@@ -3210,13 +3284,18 @@ async def run_agentic_completion_loop_async(
             reviewer_echo = _reviewer_echoed_latest_response(
                 parsed_decision, review_response, response
             )
+            parsed_reason_code = _parsed_review_decision_diagnostic_code(
+                parsed_decision
+            )
+            if parsed_reason_code is not None:
+                diagnostic_reason_codes.append(parsed_reason_code)
             decision = parsed_decision
             decision = normalize_agentic_review_decision(
                 decision,
                 user_input=user_input,
                 response=response,
             )
-            decision = apply_deterministic_incomplete_override(
+            decision, override_reason_code = _apply_deterministic_incomplete_override_with_reason(
                 decision,
                 user_input=user_input,
                 response=response,
@@ -3224,11 +3303,19 @@ async def run_agentic_completion_loop_async(
                 completion_evidence=completion_evidence,
                 write_tools_available=write_tools_available,
             )
+            if override_reason_code is not None:
+                diagnostic_reason_codes.append(override_reason_code)
             if not reviewer_echo:
+                pre_semantic_status = decision.get("status")
                 decision = await semantic_review.review(
                     decision, user_input=user_input, response=response,
                     completion_evidence=completion_evidence, audit_tool_calls=audit_tool_calls,
                 )
+                if (
+                    pre_semantic_status == "done"
+                    and decision.get("status") == "continue"
+                ):
+                    diagnostic_reason_codes.append("semantic_review_material_gap")
         latest_generation_failure = (
             generation_failure_provider()
             if generation_failure_provider is not None
@@ -3250,6 +3337,7 @@ async def run_agentic_completion_loop_async(
                     "status": decision["status"],
                     "reason": decision.get("reason", ""),
                     "next_request": decision.get("next_request", ""),
+                    "diagnostic_reason_codes": diagnostic_reason_codes,
                     "review_response": str(review_response or ""),
                 },
             )
@@ -3498,13 +3586,22 @@ def run_agentic_completion_loop_sync(
             audit_tool_calls,
             write_tools_available=write_tools_available,
         )
-        if (
+        diagnostic_reason_codes: list[str] = []
+        future_tool_promise_unconfirmed = (
             response_promises_future_tool_use(response) and not completion_confirmed
-        ) or outcome_unmet:
+        )
+        if (
+            future_tool_promise_unconfirmed or outcome_unmet
+        ):
             decision = (
                 filesystem_outcome_continuation_decision()
                 if outcome_unmet
                 else unfinished_work_decision(user_input, response)
+            )
+            diagnostic_reason_codes.append(
+                "filesystem_outcome_unmet"
+                if outcome_unmet
+                else "future_tool_promise_without_completion"
             )
             review_response = ""
             reviewer_echo = False
@@ -3523,13 +3620,18 @@ def run_agentic_completion_loop_sync(
             reviewer_echo = _reviewer_echoed_latest_response(
                 parsed_decision, review_response, response
             )
+            parsed_reason_code = _parsed_review_decision_diagnostic_code(
+                parsed_decision
+            )
+            if parsed_reason_code is not None:
+                diagnostic_reason_codes.append(parsed_reason_code)
             decision = parsed_decision
             decision = normalize_agentic_review_decision(
                 decision,
                 user_input=user_input,
                 response=response,
             )
-            decision = apply_deterministic_incomplete_override(
+            decision, override_reason_code = _apply_deterministic_incomplete_override_with_reason(
                 decision,
                 user_input=user_input,
                 response=response,
@@ -3537,11 +3639,19 @@ def run_agentic_completion_loop_sync(
                 completion_evidence=completion_evidence,
                 write_tools_available=write_tools_available,
             )
+            if override_reason_code is not None:
+                diagnostic_reason_codes.append(override_reason_code)
             if not reviewer_echo:
+                pre_semantic_status = decision.get("status")
                 decision = semantic_review.review_sync(
                     decision, user_input=user_input, response=response,
                     completion_evidence=completion_evidence, audit_tool_calls=audit_tool_calls,
                 )
+                if (
+                    pre_semantic_status == "done"
+                    and decision.get("status") == "continue"
+                ):
+                    diagnostic_reason_codes.append("semantic_review_material_gap")
         latest_generation_failure = (
             generation_failure_provider()
             if generation_failure_provider is not None
@@ -3563,6 +3673,7 @@ def run_agentic_completion_loop_sync(
                     "status": decision["status"],
                     "reason": decision.get("reason", ""),
                     "next_request": decision.get("next_request", ""),
+                    "diagnostic_reason_codes": diagnostic_reason_codes,
                     "review_response": str(review_response or ""),
                 },
             )

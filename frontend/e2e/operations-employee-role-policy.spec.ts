@@ -21,7 +21,7 @@ for (const width of [1440, 390]) {
     await addAuthCookie(page); await mockAuthenticatedApis(page); await mockPersonaWorkspace(page);
     let revisions: EmployeeRevision[] = [{ id: "rev1", agent_id: agent.id, version: 1, display_name: agent.display_name,
       mission: "提供資料の整理", responsibility_summary: "資料読取", operational_instructions: "根拠を確認",
-      agent_team_id: "employee", execution_profile_id: "manual", allowed_subagent_ids: ["operator"], capability_ceiling: [],
+      legacy: { agent_team_id: "employee", execution_profile_id: "manual", allowed_subagent_ids: ["operator"] }, capability_ceiling: [],
       budget_policy: {}, concurrency_policy: {}, wake_policy: { mode: "manual" } }];
     const writes: Record<string, unknown>[] = []; const errors: string[] = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -37,7 +37,6 @@ for (const width of [1440, 390]) {
         return route.fulfill({ json: { revisions } });
       }
       if (path === "/api/python-proxy/agents/catalog") return route.fulfill({ json: { can_manage: true,
-        teams: [{ team_id: "employee", name: "社員チーム", subagents: [{ subagent_id: "operator", name: "運用担当", capability_ids: ["workspace_read"] }], execution_profiles: [{ profile_id: "manual", name: "手動Profile" }] }],
         capabilities: [{ id: "workspace_read", family: "workspace", access: "read", native: true }] } });
       if (path === "/api/python-proxy/agents") return route.fulfill({ json: { agents: [agent] } });
       if (path === `/api/python-proxy/agents/${agent.id}`) return route.fulfill({ json: { agent } });

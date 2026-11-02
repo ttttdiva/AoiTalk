@@ -5,12 +5,13 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EmployeeThumbnail, EmployeeThumbnailControl } from "./employee-thumbnail";
 
-const mocks = vi.hoisted(() => ({ upload: vi.fn(), save: vi.fn() }));
+const mocks = vi.hoisted(() => ({ upload: vi.fn(), save: vi.fn(), swr: vi.fn() }));
+vi.mock("swr", () => ({ default: mocks.swr }));
 vi.mock("@/lib/operations-api", () => ({ operationsApi: { uploadArtifact: mocks.upload } }));
 vi.mock("@/lib/agent-employees-api", () => ({ employeeApi: { thumbnail: mocks.save } }));
 const agent = { id: "agent-a", display_name: "担当", slug: "worker", state: "active" as const, thumbnail_artifact_id: "old-image" };
 
-beforeEach(() => { vi.clearAllMocks(); mocks.upload.mockResolvedValue({ id: "saved-image" }); mocks.save.mockResolvedValue({ agent_id: agent.id, artifact_id: "saved-image" }); });
+beforeEach(() => { vi.clearAllMocks(); mocks.swr.mockReturnValue({}); mocks.upload.mockResolvedValue({ id: "saved-image" }); mocks.save.mockResolvedValue({ agent_id: agent.id, artifact_id: "saved-image" }); });
 
 describe("Agentのサムネイル", () => {
   it("shows the persisted, authenticated image and falls back on a broken image", () => {
@@ -19,6 +20,30 @@ describe("Agentのサムネイル", () => {
     expect(image).toHaveAttribute("src", expect.stringContaining("/operations/artifacts/old-image/content"));
     fireEvent.error(image);
     expect(screen.getByText("画像を表示できません")).toBeVisible();
+  });
+
+  it("uses character preview when no artifact exists and keeps artifact priority", () => {
+    mocks.swr.mockReturnValue({ data: { has_source: true, builds: [], active_revision: null } });
+    const character = { ...agent, thumbnail_artifact_id: null, character_id: "character-a" };
+    const { rerender } = render(<EmployeeThumbnail agent={character} />);
+    expect(screen.getByRole("img", { name: "担当のサムネイル" })).toHaveAttribute("src", expect.stringContaining("/source.png"));
+    rerender(<EmployeeThumbnail agent={{ ...character, thumbnail_artifact_id: "artifact-a" }} />);
+    expect(screen.getByRole("img", { name: "担当のサムネイル" })).toHaveAttribute("src", expect.stringContaining("/artifacts/artifact-a/content"));
+  });
+
+  it("shows stable, distinct identity and role icons without saving configuration", () => {
+    const qa = { ...agent, thumbnail_artifact_id: null, display_name: "QA Gateway", slug: "qa-gateway" };
+    const research = { ...qa, id: "agent-b", display_name: "調査担当", slug: "research" };
+    const { rerender } = render(<><EmployeeThumbnail agent={qa} /><EmployeeThumbnail agent={research} /></>);
+    const identity = screen.getByLabelText("QA Gatewayの識別アイコン");
+    const markup = identity.outerHTML;
+    expect(identity).toHaveTextContent("識別アイコン・QA");
+    expect(screen.getByLabelText("調査担当の識別アイコン")).toHaveTextContent("識別アイコン・調査");
+    expect(identity.querySelector("svg")?.outerHTML).not.toBe(screen.getByLabelText("調査担当の識別アイコン").querySelector("svg")?.outerHTML);
+    rerender(<><EmployeeThumbnail agent={qa} /><EmployeeThumbnail agent={research} /></>);
+    expect(screen.getByLabelText("QA Gatewayの識別アイコン").outerHTML).toBe(markup);
+    expect(mocks.save).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
   });
 
   it("uploads then saves with the previous reference and refreshes only after persistence", async () => {

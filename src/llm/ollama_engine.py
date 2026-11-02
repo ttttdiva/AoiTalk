@@ -374,6 +374,11 @@ class OllamaClient:
         gateway = self._sync_privacy_gateway(
             suppress_automatic_context=suppress_automatic_context,
         )
+        from .agent_run_budget import AgentRunBudgetStop, get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        provider_send_started = False
+        provider_request_reserved = False
         descriptor = EgressDescriptor(
             action="model.generate",
             transport="ollama.chat.completions",
@@ -384,30 +389,88 @@ class OllamaClient:
         )
 
         def sender(final_payload: Any) -> Any:
+            nonlocal provider_send_started, provider_request_reserved
             if not isinstance(final_payload, dict):
                 raise PrivacyError("Ollama outbound payload is malformed")
             self._last_privacy_payload = dict(final_payload)
+            from .agent_run_budget import AgentRunBudgetStop, get_agent_run_budget
+
+            run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+            if run_budget is not None and not run_budget.begin_provider_request():
+                failure = run_budget.failure
+                if failure is not None:
+                    raise AgentRunBudgetStop(failure)
+            provider_send_started = False
+            provider_request_reserved = run_budget is not None
             from .generation_budget import current_generation_budget, record_bounded_model_request
             budget = current_generation_budget.get()
             if budget is not None and budget.interruptible_transport:
                 from .bounded_completion import execute_interruptible_completion
 
                 budget.record_request(final_payload)
-                return execute_interruptible_completion(self.client, final_payload, budget)
+                def on_provider_send() -> None:
+                    nonlocal provider_send_started
+                    provider_send_started = True
+
+                try:
+                    return execute_interruptible_completion(
+                        self.client,
+                        final_payload,
+                        budget,
+                        on_send=on_provider_send,
+                    )
+                except Exception as error:
+                    from .agent_run_budget import is_http_429_error
+
+                    if run_budget is not None:
+                        if provider_send_started and is_http_429_error(error):
+                            run_budget.record_provider_response({"total_tokens": 0})
+                        elif provider_send_started:
+                            run_budget.mark_token_usage_unavailable()
+                        else:
+                            run_budget.abort_provider_request()
+                        provider_request_reserved = False
+                    raise
             budget = record_bounded_model_request(final_payload)
             client = self.client.with_options(max_retries=0) if budget else self.client
-            return client.chat.completions.create(**final_payload)
+            provider_send_started = True
+            try:
+                return client.chat.completions.create(**final_payload)
+            except Exception as error:
+                from .agent_run_budget import is_http_429_error
+
+                if run_budget is not None:
+                    if is_http_429_error(error):
+                        run_budget.record_provider_response({"total_tokens": 0})
+                    else:
+                        run_budget.mark_token_usage_unavailable()
+                    provider_request_reserved = False
+                raise
 
         self._last_privacy_payload = dict(payload)
-        return gateway.execute_sync(
-            payload,
-            provider="ollama",
-            descriptor=descriptor,
-            sender=sender,
-            base_url=self.base_url,
-            source_kind=request_type,
-            model=self.model_name,
-        )
+        try:
+            return gateway.execute_sync(
+                payload,
+                provider="ollama",
+                descriptor=descriptor,
+                sender=sender,
+                base_url=self.base_url,
+                source_kind=request_type,
+                model=self.model_name,
+            )
+        except AgentRunBudgetStop:
+            raise
+        except Exception as error:
+            if provider_request_reserved and run_budget is not None:
+                from .agent_run_budget import is_http_429_error
+
+                if not provider_send_started:
+                    run_budget.abort_provider_request()
+                elif is_http_429_error(error):
+                    run_budget.record_provider_response({"total_tokens": 0})
+                else:
+                    run_budget.mark_token_usage_unavailable()
+            raise
 
     def get_generation_metadata(self) -> Dict[str, Any]:
         metadata = {
@@ -498,19 +561,18 @@ class OllamaClient:
                 exc_info=True,
             )
 
-    def _capture_usage(self, response: Any) -> None:
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # Keep Help telemetry out of a reused provider's ordinary
-            # diagnostics; the outer terminal boundary restores its snapshot.
-            self._last_usage = {}
-            return
+    def _capture_usage(self, response: Any) -> dict[str, Any]:
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        # Suppressed requests return usage without changing ordinary diagnostics.
         raw = getattr(response, "usage", None)
         resolved_model = getattr(response, "model", None)
         if raw is None and isinstance(response, dict):
             raw = response.get("usage")
         if resolved_model is None and isinstance(response, dict):
             resolved_model = response.get("model")
-        self._last_usage = {
+        captured_usage = {
             key: value
             for key, value in normalize_usage(
                 raw,
@@ -519,12 +581,17 @@ class OllamaClient:
             ).items()
             if value is not None
         }
+        if suppress_automatic_context:
+            self._last_usage = {}
+            return captured_usage
+        self._last_usage = captured_usage
         input_tokens = self._last_usage.get("input_tokens")
         if input_tokens is not None and self._last_context_snapshots:
             self._last_context_snapshots[-1] = reconcile_snapshot(
                 self._last_context_snapshots[-1],
                 int(input_tokens),
             )
+        return captured_usage
 
     def _capture_and_persist_usage(
         self,
@@ -536,15 +603,18 @@ class OllamaClient:
     ) -> dict[str, Any]:
         """Capture and persist one successful Ollama API response."""
 
-        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
-            # Help is an ephemeral Guide projection; never write provider
-            # telemetry to the user's ordinary token ledger.
-            self._capture_usage(response)
-            return {}
-
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         previous_usage = dict(getattr(self, "_last_usage", {}) or {})
-        self._capture_usage(response)
-        usage = dict(self._last_usage)
+        usage = self._capture_usage(response)
+        from .agent_run_budget import get_agent_run_budget
+
+        run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+        if run_budget is not None:
+            run_budget.record_provider_response(usage or None)
+        if suppress_automatic_context:
+            return {}
         if not usage and previous_usage:
             # Ephemeral/test endpoints often omit usage entirely.  Preserve
             # the last confirmed turn observation rather than erasing it.
@@ -1865,10 +1935,9 @@ class OllamaClient:
                     )
                     full_response += content
                     yield content
-                if not suppress_automatic_context:
-                    self._capture_usage(chunk)
-                if self._last_usage and not suppress_automatic_context:
-                    stream_usage = dict(self._last_usage)
+                captured_usage = self._capture_usage(chunk)
+                if captured_usage:
+                    stream_usage = dict(captured_usage)
         except GenerationInterrupted:
             raise
         except Exception as exc:
@@ -1896,6 +1965,11 @@ class OllamaClient:
                 if self._last_usage:
                     stream_usage = dict(self._last_usage)
                 self._last_usage = dict(stream_usage)
+            from .agent_run_budget import get_agent_run_budget
+
+            run_budget = get_agent_run_budget(self, config=getattr(self, "config", None))
+            if run_budget is not None:
+                run_budget.record_provider_response(stream_usage or None)
             if stream_usage and not suppress_automatic_context:
                 persist_usage_sync(
                     self,

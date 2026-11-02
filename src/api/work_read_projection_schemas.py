@@ -23,6 +23,10 @@ class WorkMoneyEvidence(BaseModel):
     )
 
 
+class WorkRunLegacy(BaseModel):
+    acting_subagent_id: str | None = None
+
+
 class WorkRunRead(BaseModel):
     id: str
     work_item_id: str | None
@@ -34,7 +38,7 @@ class WorkRunRead(BaseModel):
     agent_id: str | None = None
     agent_revision_id: str | None = None
     agent_display_name: str | None = None
-    acting_subagent_id: str | None = None
+    legacy: WorkRunLegacy | None = None
     work_item_attempt: int | None = None
     started_at: str | None = None
     ended_at: str | None = None

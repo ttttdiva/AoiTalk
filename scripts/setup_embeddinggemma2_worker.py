@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 from pathlib import Path
 import subprocess
 import shutil
@@ -48,7 +49,12 @@ def main():
         action="store_true",
         help="Load the existing fixed model and make one query",
     )
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
     args = parser.parse_args()
+    cache_helper = runpy.run_path(str(ROOT / "src/rag/embedding_cache.py"))
+    cache_dir = cache_helper["resolve_embedding_cache"](args.cache_dir)
     if not args.cuda and shutil.which("nvidia-smi"):
         args.cuda = (
             subprocess.run(
@@ -92,11 +98,7 @@ def main():
     if args.host_check:
         checked([sys.executable, "-m", "pip", "check"])
     if args.download:
-        if args.cache_dir is None:
-            parser.error(
-                "--download requires an explicitly selected external --cache-dir"
-            )
-        cache = args.cache_dir.resolve()
+        cache = Path(cache_dir).resolve()
         if cache.is_relative_to(ROOT):
             parser.error(
                 "Model weights must use shared external storage, outside the checkout"
@@ -122,7 +124,7 @@ def main():
                 "identity": EMBEDDING_FINGERPRINT,
                 "settings": {
                     "device": "cuda" if args.cuda else "cpu",
-                    "cache_dir": str(args.cache_dir) if args.cache_dir else None,
+                    "cache_dir": cache_dir,
                     "local_files_only": True,
                 },
             },

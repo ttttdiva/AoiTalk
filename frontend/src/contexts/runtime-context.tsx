@@ -125,14 +125,6 @@ type LlmEngineResponse = {
     model?: string | null;
     effort?: string | null;
   } | null;
-  execution_profile?: {
-    effective_main?: {
-      provider?: string | null;
-      model?: string | null;
-      effort?: string | null;
-      reasoning_effort?: string | null;
-    } | null;
-  } | null;
   available?: RuntimeLlmEngine[];
   available_included?: boolean;
   deployment?: LlmDeploymentMetadata | null;
@@ -220,10 +212,6 @@ function enginePersistedRoute(parsed: LlmEngineResponse): RuntimeLlmRoute | null
 function engineEffectiveRoute(parsed: LlmEngineResponse): RuntimeLlmRoute | null {
   return (
     runtimeLlmRoute(parsed.effective_main?.provider, parsed.effective_main?.model) ??
-    runtimeLlmRoute(
-      parsed.execution_profile?.effective_main?.provider,
-      parsed.execution_profile?.effective_main?.model,
-    ) ??
     runtimeLlmRoute(parsed.effective_provider, parsed.effective_model) ??
     deploymentEffectiveRoute(parsed.deployment) ??
     enginePersistedRoute(parsed)

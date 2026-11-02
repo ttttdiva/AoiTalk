@@ -4,9 +4,12 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { HelpPopover } from "@/components/ui/help-popover";
+import { Input } from "@/components/ui/input";
+import { AppSelect } from "@/components/ui/app-select";
 import {
   ambiguousDraftFailure, draftWrite, personalDraftApi,
   type DraftDecisionResult, type DraftOperation, type DraftWrite, type PersonalDraft,
+  type PersonalDraftEvidenceCreate,
 } from "./personal-draft-api";
 
 const STATUS: Record<string, string> = {
@@ -98,7 +101,11 @@ function DraftReview({ draft, locked, onDecision }: {
   );
 }
 
-export function PersonalDraftPanel({ onMaterialized }: { onMaterialized?: () => void | Promise<void> }) {
+export function PersonalDraftPanel({ onMaterialized, onEvidenceSaved, refreshRequest = 0 }: {
+  onMaterialized?: () => void | Promise<void>;
+  onEvidenceSaved?: () => void | Promise<void>;
+  refreshRequest?: number;
+}) {
   const [drafts, setDrafts] = useState<PersonalDraft[]>([]);
   const [selected, setSelected] = useState("");
   const [loading, setLoading] = useState(true);
@@ -109,6 +116,17 @@ export function PersonalDraftPanel({ onMaterialized }: { onMaterialized?: () => 
   const extended = useRef(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [evidenceKind, setEvidenceKind] = useState<"deadline" | "inventory">("deadline");
+  const [evidenceSubject, setEvidenceSubject] = useState("");
+  const [evidenceDate, setEvidenceDate] = useState("");
+  const [evidenceLabel, setEvidenceLabel] = useState("");
+  const [evidenceType, setEvidenceType] = useState<"opening_balance" | "purchase" | "consumption">("purchase");
+  const [evidenceQuantity, setEvidenceQuantity] = useState("");
+  const [evidenceUnit, setEvidenceUnit] = useState("pcs");
+  const [evidenceSource, setEvidenceSource] = useState("");
+  const [evidenceWrite, setEvidenceWrite] = useState<PersonalDraftEvidenceCreate | null>(null);
+  const [evidenceSaving, setEvidenceSaving] = useState(false);
+  const [evidenceMessage, setEvidenceMessage] = useState("");
   const [pending, setPending] = useState<Pending | null>(null);
   const [reviewReset, setReviewReset] = useState(0);
   const draftsRef = useRef(drafts);
@@ -264,7 +282,7 @@ export function PersonalDraftPanel({ onMaterialized }: { onMaterialized?: () => 
     // eslint-disable-next-line react-hooks/set-state-in-effect -- load the owner-scoped draft list on mount.
     void reload();
     return () => { mounted.current = false; };
-  }, [reload]);
+  }, [reload, refreshRequest]);
 
   function select(id: string) {
     if (selectedRef.current !== id) {
@@ -384,6 +402,34 @@ export function PersonalDraftPanel({ onMaterialized }: { onMaterialized?: () => 
   }
 
   const draft = drafts.find((d) => d.draft_ref === selected);
+
+  async function saveEvidence() {
+    if (evidenceSaving) return;
+    let request = evidenceWrite;
+    if (!request) {
+      const proposal: PersonalDraftEvidenceCreate["proposal"] = evidenceKind === "deadline"
+        ? { kind: "deadline", data: { subject_key: evidenceSubject.trim(), due_date: evidenceDate,
+            ...(evidenceLabel.trim() ? { label: evidenceLabel.trim() } : {}) } }
+        : { kind: "inventory", data: { subject_key: evidenceSubject.trim(), entry_type: evidenceType,
+            quantity: Number(evidenceQuantity), unit: evidenceUnit.trim(), occurred_on: evidenceDate } };
+      request = { proposal, source_text: evidenceSource, idempotency_key: crypto.randomUUID() };
+      setEvidenceWrite(request);
+    }
+    setEvidenceSaving(true);
+    setEvidenceMessage("");
+    try {
+      await personalDraftApi.saveEvidence(request);
+      setEvidenceWrite(null);
+      setEvidenceSource("");
+      setEvidenceMessage("根拠を本人用に保存しました。台帳へはまだ反映されていません。");
+      await Promise.resolve(onEvidenceSaved?.());
+    } catch (error) {
+      setEvidenceMessage(`保存結果を確認できませんでした。入力と同じキーを保持しています。${reason(error)}`);
+    } finally {
+      setEvidenceSaving(false);
+    }
+  }
+
   return (
     <section aria-labelledby={headingId} className="min-w-0 space-y-3 rounded border p-3" data-testid="personal-drafts">
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -394,6 +440,61 @@ export function PersonalDraftPanel({ onMaterialized }: { onMaterialized?: () => 
         <Button variant="outline" className="min-h-11" onClick={() => void reload()}>候補を再取得</Button>
       </header>
       {message && <p role="status" className="[overflow-wrap:anywhere]">{message}</p>}
+      <details className="rounded border p-3">
+        <summary className="min-h-11 cursor-pointer py-2 font-medium">本人が選ぶ根拠を保存</summary>
+        <div className="space-y-3 pt-2">
+          <p className="text-xs text-muted-foreground">本人が明示入力した資料文面と値だけを保存します。URL取得、OCR、日付計算は行いません。保存した根拠は個人Agentの提案元として選べます。</p>
+          <label className="grid gap-1">候補の種類
+            <AppSelect className="w-full" value={evidenceKind} disabled={evidenceSaving || evidenceWrite !== null}
+              onChange={(event) => { setEvidenceKind(event.target.value as "deadline" | "inventory"); setEvidenceWrite(null); }}>
+              <option value="deadline">期限候補</option><option value="inventory">在庫記録候補</option>
+            </AppSelect>
+          </label>
+          <label className="grid gap-1">対象の中立な別名
+            <Input value={evidenceSubject} disabled={evidenceSaving || evidenceWrite !== null} maxLength={64} placeholder="document_a / supply_a"
+              onChange={(event) => { setEvidenceSubject(event.target.value); setEvidenceWrite(null); }} />
+          </label>
+          {evidenceKind === "deadline" ? <>
+            <label className="grid gap-1">本人が確認した日付
+              <Input type="date" value={evidenceDate} disabled={evidenceSaving || evidenceWrite !== null}
+                onChange={(event) => { setEvidenceDate(event.target.value); setEvidenceWrite(null); }} />
+            </label>
+            <label className="grid gap-1">名称（任意）
+              <Input value={evidenceLabel} disabled={evidenceSaving || evidenceWrite !== null} maxLength={160}
+                onChange={(event) => { setEvidenceLabel(event.target.value); setEvidenceWrite(null); }} />
+            </label>
+          </> : <>
+            <label className="grid gap-1">記録の種類
+              <AppSelect className="w-full" value={evidenceType} disabled={evidenceSaving || evidenceWrite !== null}
+                onChange={(event) => { setEvidenceType(event.target.value as typeof evidenceType); setEvidenceWrite(null); }}>
+                <option value="opening_balance">初期残数</option><option value="purchase">購入</option><option value="consumption">消費</option>
+              </AppSelect>
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="grid gap-1">数量
+                <Input type="number" min="0.000001" step="any" value={evidenceQuantity} disabled={evidenceSaving || evidenceWrite !== null}
+                  onChange={(event) => { setEvidenceQuantity(event.target.value); setEvidenceWrite(null); }} />
+              </label>
+              <label className="grid gap-1">単位
+                <Input value={evidenceUnit} disabled={evidenceSaving || evidenceWrite !== null} maxLength={32}
+                  onChange={(event) => { setEvidenceUnit(event.target.value); setEvidenceWrite(null); }} />
+              </label>
+            </div>
+            <label className="grid gap-1">記録日
+              <Input type="date" value={evidenceDate} disabled={evidenceSaving || evidenceWrite !== null}
+                onChange={(event) => { setEvidenceDate(event.target.value); setEvidenceWrite(null); }} />
+            </label>
+          </>}
+          <label className="grid gap-1">根拠の文面
+            <textarea className="min-h-28 rounded border bg-background p-2" value={evidenceSource} maxLength={16384}
+              disabled={evidenceSaving || evidenceWrite !== null} onChange={(event) => { setEvidenceSource(event.target.value); setEvidenceWrite(null); }} />
+          </label>
+          <Button type="button" className="min-h-11" disabled={evidenceSaving || !evidenceSource.trim() || !evidenceSubject.trim() || !evidenceDate ||
+            evidenceKind === "inventory" && (!evidenceQuantity || !evidenceUnit.trim())}
+            onClick={() => void saveEvidence()}>{evidenceSaving ? "保存中…" : evidenceWrite ? "同じ内容で保存を再試行" : "根拠を保存"}</Button>
+          {evidenceMessage && <p role="status">{evidenceMessage}</p>}
+        </div>
+      </details>
       {pending && <div role="alert" className="space-y-2 rounded border p-3">
         <p className="[overflow-wrap:anywhere]">対象: {pending.subject}。応答待ちの{pending.write.operation === "accept" ? "受理" : "破棄"}操作があります。対象を切り替えても、元の操作として照合します。</p>
         <Button className="min-h-11" disabled={busy} onClick={() => void retry()}>同じ操作で結果を照合</Button>

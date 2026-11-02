@@ -122,10 +122,22 @@ INTERNAL_ERROR_CATEGORY = "internal_error"
 INTERNAL_ERROR_CODE = "internal_error"
 LLM_UNAVAILABLE_CATEGORY = "llm_unavailable"
 STORAGE_UNAVAILABLE_CATEGORY = "storage_unavailable"
+CONSUMER_UNAVAILABLE_CATEGORY = "consumer_unavailable"
 _SAFE_STORAGE_ERROR_MESSAGES = {
     "storage_unavailable": "素材の保存先を利用できません。接続状態と登録記録を確認してください。",
     "storage_busy": "素材の保存先で処理が続いています。少し待ってから登録記録を確認してください。",
 }
+_SAFE_CONSUMER_UNAVAILABLE_CODES = frozenset(
+    {
+        CONSUMER_UNAVAILABLE_CATEGORY,
+        "consumer_auth_unavailable",
+        "muse_canonical_binding_not_configured",
+        "muse_session_unavailable",
+        "muse_service_unavailable",
+        "grok_bot_service_unavailable",
+        "provider_unavailable",
+    }
+)
 _SAFE_LLM_ERROR_CODES = frozenset(
     {
         GenerationErrorKind.INSUFFICIENT_QUOTA,
@@ -158,6 +170,7 @@ _SAFE_ERROR_CATEGORIES = frozenset(
         "not_found",
         LLM_UNAVAILABLE_CATEGORY,
         STORAGE_UNAVAILABLE_CATEGORY,
+        CONSUMER_UNAVAILABLE_CATEGORY,
         *(member.value for member in CharacterLookupErrorCategory),
     }
 )
@@ -252,6 +265,14 @@ def whitelist_error_detail(
             code_allowlist |= _SAFE_LLM_ERROR_CODES
         elif category == STORAGE_UNAVAILABLE_CATEGORY:
             code_allowlist |= frozenset(_SAFE_STORAGE_ERROR_MESSAGES)
+        elif category == CONSUMER_UNAVAILABLE_CATEGORY:
+            code_allowlist |= _SAFE_CONSUMER_UNAVAILABLE_CODES
+        elif (
+            category == INTERNAL_ERROR_CATEGORY
+            and str(raw_code).strip().lower() in _SAFE_CONSUMER_UNAVAILABLE_CODES
+        ):
+            category = CONSUMER_UNAVAILABLE_CATEGORY
+            code_allowlist = _SAFE_CONSUMER_UNAVAILABLE_CODES
         code = _allowlisted_machine_value(
             raw_code,
             allowlist=code_allowlist,
@@ -286,6 +307,10 @@ def whitelist_error_detail(
             code = INTERNAL_ERROR_CODE
         else:
             message = expected_message
+    elif category == CONSUMER_UNAVAILABLE_CATEGORY:
+        if code not in _SAFE_CONSUMER_UNAVAILABLE_CODES:
+            category = INTERNAL_ERROR_CATEGORY
+            code = INTERNAL_ERROR_CODE
     elif code == STORAGE_UNAVAILABLE_CATEGORY:
         # An untyped storage exception is still untrusted. Only the canonical
         # category/code/message tuple may identify a storage availability error.

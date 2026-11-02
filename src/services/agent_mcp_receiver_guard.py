@@ -13,14 +13,30 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
+
+
+def _write_schema_diagnostic(record: dict[str, Any]) -> None:
+    """Persist only the pre-sanitized list-tools footprint in application logs."""
+    try:
+        log_dir = Path(__file__).resolve().parents[2] / "logs" / "app"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "formal_mcp_schema.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    except OSError:
+        # Diagnostics must never prevent a formal MCP response.
+        logger.warning("formal_mcp_list_tools diagnostic persistence unavailable")
 
 
 FORMAL_AGENT_MCP_SERVERS = frozenset(
@@ -30,7 +46,14 @@ FORMAL_AGENT_ACTIVITY_TOOLS = frozenset({"agent_activity"})
 FORMAL_AGENT_DIALOGUE_TOOLS = frozenset(
     {
         "list_agent_workers",
+        "agent_team_delegate",
+        "delegate",
+        "delegate_plan",
+        "delegate_media",
         "delegate_agent_work",
+        "delegate_worker",
+        "load_tool_pack",
+        "ask_agent_work_question",
         "get_agent_work_status",
         "send_agent_work_message",
         "answer_agent_work_question",
@@ -202,6 +225,8 @@ def _allowed_tool(server_name: str, tool_name: str, role: str | None) -> bool:
         return tool in FORMAL_AGENT_ACTIVITY_TOOLS
     if tool not in FORMAL_AGENT_DIALOGUE_TOOLS:
         return False
+    if tool == "ask_agent_work_question":
+        return str(role or "").casefold() == "worker"
     return not (str(role or "").casefold() == "worker" and tool in FORMAL_AGENT_WORKER_DENIED_TOOLS)
 
 
@@ -413,6 +438,11 @@ async def verify_formal_agent_mcp_call(
         role = str(dialogue_marker.get("role") or "").strip().casefold() or None
         if not _allowed_tool(normalized_server, normalized_tool, role):
             raise AgentMcpReceiverDenied("formal MCP tool is outside the current receiver", code="agent_mcp_tool_denied")
+        if normalized_tool in {"delegate_plan", "delegate_media"}:
+            from .agent_revision_v2 import revision_tool_ids
+
+            if normalized_tool not in (revision_tool_ids(revision) or ()):
+                raise AgentMcpReceiverDenied(f"{normalized_tool} is absent from the pinned revision", code="agent_mcp_tool_denied")
         try:
             control_revision = int(dialogue_marker.get("control_revision")) if dialogue_marker.get("control_revision") is not None else None
         except (TypeError, ValueError):
@@ -513,10 +543,53 @@ def build_formal_agent_mcp_server(server_name: str) -> Any:
 
     from mcp.server.fastmcp import FastMCP
 
+    from ..llm.generation_cancellation import AgentDialogueInputPending
+
     normalized_server = str(server_name or "").strip().casefold()
     if normalized_server not in FORMAL_AGENT_MCP_SERVERS:
         raise ValueError("unknown formal Agent MCP server")
-    mcp = FastMCP(f"aoitalk-{normalized_server}")
+    class DiagnosticFastMCP(FastMCP):
+        async def list_tools(self) -> list[Any]:
+            tools = await super().list_tools()
+            # Only fixed first-party names and byte counts enter diagnostics;
+            # schema contents and request/context values never do.
+            allowed = (
+                FORMAL_AGENT_ACTIVITY_TOOLS
+                if normalized_server == "agent_activity"
+                else FORMAL_AGENT_DIALOGUE_TOOLS
+            )
+            sizes = {
+                tool.name: len(
+                    json.dumps(tool.inputSchema, ensure_ascii=False, separators=(",", ":"))
+                    .encode("utf-8")
+                )
+                for tool in tools
+                if tool.name in allowed
+            }
+            raw_run_id = os.environ.get("AOITALK_AGENT_RUN_ID")
+            try:
+                run_id = str(UUID(raw_run_id)) if raw_run_id is not None else None
+            except ValueError:
+                run_id = None
+            _write_schema_diagnostic(
+                {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "server": normalized_server,
+                    "count": len(tools),
+                    "run_id": run_id,
+                    "pid": os.getpid(),
+                    "input_schema_json_bytes": sizes,
+                }
+            )
+            logger.warning(
+                "formal_mcp_list_tools server=%s count=%d input_schema_json_bytes=%s",
+                normalized_server,
+                len(tools),
+                json.dumps(sizes, sort_keys=True, separators=(",", ":")),
+            )
+            return tools
+
+    mcp = DiagnosticFastMCP(f"aoitalk-{normalized_server}")
     from ..tools.agent_activity import build_agent_activity_tool
     from ..tools.agent_dialogue import build_agent_dialogue_tools
 
@@ -525,6 +598,12 @@ def build_formal_agent_mcp_server(server_name: str) -> Any:
         if normalized_server == "agent_activity"
         else build_agent_dialogue_tools()
     )
+    if normalized_server != "agent_activity":
+        from ..tools.delegate_worker import build_delegate_worker_tool
+
+        worker_definition = build_delegate_worker_tool()
+        if worker_definition is not None:
+            definitions.append(worker_definition)
     for definition in definitions:
         function = definition.function
 
@@ -532,12 +611,83 @@ def build_formal_agent_mcp_server(server_name: str) -> Any:
             @wraps(target)
             async def guarded(*args: Any, **kwargs: Any) -> Any:
                 async with formal_agent_mcp_call_context(normalized_server, tool_name):
-                    result = target(*args, **kwargs)
-                    return await result if inspect.isawaitable(result) else result
+                    try:
+                        result = target(*args, **kwargs)
+                        return await result if inspect.isawaitable(result) else result
+                    except AgentDialogueInputPending as pending:
+                        # A CLI worker runs in its own process and cannot receive
+                        # this control-flow signal, so tell it to stop instead.
+                        return json.dumps(
+                            {
+                                "success": True,
+                                "status": "waiting",
+                                "input_id": pending.input_id,
+                                "dialogue_id": pending.dialogue_id,
+                                "next": "end_turn_and_wait",
+                                "instruction": (
+                                    "The question is saved. End this turn now; the answer "
+                                    "arrives as a new message."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
 
             mcp.tool(name=tool_name, description=description)(guarded)
 
         _factory(definition.name, function, definition.description)
+        if normalized_server != "agent_activity" and definition.name == "delegate_agent_work":
+            _factory(
+                "agent_team_delegate",
+                function,
+                "Delegate bounded work to an eligible AoiTalk Worker through the current AgentRun.",
+            )
+    if normalized_server != "agent_activity":
+        loaded_packs: set[str] = set()
+
+        async def load_tool_pack(pack: str) -> str:
+            async with formal_agent_mcp_call_context(
+                normalized_server,
+                "load_tool_pack",
+            ):
+                pack_id = str(pack or "").strip()
+                if pack_id != "agent_team":
+                    return json.dumps(
+                        {"success": False, "error": "tool_pack_unavailable"},
+                        ensure_ascii=False,
+                    )
+                already_loaded = pack_id in loaded_packs
+                loaded_packs.add(pack_id)
+                return json.dumps(
+                    {
+                        "success": True,
+                        "pack": pack_id,
+                        "loaded": True,
+                        "already_loaded": already_loaded,
+                        "tools": [
+                            "delegate",
+                            "delegate_agent_work",
+                            "agent_team_delegate",
+                            "delegate_worker",
+                            "list_agent_workers",
+                            "get_agent_work_status",
+                            "send_agent_work_message",
+                            "ask_agent_work_question",
+                            "answer_agent_work_question",
+                            "escalate_agent_work_question",
+                            "stop_agent_work",
+                            "resume_agent_work",
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+
+        mcp.tool(
+            name="load_tool_pack",
+            description=(
+                "Load the AoiTalk Agent Team workflow pack. Its delegation and "
+                "question tools are exposed directly by this MCP server."
+            ),
+        )(load_tool_pack)
     return mcp
 
 

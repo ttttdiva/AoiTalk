@@ -5,7 +5,7 @@ import {
   conversationParticipants,
   conversationSessions,
 } from "@/db/schema";
-import { eq, and, inArray, isNull, desc, sql, or, isNotNull } from "drizzle-orm";
+import { eq, and, inArray, isNull, desc, sql, or } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import {
@@ -139,6 +139,166 @@ function sessionToSnake(row: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+const CONVERSATION_PAGE_DEFAULT = 10;
+const CONVERSATION_PAGE_MAX = 50;
+const CONVERSATION_CURSOR_VERSION = 1;
+
+type ConversationListCursor = {
+  v: typeof CONVERSATION_CURSOR_VERSION;
+  p: boolean;
+  a: string | null;
+  s: string | null;
+  i: string;
+  scope: {
+    projectId: string | null;
+    appId: string | null;
+    appTargetId: string | null;
+  };
+};
+
+function encodeConversationCursor(cursor: ConversationListCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeConversationCursor(
+  raw: string,
+  scope: ConversationListCursor["scope"],
+): ConversationListCursor {
+  if (!/^[A-Za-z0-9_-]{1,2048}$/.test(raw)) {
+    throw new Error("cursor の形式が不正です");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("cursor の形式が不正です");
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error("cursor の形式が不正です");
+  }
+  const candidate = value as Partial<ConversationListCursor>;
+  if (
+    candidate.v !== CONVERSATION_CURSOR_VERSION ||
+    typeof candidate.p !== "boolean" ||
+    (candidate.a !== null && typeof candidate.a !== "string") ||
+    (candidate.s !== null && typeof candidate.s !== "string") ||
+    typeof candidate.i !== "string" ||
+    candidate.i.length === 0 ||
+    !candidate.scope ||
+    typeof candidate.scope !== "object"
+  ) {
+    throw new Error("cursor の形式が不正です");
+  }
+  const candidateScope = candidate.scope as ConversationListCursor["scope"];
+  if (
+    (candidateScope.projectId ?? null) !== scope.projectId ||
+    (candidateScope.appId ?? null) !== scope.appId ||
+    (candidateScope.appTargetId ?? null) !== scope.appTargetId
+  ) {
+    throw new Error("cursor の対象スコープが一致しません");
+  }
+  for (const stamp of [candidate.a, candidate.s]) {
+    if (stamp !== null && Number.isNaN(new Date(stamp).getTime())) {
+      throw new Error("cursor の日時が不正です");
+    }
+  }
+  return {
+    v: CONVERSATION_CURSOR_VERSION,
+    p: candidate.p,
+    a: candidate.a ?? null,
+    s: candidate.s ?? null,
+    i: candidate.i,
+    scope,
+  };
+}
+
+function pageLimit(searchParams: URLSearchParams): number | null {
+  // Keep the unbounded response for existing non-Chat consumers. The Chat
+  // client opts into the bounded contract by sending `limit=10`.
+  if (!searchParams.has("limit") && !searchParams.has("cursor")) return null;
+  const raw = searchParams.get("limit") ?? String(CONVERSATION_PAGE_DEFAULT);
+  if (!/^[0-9]+$/.test(raw)) throw new Error("limit は整数で指定してください");
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > CONVERSATION_PAGE_MAX) {
+    throw new Error(`limit は1から${CONVERSATION_PAGE_MAX}の範囲で指定してください`);
+  }
+  return parsed;
+}
+
+function cursorDate(value: string | null) {
+  if (value === null) return null;
+
+  // List timestamps are PostgreSQL `timestamp without time zone` values whose
+  // stored fields are UTC. New cursors preserve those fields directly; older
+  // cursors used Date.toISOString() and end in Z, so normalize those to UTC
+  // fields before PostgreSQL discards the timezone marker on the cast.
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
+    ? new Date(value).toISOString()
+    : value;
+  return sql`${normalized.replace("T", " ").replace(/Z$/i, "")}::timestamp`;
+}
+
+function conversationCursorScope(
+  projectId: string | null,
+  appScope: { appId?: string | null; appTargetId?: string | null } | null,
+): ConversationListCursor["scope"] {
+  return {
+    projectId: projectId ?? null,
+    appId: appScope?.appId ?? null,
+    appTargetId: appScope?.appTargetId ?? null,
+  };
+}
+
+function conversationCursorCondition(cursor: ConversationListCursor) {
+  const activity = sql`coalesce(${conversationSessions.lastActivity}, ${conversationSessions.sessionStart})`;
+  const activityAfter =
+    cursor.a === null
+      ? sql`false`
+      : sql`(${activity} < ${cursorDate(cursor.a)} or ${activity} is null)`;
+  const activityEqual =
+    cursor.a === null
+      ? sql`${activity} is null`
+      : sql`${activity} = ${cursorDate(cursor.a)}`;
+  const sessionStart = conversationSessions.sessionStart;
+  const sessionStartAfter =
+    cursor.s === null
+      ? sql`false`
+      : sql`(${sessionStart} < ${cursorDate(cursor.s)} or ${sessionStart} is null)`;
+  const sessionStartEqual =
+    cursor.s === null
+      ? sql`${sessionStart} is null`
+      : sql`${sessionStart} = ${cursorDate(cursor.s)}`;
+
+  return sql`(
+    ${conversationSessions.isPinned} < ${cursor.p}
+    or (
+      ${conversationSessions.isPinned} = ${cursor.p}
+      and (
+        ${activityAfter}
+        or (${activityEqual} and (${sessionStartAfter} or (${sessionStartEqual} and ${conversationSessions.id} < ${cursor.i})))
+      )
+    )
+  )`;
+}
+
+function cursorFromSession(
+  row: {
+    session: typeof conversationSessions.$inferSelect;
+    cursorActivity: string | null;
+    cursorSessionStart: string | null;
+  },
+  scope: ConversationListCursor["scope"],
+): ConversationListCursor {
+  return {
+    v: CONVERSATION_CURSOR_VERSION,
+    p: row.session.isPinned,
+    a: row.cursorActivity,
+    s: row.cursorSessionStart,
+    i: row.session.id,
+    scope,
+  };
+}
+
 export async function GET(request: NextRequest) {
   const user = await getSession();
   if (!user) {
@@ -185,11 +345,36 @@ export async function GET(request: NextRequest) {
     }
   }
 
+  let limit: number | null;
+  let cursor: ConversationListCursor | null = null;
+  const cursorScope = conversationCursorScope(projectId, appScope);
+  try {
+    limit = pageLimit(searchParams);
+    const rawCursor = searchParams.get("cursor");
+    if (rawCursor !== null) {
+      cursor = decodeConversationCursor(rawCursor, cursorScope);
+    }
+    if (cursor && limit === null) limit = CONVERSATION_PAGE_DEFAULT;
+  } catch (error) {
+    return NextResponse.json(
+      {
+        detail: error instanceof Error ? error.message : "ページ指定が不正です",
+        code: "invalid_pagination",
+      },
+      { status: 400 },
+    );
+  }
+
+  const joinedParticipant = sql`exists (
+    select 1
+    from ${conversationParticipants}
+    where ${conversationParticipants.sessionId} = ${conversationSessions.id}
+      and ${conversationParticipants.participantType} = 'user'
+      and ${conversationParticipants.participantId} = ${user.id}
+      and ${conversationParticipants.status} = 'joined'
+  )`;
   const conditions = [
-    or(
-      eq(conversationSessions.userId, user.id),
-      isNotNull(conversationParticipants.id),
-    ),
+    or(eq(conversationSessions.userId, user.id), joinedParticipant),
     isNull(conversationSessions.deletedAt),
   ];
 
@@ -211,28 +396,29 @@ export async function GET(request: NextRequest) {
   if (appScope?.appTargetId) {
     conditions.push(eq(conversationSessions.appTargetId, appScope.appTargetId));
   }
+  if (cursor) conditions.push(conversationCursorCondition(cursor));
+  // Keep the non-empty-session rule in SQL without joining every message row.
+  // This lets PostgreSQL apply the keyset limit against session rows instead
+  // of materializing and grouping the full transcript for every session.
+  conditions.push(
+    sql`exists (
+      select 1
+      from ${conversationMessages}
+      where ${conversationMessages.sessionId} = ${conversationSessions.id}
+    )`,
+  );
 
-  const rows = await db
+  const rowsQuery = db
     .select({
       session: conversationSessions,
-      actualMessageCount: sql<number>`count(${conversationMessages.id})`,
+      // Keep the exact database precision for pagination. Drizzle's Date mode
+      // and the shared OID 1114 parser expose milliseconds, while PostgreSQL
+      // timestamps retain microseconds.
+      cursorActivity: sql<string | null>`to_char(coalesce(${conversationSessions.lastActivity}, ${conversationSessions.sessionStart}), 'YYYY-MM-DD"T"HH24:MI:SS.US')`,
+      cursorSessionStart: sql<string | null>`to_char(${conversationSessions.sessionStart}, 'YYYY-MM-DD"T"HH24:MI:SS.US')`,
     })
     .from(conversationSessions)
-    .leftJoin(
-      conversationParticipants,
-      and(
-        eq(conversationParticipants.sessionId, conversationSessions.id),
-        eq(conversationParticipants.participantType, "user"),
-        eq(conversationParticipants.participantId, user.id),
-        eq(conversationParticipants.status, "joined"),
-      ),
-    )
-    .leftJoin(
-      conversationMessages,
-      eq(conversationMessages.sessionId, conversationSessions.id),
-    )
     .where(and(...conditions))
-    .groupBy(conversationSessions.id)
     .orderBy(
       desc(conversationSessions.isPinned),
       // last_activity is the durable activity boundary. Deriving this from
@@ -243,18 +429,23 @@ export async function GET(request: NextRequest) {
       desc(conversationSessions.id),
     );
 
-  const result = rows
-    .filter((r) => Number(r.actualMessageCount ?? 0) > 0)
-    .map((r) => {
-      const session = sessionToSnake({
-        ...(r.session as unknown as Record<string, unknown>),
-        // Keep the same activity source as the resume endpoint. Session
-        // activity changes only for a session/message/agent response event,
-        // not when the session is opened or its title/read state is changed.
-        lastActivity: r.session.lastActivity ?? r.session.sessionStart,
-      });
-      return session;
+  const rows = await (limit === null
+    ? rowsQuery
+    : rowsQuery.limit(limit + 1));
+
+  const hasMore = limit !== null && rows.length > limit;
+  const pageRows = limit === null ? rows : rows.slice(0, limit);
+
+  const result = pageRows.map((r) => {
+    const session = sessionToSnake({
+      ...(r.session as unknown as Record<string, unknown>),
+      // Keep the same activity source as the resume endpoint. Session
+      // activity changes only for a session/message/agent response event,
+      // not when the session is opened or its title/read state is changed.
+      lastActivity: r.session.lastActivity ?? r.session.sessionStart,
     });
+    return session;
+  });
 
   let statusProjections: Awaited<
     ReturnType<typeof fetchConversationHistoryStatuses>
@@ -307,9 +498,18 @@ export async function GET(request: NextRequest) {
     throw error;
   }
 
+  const nextCursor =
+    hasMore && pageRows.length > 0
+      ? encodeConversationCursor(
+          cursorFromSession(pageRows[pageRows.length - 1], cursorScope),
+        )
+      : null;
+
   return jsonWithConditional(request, {
     conversations: projectedResult,
     total: projectedResult.length,
+    has_more: hasMore,
+    next_cursor: nextCursor,
   });
 }
 

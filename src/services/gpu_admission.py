@@ -34,6 +34,9 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from .gpu_trial_lease_policy import validate_lease_ttl_seconds
+from .restart_drain import is_restart_draining
+
 DEFAULT_BACKEND = "local-gpu"
 MAX_LEASE_TTL_SECONDS = 180.0
 # Must exceed the slowest legitimate native shutdown (pinned Strata /v1/unload escalates
@@ -132,7 +135,7 @@ class GpuAdmissionCoordinator:
     ):
         self.clock = clock
         self.boot_id = boot_id or uuid.uuid4().hex
-        self.max_ttl = float(max_ttl)
+        self.max_ttl = validate_lease_ttl_seconds(max_ttl, max_seconds=max_ttl)
         self.max_replay = int(max_replay)
         # CLEANUP / RECOVERY are bounded: past the budget the state is an explicit ERROR
         # (gates stay closed, trusted recovery keeps trying) instead of "in progress" forever.
@@ -262,10 +265,12 @@ class GpuAdmissionCoordinator:
             self.tick()
             if (not isinstance(owner, str) or not owner or len(owner) > _MAX_OWNER_LENGTH
                     or not isinstance(operation_id, str) or not operation_id
-                    or len(operation_id) > _MAX_OPERATION_LENGTH
-                    or isinstance(ttl, bool) or not isinstance(ttl, (int, float))
-                    or not 0 < ttl <= self.max_ttl):
+                    or len(operation_id) > _MAX_OPERATION_LENGTH):
                 raise ValueError("invalid lease")
+            try:
+                ttl = validate_lease_ttl_seconds(ttl, max_seconds=self.max_ttl)
+            except ValueError:
+                raise ValueError("invalid lease") from None
             key = (owner, operation_id)
             old = self.operations.get(key)
             if old is not None:
@@ -311,7 +316,9 @@ class GpuAdmissionCoordinator:
     def admit_job(self) -> str | None:
         with self.lock:
             self.tick()
-            if self.phase != "OPEN":
+            # Background index jobs wait out a restart reservation; chat
+            # embedding requests (try_admit_request) are never gated by it.
+            if self.phase != "OPEN" or is_restart_draining():
                 return None
             ticket = secrets.token_hex(16)
             self.jobs.add(ticket)
@@ -517,6 +524,7 @@ class GpuAdmissionCoordinator:
                 requests=len(self.requests), spawns=len(self.spawns), error=self.error,
                 reason=self.reason, release_started=self.release_started,
                 recovery_pending=self.recovery_pending, manifest_size=len(self.manifest),
+                max_lease_ttl_seconds=self.max_ttl,
                 owner=lease["owner"] if lease else None,
                 expires_in_seconds=max(0.0, lease["expires"] - self.clock()) if lease else None,
             )
@@ -552,18 +560,27 @@ def get_gpu_admission(backend: str = DEFAULT_BACKEND) -> GpuAdmissionCoordinator
         return coordinator
 
 
-def configure_gpu_admission(backend: str = DEFAULT_BACKEND, *, recovering: bool = False) -> GpuAdmissionCoordinator:
+def configure_gpu_admission(
+    backend: str = DEFAULT_BACKEND,
+    *,
+    recovering: bool = False,
+    max_ttl: float = MAX_LEASE_TTL_SECONDS,
+) -> GpuAdmissionCoordinator:
     """Create the backend coordinator before any ticket holder starts.
 
     ``recovering`` is only legal while nothing has used the coordinator yet:
     switching an active OPEN coordinator to RECOVERY would orphan its tickets.
     """
+    selected_max_ttl = validate_lease_ttl_seconds(max_ttl, max_seconds=max_ttl)
     with _registry_lock:
         existing = _registry.get(backend)
         if existing is None:
-            existing = _registry[backend] = GpuAdmissionCoordinator(recovering=recovering)
+            existing = _registry[backend] = GpuAdmissionCoordinator(
+                recovering=recovering, max_ttl=selected_max_ttl)
         elif recovering and existing.phase != "RECOVERY":
             raise RuntimeError("GPU admission was used before recovery was configured")
+        elif existing.max_ttl != selected_max_ttl:
+            raise RuntimeError("GPU admission max TTL was already configured differently")
         return existing
 
 

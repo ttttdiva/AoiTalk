@@ -2721,7 +2721,13 @@ class ManagedLocalRuntimeManager:
                 runtime_installed=installed, model_installed=installed, done=True,
                 error=error, started_at=None, prepare_supported=supported and not external,
                 runtime_path=settings["source_root"], model_path=settings["data_dir"],
-                runtime_metadata={"version": settings["runtime_profile"]["source_revision"], "install_source": "official-setup"},
+                runtime_metadata={
+                    "version": settings["runtime_profile"].get(
+                        "engine_version",
+                        settings["runtime_profile"]["source_revision"],
+                    ),
+                    "install_source": "official-setup",
+                },
             )
             state["setup_required"] = not installed and not external
             return state
@@ -3005,7 +3011,11 @@ class ManagedLocalRuntimeManager:
             started_at=None,
             prepare_supported=True,
             runtime_metadata={
-                "version": str(profile.get("source_revision") or ""),
+                "version": str(
+                    profile.get("engine_version")
+                    or profile.get("source_revision")
+                    or ""
+                ),
                 "install_source": "official-setup",
             },
         )

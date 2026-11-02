@@ -6,6 +6,7 @@ AgentLLMClientと互換のインターフェースを提供する。
 """
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -145,6 +146,13 @@ from ..services.user_settings_service import get_user_custom_instructions_sync
 
 logger = logging.getLogger(__name__)
 
+_CLI_STAGE_STARTED_AT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "cli_stage_started_at", default=None
+)
+_CLI_STAGE_WORKER_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cli_stage_worker_active", default=False
+)
+
 DEFAULT_CLI_TOOL_RESULT_MAX_CHARS = 8000
 MAX_CLI_TOOL_RESULT_MAX_CHARS = 16000
 # CLI-native tool loops need a bounded budget, but work profiles must be able
@@ -178,6 +186,63 @@ CLI_HELP_ISOLATION_UNAVAILABLE = (
 )
 
 _PLAIN_TEXT_MODEL_OVERRIDE_UNSET = object()
+_TOKEN_USAGE_OPTIONAL_CLI_PROVIDERS = frozenset(
+    {"antigravity-cli", "claude-code", "codex-cli", "grok-build-cli"}
+)
+
+
+def _allowed_codex_mcp_server_names(extra_args: Any) -> tuple[str, ...]:
+    """Read enabled MCP names from the final per-invocation Codex overrides."""
+
+    if not isinstance(extra_args, (list, tuple)):
+        return ()
+    enabled_by_name: dict[str, bool] = {}
+    for index, argument in enumerate(extra_args[:-1]):
+        if argument != "-c":
+            continue
+        setting = extra_args[index + 1]
+        if not isinstance(setting, str):
+            continue
+        key, separator, value = setting.partition("=")
+        prefix = "mcp_servers."
+        if not separator or not key.startswith(prefix):
+            continue
+        server_name, dot, field_name = key[len(prefix):].rpartition(".")
+        if (
+            not dot
+            or field_name != "enabled"
+            or not server_name
+            or len(server_name) > 128
+        ):
+            continue
+        if not all(
+            character.isascii()
+            and (character.isalnum() or character in "_.-")
+            for character in server_name
+        ):
+            continue
+        enabled_by_name[server_name] = value.strip().casefold() == "true"
+    return tuple(sorted(name for name, enabled in enabled_by_name.items() if enabled))
+
+
+def _log_cli_invocation_diagnostic(
+    *,
+    suppress_automatic_context: bool,
+    aoidots_agent_execution_validated: bool,
+    effective_extra_args: Any,
+) -> None:
+    """Log only safe invocation booleans and enabled Codex MCP server names."""
+
+    server_names = _allowed_codex_mcp_server_names(effective_extra_args)
+    logger.info(
+        "CLI invocation diagnostic: suppress_automatic_context=%s "
+        "aoidots_agent_execution_validated=%s allowed_mcp_server_names=%s "
+        "allowed_mcp_server_count=%d",
+        bool(suppress_automatic_context),
+        bool(aoidots_agent_execution_validated),
+        server_names,
+        len(server_names),
+    )
 
 
 def _is_codex_model_unavailable(value: Any) -> bool:
@@ -277,8 +342,10 @@ class CLILLMClient:
         self._last_context_snapshots: list[dict[str, Any]] = []
         self._last_cli_usage: dict[str, Any] = {}
         self._agent_run_usage: dict[str, int] = {}
+        self._isolated_system_prompt_override = ""
         self._last_turn_tool_rounds_exhausted = False
         self._last_turn_tool_loop_failed = False
+        self._last_generation_failure = None
         self._cli_native_session_reset_requested = False
         self._cli_native_session_info: dict[str, Any] = {
             "mode": "stateless",
@@ -402,6 +469,8 @@ class CLILLMClient:
     def set_session_context(
         self, user_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
     ):
+        # TerminalMode can bind turn identity after installing an isolated
+        # Agent prompt. Keep that prompt independent from ordinary user state.
         if user_id:
             self.session_user_id = str(user_id)
         if metadata:
@@ -484,6 +553,7 @@ class CLILLMClient:
         # _build_system_context は custom_system_prompt を最優先するため、
         # ここを残すとヘッダーで選択したキャラクターが実生成へ反映されない。
         self.custom_system_prompt = None
+        self._isolated_system_prompt_override = ""
         self._cli_native_session_reset_requested = True
         logger.info(f"[CLILLMClient] Character changed to: {character_name}")
 
@@ -496,6 +566,7 @@ class CLILLMClient:
                 # update_character はヘッダー切替からも呼ばれるため、
                 # set_character と同じく旧キャラクターのプロンプトを破棄する。
                 self.custom_system_prompt = None
+                self._isolated_system_prompt_override = ""
                 self.clear_history()
                 self._cli_native_session_reset_requested = True
                 logger.info(f"[CLILLMClient] キャラクター更新: {self.character_name} (会話履歴クリア済み)")
@@ -503,9 +574,17 @@ class CLILLMClient:
                 logger.warning(f"[CLILLMClient] キャラクター設定が見つかりません: {yaml_filename}")
 
     def set_system_prompt(self, prompt: str):
+        self._isolated_system_prompt_override = ""
         self.custom_system_prompt = prompt
         self._cli_native_session_reset_requested = True
         logger.info(f"[CLILLMClient] Custom system prompt set: {prompt[:50]}...")
+
+    def set_isolated_system_prompt(self, prompt: str) -> None:
+        """Set a request-local prompt without replacing the ambient prompt."""
+
+        self._isolated_system_prompt_override = str(prompt or "").strip()
+        self._cli_native_session_reset_requested = True
+        logger.info("[CLILLMClient] Isolated system prompt set")
 
     def set_llm_mode(self, mode: str):
         if mode not in ['fast', 'thinking']:
@@ -858,6 +937,65 @@ class CLILLMClient:
             self._cli_execution_lock = lock
         return lock
 
+    def _cli_stage_provider_model(self) -> tuple[str, str]:
+        backend = getattr(self, "cli_backend", None)
+        try:
+            provider = str(backend.get_provider_name() or "cli")
+        except Exception:
+            provider = "cli"
+        provider = provider.strip().lower().replace(" ", "-") or "cli"
+        model = (
+            getattr(backend, "_model", None)
+            or getattr(self, "model_name", None)
+            or "cli"
+        )
+        return provider, str(model or "cli").strip() or "cli"
+
+    def _observe_cli_stage(self, stage: str, *, pid: int | None = None) -> None:
+        """Record safe CLI boundary timing without request or response text."""
+        started_at = _CLI_STAGE_STARTED_AT.get()
+        if started_at is None:
+            started_at = time.monotonic()
+        provider, model = self._cli_stage_provider_model()
+        if "grok" not in provider:
+            return
+        try:
+            observed_pid = int(pid if pid is not None else os.getpid())
+        except (TypeError, ValueError, OSError):
+            observed_pid = int(os.getpid())
+        elapsed_ms = max(0, int((time.monotonic() - started_at) * 1000))
+        logger.info(
+            "[CLILLMClient] stage=%s provider=%s model=%s elapsed_ms=%d pid=%d",
+            str(stage),
+            provider,
+            model,
+            elapsed_ms,
+            observed_pid,
+        )
+
+    def _begin_cli_stage_observation(self, stage: str = "session_dispatch_enter"):
+        token = _CLI_STAGE_STARTED_AT.set(time.monotonic())
+        try:
+            self._observe_cli_stage(stage)
+        except BaseException:
+            _CLI_STAGE_STARTED_AT.reset(token)
+            raise
+        return token
+
+    def _finish_cli_stage_observation(self) -> None:
+        _CLI_STAGE_STARTED_AT.set(None)
+
+    def _observe_cli_process_stage(self, stage: str, process: Any = None) -> None:
+        """Observe Grok spawn boundaries without retaining process state."""
+
+        pid = None
+        if process is not None:
+            try:
+                pid = int(getattr(process, "pid", 0) or 0)
+            except (TypeError, ValueError):
+                pid = 0
+        self._observe_cli_stage(stage, pid=pid if pid and pid > 0 else None)
+
     def _ensure_cli_privacy_direct(self) -> None:
         """Refresh the central CLI boundary before every invocation.
 
@@ -887,6 +1025,24 @@ class CLILLMClient:
         except Exception:
             agent_invocation = bool(getattr(self, "_agent_native_scope_required", False))
         if not agent_invocation:
+            return controls
+        from .cli_native_capabilities import _codex_aoidots_agent_execution, _native_delegation_phase_proof
+
+        if getattr(self, "_agent_native_phase_required", False):
+            if _native_delegation_phase_proof(self) is None:
+                return None
+            return controls if controls == {"extra_args": self.cli_backend.native_delegation_phase_args()} else None
+
+        if (
+            _codex_aoidots_agent_execution(self)
+            and bool(
+                getattr(
+                    self.cli_backend,
+                    "supports_formal_agent_mcp_config_overrides",
+                    False,
+                )
+            )
+        ):
             return controls
         supports_strict = getattr(
             self.cli_backend,
@@ -966,8 +1122,26 @@ class CLILLMClient:
                 result[index + 1] = json.dumps(payload, ensure_ascii=False)
         return result
 
+    def _collect_codex_native_tool_calls(self) -> None:
+        consume = getattr(self.cli_backend, "consume_last_native_tool_calls", None)
+        if not callable(consume):
+            return
+        try:
+            calls = consume()
+        except Exception:
+            logger.debug("Codex MCP tool receipt collection failed", exc_info=True)
+            return
+        if not isinstance(calls, list) or not calls:
+            return
+        current = getattr(self, "_last_tool_calls", None)
+        if not isinstance(current, list):
+            current = []
+            self._last_tool_calls = current
+        current.extend(item for item in calls if isinstance(item, dict))
+
     def _execute_prompt_tracked_locked(self, *args: Any, **kwargs: Any):
         """CLI実行と、その構造化usageの永続化を一体で行う。"""
+        self._observe_cli_stage("privacy_transaction_start")
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
@@ -1119,11 +1293,23 @@ class CLILLMClient:
         success = False
         output = ""
         usage: Optional[dict[str, Any]] = None
+        request_started = False
+        run_budget = None
+        from .agent_run_budget import (
+            AgentRunBudgetStop,
+            budget_failure_generation_failure,
+            get_agent_run_budget,
+        )
+
+        run_budget = get_agent_run_budget(self, config=self.config)
+        provider_name = str(
+            self.cli_backend.get_provider_name() or "cli"
+        ).strip().lower().replace(" ", "-")
+        token_usage_optional = (
+            provider_name in _TOKEN_USAGE_OPTIONAL_CLI_PROVIDERS
+        )
         try:
             gateway = self._sync_privacy_gateway()
-            provider_name = str(
-                self.cli_backend.get_provider_name() or "cli"
-            ).strip().lower().replace(" ", "-")
             request_payload = {
                 "prompt": str(prompt or ""),
                 "system_context": str(system_context or ""),
@@ -1131,6 +1317,7 @@ class CLILLMClient:
             }
 
             def send_cli_request(final_payload: Any):
+                nonlocal request_started
                 if not isinstance(final_payload, dict):
                     raise PrivacyError("CLI outbound payload is malformed")
                 final_prompt = final_payload.get("prompt")
@@ -1167,6 +1354,9 @@ class CLILLMClient:
                 )
                 setattr(self.cli_backend, "_aoitalk_egress_transaction", True)
                 fresh_entry = None
+                stage_observer_had_attr = False
+                stage_observer_previous = None
+                stage_observer_installed = False
                 try:
                     fresh_entry = self._bind_fresh_native_provider_entry()
                     if fresh_entry:
@@ -1192,51 +1382,146 @@ class CLILLMClient:
                                 "native provider capabilities changed before launch"
                             )
                         call_kwargs.update(refreshed_controls)
-                    with cli_backend_call_scope():
-                        return self.cli_backend.execute_prompt(*call_args, **call_kwargs)
-                finally:
-                    self._reset_fresh_native_provider_entry(fresh_entry)
-                    if had_marker:
-                        setattr(
-                            self.cli_backend,
-                            "_aoitalk_egress_transaction",
-                            previous_marker,
+                    if "grok" in provider_name:
+                        stage_observer_had_attr = hasattr(
+                            self.cli_backend, "_aoitalk_stage_observer"
                         )
-                    else:
+                        stage_observer_previous = getattr(
+                            self.cli_backend, "_aoitalk_stage_observer", None
+                        )
                         try:
-                            delattr(self.cli_backend, "_aoitalk_egress_transaction")
-                        except AttributeError:
-                            pass
+                            setattr(
+                                self.cli_backend,
+                                "_aoitalk_stage_observer",
+                                self._observe_cli_process_stage,
+                            )
+                            stage_observer_installed = True
+                        except Exception:
+                            # Stage observation is diagnostic only; never weaken
+                            # the provider privacy or execution boundary because
+                            # a legacy backend rejects an observer attribute.
+                            stage_observer_installed = False
+                    with cli_backend_call_scope():
+                        if run_budget is not None and not run_budget.begin_provider_request():
+                            failure = run_budget.failure
+                            if failure is not None:
+                                raise AgentRunBudgetStop(failure)
+                        request_started = True
+                        from .cli_native_capabilities import (
+                            _codex_aoidots_agent_execution,
+                            _formal_agent_work_context,
+                        )
+
+                        aoidots_context = _codex_aoidots_agent_execution(self)
+                        context_builder = getattr(
+                            self.cli_backend,
+                            "formal_agent_mcp_context",
+                            None,
+                        )
+                        self._observe_cli_stage("privacy_gate_passed")
+
+                        def execute_backend_prompt():
+                            if "codex" in provider_name and self._agent_prompt_active():
+                                _log_cli_invocation_diagnostic(
+                                    suppress_automatic_context=bool(
+                                        getattr(
+                                            get_turn_context(),
+                                            "suppress_automatic_context",
+                                            False,
+                                        )
+                                    ),
+                                    aoidots_agent_execution_validated=bool(
+                                        aoidots_context
+                                    ),
+                                    effective_extra_args=call_kwargs.get("extra_args"),
+                                )
+                            self._observe_cli_stage("backend_execute_entry")
+                            try:
+                                return self.cli_backend.execute_prompt(
+                                    *call_args,
+                                    **call_kwargs,
+                                )
+                            finally:
+                                self._observe_cli_stage("backend_execute_exit")
+
+                        if getattr(self, "_agent_native_phase_required", False):
+                            with self.cli_backend.native_delegation_phase_context(self):
+                                result = execute_backend_prompt()
+                        elif aoidots_context and callable(context_builder):
+                            with context_builder(_formal_agent_work_context(self)):
+                                result = execute_backend_prompt()
+                        else:
+                            result = execute_backend_prompt()
+                        self._collect_codex_native_tool_calls()
+                        return result
+                finally:
+                    try:
+                        if stage_observer_installed:
+                            if stage_observer_had_attr:
+                                setattr(
+                                    self.cli_backend,
+                                    "_aoitalk_stage_observer",
+                                    stage_observer_previous,
+                                )
+                            else:
+                                delattr(self.cli_backend, "_aoitalk_stage_observer")
+                    except Exception as exc:
+                        logger.debug(
+                            "CLI process stage observer restoration failed; exception_type=%s",
+                            type(exc).__name__,
+                        )
+                    finally:
+                        try:
+                            self._reset_fresh_native_provider_entry(fresh_entry)
+                        finally:
+                            if had_marker:
+                                setattr(
+                                    self.cli_backend,
+                                    "_aoitalk_egress_transaction",
+                                    previous_marker,
+                                )
+                            else:
+                                try:
+                                    delattr(self.cli_backend, "_aoitalk_egress_transaction")
+                                except AttributeError:
+                                    pass
 
             if budget_timeout_supplier is not None:
                 budget_timeout_supplier()
-            success, output = gateway.execute_sync(
-                request_payload,
-                provider=provider_name,
-                descriptor=EgressDescriptor(
-                    action="model.generate",
-                    transport="cli.subprocess",
-                    destination=provider_name,
+            try:
+                success, output = gateway.execute_sync(
+                    request_payload,
                     provider=provider_name,
-                    tool="llm.cli",
+                    descriptor=EgressDescriptor(
+                        action="model.generate",
+                        transport="cli.subprocess",
+                        destination=provider_name,
+                        provider=provider_name,
+                        tool="llm.cli",
+                        model=str(
+                            snapshot_model
+                            or getattr(self.cli_backend, "_model", None)
+                            or getattr(self, "model_name", "cli")
+                        ),
+                    ),
+                    base_url=None,
+                    source_kind="cli_prompt",
                     model=str(
                         snapshot_model
                         or getattr(self.cli_backend, "_model", None)
                         or getattr(self, "model_name", "cli")
                     ),
-                ),
-                base_url=None,
-                source_kind="cli_prompt",
-                model=str(
-                    snapshot_model
-                    or getattr(self.cli_backend, "_model", None)
-                    or getattr(self, "model_name", "cli")
-                ),
-                sender=send_cli_request,
-            )
+                    sender=send_cli_request,
+                )
+            except AgentRunBudgetStop as exc:
+                failure = budget_failure_generation_failure(exc.failure)
+                self._last_generation_failure = failure
+                success = False
+                output = failure.user_message if failure else exc.failure.code
             if isinstance(output, str):
                 output = gateway.restore(output)
         finally:
+            self._observe_cli_stage("privacy_transaction_exit")
             try:
                 usage = consume_usage() if callable(consume_usage) else None
             except Exception:
@@ -1245,6 +1530,30 @@ class CLILLMClient:
                     exc_info=True,
                 )
                 usage = None
+
+            phase_usage_incomplete = bool(
+                getattr(self, "_agent_native_phase_required", False)
+                and getattr(self.cli_backend, "_native_phase_usage_incomplete", False)
+            )
+            if getattr(self, "_agent_native_phase_required", False):
+                self._agent_native_usage_incomplete = phase_usage_incomplete
+                if isinstance(usage, dict):
+                    usage = dict(usage)
+                    if getattr(self.cli_backend, "_native_phase_missing_input", False):
+                        usage.pop("input_tokens", None)
+                    if getattr(self.cli_backend, "_native_phase_missing_output", False):
+                        usage.pop("output_tokens", None)
+
+            if request_started and run_budget is not None:
+                budget_failure = run_budget.record_provider_response(
+                    usage,
+                    token_usage_optional=token_usage_optional,
+                    usage_incomplete=phase_usage_incomplete,
+                )
+                if budget_failure is not None:
+                    self._last_generation_failure = budget_failure_generation_failure(
+                        budget_failure
+                    )
 
             if not suppress_automatic_context:
                 self._last_cli_usage = dict(usage or {})
@@ -1274,7 +1583,8 @@ class CLILLMClient:
                     request_snapshot, usage.get("input_tokens")
                 )
 
-            if success and usage and not suppress_automatic_context:
+            if (success and usage and not suppress_automatic_context
+                    and "input_tokens" in usage and "output_tokens" in usage):
                 try:
                     from ..services.token_tracking_service import get_token_tracking_service
 
@@ -1366,6 +1676,28 @@ class CLILLMClient:
         image_data: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Union[str, Generator[str, None, None]]:
+        stage_token = self._begin_cli_stage_observation("generation_dispatch_enter")
+        try:
+            return self._generate_response_impl(
+                user_input,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=stream,
+                image_data=image_data,
+                **kwargs,
+            )
+        finally:
+            _CLI_STAGE_STARTED_AT.reset(stage_token)
+
+    def _generate_response_impl(
+        self,
+        user_input: str,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        stream: bool = False,
+        image_data: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Union[str, Generator[str, None, None]]:
         logger.info(f"[CLILLMClient] Generating response for: {user_input[:50]}...")
         stream_callback = kwargs.get("stream_callback")
         max_tokens = dialogue_provider_max_output_tokens(self, max_tokens)
@@ -1431,6 +1763,7 @@ class CLILLMClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Core synchronous generation logic"""
+        self._observe_cli_stage("generation_entry")
         suppress_automatic_context = bool(
             getattr(get_turn_context(), "suppress_automatic_context", False)
         )
@@ -1457,12 +1790,14 @@ class CLILLMClient:
             for name in (
                 "_last_context_snapshots",
                 "_last_cli_usage",
+                "_last_tool_calls",
                 "_agent_run_usage",
                 "_last_turn_tool_rounds_exhausted",
                 "_last_turn_tool_loop_failed",
                 "_cli_native_session_info",
                 "_current_context_bundle",
                 "_privacy_project_metadata",
+                "_isolated_system_prompt_override",
             ):
                 if not hasattr(self, name):
                     continue
@@ -1476,6 +1811,7 @@ class CLILLMClient:
         provider_name = str(self.cli_backend.get_provider_name() or "").strip().lower()
         self._last_context_snapshots = []
         self._last_cli_usage = {}
+        self._last_tool_calls = []
         self._agent_run_usage = {}
         # A shared CLI client can serve consecutive sessions.  Never carry a
         # previous turn's exhaustion state into a successful new turn.
@@ -1548,17 +1884,24 @@ class CLILLMClient:
         no_progress_guard_scope.__enter__()
 
         try:
-            project_context = self._resolve_project_context_sync()
-            project_token = set_runtime_project_context(project_context)
-            self._privacy_project_metadata = (
-                dict((project_context or {}).get("metadata") or {})
-                if isinstance(project_context, dict)
-                and isinstance((project_context or {}).get("metadata"), dict)
-                else {}
-            )
-            self._current_context_bundle = self._build_context_bundle_sync(
-                user_input, project_context
-            )
+            self._observe_cli_stage("context_or_retrieval_start")
+            try:
+                project_context = self._resolve_project_context_sync()
+                project_token = set_runtime_project_context(project_context)
+                self._privacy_project_metadata = (
+                    dict((project_context or {}).get("metadata") or {})
+                    if isinstance(project_context, dict)
+                    and isinstance((project_context or {}).get("metadata"), dict)
+                    else {}
+                )
+                self._current_context_bundle = self._build_context_bundle_sync(
+                    user_input, project_context
+                )
+            except Exception:
+                self._observe_cli_stage("context_or_retrieval_failed")
+                raise
+            else:
+                self._observe_cli_stage("context_or_retrieval_complete")
 
             # Reasoning mode check
             # Reserved controller turns (notably AoiTalk Help) must not enter
@@ -1987,6 +2330,8 @@ class CLILLMClient:
             if turn_result.stopped_reason == "cancelled":
                 raise GenerationCancelled("CLI generation cancelled")
             tool_loop_stop_reason = turn_result.stopped_reason
+            if turn_result.generation_failure is not None:
+                self._last_generation_failure = turn_result.generation_failure
             tool_rounds_exhausted = tool_loop_stop_reason == "max_rounds"
             tool_loop_failed = (
                 tool_loop_stop_reason not in CLI_TOOL_LOOP_SUCCESS_REASONS
@@ -2014,6 +2359,7 @@ class CLILLMClient:
                 )
                 for tool_result in audit_results
             ]
+            self._last_tool_calls.extend(tool_call_records)
             if tool_loop_failed:
                 # A failed loop can carry a provider marker from the last
                 # attempted round.  Never persist/display that marker: it may
@@ -2087,6 +2433,9 @@ class CLILLMClient:
             logger.info(f"[CLILLMClient] Response generated: {len(response)} chars")
             return response
         finally:
+            self._observe_cli_stage("generation_return")
+            if not _CLI_STAGE_WORKER_ACTIVE.get():
+                self._finish_cli_stage_observation()
             no_progress_guard_scope.__exit__(None, None, None)
             if native_store is not None and native_lease is not None:
                 try:
@@ -2173,6 +2522,8 @@ class CLILLMClient:
         if turn_result.stopped_reason == "cancelled":
             raise GenerationCancelled("CLI generation cancelled")
         tool_loop_stop_reason = turn_result.stopped_reason
+        if turn_result.generation_failure is not None:
+            self._last_generation_failure = turn_result.generation_failure
         tool_rounds_exhausted = tool_loop_stop_reason == "max_rounds"
         tool_loop_failed = (
             tool_loop_stop_reason not in CLI_TOOL_LOOP_SUCCESS_REASONS
@@ -2254,6 +2605,12 @@ class CLILLMClient:
         continue through the existing static helper below.
         """
 
+        if getattr(self, "_agent_native_phase_required", False):
+            from .cli_native_capabilities import _native_delegation_phase_proof
+            proof = _native_delegation_phase_proof(self)
+            if proof is None:
+                raise AgentDialogueWorkspaceDenied("native delegation proof is unavailable")
+            return Path(proof.workspace.working_directory).resolve()
         if self._agent_prompt_active():
             workspace = self._bound_agent_dialogue_workspace()
             if workspace is None:
@@ -2266,6 +2623,8 @@ class CLILLMClient:
     def _agent_cli_plain_text_cwd(self) -> Path:
         """Resolve the isolated cwd for a tool-free Agent generation."""
 
+        if getattr(self, "_agent_native_phase_required", False):
+            raise AgentDialogueWorkspaceDenied("native delegation requires its native generation entry")
         if self._agent_prompt_active():
             workspace = self._bound_agent_dialogue_workspace()
             if workspace is None:
@@ -2750,23 +3109,28 @@ class CLILLMClient:
         max_tokens: Optional[int] = None,
         **kwargs,
     ) -> str:
-        from ..services.session_llm_generation import run_session_aware_generation
+        stage_token = self._begin_cli_stage_observation()
+        try:
+            from ..services.session_llm_generation import run_session_aware_generation
 
-        max_tokens = dialogue_provider_max_output_tokens(self, max_tokens)
+            max_tokens = dialogue_provider_max_output_tokens(self, max_tokens)
 
-        return await run_session_aware_generation(
-            self,
-            # Lightweight/internal clients (and cancellation tests) may be
-            # constructed without the full config object.  The session-aware
-            # dispatcher already treats a missing config as no overrides;
-            # avoid turning that valid direct-generation path into an
-            # AttributeError before the provider is invoked.
-            getattr(self, "config", None),
-            user_input,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs,
-        )
+            return await run_session_aware_generation(
+                self,
+                # Lightweight/internal clients (and cancellation tests) may be
+                # constructed without the full config object.  The session-aware
+                # dispatcher already treats a missing config as no overrides;
+                # avoid turning that valid direct-generation path into an
+                # AttributeError before the provider is invoked.
+                getattr(self, "config", None),
+                user_input,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+        finally:
+            self._observe_cli_stage("session_dispatch_exit")
+            _CLI_STAGE_STARTED_AT.reset(stage_token)
 
     async def _generate_response_async_impl(
         self,
@@ -2775,14 +3139,40 @@ class CLILLMClient:
         max_tokens: Optional[int] = None,
         **kwargs,
     ) -> str:
-        return await run_owned_cli_worker(lambda: self.generate_response(
-            user_input, temperature, max_tokens, stream=False, **kwargs))
+        self._observe_cli_stage("worker_submit")
+        worker_token = _CLI_STAGE_WORKER_ACTIVE.set(True)
+        try:
+            def run_worker() -> str:
+                self._observe_cli_stage("worker_entry")
+                return self.generate_response(
+                    user_input, temperature=temperature, max_tokens=max_tokens,
+                    stream=False, **kwargs
+                )
+
+            return await run_owned_cli_worker(run_worker)
+        finally:
+            self._observe_cli_stage("worker_return")
+            _CLI_STAGE_WORKER_ACTIVE.reset(worker_token)
 
     async def generate_plain_text_async(
         self,
         prompt: str,
         *,
         system_prompt: Optional[str] = None,
+    ) -> str:
+        return await self._generate_isolated_cli_async(prompt, system_prompt=system_prompt)
+
+    async def generate_native_delegation_phase_async(
+        self, prompt: str, *, system_prompt: Optional[str] = None,
+    ) -> str:
+        from .cli_native_capabilities import _native_delegation_phase_proof
+        if (not getattr(self, "_agent_native_phase_required", False)
+                or _native_delegation_phase_proof(self) is None):
+            raise AgentDialogueWorkspaceDenied("native delegation proof is unavailable")
+        return await self._generate_isolated_cli_async(prompt, system_prompt=system_prompt, native_phase=True)
+
+    async def _generate_isolated_cli_async(
+        self, prompt: str, *, system_prompt: Optional[str] = None, native_phase: bool = False,
     ) -> str:
         """Generate one tool-free CLI response without the chat/tool loop.
 
@@ -2793,12 +3183,15 @@ class CLILLMClient:
         usage/snapshots are preserved, but it supplies only a strict system
         instruction and never runs tool-call parsing.
         """
-        system = system_prompt or (
+        system = system_prompt or ((
+            "Follow the user instruction using the issued read-only workspace. "
+            "Return only the requested JSON object without Markdown fences."
+        ) if native_phase else (
             "You are a machine-readable AoiTalk workflow helper. Follow the "
             "user instruction exactly. Do not call tools, do not add an "
             "explanation or Markdown fences, and return only the requested "
             "JSON object."
-        )
+        ))
         if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             # Low-level plain/title helpers can be called directly during a
             # trusted Help turn.  Do not let a caller-supplied instruction (or
@@ -2900,7 +3293,7 @@ class CLILLMClient:
                 get_client_generation_policy(self)
             )
             try:
-                cwd = self._agent_cli_plain_text_cwd()
+                cwd = self._agent_cli_execution_cwd(None) if native_phase else self._agent_cli_plain_text_cwd()
                 kwargs: dict[str, Any] = {
                     "prompt": prompt_text,
                     "cwd": cwd,
@@ -2921,7 +3314,7 @@ class CLILLMClient:
                         # the configured model; avoid recording a false model
                         # name in the request snapshot/usage record.
                         kwargs["_snapshot_model"] = "codex-default"
-                if is_codex:
+                if is_codex and not native_phase:
                     kwargs["disable_native_tools"] = True
                 return self._execute_prompt_tracked(**kwargs)
             finally:
@@ -2932,6 +3325,9 @@ class CLILLMClient:
             self._last_context_snapshots = []
             self._last_cli_usage = {}
             self._agent_run_usage = {}
+            if native_phase:
+                self._agent_native_usage_incomplete = False
+                self.cli_backend._native_phase_usage_incomplete = False
             timeout_supplier = lambda: remaining_timeout(deadline, provider_timeout)
             success, output = invoke(
                 timeout_supplier=timeout_supplier
@@ -2941,7 +3337,7 @@ class CLILLMClient:
             # An explicit Team/Agent target must retain its exact model. An
             # account-default retry would make the pinned route audit false.
             explicit_target = bool(config is not None and config.get("runtime.target_model", ""))
-            if not success and is_codex and not explicit_target and _is_codex_model_unavailable(output):
+            if not success and is_codex and not native_phase and not explicit_target and _is_codex_model_unavailable(output):
                 logger.warning(
                     "[CLILLMClient] Codex model is unavailable for the current "
                     "account; retrying plain generation with the CLI default"
@@ -3120,7 +3516,12 @@ class CLILLMClient:
         agent_turn = self._agent_prompt_active()
 
         # System instructions (セクションヘッダなし — Geminiが誤解しないように)
-        if suppress_automatic_context:
+        isolated_system_prompt = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        if isolated_system_prompt:
+            parts.append(isolated_system_prompt)
+        elif suppress_automatic_context:
             parts.append(AOITALK_HELP_ISOLATED_SYSTEM_PROMPT)
         elif self.custom_system_prompt and not suppress_automatic_context:
             parts.append(self.custom_system_prompt)
@@ -3227,6 +3628,7 @@ class CLILLMClient:
         return native_cli_feature_gate_args(
             self.cli_backend, getattr(self, "config", None), disabled_features,
             getattr(self, "_mcp_servers", {}),
+            client=self,
         )
 
     def _current_native_duplicate_tool_names(self):
