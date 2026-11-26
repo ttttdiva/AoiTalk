@@ -1,8 +1,9 @@
 {
     "mobile":  {
+                   "version":  "0.1.369",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.369/aoitalk-mobile.apk",
+                   "notes":  "Androidの更新画面にAPKの容量を表示し、ダウンロード開始後の案内を通知バーにまとめました。",
                    "date":  "2026-11-26",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.368/aoitalk-mobile.apk",
-                   "version":  "0.1.368",
-                   "notes":  "v0.1.368 リリース"
+                   "bytes":  43294440
                }
 }
